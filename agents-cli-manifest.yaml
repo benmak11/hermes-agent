@@ -1,0 +1,15 @@
+name: "hermes"
+acli_version: "0.5.0"
+agent_directory: "agents"
+region: "us-central1"
+base_template: "adk"
+generated_at: "2026-06-20T19:32:56.826901+00:00"
+language: "python"
+create_params:
+  deployment_target: "cloud_run"
+  session_type: "cloud_sql"
+  cicd_runner: "skip"
+  include_data_ingestion: false
+  
+  datastore: "none"
+  agent_guidance_filename: "CLAUDE.md"
