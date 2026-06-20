@@ -38,21 +38,24 @@ if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
     except Exception:
         pass
 
-# GOOGLE_CLOUD_LOCATION drives where Gemini requests are served. us-central1
-# matches the Cloud Run deployment region. If a model (e.g. gemini-3-pro)
-# requires the global endpoint, set GOOGLE_CLOUD_LOCATION=global.
-os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "us-central1")
+# GOOGLE_CLOUD_LOCATION drives where Gemini requests are served. gemini-3-pro
+# is served from the "global" endpoint (it is NOT available in regional
+# endpoints like us-central1), so default to global. This is independent of the
+# Cloud Run deployment region (which stays us-central1).
+os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "global")
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "True")
 
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 FLASH_MODEL = "gemini-flash-latest"
-PRO_MODEL = "gemini-3-pro"
-# The Application agent drives a browser via Computer Use, which requires a
-# computer-use-capable Gemini model. gemini-3-pro is used here; swap if you
-# adopt a dedicated computer-use preview model.
-COMPUTER_USE_MODEL = "gemini-3-pro"
+# The Gemini 3 Pro model available to this project is "gemini-3.1-pro-preview".
+# There is no bare "gemini-3-pro" id in the Vertex catalog.
+PRO_MODEL = "gemini-3.1-pro-preview"
+# The Application agent drives a browser via Computer Use. Using the Gemini 3 Pro
+# model here; verify computer-use support when wiring the real browser backend
+# (a dedicated computer-use model may be needed).
+COMPUTER_USE_MODEL = "gemini-3.1-pro-preview"
 
 _RETRY = types.HttpRetryOptions(attempts=3)
 
