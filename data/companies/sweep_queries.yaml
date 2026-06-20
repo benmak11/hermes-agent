@@ -1,0 +1,26 @@
+# Each query gets run against all three platforms. Tune to your interests.
+# Group by role family so it's easy to add/remove whole families.
+# Use the same operators that work in Google's UI.
+# NOTE: these queries discover NEW companies. Once a company is in known.yaml,
+# the daily fetch already pulls ALL its open roles regardless of these queries —
+# so you don't need a query for every title, just enough to surface good companies.
+queries:
+  # engineering
+  - '"staff engineer" "remote"'
+  - '"senior software engineer" "remote" -principal'
+  - '"engineering manager" "remote"'
+  # product
+  - '"senior product manager" "remote"'
+  - '"group product manager" "remote"'
+  # design
+  - '"product designer" "remote"'
+  # data
+  - '"data scientist" "remote"'
+  # marketing / growth
+  - '"product marketing manager" "remote"'
+
+# Applied to every query as negative terms.
+exclude_keywords:
+  - "clearance"
+  - "must be in office"
+  - "us citizen"

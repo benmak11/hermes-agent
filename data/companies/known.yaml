@@ -1,0 +1,33 @@
+# Companies you've vetted and want to track daily.
+# Each company has a slug per platform; a company can appear on multiple if
+# they use different ATSes for different divisions.
+# Find a company's ATS by clicking any posting on its careers site:
+#   boards.greenhouse.io/{slug}/...  -> greenhouse
+#   jobs.lever.co/{slug}/...         -> lever
+#   jobs.ashbyhq.com/{slug}/...      -> ashby
+greenhouse:
+  - slug: stripe
+    added: "2026-06-01"
+    notes: "Payments infra"
+  - slug: airbnb
+    added: "2026-06-01"
+  - slug: figma
+    added: "2026-06-01"
+  - slug: notion
+    added: "2026-06-01"
+  - slug: vercel
+    added: "2026-06-01"
+  - slug: linear
+    added: "2026-06-01"
+
+lever:
+  - slug: spotify
+    added: "2026-06-01"
+
+ashby:
+  - slug: ramp
+    added: "2026-06-01"
+  - slug: replit
+    added: "2026-06-01"
+  - slug: retool
+    added: "2026-06-01"
