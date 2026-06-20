@@ -1,0 +1,4 @@
+# Companies you never want to see again. The sweep filters these out before
+# adding to unvetted, and the daily fetch skips them.
+# Format: list of {platform, slug, blocked_at, reason} for an audit trail.
+blocked: []
