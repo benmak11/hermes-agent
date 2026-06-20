@@ -150,6 +150,9 @@ dmypy.json
 tmp*
 .agents-cli-scripts/
 
+# Personal data (PII) — keep local, never commit
+data/profile.yaml
+
 # Node
 **/node_modules
 npm-debug.log

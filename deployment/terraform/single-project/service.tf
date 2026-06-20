@@ -143,9 +143,11 @@ resource "google_cloud_run_v2_service" "app" {
         value = var.project_id
       }
 
+      # gemini-3-pro is served from the global endpoint, not regional ones.
+      # This is intentionally "global", not var.region (the Cloud Run region).
       env {
         name  = "GOOGLE_CLOUD_LOCATION"
-        value = var.region
+        value = "global"
       }
 
       env {
