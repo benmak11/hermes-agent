@@ -7,7 +7,11 @@ import Link from "next/link";
 
 import { auth } from "@/lib/firebase";
 
-export function TopNav({ section }: { section: "review" | "companies" }) {
+export function TopNav({
+  section,
+}: {
+  section: "review" | "companies" | "applications";
+}) {
   return (
     <header
       className="sticky top-0 z-10 flex h-14 items-center justify-between border-b px-6 backdrop-blur"
@@ -33,6 +37,13 @@ export function TopNav({ section }: { section: "review" | "companies" }) {
 
       {section === "review" ? (
         <div className="flex items-center gap-[18px]">
+          <Link
+            href="/applications"
+            className="text-[13px] font-medium"
+            style={{ color: "var(--label)" }}
+          >
+            Applications
+          </Link>
           <Link
             href="/settings/companies"
             className="text-[13px] font-medium"

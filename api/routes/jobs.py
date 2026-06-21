@@ -4,14 +4,16 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 from pydantic import BaseModel
 
 from api.deps import verify_user
+from api.routes.applications import application_id, run_tailoring
 
 router = APIRouter(tags=["jobs"])
 
@@ -57,15 +59,35 @@ class Decision(BaseModel):
 
 @router.post("/jobs/{job_id}/decide")
 def decide(
-    job_id: str, body: Decision, user_id: str = Depends(verify_user)
+    job_id: str,
+    body: Decision,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(verify_user),
 ) -> dict:
-    """Record the user's decision on a job."""
-    (
-        _client()
-        .collection("users")
-        .document(user_id)
-        .collection("jobs")
-        .document(job_id)
-        .update({"user_decision": body.decision})
+    """Record the user's decision on a job.
+
+    Approving a job kicks off tailoring: create the Application in ``tailoring``
+    state and schedule the (LLM + render + upload) pipeline as a background task.
+    Idempotent — an existing Application is left untouched.
+    """
+    user_ref = _client().collection("users").document(user_id)
+    user_ref.collection("jobs").document(job_id).update(
+        {"user_decision": body.decision}
     )
+
+    if body.decision == "approved":
+        app_ref = user_ref.collection("applications").document(application_id(job_id))
+        if not app_ref.get().exists:
+            now = datetime.now(UTC).isoformat()
+            app_ref.set(
+                {
+                    "id": application_id(job_id),
+                    "user_id": user_id,
+                    "job_id": job_id,
+                    "status": "tailoring",
+                    "timeline": [{"at": now, "status": "tailoring"}],
+                }
+            )
+            background_tasks.add_task(run_tailoring, user_id, job_id)
+
     return {"ok": True}
