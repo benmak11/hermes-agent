@@ -40,6 +40,17 @@ For seniority, infer from required years of experience, scope, and title. Two tr
 - Management track: 'Manager' → manager; 'Senior Manager'/'Group' → senior-manager;
   'Director'/'Head of' → director; 'VP'/'Vice President' → vp
 Pick the track that matches the title. These levels apply across all functions at tech companies.
+
+For location, extract the job's geography from the posting and the location line:
+- job_country / job_state / job_city: the physical work location. For multi-site
+  postings, pick the primary one. Leave any field null when the posting does not state it.
+- remote_policy: remote / hybrid / onsite (as above).
+- remote_scope: for remote roles, where remote workers may be based, e.g. 'United States',
+  'US-only', 'Europe', 'EMEA', 'Worldwide', 'LATAM'. null when the role is onsite/hybrid
+  or the scope is unstated.
+- us_remote_ok: true ONLY if the JD explicitly allows US-based remote workers (e.g.
+  'Remote - US', 'US remote', 'remote anywhere in the US', 'US-based remote'). Otherwise false.
+  Do not infer this from the company being US-headquartered; require an explicit statement.
 """
 
 MATCH_PROMPT_TEMPLATE = """You are a careful, skeptical career advisor scoring this job against the candidate's profile.
@@ -51,6 +62,10 @@ MATCH_PROMPT_TEMPLATE = """You are a careful, skeptical career advisor scoring t
 Company: {company}
 Title: {title}
 Location: {location}
+
+# Candidate Geography
+Residence: {residence}
+Accepted work styles: {remote_policy}
 
 ## Parsed JD
 {parsed_jd_json}
@@ -82,8 +97,30 @@ The candidate recently approved jobs with these patterns:
 4. comp_alignment: 100 if comp_range.min_total >= min_comp_total. 50 if unknown.
    0 if comp_range.max_total < min_comp_total.
 5. deal_breaker_penalty: Start at 100. Subtract 30 per deal-breaker hit. Floor at 0.
+6. GEOGRAPHIC ELIGIBILITY (hard gate). Decide whether the candidate can actually
+   hold this job from where they live (see "Candidate Geography" above and the
+   parsed job_country/job_state/job_city/remote_scope/us_remote_ok fields):
+   - Onsite or hybrid roles: the job's location must match the candidate's residence.
+     Require the same COUNTRY; also require the same state when the candidate's state
+     is known, and the same city/metro when in-person attendance is required and the
+     candidate's city is known. A role that needs relocation or presence in another
+     country is INELIGIBLE.
+   - Remote roles: the role's remote_scope must INCLUDE the candidate's country
+     (e.g. residence United States + remote_scope 'United States'/'US-only'/'Worldwide'
+     → eligible; residence United States + remote_scope 'Europe'/'EMEA'/'LATAM'
+     → INELIGIBLE). If remote_scope is unstated, treat it as ineligible unless
+     us_remote_ok is true.
+   - EXCEPTION: if us_remote_ok is true and the candidate is US-based, the role is
+     ELIGIBLE regardless of where the company or office is located.
+   - Also honor the candidate's accepted work styles: a purely onsite role when the
+     candidate accepts only remote is ineligible, and vice versa.
+   If the role is geographically INELIGIBLE: set deal_breaker_penalty = 0, add an
+   explicit red flag like "Location ineligible: <job location> not reachable from
+   <residence>", set recommendation = "skip", and CAP overall_score at 20 (override
+   the weighted formula — a job the candidate cannot take is not a match no matter
+   how strong the role fit).
 
-overall_score = weighted average:
+overall_score = weighted average (UNLESS overridden by the geographic gate above):
   0.30 * role_fit + 0.25 * qualifications_match + 0.20 * seniority_match +
   0.15 * comp_alignment + 0.10 * deal_breaker_penalty
 
@@ -95,6 +132,19 @@ recommendation thresholds:
 
 Be honest. Skeptical scoring is more useful than charitable scoring.
 """
+
+def _residence_str(profile: MasterProfile) -> str:
+    """Human-readable residence for the prompt, with country-level fallback.
+
+    Prefers the structured `residence` (city, state, country); falls back to the
+    freeform `location` string when residence is not set.
+    """
+    r = profile.residence
+    if r is None:
+        return profile.location
+    parts = [p for p in (r.city, r.state, r.country) if p]
+    return ", ".join(parts) if parts else profile.location
+
 
 # Sentinel score for jobs filtered out before full scoring.
 OUT_OF_FAMILY = JobMatch(
@@ -153,6 +203,8 @@ async def match_job(
         company=job.company,
         title=job.title,
         location=job.location or "unspecified",
+        residence=_residence_str(profile),
+        remote_policy=", ".join(profile.preferences.remote_policy) or "unspecified",
         parsed_jd_json=job.jd_parsed.model_dump_json(indent=2),
         jd_text=job.jd_raw[:4000],  # truncate
         rejection_patterns=rejection_patterns or "(none yet)",
