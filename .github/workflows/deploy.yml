@@ -1,0 +1,54 @@
+# Deploy to Cloud Run on merge to main. Auth is keyless via Workload Identity
+# Federation (no stored secrets). Cloud Run preserves each service's existing
+# config (memory/CPU, env vars like RESUME_BUCKET/WEB_ORIGINS, --no-cpu-throttling)
+# across --source deploys, so we only re-build + ship the new code here.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: hermes-agent-btm-001
+  GCP_REGION: us-central1
+
+jobs:
+  deploy:
+    name: Build & deploy (api + web)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for Workload Identity Federation
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy hermes-api
+        run: |
+          gcloud run deploy hermes-api \
+            --source . \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT" \
+            --quiet
+
+      - name: Deploy hermes-web
+        run: |
+          gcloud run deploy hermes-web \
+            --source web \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT" \
+            --quiet

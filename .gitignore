@@ -19,8 +19,11 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to repo root: these are Python build artifacts. Without the leading
+# slash, "lib/" also matched web/src/lib/ and silently excluded the frontend's
+# lib modules from git (broke CI: @/lib/* imports unresolved).
+/lib/
+/lib64/
 parts/
 sdist/
 var/
