@@ -26,6 +26,7 @@ dependencies = [
     "pydantic-settings",
     "httpx",
     "playwright",
+    "sse-starlette",  # SSE progress stream for application submission (Phase 7)
     "google-cloud-firestore",
     "google-cloud-storage",
     "google-cloud-secret-manager",

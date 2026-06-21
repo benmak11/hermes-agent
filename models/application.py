@@ -39,6 +39,9 @@ class Application(BaseModel):
     # Denormalized for display on the review page (avoids a second job fetch).
     job_company: str | None = None
     job_title: str | None = None
+    # Original posting URL — surfaced so the user can apply manually when
+    # automated submission isn't possible (e.g. non-Greenhouse / custom forms).
+    job_url: str | None = None
     status: ApplicationStatus
     # gs:// URI of the tailored resume docx produced by the Tailoring pipeline.
     resume_variant_uri: str | None = None
@@ -49,5 +52,10 @@ class Application(BaseModel):
     # re-running the (LLM) tailoring step. Each item: {company, role, bullets:[...]}.
     master_bullets: list[dict] = Field(default_factory=list)
     tailored_bullets: list[dict] = Field(default_factory=list)
+    # Submission (Phase 7). last_submitted_at gates idempotency — a job is never
+    # auto-resubmitted. screenshots holds {name, uri} evidence (pre-submit +
+    # confirmation) uploaded to GCS.
+    last_submitted_at: datetime | None = None
+    screenshots: list[dict] = Field(default_factory=list)
     confirmation: Confirmation | None = None
     timeline: list[StatusEvent] = Field(default_factory=list)

@@ -77,6 +77,7 @@ async def tailor_application(
         job_id=job.id,
         job_company=job.company,
         job_title=job.title,
+        job_url=job.url,
         status="ready_for_review",
         resume_variant_uri=resume_uri,
         objective_text=objective,

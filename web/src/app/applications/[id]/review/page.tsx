@@ -8,9 +8,32 @@ import { useEffect, useState } from "react";
 
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { auth } from "@/lib/firebase";
 import type { Application, RoleBullets } from "@/lib/types";
 import { TopNav } from "@/components/TopNav";
 import { statusPill } from "../../status";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080";
+
+/** Fetch the tailored resume (auth header) and trigger a browser download. */
+async function downloadResume(appId: string, company: string): Promise<void> {
+  const token = await auth.currentUser?.getIdToken();
+  const res = await fetch(`${API_BASE}/applications/${appId}/resume`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) {
+    window.alert("Could not download the resume.");
+    return;
+  }
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `resume_${company.replace(/\s+/g, "_")}.docx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
 
 export default function ReviewPage() {
   const { user, loading } = useAuth();
@@ -28,13 +51,42 @@ export default function ReviewPage() {
     queryKey,
     queryFn: () => apiFetch<Application>(`/applications/${id}`),
     enabled: !!user,
-    // Poll only while tailoring is in flight, then stop.
+    // Poll while tailoring or submitting is in flight, then stop. (The SSE
+    // stream below pushes faster updates; this polling is the safety net.)
     refetchInterval: (q) =>
-      q.state.data?.status === "tailoring" ? 3000 : false,
+      q.state.data?.status === "tailoring" ||
+      q.state.data?.status === "submitting"
+        ? 3000
+        : false,
   });
 
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey });
+
+  // Live submission progress via SSE. EventSource can't set headers, so the
+  // Firebase token rides as a query param (verified server-side).
+  useEffect(() => {
+    if (app?.status !== "submitting") return;
+    let es: EventSource | null = null;
+    let cancelled = false;
+    (async () => {
+      const token = await auth.currentUser?.getIdToken();
+      if (cancelled || !token) return;
+      es = new EventSource(
+        `${API_BASE}/applications/${id}/events?token=${token}`,
+      );
+      const refresh = () =>
+        queryClient.invalidateQueries({ queryKey });
+      es.addEventListener("progress", refresh);
+      es.addEventListener("status", refresh);
+      es.onerror = () => es?.close();
+    })();
+    return () => {
+      cancelled = true;
+      es?.close();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [app?.status, id]);
 
   const saveObjective = useMutation({
     mutationFn: (objective_text: string) =>
@@ -93,8 +145,22 @@ export default function ReviewPage() {
             >
               {app.job_title ?? app.job_id}
             </h1>
-            <div className="mt-1 text-[13px]" style={{ color: "var(--muted)" }}>
-              {app.job_company ?? ""}
+            <div
+              className="mt-1 flex items-center gap-2.5 text-[13px]"
+              style={{ color: "var(--muted)" }}
+            >
+              <span>{app.job_company ?? ""}</span>
+              {app.job_url && (
+                <a
+                  href={app.job_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-medium"
+                  style={{ color: "var(--accent)" }}
+                >
+                  View posting ↗
+                </a>
+              )}
             </div>
           </div>
           <span
@@ -119,15 +185,6 @@ export default function ReviewPage() {
             This page updates automatically.
           </Banner>
         )}
-        {app.status === "failed" && (
-          <Banner danger>
-            Tailoring failed:{" "}
-            {[...app.timeline].reverse().find((e) => e.status === "failed")
-              ?.note ?? "unknown error"}
-            . Try regenerating.
-          </Banner>
-        )}
-
         {app.status !== "tailoring" && (
           <>
             <ObjectiveEditor
@@ -168,18 +225,35 @@ export default function ReviewPage() {
           </>
         )}
 
+        <SubmissionPanel app={app} />
+
         <div className="mt-8 flex items-center gap-3">
           <button
-            onClick={() => submit.mutate()}
-            disabled={app.status !== "ready_for_review" || submit.isPending}
+            onClick={() => {
+              const verb = app.status === "failed" ? "Retry submitting" : "Submit";
+              if (
+                window.confirm(
+                  `${verb} a real application to ${app.job_company ?? "this company"} for "${app.job_title ?? app.job_id}"? This cannot be undone.`,
+                )
+              )
+                submit.mutate();
+            }}
+            disabled={
+              !(app.status === "ready_for_review" || app.status === "failed") ||
+              submit.isPending
+            }
             className="inline-flex h-[40px] items-center gap-2 rounded-[9px] px-5 text-[13px] font-semibold disabled:opacity-40"
             style={{ background: "var(--text)", color: "var(--surface)" }}
           >
-            ✓ Approve &amp; Submit
+            ✓ {app.status === "failed" ? "Retry Submit" : "Approve & Submit"}
           </button>
           <button
             onClick={() => regenerate.mutate()}
-            disabled={app.status === "tailoring" || regenerate.isPending}
+            disabled={
+              app.status === "tailoring" ||
+              app.status === "submitting" ||
+              regenerate.isPending
+            }
             className="inline-flex h-[40px] items-center gap-1.5 rounded-[9px] border px-4 text-[13px] font-semibold disabled:opacity-40"
             style={{
               background: "var(--surface)",
@@ -279,6 +353,106 @@ function ObjectiveEditor({
         )}
       </div>
     </Section>
+  );
+}
+
+function SubmissionPanel({ app }: { app: Application }) {
+  if (
+    app.status === "ready_for_review" ||
+    app.status === "tailoring" ||
+    app.status === "queued"
+  ) {
+    return null;
+  }
+
+  // Submission progress notes, oldest→newest among the submission lifecycle.
+  const notes = app.timeline.filter(
+    (e) => e.note && ["submitting", "submitted", "failed"].includes(e.status),
+  );
+  const lastFailed = [...app.timeline]
+    .reverse()
+    .find((e) => e.status === "failed");
+
+  return (
+    <section
+      className="mt-6 rounded-[14px] border p-[22px]"
+      style={{
+        background: "var(--surface)",
+        borderColor:
+          app.status === "failed" ? "var(--warn-border)" : "var(--border)",
+      }}
+    >
+      <h2
+        className="mb-3 text-[15px] font-semibold tracking-tight"
+        style={{ color: "var(--text)" }}
+      >
+        {app.status === "submitting" && "Submitting application…"}
+        {app.status === "submitted" && "Application submitted ✓"}
+        {app.status === "responded" && "Employer responded"}
+        {app.status === "failed" && "Last attempt failed"}
+      </h2>
+
+      {app.status === "failed" && (
+        <>
+          <p className="mb-3 text-[13px]" style={{ color: "var(--danger)" }}>
+            {lastFailed?.note ?? "Unknown error."} You can retry, or apply manually
+            below with your tailored resume.
+          </p>
+          <div className="mb-4 flex flex-wrap items-center gap-2.5">
+            {app.job_url && (
+              <a
+                href={app.job_url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex h-[34px] items-center gap-1.5 rounded-[8px] px-4 text-[13px] font-semibold"
+                style={{ background: "var(--text)", color: "var(--surface)" }}
+              >
+                Apply manually ↗
+              </a>
+            )}
+            <button
+              onClick={() =>
+                downloadResume(app.id, app.job_company ?? "company")
+              }
+              className="inline-flex h-[34px] items-center gap-1.5 rounded-[8px] border px-4 text-[13px] font-semibold"
+              style={{
+                background: "var(--surface)",
+                borderColor: "var(--border)",
+                color: "var(--label)",
+              }}
+            >
+              ↓ Download tailored resume
+            </button>
+          </div>
+        </>
+      )}
+
+      {notes.length > 0 && (
+        <ol className="space-y-1.5">
+          {notes.map((e, i) => (
+            <li
+              key={i}
+              className="flex gap-2 font-mono text-xs"
+              style={{ color: "var(--muted)" }}
+            >
+              <span style={{ color: "var(--subtle)" }}>
+                {new Date(e.at).toLocaleTimeString()}
+              </span>
+              <span>{e.note}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {app.confirmation?.screenshot_uri && (
+        <p
+          className="mt-3 break-all font-mono text-[11px]"
+          style={{ color: "var(--subtle)" }}
+        >
+          Confirmation screenshot: {app.confirmation.screenshot_uri}
+        </p>
+      )}
+    </section>
   );
 }
 
