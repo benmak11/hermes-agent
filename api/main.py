@@ -11,21 +11,35 @@ import os
 from urllib.parse import quote
 
 import google.auth
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from google.adk.cli.fast_api import get_fast_api_app
 from google.cloud import logging as google_cloud_logging
 
 from api.app_utils.telemetry import setup_telemetry
 from api.app_utils.typing import Feedback
+from api.routes import companies as companies_routes
+from api.routes import jobs as jobs_routes
+
+# Load local .env for dev (GOOGLE_CLOUD_*, AUTH_DEV_MODE, WEB_ORIGINS). No-op in
+# Cloud Run, where env is provided by Terraform and no .env file is shipped.
+load_dotenv()
 
 setup_telemetry()
 _, project_id = google.auth.default()
 logging_client = google_cloud_logging.Client()
 logger = logging_client.logger(__name__)
 
-allow_origins = (
-    os.getenv("ALLOW_ORIGINS", "").split(",") if os.getenv("ALLOW_ORIGINS") else None
+# Origins allowed to call the API (the Next.js frontend). This drives BOTH
+# ADK's cross-origin gate for non-safe methods (POST/PUT/...) AND the CORS
+# response headers — get_fast_api_app handles both from allow_origins, so no
+# separate CORSMiddleware is needed (a second one would duplicate the
+# Access-Control-Allow-Origin header and break the browser). Configure via
+# WEB_ORIGINS or ALLOW_ORIGINS (comma-separated); defaults to local dev.
+_origins_env = (
+    os.getenv("WEB_ORIGINS") or os.getenv("ALLOW_ORIGINS") or "http://localhost:3000"
 )
+allow_origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
 
 # Artifact bucket for ADK (created by Terraform, passed via env var)
 logs_bucket_name = os.environ.get("LOGS_BUCKET_NAME")
@@ -68,6 +82,10 @@ app: FastAPI = get_fast_api_app(
 )
 app.title = "hermes"
 app.description = "API gateway for the hermes multi-agent system"
+
+# Web vetting API (Firebase-auth job + company endpoints).
+app.include_router(jobs_routes.router)
+app.include_router(companies_routes.router)
 
 
 @app.post("/feedback")
