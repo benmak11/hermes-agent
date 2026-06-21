@@ -20,8 +20,18 @@ WORKDIR /code
 
 COPY ./pyproject.toml ./README.md ./uv.lock* ./
 
+# All packages listed in [tool.hatch.build.targets.wheel] must be present so the
+# project wheel builds, and so the API routers can import them at runtime
+# (api.routes.companies -> tools.companies, agents -> models, etc.).
 COPY ./agents ./agents
 COPY ./api ./api
+COPY ./models ./models
+COPY ./tools ./tools
+COPY ./cli ./cli
+
+# Company lists read by the companies endpoint (data/companies/*.yaml). The PII
+# profile (data/profile.yaml) is gitignored and intentionally not shipped.
+COPY ./data/companies ./data/companies
 
 RUN uv sync --frozen
 

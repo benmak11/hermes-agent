@@ -41,6 +41,18 @@ class Education(BaseModel):
     end_year: int | None = None
 
 
+class Residence(BaseModel):
+    """Where the candidate is based. Drives the matching geo-eligibility rule.
+
+    For onsite/hybrid roles, state and city tighten the match to the candidate's
+    metro; when they are null the rule degrades to country-level matching.
+    """
+
+    country: str
+    state: str | None = None  # state / province / region
+    city: str | None = None
+
+
 class JobPreferences(BaseModel):
     target_role_families: list[str] = Field(
         description=(
@@ -84,6 +96,9 @@ class MasterProfile(BaseModel):
     email: str
     phone: str | None = None
     location: str
+    # Structured residence used by the matching geo-eligibility rule. Optional for
+    # backward compatibility; falls back to `location` (country-level) when absent.
+    residence: Residence | None = None
     links: dict[str, str] = Field(
         default_factory=dict,
         description="e.g. {'github': '...', 'linkedin': '...', 'portfolio': '...'}",

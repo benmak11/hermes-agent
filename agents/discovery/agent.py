@@ -19,8 +19,17 @@ def create_discovery_agent() -> ParallelAgent:
         description="Searches public job boards for relevant openings.",
         instruction=(
             "Search public job boards (LinkedIn, Indeed, etc.) for openings "
-            "that match the user's target role, skills, and location. Return a "
-            "concise list of postings with title, company, location, and link."
+            "that match the user's target role, skills, and location.\n"
+            "Focus the search geographically on where the candidate can actually "
+            "work:\n"
+            "- Candidate location: {candidate_location?}\n"
+            "- Accepted work styles: {remote_policy?}\n"
+            "Prefer roles in the candidate's country (and state/city when given), "
+            "plus remote roles explicitly open to that country (e.g. 'US remote'). "
+            "Exclude roles that require relocation to, or are remote-only within, a "
+            "different country (e.g. 'Remote - Europe' for a US candidate) unless "
+            "the posting explicitly hires remote workers in the candidate's country. "
+            "Return a concise list of postings with title, company, location, and link."
         ),
         tools=[google_search],
         output_key="job_board_results",
@@ -32,8 +41,17 @@ def create_discovery_agent() -> ParallelAgent:
         description="Searches company career pages for relevant openings.",
         instruction=(
             "Search target companies' career pages for openings matching the "
-            "user's target role, skills, and location. Return a concise list "
-            "of postings with title, company, location, and link."
+            "user's target role, skills, and location.\n"
+            "Focus the search geographically on where the candidate can actually "
+            "work:\n"
+            "- Candidate location: {candidate_location?}\n"
+            "- Accepted work styles: {remote_policy?}\n"
+            "Prefer roles in the candidate's country (and state/city when given), "
+            "plus remote roles explicitly open to that country (e.g. 'US remote'). "
+            "Exclude roles that require relocation to, or are remote-only within, a "
+            "different country unless the posting explicitly hires remote workers in "
+            "the candidate's country. Return a concise list of postings with title, "
+            "company, location, and link."
         ),
         tools=[google_search],
         output_key="company_careers_results",
