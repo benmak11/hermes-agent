@@ -12,9 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM python:3.12-slim
+# Playwright base image (Ubuntu noble, Python 3.12) ships Chromium + all the
+# system libraries the browser needs — required for the Phase 7 Application agent
+# to drive Greenhouse forms headlessly on Cloud Run. Tag must match the installed
+# playwright pip version (1.60.0). Browsers live at /ms-playwright.
+FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
 
 RUN pip install --no-cache-dir uv==0.8.13
+
+# Let Playwright find the browsers preinstalled in the base image (this env var
+# must persist to runtime, not just build).
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /code
 

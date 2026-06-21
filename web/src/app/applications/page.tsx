@@ -91,12 +91,14 @@ function AppRow({ app }: { app: Application }) {
   const av = avatarColor(company);
   const pill = statusPill(app.status);
   return (
-    <Link
-      href={`/applications/${app.id}/review`}
+    <div
       className="flex items-center justify-between gap-4 rounded-[12px] border p-4"
       style={{ background: "var(--surface)", borderColor: "var(--border)" }}
     >
-      <div className="flex min-w-0 items-center gap-3">
+      <Link
+        href={`/applications/${app.id}/review`}
+        className="flex min-w-0 flex-1 items-center gap-3"
+      >
         <span
           className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-lg text-[15px] font-bold"
           style={{ background: av.bg, color: av.color }}
@@ -114,17 +116,30 @@ function AppRow({ app }: { app: Application }) {
             {company}
           </div>
         </div>
-      </div>
-      <span
-        className="inline-flex flex-none items-center gap-1.5 rounded-full border px-[9px] py-[3px] font-mono text-[11px] font-semibold"
-        style={{ background: pill.bg, borderColor: pill.border, color: pill.color }}
-      >
+      </Link>
+      <div className="flex flex-none items-center gap-4">
+        {app.job_url && (
+          <a
+            href={app.job_url}
+            target="_blank"
+            rel="noreferrer"
+            className="whitespace-nowrap text-[13px] font-medium"
+            style={{ color: "var(--accent)" }}
+          >
+            View posting ↗
+          </a>
+        )}
         <span
-          className="inline-block h-1.5 w-1.5 rounded-full"
-          style={{ background: pill.color }}
-        />
-        {pill.label}
-      </span>
-    </Link>
+          className="inline-flex items-center gap-1.5 rounded-full border px-[9px] py-[3px] font-mono text-[11px] font-semibold"
+          style={{ background: pill.bg, borderColor: pill.border, color: pill.color }}
+        >
+          <span
+            className="inline-block h-1.5 w-1.5 rounded-full"
+            style={{ background: pill.color }}
+          />
+          {pill.label}
+        </span>
+      </div>
+    </div>
   );
 }
