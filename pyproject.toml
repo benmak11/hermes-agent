@@ -31,6 +31,7 @@ dependencies = [
     "google-cloud-secret-manager",
     "google-auth",
     "google-api-python-client",  # Gmail
+    "firebase-admin",  # web auth (verify Firebase ID tokens)
     "python-docx",
     "pypdf",
     "pyyaml",
