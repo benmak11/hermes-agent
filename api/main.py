@@ -18,6 +18,7 @@ from google.cloud import logging as google_cloud_logging
 
 from api.app_utils.telemetry import setup_telemetry
 from api.app_utils.typing import Feedback
+from api.routes import applications as applications_routes
 from api.routes import companies as companies_routes
 from api.routes import jobs as jobs_routes
 
@@ -86,6 +87,7 @@ app.description = "API gateway for the hermes multi-agent system"
 # Web vetting API (Firebase-auth job + company endpoints).
 app.include_router(jobs_routes.router)
 app.include_router(companies_routes.router)
+app.include_router(applications_routes.router)
 
 
 @app.post("/feedback")
