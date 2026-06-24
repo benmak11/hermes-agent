@@ -212,6 +212,7 @@ tools/a2a-inspector/
 
 # documentation
 docs/implementation.md
+docs/RUNNING.md
 CLAUDE.md
 
 # Local Firestore job-data backups (not for VCS)

@@ -8,7 +8,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import type { Decision, Job } from "@/lib/types";
+import type { Decision, Job, ProfileResponse } from "@/lib/types";
 import { avatarColor, barColor, initial, recPill, scoreColor } from "@/lib/ui";
 import { TopNav } from "@/components/TopNav";
 
@@ -24,13 +24,26 @@ export default function VettingPage() {
     if (!loading && !user) router.push("/login");
   }, [loading, user, router]);
 
+  // First-run gate: a user with no profile yet is sent to onboarding before
+  // they ever see the (empty) job queue.
+  const { data: profileData, isLoading: profileLoading } = useQuery({
+    queryKey: ["profile-gate"],
+    queryFn: () => apiFetch<ProfileResponse>("/profile"),
+    enabled: !!user,
+  });
+  const needsOnboarding = profileData && profileData.profile === null;
+
+  useEffect(() => {
+    if (needsOnboarding) router.push("/onboarding");
+  }, [needsOnboarding, router]);
+
   const queryKey = ["pending", minScore] as const;
 
   const { data, isLoading, error } = useQuery({
     queryKey,
     queryFn: () =>
       apiFetch<PendingResponse>(`/jobs/pending?min_score=${minScore}`),
-    enabled: !!user,
+    enabled: !!user && profileData?.profile != null,
   });
 
   const decide = useMutation({
@@ -73,7 +86,7 @@ export default function VettingPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, [act]);
 
-  if (loading || !user) {
+  if (loading || !user || profileLoading || needsOnboarding) {
     return <div className="p-8" style={{ color: "var(--muted)" }}>Loading…</div>;
   }
 

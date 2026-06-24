@@ -84,6 +84,11 @@ select = [
 ]
 ignore = ["E501", "C901", "B006"] # ignore line too long, too complex
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI uses callables (File/Form/Body) as argument defaults by design; this
+# is the same pattern ruff already allowlists for Depends/Query/Header.
+extend-immutable-calls = ["fastapi.File", "fastapi.Form", "fastapi.Body"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["agents", "api"]
 

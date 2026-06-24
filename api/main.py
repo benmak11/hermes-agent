@@ -21,6 +21,7 @@ from api.app_utils.typing import Feedback
 from api.routes import applications as applications_routes
 from api.routes import companies as companies_routes
 from api.routes import jobs as jobs_routes
+from api.routes import profile as profile_routes
 
 # Load local .env for dev (GOOGLE_CLOUD_*, AUTH_DEV_MODE, WEB_ORIGINS). No-op in
 # Cloud Run, where env is provided by Terraform and no .env file is shipped.
@@ -88,6 +89,7 @@ app.description = "API gateway for the hermes multi-agent system"
 app.include_router(jobs_routes.router)
 app.include_router(companies_routes.router)
 app.include_router(applications_routes.router)
+app.include_router(profile_routes.router)
 
 
 @app.post("/feedback")
