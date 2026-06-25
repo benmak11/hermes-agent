@@ -19,9 +19,11 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 from models.job import Job
 from models.profile import MasterProfile
+from obs.logging import get_logger
 from tools.tailoring.pipeline import application_id, tailor_application
 
 load_dotenv()
+log = get_logger("cli.run_tailoring")
 
 
 async def main() -> None:
@@ -73,6 +75,7 @@ async def main() -> None:
             print(f"  ✓ {job.company} - {job.title[:50]} -> {app.resume_variant_uri}")
         except Exception as e:  # report and continue with the next job
             counts["failed"] += 1
+            log.exception("tailor.failed", job_id=job.id, company=job.company)
             print(f"  ✗ {job.company} - {job.title[:50]}: {e}")
 
     print(f"✓ Tailored {counts['ok']}, failed {counts['failed']}")

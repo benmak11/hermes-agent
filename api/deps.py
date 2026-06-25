@@ -8,6 +8,10 @@ import os
 
 from fastapi import Header, HTTPException, Query
 
+from obs.logging import bind_request_context, get_logger
+
+log = get_logger("api.auth")
+
 _firebase_ready = False
 
 
@@ -24,9 +28,15 @@ def _ensure_firebase() -> None:
 
 
 def _verify_token(token: str | None) -> str:
-    """Verify a Firebase ID token (or honor the dev bypass) and return the uid."""
+    """Verify a Firebase ID token (or honor the dev bypass) and return the uid.
+
+    Binds the resolved ``user_id`` into the log context so every subsequent line
+    for this request (route, background task, tools) carries it.
+    """
     if os.getenv("AUTH_DEV_MODE") == "1" and os.getenv("AUTH_DEV_USER"):
-        return os.environ["AUTH_DEV_USER"]
+        uid = os.environ["AUTH_DEV_USER"]
+        bind_request_context(user_id=uid, auth="dev")
+        return uid
 
     if not token:
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -36,9 +46,13 @@ def _verify_token(token: str | None) -> str:
 
     try:
         decoded = fb_auth.verify_id_token(token)
-        return decoded["uid"]
     except Exception as e:
+        log.warning("auth.verify_failed", error=str(e))
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}") from e
+
+    uid = decoded["uid"]
+    bind_request_context(user_id=uid)
+    return uid
 
 
 async def verify_user(authorization: str | None = Header(default=None)) -> str:

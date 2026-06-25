@@ -23,7 +23,7 @@ jobs:
       - name: Sync deps
         run: uv sync --all-groups --frozen
       - name: Lint
-        run: uvx ruff check agents api models tools cli
+        run: uvx ruff check agents api models tools cli obs
       - name: Unit tests
         run: uv run pytest tests/unit -q
 
