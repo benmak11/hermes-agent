@@ -51,6 +51,70 @@ export type CompaniesResponse = {
   blocklist: BlockEntry[];
 };
 
+// ---- Profile (mirrors models/profile.py MasterProfile) ----
+
+export type ProfileBullet = {
+  text: string;
+  tags: string[];
+  impact?: string | null;
+};
+
+export type ProfileExperience = {
+  company: string;
+  role: string;
+  start: string; // ISO date
+  end?: string | null; // null = current
+  location?: string | null;
+  bullets: ProfileBullet[];
+};
+
+export type ProfileEducation = {
+  institution: string;
+  degree: string;
+  field: string;
+  start_year: number;
+  end_year?: number | null;
+};
+
+export type Residence = {
+  country: string;
+  state?: string | null;
+  city?: string | null;
+};
+
+export type RemoteStyle = "remote" | "hybrid" | "onsite";
+
+export type JobPreferences = {
+  target_role_families: string[];
+  target_titles: string[];
+  target_seniorities: string[];
+  min_comp_total?: number | null;
+  remote_policy: RemoteStyle[];
+  locations: string[];
+  must_haves: string[];
+  deal_breakers: string[];
+};
+
+export type Profile = {
+  user_id: string;
+  full_name: string;
+  email: string;
+  phone?: string | null;
+  location: string;
+  residence?: Residence | null;
+  links: Record<string, string>;
+  objective_template: string;
+  experience: ProfileExperience[];
+  education: ProfileEducation[];
+  skills: Record<string, string[]>;
+  preferences: JobPreferences;
+};
+
+export type ProfileResponse = {
+  profile: Profile | null;
+  onboarding_complete: boolean;
+};
+
 export type Decision = "approved" | "rejected" | "starred";
 export type CompanyActionType = "promote" | "block" | "dismiss" | "pause";
 

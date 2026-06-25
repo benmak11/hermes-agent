@@ -1,127 +1,82 @@
 # Hermes
 
-A multi-agent job discovery and application system, built on the
-[ADK](https://adk.dev/). A Coordinator delegates to five specialists:
+Hermes is a multi-agent **job-search assistant**: it builds a profile from your
+résumé, discovers and ranks openings against it, tailors a résumé per posting,
+and submits applications — surfaced through a web app and backed by an
+agent/pipeline system on Google Cloud.
 
-| Agent | Type | Model | Role |
-|-------|------|-------|------|
-| Coordinator | LlmAgent | `gemini-flash-latest` | Orchestrates the end-to-end flow |
-| Discovery | ParallelAgent | — | Scouts job sources concurrently (job boards + company careers) |
-| Matching | LlmAgent | `gemini-3-pro` | Ranks postings against the candidate profile |
-| Tailoring | LlmAgent | `gemini-flash-latest` | Tailors resume and cover letter per posting |
-| Application | LlmAgent | `gemini-3-pro` | Submits applications via the Computer Use browser tool |
-| Tracking | LlmAgent | `gemini-flash-latest` | Records and reports application status |
+It is built on the [ADK](https://adk.dev/) with Vertex AI Gemini, a FastAPI
+gateway, a Next.js frontend, and Firestore — deployed on Cloud Run.
 
-Scaffolded with `agents-cli` version `0.5.0` (Cloud Run + FastAPI gateway).
+## How it works
 
-## Project Structure
+The end-to-end funnel:
 
 ```
-hermes/
-├── agents/                    # Agent code (one package per agent)
-│   ├── _shared.py             # Env setup + model helpers (FLASH/PRO models)
-│   ├── coordinator/agent.py   # Root agent; assembles the sub-agents
-│   ├── discovery/agent.py     # ParallelAgent fan-out over job sources
-│   ├── matching/agent.py      # Gemini 3 Pro matcher
-│   ├── tailoring/agent.py     # Gemini Flash tailoring
-│   ├── application/agent.py   # Computer Use submission agent
-│   │   └── computer.py        # Browser backend (BaseComputer)
-│   └── tracking/agent.py      # Gemini Flash tracker
-├── api/main.py                # FastAPI gateway (serves the agents)
-├── deployment/                # Terraform for Cloud Run + Cloud SQL
-├── tests/                     # Unit, integration, and eval tests
-├── .env.example               # Copy to .env and fill in
-├── Dockerfile
-├── CLAUDE.md                  # AI-assisted development guide
-└── pyproject.toml             # Project dependencies
+onboarding → discovery → matching / vetting → tailoring → application → tracking
+ (résumé →     (scout      (rank vs. profile,   (rerank      (submit to     (status,
+  profile)      sources)    geo-eligibility)     bullets +    the ATS)       deferred)
+                                                 objective +
+                                                 ATS docx)
 ```
 
-The gateway uses ADK's agent discovery (`agents_dir="agents"`), so every package
-under `agents/` is an independently runnable app — `coordinator` is the primary
-one (clients call `/run` with `app_name="coordinator"`), and the specialists can
-be exercised in isolation in the playground.
+An ADK **Coordinator** orchestrates five specialists. In practice the heavy
+lifting for discovery, matching, tailoring, and application runs as
+**deterministic pipelines** (`tools/` + `cli/` runners) that mirror each agent's
+contract; the ADK agents in `agents/` keep the Coordinator and playground wiring.
 
-> ⚠️ **Note:** This project uses a custom `agents/` + `api/` layout that differs
-> from the default `agents-cli` `app/` convention. The `agents-cli playground` /
-> `deploy` / `eval` commands assume the default layout and may need the agent
-> directory passed explicitly (or use `uv run adk web agents` and
-> `uv run uvicorn api.main:app` directly).
+| Agent | Model | Role |
+|-------|-------|------|
+| Coordinator | `gemini-flash-latest` | Orchestrates the end-to-end flow |
+| Discovery | — (ParallelAgent) | Scouts job boards + company careers concurrently |
+| Matching | `gemini-3.1-pro-preview` | Ranks postings against the profile; geo-eligibility gate |
+| Tailoring | `gemini-flash-latest` | Reranks bullets, writes an objective, renders an ATS-safe résumé |
+| Application | `gemini-3.1-pro-preview` | Submits applications (Greenhouse via Playwright) |
+| Tracking | `gemini-flash-latest` | Records application status (deferred) |
 
-## Requirements
+## Components
 
-Before you begin, ensure you have:
-- **uv**: Python package manager (used for all dependency management in this project) - [Install](https://docs.astral.sh/uv/getting-started/installation/) ([add packages](https://docs.astral.sh/uv/concepts/dependencies/) with `uv add <package>`)
-- **agents-cli**: Agents CLI - Install with `uv tool install google-agents-cli`
-- **Google Cloud SDK**: For GCP services - [Install](https://cloud.google.com/sdk/docs/install)
+| Path | What it is |
+|------|-----------|
+| `agents/` | ADK agents (Coordinator + specialists). `_shared.py` defines the model helpers. |
+| `tools/` | Deterministic pipeline logic — `discovery/`, `matching/`, `tailoring/`, `submitters/`, `profile/`, `ats/`, `gmail/`, `computer_use/`. |
+| `cli/` | Batch runners for the pipelines (import résumé, sync profile, discovery, matching, tailoring, user migration). |
+| `api/` | FastAPI gateway. Serves the ADK agents **and** the Firestore-backed web API: `routes/{jobs,companies,applications,profile}.py` with Firebase-auth deps. |
+| `web/` | Next.js 16 frontend — login, onboarding/profile, job vetting (review/approve/skip/star), applications, company vetting. |
+| `models/` | Pydantic schemas (`profile`, `job`, `match`, `application`). |
+| `deployment/` | Terraform for Cloud Run + supporting infrastructure. |
+| `tests/` | Unit, integration, and eval tests. |
 
+## Data & storage
 
-## Quick Start
+- **Firestore (Native)** — the profile lives at `users/{uid}`; `jobs`,
+  `applications`, and company data are subcollections.
+- **Cloud Storage** — tailored résumés (`.docx`) and submission screenshots
+  (the `RESUME_BUCKET`).
+- **Firebase Auth** — the web app signs users in; the API verifies Firebase ID
+  tokens (with a local dev bypass gated on `AUTH_DEV_MODE`).
 
-Install `agents-cli` and its skills if not already installed:
+## Current state
 
-```bash
-uvx google-agents-cli setup
-```
-
-Install required packages:
-
-```bash
-agents-cli install
-```
-
-Test the agent with a local web server:
-
-```bash
-agents-cli playground
-```
-
-You can also use features from the [ADK](https://adk.dev/) CLI with `uv run adk`.
-
-## Commands
-
-| Command              | Description                                                                                 |
-| -------------------- | ------------------------------------------------------------------------------------------- |
-| `agents-cli install` | Install dependencies using uv                                                         |
-| `agents-cli playground` | Launch local development environment                                                  |
-| `agents-cli lint`    | Run code quality checks                                                               |
-| `agents-cli eval`    | Evaluate agent behavior (generate, grade, analyze, and more — see `agents-cli eval --help`) |
-| `uv run pytest tests/unit tests/integration` | Run unit and integration tests                                                        |
-| `agents-cli deploy`  | Deploy agent to Cloud Run                                                                   |
-
-## 🛠️ Project Management
-
-| Command | What It Does |
-|---------|--------------|
-| `agents-cli scaffold enhance` | Add CI/CD pipelines and Terraform infrastructure |
-| `agents-cli infra cicd` | One-command setup of entire CI/CD pipeline + infrastructure |
-| `agents-cli scaffold upgrade` | Auto-upgrade to latest version while preserving customizations |
-
----
-
-## Development
-
-Edit each agent under `agents/<name>/agent.py`. Run the dev UI over all agents:
-
-```bash
-uv run adk web agents
-```
-
-Or run the FastAPI gateway directly:
-
-```bash
-uv run uvicorn api.main:app --reload --port 8000
-```
+- **Live:** onboarding (résumé → profile), discovery, matching with a
+  location-eligibility gate, the job-vetting web UI, tailoring (bullets +
+  objective + ATS-safe résumé to GCS with a diff/review screen), and the
+  Application agent's Greenhouse path (Playwright submit with SSE progress,
+  screenshots, idempotency, and a manual-apply fallback).
+- **Deferred:** the Application "Computer Use" browser path for non-Greenhouse
+  ATSes, and the Tracking agent (Gmail response tracking).
 
 ## Deployment
 
-```bash
-gcloud config set project <your-project-id>
-agents-cli deploy
-```
-
-To add CI/CD and Terraform, run `agents-cli scaffold enhance`.
-To set up your production infrastructure, run `agents-cli infra cicd`.
-
-## Observability
+Two Cloud Run services in `us-central1` (scale-to-zero): **`hermes-api`** (the
+FastAPI gateway) and **`hermes-web`** (the Next.js app). CI/CD runs through
+GitHub Actions — checks on every PR, and a deploy to Cloud Run on merge to
+`main` via keyless Workload Identity Federation.
 
 Built-in telemetry exports to Cloud Trace, BigQuery, and Cloud Logging.
+
+## Running it
+
+Local setup, the data-pipeline runbook, and deploy steps are kept out of this
+README. See **`docs/RUNNING.md`** (a local operator runbook, not tracked in
+git).

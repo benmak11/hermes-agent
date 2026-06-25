@@ -10,7 +10,7 @@ import { auth } from "@/lib/firebase";
 export function TopNav({
   section,
 }: {
-  section: "review" | "companies" | "applications";
+  section: "review" | "companies" | "applications" | "profile";
 }) {
   return (
     <header
@@ -35,8 +35,15 @@ export function TopNav({
         </span>
       </Link>
 
-      {section === "review" ? (
+      {section === "review" || section === "profile" ? (
         <div className="flex items-center gap-[18px]">
+          <Link
+            href="/"
+            className="text-[13px] font-medium"
+            style={{ color: section === "review" ? "var(--text)" : "var(--label)" }}
+          >
+            Review
+          </Link>
           <Link
             href="/applications"
             className="text-[13px] font-medium"
@@ -50,6 +57,23 @@ export function TopNav({
             style={{ color: "var(--label)" }}
           >
             Companies
+          </Link>
+          <Link
+            href="/profile"
+            className="flex items-center gap-1.5 text-[13px] font-medium"
+            style={{ color: section === "profile" ? "var(--text)" : "var(--label)" }}
+          >
+            Profile
+            <span
+              className="rounded border px-1 py-px font-mono text-[9px] font-semibold"
+              style={{
+                background: "var(--accent-bg)",
+                borderColor: "var(--accent-border)",
+                color: "var(--accent-text)",
+              }}
+            >
+              NEW
+            </span>
           </Link>
           <button
             onClick={() => signOut(auth)}
