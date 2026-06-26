@@ -36,6 +36,7 @@ COPY ./api ./api
 COPY ./models ./models
 COPY ./tools ./tools
 COPY ./cli ./cli
+COPY ./obs ./obs
 
 # Company lists read by the companies endpoint (data/companies/*.yaml). The PII
 # profile (data/profile.yaml) is gitignored and intentionally not shipped.
