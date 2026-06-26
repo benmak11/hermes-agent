@@ -24,9 +24,12 @@ from sse_starlette.sse import EventSourceResponse
 from api.deps import verify_user, verify_user_query
 from models.job import Job
 from models.profile import MasterProfile
+from obs.logging import get_logger
 from tools.submitters.router import submit_application
 from tools.submitters.storage import download_resume, upload_screenshot
 from tools.tailoring.pipeline import application_id, tailor_application
+
+log = get_logger("api.applications")
 
 # Statuses from which a fresh submission is allowed (failed permits a retry).
 SUBMITTABLE = {"ready_for_review", "failed"}
@@ -59,9 +62,13 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
     onto the existing (``tailoring``-state) Application doc. On failure the doc is
     flipped to ``failed`` with a timeline note so the UI can surface it.
     """
+    # Background tasks run after the response, outside the request context, so
+    # bind the ids onto this logger explicitly to keep the trail intact.
+    task_log = log.bind(user_id=user_id, job_id=job_id, task="tailoring")
     db = _client()
     user_ref = db.collection("users").document(user_id)
     app_ref = user_ref.collection("applications").document(application_id(job_id))
+    task_log.info("tailoring.start")
     try:
         profile = MasterProfile.model_validate(user_ref.get().to_dict())
         job_doc = user_ref.collection("jobs").document(job_id).get()
@@ -71,7 +78,9 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
 
         app = await tailor_application(job, profile, upload=True)
         app_ref.set(app.model_dump(mode="json"))
+        task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
     except Exception as e:  # persist failure for the UI, surface in timeline
+        task_log.exception("tailoring.failed")
         app_ref.set(
             {
                 "status": "failed",
@@ -197,6 +206,10 @@ async def run_submission(user_id: str, app_id: str) -> None:
         return
     app = snap.to_dict()
     job_id = app["job_id"]
+    task_log = log.bind(
+        user_id=user_id, app_id=app_id, job_id=job_id, task="submission"
+    )
+    task_log.info("submission.start", source=app.get("job_source"))
     user_ref = _client().collection("users").document(user_id)
 
     def progress(message: str, status: str) -> None:
@@ -234,6 +247,12 @@ async def run_submission(user_id: str, app_id: str) -> None:
                     {"name": name, "uri": upload_screenshot(Path(local), user_id, job_id, name)}
                 )
 
+        task_log.info(
+            "submission.result",
+            success=bool(result.get("success")),
+            error=result.get("error"),
+            screenshots=len(shots),
+        )
         if result.get("success"):
             confirm_uri = next(
                 (s["uri"] for s in shots if s["name"] == "confirmation.png"), None
@@ -270,6 +289,7 @@ async def run_submission(user_id: str, app_id: str) -> None:
                 merge=True,
             )
     except Exception as e:  # record failure for the UI
+        task_log.exception("submission.failed")
         ref.set(
             {
                 "status": "failed",

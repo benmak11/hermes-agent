@@ -24,6 +24,9 @@ from playwright.async_api import Page, async_playwright
 
 from models.job import Job
 from models.profile import MasterProfile
+from obs.logging import get_logger
+
+log = get_logger("tools.submitters.greenhouse")
 
 # Progress sink: called with (message, status) as the submission advances.
 ProgressFn = Callable[[str, str], Awaitable[None] | None]
@@ -71,6 +74,8 @@ async def submit_greenhouse(
     Returns a dict with ``success`` plus, on success, screenshot paths and any
     detected confirmation; on failure, ``error`` and the pre-submit screenshot.
     """
+    job_log = log.bind(job_id=job.id, company=job.company, url=job.url)
+    job_log.info("submit.start", dry_run=dry_run, headless=headless)
     first = profile.full_name.split()[0]
     last = " ".join(profile.full_name.split()[1:])
     pre_path = f"/tmp/pre_submit_{job.id}.png"
@@ -98,6 +103,7 @@ async def submit_greenhouse(
 
             if await _detect_captcha(page):
                 await page.screenshot(path=pre_path, full_page=True)
+                job_log.warning("submit.bail", reason="captcha")
                 return {
                     "success": False,
                     "error": "CAPTCHA present — solve it in a browser, then retry.",
@@ -111,6 +117,7 @@ async def submit_greenhouse(
             file_input = page.locator('input[type="file"]').first
             if not (await email_field.count() and await file_input.count()):
                 await page.screenshot(path=pre_path, full_page=True)
+                job_log.warning("submit.bail", reason="custom_wrapper")
                 return {
                     "success": False,
                     "error": (
@@ -140,6 +147,7 @@ async def submit_greenhouse(
                 '[aria-required="true"]:not(:has(input:not([value=""])))'
             ).count()
             if unanswered > 0:
+                job_log.warning("submit.bail", reason="unanswered", count=unanswered)
                 return {
                     "success": False,
                     "error": f"{unanswered} required custom question(s) need answers.",
@@ -148,6 +156,7 @@ async def submit_greenhouse(
 
             if dry_run:
                 await _emit(on_progress, "Dry run — stopped before Submit", "ready_for_review")
+                job_log.info("submit.dry_run_ok")
                 return {
                     "success": True,
                     "dry_run": True,
@@ -170,12 +179,16 @@ async def submit_greenhouse(
                 "Confirmation detected" if confirmed else "Submitted (no confirmation text found)",
                 "submitted" if confirmed else "submitting",
             )
+            job_log.info("submit.complete", confirmed=confirmed)
             return {
                 "success": confirmed,
                 "pre_submit_screenshot": pre_path,
                 "confirmation_screenshot": confirm_path,
                 **({} if confirmed else {"error": "No confirmation text detected."}),
             }
+        except Exception:
+            job_log.exception("submit.error")
+            raise
         finally:
             await browser.close()
 

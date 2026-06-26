@@ -17,6 +17,9 @@ from google import genai
 from google.genai import types
 
 from models.profile import MasterProfile
+from obs.logging import get_logger
+
+log = get_logger("tools.profile.extract")
 
 SYSTEM_PROMPT = """You extract structured career data from resumes.
 
@@ -79,21 +82,28 @@ def extract_profile(raw_text: str, user_id: str) -> MasterProfile:
     if not raw_text.strip():
         raise ValueError("Resume text is empty — nothing to extract.")
 
+    call_log = log.bind(user_id=user_id, chars=len(raw_text))
+    call_log.info("extract.gemini.start", model="gemini-3.1-pro-preview")
     client = genai.Client(vertexai=True)
 
-    response = client.models.generate_content(
-        # "gemini-3-pro" is not a valid catalog id; the Gemini 3 Pro model is
-        # "gemini-3.1-pro-preview".
-        model="gemini-3.1-pro-preview",
-        contents=[raw_text],
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=MasterProfile,
-            temperature=0.1,  # we want determinism here
-        ),
-    )
+    try:
+        response = client.models.generate_content(
+            # "gemini-3-pro" is not a valid catalog id; the Gemini 3 Pro model is
+            # "gemini-3.1-pro-preview".
+            model="gemini-3.1-pro-preview",
+            contents=[raw_text],
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                response_schema=MasterProfile,
+                temperature=0.1,  # we want determinism here
+            ),
+        )
+        profile = MasterProfile.model_validate_json(response.text)
+    except Exception:
+        call_log.exception("extract.gemini.failed")
+        raise
 
-    profile = MasterProfile.model_validate_json(response.text)
     profile.user_id = user_id
+    call_log.info("extract.gemini.done", roles=len(profile.experience))
     return profile

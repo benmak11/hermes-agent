@@ -15,6 +15,9 @@ from google.genai import types
 from models.job import Job, ParsedJD
 from models.match import JobMatch, ScoreBreakdown
 from models.profile import MasterProfile
+from obs.logging import get_logger
+
+log = get_logger("tools.matching")
 
 # Keep in sync with agents/_shared.py. Parsing is high-volume → Flash; scoring
 # is the call worth paying for → Pro (gemini-3.1-pro-preview, since plain
@@ -168,17 +171,21 @@ OUT_OF_FAMILY = JobMatch(
 async def parse_jd(job: Job) -> ParsedJD:
     """Cheap structured extraction with Flash — runs on every discovered job."""
     client = genai.Client(vertexai=True)
-    response = await client.aio.models.generate_content(
-        model=FLASH_MODEL,
-        contents=[job.jd_raw],
-        config=types.GenerateContentConfig(
-            system_instruction=PARSE_JD_PROMPT,
-            response_mime_type="application/json",
-            response_schema=ParsedJD,
-            temperature=0.1,
-        ),
-    )
-    return ParsedJD.model_validate_json(response.text)
+    try:
+        response = await client.aio.models.generate_content(
+            model=FLASH_MODEL,
+            contents=[job.jd_raw],
+            config=types.GenerateContentConfig(
+                system_instruction=PARSE_JD_PROMPT,
+                response_mime_type="application/json",
+                response_schema=ParsedJD,
+                temperature=0.1,
+            ),
+        )
+        return ParsedJD.model_validate_json(response.text)
+    except Exception:
+        log.exception("matching.parse_jd.failed", job_id=job.id, company=job.company)
+        raise
 
 
 async def match_job(
@@ -188,12 +195,16 @@ async def match_job(
     approval_patterns: str = "",
 ) -> JobMatch:
     """Parse (if needed), family pre-filter, then full Pro scoring."""
+    job_log = log.bind(job_id=job.id, company=job.company)
     if job.jd_parsed is None:
         job.jd_parsed = await parse_jd(job)
 
     # Cheap pre-filter: skip jobs outside target families before the Pro call.
     targets = {f.lower() for f in profile.preferences.target_role_families}
     if job.jd_parsed.role_family not in targets:
+        job_log.info(
+            "matching.skip_out_of_family", role_family=job.jd_parsed.role_family
+        )
         m = OUT_OF_FAMILY.model_copy()
         m.job_id = job.id
         return m
@@ -213,15 +224,24 @@ async def match_job(
 
     # Full scoring uses Pro — this is the call worth paying for.
     client = genai.Client(vertexai=True)
-    response = await client.aio.models.generate_content(
-        model=PRO_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=JobMatch,
-            temperature=0.2,
-        ),
-    )
-    match = JobMatch.model_validate_json(response.text)
+    try:
+        response = await client.aio.models.generate_content(
+            model=PRO_MODEL,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=JobMatch,
+                temperature=0.2,
+            ),
+        )
+        match = JobMatch.model_validate_json(response.text)
+    except Exception:
+        job_log.exception("matching.score.failed")
+        raise
     match.job_id = job.id  # ensure consistency
+    job_log.info(
+        "matching.scored",
+        score=match.overall_score,
+        recommendation=match.recommendation,
+    )
     return match

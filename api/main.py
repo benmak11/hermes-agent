@@ -14,23 +14,26 @@ import google.auth
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from google.adk.cli.fast_api import get_fast_api_app
-from google.cloud import logging as google_cloud_logging
 
+from api.app_utils.middleware import RequestContextMiddleware
 from api.app_utils.telemetry import setup_telemetry
 from api.app_utils.typing import Feedback
 from api.routes import applications as applications_routes
 from api.routes import companies as companies_routes
 from api.routes import jobs as jobs_routes
 from api.routes import profile as profile_routes
+from obs.logging import configure_logging, get_logger
 
 # Load local .env for dev (GOOGLE_CLOUD_*, AUTH_DEV_MODE, WEB_ORIGINS). No-op in
 # Cloud Run, where env is provided by Terraform and no .env file is shipped.
 load_dotenv()
 
+# Structured logging first, so everything below (telemetry, ADK, route imports)
+# logs through the same JSON-on-stdout pipeline Cloud Logging ingests.
+configure_logging()
 setup_telemetry()
 _, project_id = google.auth.default()
-logging_client = google_cloud_logging.Client()
-logger = logging_client.logger(__name__)
+logger = get_logger(__name__)
 
 # Origins allowed to call the API (the Next.js frontend). This drives BOTH
 # ADK's cross-origin gate for non-safe methods (POST/PUT/...) AND the CORS
@@ -85,6 +88,10 @@ app: FastAPI = get_fast_api_app(
 app.title = "hermes"
 app.description = "API gateway for the hermes multi-agent system"
 
+# Per-request correlation id + structured access log. Added last so it is the
+# outermost middleware and wraps every route (web API and ADK endpoints alike).
+app.add_middleware(RequestContextMiddleware)
+
 # Web vetting API (Firebase-auth job + company endpoints).
 app.include_router(jobs_routes.router)
 app.include_router(companies_routes.router)
@@ -102,7 +109,7 @@ def collect_feedback(feedback: Feedback) -> dict[str, str]:
     Returns:
         Success message
     """
-    logger.log_struct(feedback.model_dump(), severity="INFO")
+    logger.info("feedback.received", **feedback.model_dump())
     return {"status": "success"}
 
 

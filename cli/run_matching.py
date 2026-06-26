@@ -16,9 +16,11 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 from models.job import Job
 from models.profile import MasterProfile
+from obs.logging import get_logger
 from tools.matching.pipeline import match_job
 
 load_dotenv()
+log = get_logger("cli.run_matching")
 
 
 async def main() -> None:
@@ -79,6 +81,7 @@ async def main() -> None:
                 )
             except Exception as e:
                 counts["failed"] += 1
+                log.exception("match.failed", job_id=job.id, company=job.company)
                 print(f"  ✗ {job.company} - {job.title[:50]}: {e}")
 
     await asyncio.gather(*(_score(ref, job) for ref, job in pending))

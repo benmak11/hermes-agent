@@ -16,10 +16,13 @@ from pathlib import Path
 from models.application import Application, StatusEvent
 from models.job import Job
 from models.profile import MasterProfile
+from obs.logging import get_logger
 
 from .objective import generate_objective
 from .render import render_resume_docx, upload_resume
 from .rerank import rerank_experience
+
+log = get_logger("tools.tailoring")
 
 
 def application_id(job_id: str) -> str:
@@ -39,6 +42,8 @@ async def tailor_application(
     (used by tests); ``resume_variant_uri`` is left as the local file path.
     """
     created_at = datetime.now(UTC)
+    job_log = log.bind(job_id=job.id, company=job.company, user_id=profile.user_id)
+    job_log.info("tailoring.start", upload=upload)
 
     if job.jd_parsed is None:
         # Tailoring relies on the parsed JD (skills drive bullet reranking). A job
@@ -71,6 +76,7 @@ async def tailor_application(
         ]
 
     ready_at = datetime.now(UTC)
+    job_log.info("tailoring.done", resume_uri=resume_uri)
     return Application(
         id=application_id(job.id),
         user_id=profile.user_id,

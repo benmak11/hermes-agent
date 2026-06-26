@@ -22,7 +22,10 @@ from google.cloud import firestore
 
 from api.deps import verify_user
 from models.profile import MasterProfile
+from obs.logging import get_logger
 from tools.profile.extract import extract_profile, read_resume_text
+
+log = get_logger("api.profile")
 
 # Cap upload size so a hostile/huge file can't blow up memory (design says 10 MB).
 MAX_RESUME_BYTES = 10 * 1024 * 1024
@@ -89,15 +92,22 @@ async def extract(
             status_code=422, detail="Could not read any text from that resume."
         )
 
+    log.info(
+        "profile.extract.request",
+        source="file" if file is not None else "text",
+        chars=len(resume_text),
+    )
     try:
         profile = await asyncio.to_thread(extract_profile, resume_text, user_id)
     except Exception as e:  # extraction/validation failure → 422 for the UI
+        log.exception("profile.extract.failed", chars=len(resume_text))
         raise HTTPException(
             status_code=422, detail=f"Could not parse that resume: {e}"
         ) from e
 
     payload = profile.model_dump(mode="json")
     _user_ref(user_id).set({**payload, "onboarding_complete": False}, merge=True)
+    log.info("profile.extract.saved", roles=len(profile.experience))
     return {"profile": payload}
 
 

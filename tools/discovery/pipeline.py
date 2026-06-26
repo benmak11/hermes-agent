@@ -12,16 +12,16 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 
-import structlog
 from google.cloud import firestore
 
 from models.job import Job
+from obs.logging import get_logger
 from tools.ats.ashby import fetch_ashby_jobs
 from tools.ats.greenhouse import fetch_greenhouse_jobs
 from tools.ats.lever import fetch_lever_jobs
 from tools.companies import Platform, all_active_companies
 
-log = structlog.get_logger()
+log = get_logger("tools.discovery")
 
 # Dispatch table — keeps the fetcher choice data-driven, not a giant if/elif.
 FETCHERS: dict[Platform, Callable[[str, str], Awaitable[list[Job]]]] = {

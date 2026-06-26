@@ -6,7 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
-import { apiFetch } from "@/lib/api";
+import { apiFetch, newRequestId } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { auth } from "@/lib/firebase";
 import type { Application, RoleBullets } from "@/lib/types";
@@ -18,10 +18,15 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080";
 /** Fetch the tailored resume (auth header) and trigger a browser download. */
 async function downloadResume(appId: string, company: string): Promise<void> {
   const token = await auth.currentUser?.getIdToken();
+  const requestId = newRequestId();
   const res = await fetch(`${API_BASE}/applications/${appId}/resume`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    headers: {
+      "X-Request-Id": requestId,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
   });
   if (!res.ok) {
+    console.error(`api ${res.status} resume download (request ${requestId})`);
     window.alert("Could not download the resume.");
     return;
   }
@@ -63,8 +68,10 @@ export default function ReviewPage() {
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey });
 
-  // Live submission progress via SSE. EventSource can't set headers, so the
-  // Firebase token rides as a query param (verified server-side).
+  // Live submission progress via SSE. EventSource can't set headers, so both
+  // the Firebase token and the correlation id ride as query params (the token
+  // is verified server-side; the id is adopted as X-Request-Id by the
+  // middleware so the stream shares the page's request trail).
   useEffect(() => {
     if (app?.status !== "submitting") return;
     let es: EventSource | null = null;
@@ -72,8 +79,10 @@ export default function ReviewPage() {
     (async () => {
       const token = await auth.currentUser?.getIdToken();
       if (cancelled || !token) return;
+      const requestId = newRequestId();
       es = new EventSource(
-        `${API_BASE}/applications/${id}/events?token=${token}`,
+        `${API_BASE}/applications/${id}/events?token=${token}` +
+          `&request_id=${requestId}`,
       );
       const refresh = () =>
         queryClient.invalidateQueries({ queryKey });
