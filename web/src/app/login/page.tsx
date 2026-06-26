@@ -165,7 +165,13 @@ export default function LoginPage() {
     try {
       await sendPasswordResetEmail(auth, email.trim());
       setError(null);
-      setNotice(`Password reset link sent to ${email.trim()}.`);
+      // Firebase has *accepted* the request here; it does not confirm delivery.
+      // The default sender (noreply@<project>.firebaseapp.com) is often filtered,
+      // so steer the user to spam rather than over-promising "sent".
+      setNotice(
+        `If an account exists for ${email.trim()}, a reset link is on its way — ` +
+          `check your spam/Promotions folder if it doesn't arrive in a minute.`,
+      );
     } catch (e) {
       setError(describeAuthError(errCode(e)));
     }
