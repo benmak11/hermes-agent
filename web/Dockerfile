@@ -19,12 +19,17 @@ ARG NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=hermes-agent-btm-001.firebaseapp.com
 ARG NEXT_PUBLIC_FIREBASE_PROJECT_ID=hermes-agent-btm-001
 ARG NEXT_PUBLIC_FIREBASE_APP_ID=1:812714701339:web:d258dd8cc3084a76f23ebe
 ARG NEXT_PUBLIC_API_BASE=https://hermes-api-812714701339.us-central1.run.app
+# Invite codes that unlock email/password account creation on /login (soft,
+# client-side gate — see .env.example). Empty default = signup disabled; set
+# real codes here, or pass --build-arg, to enable it in the deployed image.
+ARG NEXT_PUBLIC_INVITE_CODES=HERMES-PR0D
 
 ENV NEXT_PUBLIC_FIREBASE_API_KEY=$NEXT_PUBLIC_FIREBASE_API_KEY \
     NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=$NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN \
     NEXT_PUBLIC_FIREBASE_PROJECT_ID=$NEXT_PUBLIC_FIREBASE_PROJECT_ID \
     NEXT_PUBLIC_FIREBASE_APP_ID=$NEXT_PUBLIC_FIREBASE_APP_ID \
-    NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE
+    NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE \
+    NEXT_PUBLIC_INVITE_CODES=$NEXT_PUBLIC_INVITE_CODES
 
 RUN npm run build
 

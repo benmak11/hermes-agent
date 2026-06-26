@@ -5,6 +5,7 @@
 import { signOut } from "firebase/auth";
 import Link from "next/link";
 
+import { UserAvatar } from "@/components/UserAvatar";
 import { auth } from "@/lib/firebase";
 
 export function TopNav({
@@ -82,10 +83,7 @@ export function TopNav({
           >
             Sign out
           </button>
-          <div
-            className="h-7 w-7 rounded-full border"
-            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
-          />
+          <UserAvatar />
         </div>
       ) : (
         <Link

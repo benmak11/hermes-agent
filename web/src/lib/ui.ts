@@ -81,3 +81,32 @@ export function avatarColor(seed: string): { bg: string; color: string } {
 export function initial(name: string): string {
   return (name.trim()[0] ?? "?").toUpperCase();
 }
+
+export type UserAvatar =
+  | { kind: "initials"; text: string }
+  | { kind: "email"; text: string }
+  | { kind: "glyph" };
+
+/**
+ * Resolve a signed-in user's avatar: a name yields initials (first + last),
+ * otherwise the email's first letter, otherwise a neutral person glyph.
+ * Mirrors the onboarding "Avatar resolution" spec:
+ *   initials(name) ?? email[0].toUpperCase() ?? glyph
+ */
+export function resolveUserAvatar(
+  name?: string | null,
+  email?: string | null,
+): UserAvatar {
+  const parts = (name ?? "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 1) {
+    return { kind: "initials", text: parts[0][0].toUpperCase() };
+  }
+  if (parts.length >= 2) {
+    const first = parts[0][0];
+    const last = parts[parts.length - 1][0];
+    return { kind: "initials", text: (first + last).toUpperCase() };
+  }
+  const e = email?.trim();
+  if (e) return { kind: "email", text: e[0].toUpperCase() };
+  return { kind: "glyph" };
+}
