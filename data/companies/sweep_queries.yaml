@@ -1,23 +1,23 @@
-# Each query gets run against all three platforms. Tune to your interests.
-# Group by role family so it's easy to add/remove whole families.
+# Each query gets run against all platform domains. Tune to your interests.
+# Keep these in sync with preferences.target_titles in data/profile.yaml —
+# they exist to surface companies hiring for roles YOU want.
 # Use the same operators that work in Google's UI.
 # NOTE: these queries discover NEW companies. Once a company is in known.yaml,
 # the daily fetch already pulls ALL its open roles regardless of these queries —
 # so you don't need a query for every title, just enough to surface good companies.
 queries:
-  # engineering
-  - '"staff engineer" "remote"'
-  - '"senior software engineer" "remote" -principal'
-  - '"engineering manager" "remote"'
-  # product
-  - '"senior product manager" "remote"'
-  - '"group product manager" "remote"'
-  # design
-  - '"product designer" "remote"'
-  # data
-  - '"data scientist" "remote"'
-  # marketing / growth
-  - '"product marketing manager" "remote"'
+  # engineering (profile: Senior Software Engineer, Backend Engineer)
+  - '"senior software engineer" "remote"'
+  - '"staff software engineer" "remote"'
+  - '"backend engineer" "remote"'
+  # adjacent titles for the same work (backend / cloud infrastructure)
+  - '"platform engineer" "remote"'
+  - '"infrastructure engineer" "remote"'
+  # data (profile: Data Engineer)
+  - '"data engineer" "remote"'
+  # machine learning (profile: Machine Learning Engineer)
+  - '"machine learning engineer" "remote"'
+  - '"ml engineer" "remote"'
 
 # Applied to every query as negative terms.
 exclude_keywords:

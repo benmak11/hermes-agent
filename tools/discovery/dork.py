@@ -19,15 +19,20 @@ import yaml
 
 from tools.companies import PLATFORMS, Platform, append_unvetted
 
-PLATFORM_DOMAINS: dict[Platform, str] = {
-    "greenhouse": "boards.greenhouse.io",
-    "lever": "jobs.lever.co",
-    "ashby": "jobs.ashbyhq.com",
+# Greenhouse is mid-migration from boards.greenhouse.io to the new
+# job-boards.greenhouse.io app; both host live postings, so sweep both.
+PLATFORM_DOMAINS: dict[Platform, list[str]] = {
+    "greenhouse": ["boards.greenhouse.io", "job-boards.greenhouse.io"],
+    "lever": ["jobs.lever.co"],
+    "ashby": ["jobs.ashbyhq.com"],
 }
 
-# URL patterns to extract company slug. Tested against real URLs from each platform.
+# URL patterns to extract company slug. Tested against real URLs from each
+# platform. Greenhouse matches legacy, new, and EU (job-boards.eu) hosts.
 SLUG_REGEXES: dict[Platform, re.Pattern] = {
-    "greenhouse": re.compile(r"boards\.greenhouse\.io/([a-zA-Z0-9_-]+)"),
+    "greenhouse": re.compile(
+        r"(?:job-)?boards(?:\.eu)?\.greenhouse\.io/([a-zA-Z0-9_-]+)"
+    ),
     "lever": re.compile(r"jobs\.lever\.co/([a-zA-Z0-9_-]+)"),
     "ashby": re.compile(r"jobs\.ashbyhq\.com/([a-zA-Z0-9_-]+)"),
 }
@@ -135,16 +140,16 @@ async def run_sweep(backend: SearchBackend) -> dict[Platform, int]:
     added: dict[Platform, int] = dict.fromkeys(PLATFORMS, 0)
 
     for platform in PLATFORMS:
-        domain = PLATFORM_DOMAINS[platform]
         platform_slugs: set[str] = set()
 
-        for query in queries:
-            scoped_query = f"site:{domain} {query}"
-            for exc in exclude:
-                scoped_query += f' -"{exc}"'
+        for domain in PLATFORM_DOMAINS[platform]:
+            for query in queries:
+                scoped_query = f"site:{domain} {query}"
+                for exc in exclude:
+                    scoped_query += f' -"{exc}"'
 
-            urls = await backend.search(scoped_query)
-            platform_slugs.update(extract_slugs(urls, platform))
+                urls = await backend.search(scoped_query)
+                platform_slugs.update(extract_slugs(urls, platform))
 
         n = append_unvetted(platform, sorted(platform_slugs))
         added[platform] = n
