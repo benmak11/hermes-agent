@@ -25,6 +25,7 @@ export default function CompaniesPage() {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<Tab>("unvetted");
   const [search, setSearch] = useState("");
+  const [showAll, setShowAll] = useState(false);
 
   useEffect(() => {
     if (!loading && !user) router.push("/login");
@@ -98,7 +99,7 @@ export default function CompaniesPage() {
         </div>
 
         {tab !== "blocklist" && (
-          <div className="mt-[18px]">
+          <div className="mt-[18px] flex items-center justify-between">
             <input
               placeholder="Search companies…"
               value={search}
@@ -110,6 +111,15 @@ export default function CompaniesPage() {
                 color: "var(--text)",
               }}
             />
+            <span
+              className="font-mono text-[11px] font-medium uppercase tracking-wider"
+              style={{ color: "var(--subtle)" }}
+            >
+              {Object.keys(
+                (tab === "unvetted" ? data?.unvetted : data?.known) ?? {},
+              ).join(" · ") || "—"}{" "}
+              · {counts[tab]} discovered
+            </span>
           </div>
         )}
 
@@ -144,7 +154,7 @@ export default function CompaniesPage() {
               No companies.
             </p>
           ) : (
-            rows.map((r) => {
+            (showAll ? rows : rows.slice(0, 30)).map((r) => {
               const av = avatarColor(r.slug);
               return (
                 <div
@@ -204,6 +214,22 @@ export default function CompaniesPage() {
             })
           )}
         </div>
+
+        {tab !== "blocklist" && !showAll && rows.length > 30 && (
+          <div
+            className="mt-3.5 text-center text-[13px] font-medium"
+            style={{ color: "var(--muted)" }}
+          >
+            Showing 30 of {rows.length} ·{" "}
+            <button
+              onClick={() => setShowAll(true)}
+              className="font-semibold"
+              style={{ color: "var(--accent)" }}
+            >
+              Show all
+            </button>
+          </div>
+        )}
       </main>
     </>
   );
