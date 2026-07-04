@@ -4,21 +4,53 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import {
+  clearFirstRun,
+  loadStats,
+  paceMinutes,
+  recordDecision,
+  revertDecision,
+  reviewedCount,
+  saveMinScore,
+  saveStats,
+  useFirstRun,
+  useMinScore,
+  useSessionStats,
+  type SessionStats,
+} from "@/lib/session";
 import type { Decision, Job, ProfileResponse } from "@/lib/types";
 import { avatarColor, barColor, initial, recPill, scoreColor } from "@/lib/ui";
 import { TopNav } from "@/components/TopNav";
 
 type PendingResponse = { jobs: Job[] };
 
+/** A decision in its 6s soft-commit window (mock 07): undoable until it lands. */
+type PendingCommit = { job: Job; decision: Decision };
+
+const SOFT_COMMIT_MS = 6000;
+
+const DECISION_VERB: Record<Decision, string> = {
+  approved: "Approved",
+  rejected: "Skipped",
+  starred: "Starred",
+};
+
 export default function VettingPage() {
   const { user, loading } = useAuth();
   const router = useRouter();
   const queryClient = useQueryClient();
-  const [minScore, setMinScore] = useState(60);
+  const uid = user?.uid ?? null;
+  // Storage-backed values (hydration-safe external stores).
+  const minScore = useMinScore();
+  const stats = useSessionStats(uid);
+  const firstRun = useFirstRun();
+  const [pending, setPending] = useState<PendingCommit | null>(null);
+  const commitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRef = useRef<PendingCommit | null>(null);
 
   useEffect(() => {
     if (!loading && !user) router.push("/login");
@@ -44,6 +76,9 @@ export default function VettingPage() {
     queryFn: () =>
       apiFetch<PendingResponse>(`/jobs/pending?min_score=${minScore}`),
     enabled: !!user && profileData?.profile != null,
+    // Matches stream in as agents write them — poll faster while discovery is
+    // fresh after onboarding, gently otherwise.
+    refetchInterval: firstRun ? 5000 : 30000,
   });
 
   const decide = useMutation({
@@ -52,47 +87,122 @@ export default function VettingPage() {
         method: "POST",
         body: JSON.stringify({ decision }),
       }),
-    onMutate: async ({ id }) => {
-      await queryClient.cancelQueries({ queryKey });
-      const prev = queryClient.getQueryData<PendingResponse>(queryKey);
-      queryClient.setQueryData<PendingResponse>(queryKey, (old) =>
-        old ? { jobs: old.jobs.filter((j) => j.id !== id) } : old,
-      );
-      return { prev };
-    },
-    onError: (_e, _vars, ctx) => {
-      if (ctx?.prev) queryClient.setQueryData(queryKey, ctx.prev);
+    onError: () => {
+      // A failed hard-commit refetches so the card comes back — the decision
+      // is still pending server-side and isn't silently lost.
+      queryClient.invalidateQueries({ queryKey: ["pending"] });
     },
   });
+  // useMutation's `mutate` is referentially stable; the mutation object is not.
+  const mutateDecide = decide.mutate;
+
+  const bumpStats = useCallback(
+    (fn: (s: SessionStats) => SessionStats) => {
+      if (uid) saveStats(uid, fn(loadStats(uid)));
+    },
+    [uid],
+  );
+
+  const commitNow = useCallback(() => {
+    const p = pendingRef.current;
+    if (!p) return;
+    if (commitTimer.current) clearTimeout(commitTimer.current);
+    commitTimer.current = null;
+    pendingRef.current = null;
+    setPending(null);
+    mutateDecide({ id: p.job.id, decision: p.decision });
+  }, [mutateDecide]);
+
+  const softDecide = useCallback(
+    (job: Job, decision: Decision) => {
+      // One soft-commit window at a time: a new decision lands the previous one.
+      if (pendingRef.current) commitNow();
+      queryClient.setQueryData<PendingResponse>(queryKey, (old) =>
+        old ? { jobs: old.jobs.filter((j) => j.id !== job.id) } : old,
+      );
+      const p = { job, decision };
+      pendingRef.current = p;
+      setPending(p);
+      bumpStats((s) => recordDecision(s, decision));
+      commitTimer.current = setTimeout(commitNow, SOFT_COMMIT_MS);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [commitNow, queryClient, minScore, bumpStats],
+  );
+
+  const undo = useCallback(() => {
+    const p = pendingRef.current;
+    if (!p) return;
+    if (commitTimer.current) clearTimeout(commitTimer.current);
+    commitTimer.current = null;
+    pendingRef.current = null;
+    setPending(null);
+    queryClient.setQueryData<PendingResponse>(queryKey, (old) =>
+      old ? { jobs: [p.job, ...old.jobs.filter((j) => j.id !== p.job.id)] } : old,
+    );
+    bumpStats((s) => revertDecision(s, p.decision));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queryClient, minScore, bumpStats]);
+
+  // Leaving the page lands any decision still in its window (unmount only —
+  // a ref keeps render-to-render identity churn from flushing the timer).
+  const commitRef = useRef(commitNow);
+  useEffect(() => {
+    commitRef.current = commitNow;
+  }, [commitNow]);
+  useEffect(() => () => commitRef.current(), []);
 
   const jobs = data?.jobs ?? [];
   const top = jobs[0];
 
   const act = useCallback(
     (decision: Decision) => {
-      if (top) decide.mutate({ id: top.id, decision });
+      if (top) softDecide(top, decision);
     },
-    [top, decide],
+    [top, softDecide],
   );
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.target instanceof HTMLElement && e.target.tagName === "INPUT") return;
+      if (
+        e.target instanceof HTMLElement &&
+        (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")
+      )
+        return;
       if (e.key === "a") act("approved");
       else if (e.key === "s") act("rejected");
       else if (e.key === "r") act("starred");
+      else if (e.key === "z") undo();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [act]);
+  }, [act, undo]);
+
+  // The first-run treatment retires once the queue is real and being worked.
+  useEffect(() => {
+    if (firstRun && reviewedCount(stats) >= 3) clearFirstRun();
+  }, [firstRun, stats]);
 
   if (loading || !user || profileLoading || needsOnboarding) {
     return <div className="p-8" style={{ color: "var(--muted)" }}>Loading…</div>;
   }
 
+  const reviewed = reviewedCount(stats);
+  const remaining = jobs.length;
+  const total = reviewed + remaining;
+  const pace = paceMinutes(stats, remaining);
+
   return (
     <>
-      <TopNav section="review" />
+      <TopNav
+        section="review"
+        center={
+          reviewed > 0 && total > 0 ? (
+            <SessionProgress reviewed={reviewed} total={total} />
+          ) : undefined
+        }
+        pill={firstRun ? <DiscoveryPill /> : undefined}
+      />
       <main className="mx-auto w-full max-w-[760px] flex-1 px-8 py-7">
         <div className="mb-6 flex items-start justify-between gap-5">
           <div>
@@ -101,21 +211,36 @@ export default function VettingPage() {
                 className="text-[22px] font-semibold tracking-tight"
                 style={{ color: "var(--text)" }}
               >
-                Jobs to review
+                {firstRun ? "Your first matches" : "Jobs to review"}
               </h1>
-              <span
-                className="inline-flex h-[22px] min-w-6 items-center justify-center rounded-full px-[7px] font-mono text-xs font-semibold"
-                style={{ background: "var(--text)", color: "var(--surface)" }}
+              {!firstRun && (
+                <span
+                  className="inline-flex h-[22px] min-w-6 items-center justify-center rounded-full px-[7px] font-mono text-xs font-semibold"
+                  style={{ background: "var(--text)", color: "var(--surface)" }}
+                >
+                  {jobs.length}
+                </span>
+              )}
+            </div>
+            {firstRun ? (
+              <div
+                className="mt-2 font-mono text-[12.5px] font-medium"
+                style={{ color: "var(--muted)" }}
               >
-                {jobs.length}
-              </span>
-            </div>
-            <div
-              className="mt-2 flex items-center gap-1.5 text-xs"
-              style={{ color: "var(--muted)" }}
-            >
-              <Kbd>a</Kbd> approve <Kbd>s</Kbd> skip <Kbd>r</Kbd> star
-            </div>
+                <span style={{ color: "var(--good)", fontWeight: 600 }}>
+                  {jobs.length} {jobs.length === 1 ? "match" : "matches"}
+                </span>{" "}
+                so far — start reviewing, more will appear below
+              </div>
+            ) : (
+              <div
+                className="mt-2 flex items-center gap-1.5 text-xs"
+                style={{ color: "var(--muted)" }}
+              >
+                <Kbd>a</Kbd> approve <Kbd>s</Kbd> skip <Kbd>r</Kbd> star{" "}
+                <Kbd>z</Kbd> undo
+              </div>
+            )}
           </div>
 
           <label
@@ -133,7 +258,7 @@ export default function VettingPage() {
               min={0}
               max={100}
               value={minScore}
-              onChange={(e) => setMinScore(Number(e.target.value))}
+              onChange={(e) => saveMinScore(Number(e.target.value))}
               className="w-[130px] accent-[var(--accent)]"
             />
             <span
@@ -149,8 +274,8 @@ export default function VettingPage() {
         {error && (
           <p style={{ color: "var(--danger)" }}>Failed to load: {String(error)}</p>
         )}
-        {!isLoading && jobs.length === 0 && (
-          <EmptyState minScore={minScore} onLower={() => setMinScore(0)} />
+        {!isLoading && jobs.length === 0 && !firstRun && (
+          <EmptyState minScore={minScore} onLower={() => saveMinScore(0)} />
         )}
 
         <div className="space-y-4">
@@ -159,12 +284,206 @@ export default function VettingPage() {
               key={job.id}
               job={job}
               isTop={i === 0}
-              onDecide={(d) => decide.mutate({ id: job.id, decision: d })}
+              onDecide={(d) => softDecide(job, d)}
             />
           ))}
         </div>
+
+        {firstRun && !isLoading && <ScoringCard />}
+
+        {reviewed > 0 && (
+          <div
+            className="mt-4 flex items-center gap-3.5 font-mono text-xs font-medium"
+            style={{ color: "var(--muted)" }}
+          >
+            <CountDot color="var(--good)" label={`${stats.approved} approved`} />
+            <CountDot
+              color="var(--border-mid)"
+              label={`${stats.skipped} skipped`}
+            />
+            <CountDot color="var(--star)" label={`${stats.starred} starred`} />
+            <span className="ml-auto" style={{ color: "var(--subtle)" }}>
+              {remaining} remaining
+              {pace != null ? ` · ~${pace} min at your pace` : ""}
+            </span>
+          </div>
+        )}
       </main>
+
+      {pending && <UndoToast pending={pending} onUndo={undo} />}
     </>
+  );
+}
+
+function SessionProgress({
+  reviewed,
+  total,
+}: {
+  reviewed: number;
+  total: number;
+}) {
+  const pct = Math.min(100, Math.round((reviewed / total) * 100));
+  return (
+    <div className="flex items-center gap-[11px]">
+      <div
+        className="h-[5px] w-[150px] overflow-hidden rounded-full"
+        style={{ background: "var(--surface-2)" }}
+      >
+        <div
+          className="h-full rounded-full"
+          style={{ width: `${pct}%`, background: "var(--good)" }}
+        />
+      </div>
+      <span
+        className="font-mono text-xs font-semibold"
+        style={{ color: "var(--label)" }}
+      >
+        {reviewed} of {total} reviewed
+      </span>
+    </div>
+  );
+}
+
+function DiscoveryPill() {
+  return (
+    <span
+      className="inline-flex items-center gap-2 rounded-full border px-3 py-[5px] font-mono text-xs font-semibold"
+      style={{
+        background: "var(--accent-bg)",
+        borderColor: "var(--accent-border)",
+        color: "var(--accent-text)",
+      }}
+    >
+      <span
+        className="inline-block h-[11px] w-[11px] rounded-full border-2"
+        style={{
+          borderColor: "var(--accent-text)",
+          borderTopColor: "transparent",
+          animation: "hspin 0.8s linear infinite",
+        }}
+      />
+      discovery running
+    </span>
+  );
+}
+
+/** Dashed placeholder for a match still being scored (mock 06). */
+function ScoringCard() {
+  return (
+    <div
+      className="mt-4 rounded-[14px] px-[22px] py-5"
+      style={{
+        border: "1px dashed var(--border-mid)",
+        background: "color-mix(in srgb, var(--surface) 60%, transparent)",
+      }}
+    >
+      <div className="flex items-center gap-[11px]">
+        <div
+          className="h-[34px] w-[34px] rounded-lg h-pulse"
+          style={{ background: "var(--surface-2)" }}
+        />
+        <div className="flex-1">
+          <div
+            className="h-[13px] w-[220px] rounded h-pulse"
+            style={{ background: "var(--surface-2)" }}
+          />
+          <div
+            className="mt-[7px] h-[11px] w-[110px] rounded h-pulse"
+            style={{ background: "var(--divider)" }}
+          />
+        </div>
+        <span
+          className="font-mono text-[11px] font-medium"
+          style={{ color: "var(--subtle)" }}
+        >
+          scoring…
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function CountDot({ color, label }: { color: string; label: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span
+        className="h-2 w-2 rounded-full"
+        style={{ background: color }}
+      />
+      {label}
+    </span>
+  );
+}
+
+/**
+ * Bottom-center undo toast (mock 07): dark pill with the decision, an Undo
+ * button carrying the `z` kbd, and a 20px SVG ring draining over the 6s
+ * soft-commit window.
+ */
+function UndoToast({
+  pending,
+  onUndo,
+}: {
+  pending: PendingCommit;
+  onUndo: () => void;
+}) {
+  return (
+    <div
+      key={pending.job.id}
+      className="h-slideup fixed bottom-[22px] left-1/2 z-20 flex -translate-x-1/2 items-center gap-3.5 rounded-xl py-[11px] pl-4 pr-3"
+      style={{
+        background: "var(--toast-bg)",
+        boxShadow: "0 10px 30px rgba(0,0,0,0.3)",
+        animationDuration: "0.3s",
+      }}
+    >
+      <span className="text-[13px]" style={{ color: "var(--toast-text)" }}>
+        {DECISION_VERB[pending.decision]}{" "}
+        <b style={{ color: "var(--toast-strong)" }}>{pending.job.title}</b> ·{" "}
+        {pending.job.company}
+      </span>
+      <button
+        onClick={onUndo}
+        className="inline-flex h-[30px] items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-semibold"
+        style={{
+          background: "var(--toast-btn-bg)",
+          borderColor: "var(--toast-btn-border)",
+          color: "var(--toast-btn-text)",
+        }}
+      >
+        Undo{" "}
+        <kbd
+          className="inline-flex h-[17px] min-w-4 items-center justify-center rounded border px-1 font-mono text-[10px] font-semibold"
+          style={{
+            background: "var(--toast-kbd-bg)",
+            borderColor: "var(--toast-kbd-border)",
+            color: "var(--toast-kbd-text)",
+          }}
+        >
+          z
+        </kbd>
+      </button>
+      <svg width="20" height="20" viewBox="0 0 20 20" style={{ transform: "rotate(-90deg)" }}>
+        <circle
+          cx="10"
+          cy="10"
+          r="8"
+          fill="none"
+          stroke="var(--toast-ring-track)"
+          strokeWidth="2.5"
+        />
+        <circle
+          cx="10"
+          cy="10"
+          r="8"
+          fill="none"
+          stroke="var(--toast-ring)"
+          strokeWidth="2.5"
+          strokeDasharray="50.3"
+          style={{ animation: `ringDrain ${SOFT_COMMIT_MS}ms linear both` }}
+        />
+      </svg>
+    </div>
   );
 }
 
@@ -200,7 +519,7 @@ function JobCard({
 
   return (
     <article
-      className="rounded-[14px] border p-[22px]"
+      className="h-slideup rounded-[14px] border p-[22px]"
       style={{
         background: "var(--surface)",
         borderColor: isTop ? "var(--border-strong)" : "var(--border)",

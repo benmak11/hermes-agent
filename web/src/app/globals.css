@@ -14,6 +14,7 @@
   --surface: #ffffff;
   --surface-2: #f4f4f5;
   --border: #e7e7e9;
+  --border-mid: #d4d4d8;
   --border-strong: #18181b;
   --ring: rgba(24, 24, 27, 0.06);
   --text: #18181b;
@@ -35,9 +36,30 @@
   --first-bg: #fef3c7;
   --first-text: #92400e;
   --danger: #dc2626;
+  --danger-bg: #fef2f2;
   --danger-border: #fecaca;
+  --star: #f59e0b;
   --skeleton: #e6e6e8;
   --skeleton-2: #eeeeef;
+  /* Interview journal tints (offer celebration + reflection panels). */
+  --offer-bg: #f7fef9;
+  --offer-divider: #d1fae5;
+  --good-panel-bg: #f8fdf9;
+  --good-panel-border: #e3f5e9;
+  --danger-panel-bg: #fdf9f8;
+  --danger-panel-border: #f5e5e3;
+  /* Undo toast: an inverted surface, so it gets its own ramp. */
+  --toast-bg: #18181b;
+  --toast-text: #e4e4e7;
+  --toast-strong: #ffffff;
+  --toast-btn-bg: #27272a;
+  --toast-btn-border: #3f3f46;
+  --toast-btn-text: #ffffff;
+  --toast-kbd-bg: #3f3f46;
+  --toast-kbd-border: #52525b;
+  --toast-kbd-text: #d4d4d8;
+  --toast-ring-track: #3f3f46;
+  --toast-ring: #a1a1aa;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -47,6 +69,7 @@
     --surface: #151517;
     --surface-2: #1c1c1f;
     --border: #27272a;
+    --border-mid: #3f3f46;
     --border-strong: #52525b;
     --ring: rgba(82, 82, 91, 0.18);
     --text: #fafafa;
@@ -68,9 +91,28 @@
     --first-bg: #2a230e;
     --first-text: #fcd34d;
     --danger: #f87171;
+    --danger-bg: #2a0e0e;
     --danger-border: #7f1d1d;
+    --star: #fbbf24;
     --skeleton: #1c1c1f;
     --skeleton-2: #232327;
+    --offer-bg: #0e1f15;
+    --offer-divider: #14532d;
+    --good-panel-bg: #101a13;
+    --good-panel-border: #1e3a2a;
+    --danger-panel-bg: #1a1010;
+    --danger-panel-border: #3a1e1e;
+    --toast-bg: #fafafa;
+    --toast-text: #3f3f46;
+    --toast-strong: #0a0a0a;
+    --toast-btn-bg: #f4f4f5;
+    --toast-btn-border: #d4d4d8;
+    --toast-btn-text: #18181b;
+    --toast-kbd-bg: #ffffff;
+    --toast-kbd-border: #d4d4d8;
+    --toast-kbd-text: #52525b;
+    --toast-ring-track: #d4d4d8;
+    --toast-ring: #52525b;
   }
 }
 
@@ -130,4 +172,46 @@ body {
 
 .h-pop {
   animation: hpopin 0.4s ease both;
+}
+
+/* Mock-spec entrance animations: cards/toasts slide up, badges/confetti pop. */
+@keyframes slideUp {
+  from {
+    transform: translateY(14px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.h-slideup {
+  animation: slideUp 0.4s ease both;
+}
+
+@keyframes popIn {
+  from {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.h-popin {
+  animation: popIn 0.45s ease both;
+}
+
+/* Undo-toast countdown ring: drains a circle of circumference 2π·8 ≈ 50.3
+   over the 6s soft-commit window. */
+@keyframes ringDrain {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: 50.3;
+  }
 }

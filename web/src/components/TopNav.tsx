@@ -8,10 +8,29 @@ import Link from "next/link";
 import { UserAvatar } from "@/components/UserAvatar";
 import { auth } from "@/lib/firebase";
 
+type Section = "review" | "companies" | "applications" | "profile" | "interviews";
+
+const LINKS: { section: Section; href: string; label: string }[] = [
+  { section: "review", href: "/", label: "Review" },
+  { section: "interviews", href: "/interviews", label: "Interviews" },
+  { section: "companies", href: "/settings/companies", label: "Companies" },
+];
+
+/**
+ * 56px translucent app nav (mock spec): logo + `/ route` breadcrumb left;
+ * Review · Interviews · Companies · Sign out + avatar right, with the current
+ * page's link omitted. The avatar opens /profile and wears a blue focus ring
+ * while there. `center` (session progress) and `pill` (discovery status) are
+ * slots for the review screen. Companies keeps its "← Back to jobs" shortcut.
+ */
 export function TopNav({
   section,
+  center,
+  pill,
 }: {
-  section: "review" | "companies" | "applications" | "profile";
+  section: Section;
+  center?: React.ReactNode;
+  pill?: React.ReactNode;
 }) {
   return (
     <header
@@ -29,63 +48,18 @@ export function TopNav({
           Hermes
         </span>
         <span
-          className="ml-1.5 font-mono text-xs"
+          className="ml-1.5 font-mono text-xs font-medium"
           style={{ color: "var(--subtle)" }}
         >
           / {section}
         </span>
       </Link>
 
-      {section === "review" || section === "profile" ? (
-        <div className="flex items-center gap-[18px]">
-          <Link
-            href="/"
-            className="text-[13px] font-medium"
-            style={{ color: section === "review" ? "var(--text)" : "var(--label)" }}
-          >
-            Review
-          </Link>
-          <Link
-            href="/applications"
-            className="text-[13px] font-medium"
-            style={{ color: "var(--label)" }}
-          >
-            Applications
-          </Link>
-          <Link
-            href="/settings/companies"
-            className="text-[13px] font-medium"
-            style={{ color: "var(--label)" }}
-          >
-            Companies
-          </Link>
-          <Link
-            href="/profile"
-            className="flex items-center gap-1.5 text-[13px] font-medium"
-            style={{ color: section === "profile" ? "var(--text)" : "var(--label)" }}
-          >
-            Profile
-            <span
-              className="rounded border px-1 py-px font-mono text-[9px] font-semibold"
-              style={{
-                background: "var(--accent-bg)",
-                borderColor: "var(--accent-border)",
-                color: "var(--accent-text)",
-              }}
-            >
-              NEW
-            </span>
-          </Link>
-          <button
-            onClick={() => signOut(auth)}
-            className="text-[13px]"
-            style={{ color: "var(--subtle)" }}
-          >
-            Sign out
-          </button>
-          <UserAvatar />
-        </div>
-      ) : (
+      {center && (
+        <div className="absolute left-1/2 -translate-x-1/2">{center}</div>
+      )}
+
+      {section === "companies" ? (
         <Link
           href="/"
           className="text-[13px] font-medium"
@@ -93,6 +67,39 @@ export function TopNav({
         >
           ← Back to jobs
         </Link>
+      ) : (
+        <div className="flex items-center gap-[18px]">
+          {pill}
+          {LINKS.filter((l) => l.section !== section).map((l) => (
+            <Link
+              key={l.section}
+              href={l.href}
+              className="text-[13px] font-medium"
+              style={{ color: "var(--label)" }}
+            >
+              {l.label}
+            </Link>
+          ))}
+          <button
+            onClick={() => signOut(auth)}
+            className="text-[13px]"
+            style={{ color: "var(--subtle)" }}
+          >
+            Sign out
+          </button>
+          <Link
+            href="/profile"
+            aria-label="Profile"
+            className="rounded-full"
+            style={
+              section === "profile"
+                ? { boxShadow: "0 0 0 2px var(--bg), 0 0 0 4px var(--accent)" }
+                : undefined
+            }
+          >
+            <UserAvatar />
+          </Link>
+        </div>
       )}
     </header>
   );
