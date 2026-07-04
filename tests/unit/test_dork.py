@@ -15,6 +15,15 @@ def test_extract_slugs_greenhouse_only() -> None:
     assert extract_slugs(urls, "greenhouse") == {"stripe", "airbnb"}
 
 
+def test_extract_slugs_new_greenhouse_hosts() -> None:
+    urls = [
+        "https://job-boards.greenhouse.io/gitlab/jobs/8503792002",
+        "https://job-boards.eu.greenhouse.io/pleo/jobs/123",
+        "https://boards.eu.greenhouse.io/adyen/jobs/456",
+    ]
+    assert extract_slugs(urls, "greenhouse") == {"gitlab", "pleo", "adyen"}
+
+
 def test_extract_slugs_per_platform() -> None:
     urls = [
         "https://jobs.lever.co/spotify/abc-123",
