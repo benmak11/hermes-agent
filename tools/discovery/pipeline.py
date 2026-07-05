@@ -59,10 +59,18 @@ async def run_discovery(user_id: str) -> dict:
     failures: list[dict] = []
     empty_boards: list[dict] = []
 
-    for result in results:
+    for (platform, slug, source), result in zip(companies, results, strict=True):
         if isinstance(result, Exception):
-            log.error("discovery.fetch_exception", error=str(result))
-            failures.append({"error": str(result)})
+            # HTTP failures are already logged (and absorbed) by the fetchers;
+            # an exception here is a parse/programmer error worth a traceback.
+            log.error(
+                "discovery.fetch_exception",
+                platform=platform,
+                slug=slug,
+                source=source,
+                error=str(result),
+            )
+            failures.append({"platform": platform, "slug": slug, "error": str(result)})
             continue
         platform, slug, source, fetched = result
         if not fetched:
@@ -105,4 +113,9 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
             counter["new"] += 1
 
     await asyncio.gather(*(_persist_one(j) for j in unique.values()))
+    log.info(
+        "discovery.persisted",
+        new_jobs=counter["new"],
+        seen_before=len(unique) - counter["new"],
+    )
     return counter["new"]

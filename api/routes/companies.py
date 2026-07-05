@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from api.deps import verify_user
+from obs.logging import get_logger
 from tools.companies import (
     apply_company_action,
     load_blocklist_detailed,
@@ -18,6 +19,7 @@ from tools.companies import (
 )
 
 router = APIRouter(tags=["companies"])
+log = get_logger("api.companies")
 
 
 @router.get("/companies")
@@ -47,4 +49,11 @@ class CompanyAction(BaseModel):
 def company_action(body: CompanyAction, user_id: str = Depends(verify_user)) -> dict:
     """Apply a promote/block/dismiss/pause action to a company."""
     apply_company_action(body.platform, body.slug, body.action, body.reason)
+    log.info(
+        "company.action",
+        platform=body.platform,
+        slug=body.slug,
+        action=body.action,
+        reason=body.reason,
+    )
     return {"ok": True}

@@ -17,7 +17,10 @@ from urllib.parse import quote_plus
 import httpx
 import yaml
 
+from obs.logging import get_logger
 from tools.companies import PLATFORMS, Platform, append_unvetted
+
+log = get_logger("tools.discovery.sweep")
 
 # Greenhouse is mid-migration from boards.greenhouse.io to the new
 # job-boards.greenhouse.io app; both host live postings, so sweep both.
@@ -148,10 +151,22 @@ async def run_sweep(backend: SearchBackend) -> dict[Platform, int]:
                 for exc in exclude:
                     scoped_query += f' -"{exc}"'
 
-                urls = await backend.search(scoped_query)
+                try:
+                    urls = await backend.search(scoped_query)
+                except Exception:
+                    # One bad query (rate limit, quota) shouldn't lose the rest
+                    # of the sweep — record the failure point and continue.
+                    log.exception("sweep.query_failed", platform=platform, query=query)
+                    continue
                 platform_slugs.update(extract_slugs(urls, platform))
 
         n = append_unvetted(platform, sorted(platform_slugs))
         added[platform] = n
+        log.info(
+            "sweep.platform_done",
+            platform=platform,
+            slugs_found=len(platform_slugs),
+            new_unvetted=n,
+        )
 
     return added

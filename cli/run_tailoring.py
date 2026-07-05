@@ -19,7 +19,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 from models.job import Job
 from models.profile import MasterProfile
-from obs.logging import get_logger
+from obs.logging import bind_run_context, get_logger
 from tools.tailoring.pipeline import application_id, tailor_application
 
 load_dotenv()
@@ -35,6 +35,7 @@ async def main() -> None:
         "--no-upload", action="store_true", help="Render locally, skip GCS upload"
     )
     args = parser.parse_args()
+    bind_run_context("tailoring", user_id=args.user_id)
 
     db = firestore.AsyncClient()
     user_ref = db.collection("users").document(args.user_id)

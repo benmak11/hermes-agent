@@ -16,6 +16,7 @@ import yaml
 from dotenv import load_dotenv
 
 from models.profile import MasterProfile
+from obs.logging import bind_run_context
 from tools.profile.extract import extract_profile, read_resume_text
 
 # Load GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION / GOOGLE_GENAI_USE_VERTEXAI
@@ -34,6 +35,7 @@ def main():
     parser.add_argument("--user-id", required=True)
     parser.add_argument("--output", type=Path, default=Path("data/profile.yaml"))
     args = parser.parse_args()
+    bind_run_context("import_resume", user_id=args.user_id)
 
     if not args.resume.exists():
         sys.exit(f"File not found: {args.resume}")

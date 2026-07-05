@@ -14,8 +14,10 @@ from pydantic import BaseModel
 
 from api.deps import verify_user
 from api.routes.applications import application_id, run_tailoring
+from obs.logging import get_logger
 
 router = APIRouter(tags=["jobs"])
+log = get_logger("api.jobs")
 
 _db: firestore.Client | None = None
 
@@ -74,6 +76,7 @@ def decide(
     user_ref.collection("jobs").document(job_id).update(
         {"user_decision": body.decision}
     )
+    log.info("job.decided", job_id=job_id, decision=body.decision)
 
     if body.decision == "approved":
         app_ref = user_ref.collection("applications").document(application_id(job_id))
@@ -89,5 +92,6 @@ def decide(
                 }
             )
             background_tasks.add_task(run_tailoring, user_id, job_id)
+            log.info("job.tailoring_scheduled", job_id=job_id)
 
     return {"ok": True}

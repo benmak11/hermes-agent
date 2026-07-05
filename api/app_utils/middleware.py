@@ -15,7 +15,7 @@ import time
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
 from obs.logging import (
@@ -61,7 +61,16 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             duration_ms = round((time.perf_counter() - start) * 1000, 1)
             # The unhandled error itself — the failure point we want traceable.
             self._log.exception("request.error", duration_ms=duration_ms)
-            raise
+            # Answer with the correlation id instead of re-raising into a bare
+            # 500: the UI surfaces "request <id>", which is exactly the string
+            # to paste into Cloud Logging (jsonPayload.request_id) to find the
+            # traceback above. HTTPException never lands here — FastAPI turns
+            # it into a response inside call_next.
+            return JSONResponse(
+                {"detail": "Internal server error", "request_id": request_id},
+                status_code=500,
+                headers={"X-Request-Id": request_id},
+            )
 
         duration_ms = round((time.perf_counter() - start) * 1000, 1)
         if not quiet:

@@ -10,6 +10,7 @@ import asyncio
 
 from dotenv import load_dotenv
 
+from obs.logging import bind_run_context
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
 
 # Load GOOGLE_CLOUD_PROJECT (and friends) so the Firestore client targets the
@@ -21,6 +22,7 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--user-id", required=True)
     args = parser.parse_args()
+    bind_run_context("discovery", user_id=args.user_id)
 
     print("→ Running discovery...")
     summary = await run_discovery(args.user_id)

@@ -8,8 +8,11 @@ from pathlib import Path
 
 from models.job import Job
 from models.profile import MasterProfile
+from obs.logging import get_logger
 
 from .greenhouse import ProgressFn, submit_greenhouse
+
+log = get_logger("tools.submitters")
 
 
 async def submit_application(
@@ -37,6 +40,12 @@ async def submit_application(
             on_progress=on_progress,
         )
 
+    log.warning(
+        "submit.unsupported_source",
+        job_id=job.id,
+        company=job.company,
+        source=job.source,
+    )
     return {
         "success": False,
         "error": (
