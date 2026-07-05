@@ -11,9 +11,8 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 
-import httpx
-
 from models.job import Job
+from tools.ats._http import fetch_board_json
 from tools.text import html_to_text
 
 BASE = "https://boards-api.greenhouse.io/v1/boards"
@@ -30,14 +29,9 @@ async def fetch_greenhouse_jobs(company_slug: str, user_id: str) -> list[Job]:
         List of Job records, may be empty if the company isn't on Greenhouse
     """
     url = f"{BASE}/{company_slug}/jobs?content=true"
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            response = await client.get(url)
-            response.raise_for_status()
-        except httpx.HTTPError:
-            return []  # company not on Greenhouse, or board is private
-
-    data = response.json()
+    data = await fetch_board_json("greenhouse", company_slug, url)
+    if data is None:  # company not on Greenhouse, or fetch failed (logged)
+        return []
     jobs: list[Job] = []
     for raw in data.get("jobs", []):
         source_id = str(raw["id"])

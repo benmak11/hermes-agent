@@ -11,6 +11,7 @@ import os
 
 from dotenv import load_dotenv
 
+from obs.logging import bind_run_context
 from tools.discovery.dork import DirectGoogleBackend, SerperBackend, run_sweep
 
 load_dotenv()
@@ -24,6 +25,7 @@ async def main() -> None:
         default=os.environ.get("DISCOVERY_BACKEND", "direct"),
     )
     args = parser.parse_args()
+    bind_run_context("company_sweep", backend=args.backend)
 
     if args.backend == "serper":
         api_key = os.environ["SERPER_API_KEY"]

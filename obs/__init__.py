@@ -4,6 +4,7 @@
 
 from obs.logging import (
     bind_request_context,
+    bind_run_context,
     clear_request_context,
     configure_logging,
     get_logger,
@@ -12,6 +13,7 @@ from obs.logging import (
 
 __all__ = [
     "bind_request_context",
+    "bind_run_context",
     "clear_request_context",
     "configure_logging",
     "get_logger",

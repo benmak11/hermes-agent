@@ -1,8 +1,11 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
 
-import logging
 import os
+
+from obs.logging import get_logger
+
+log = get_logger("api.telemetry")
 
 
 def setup_telemetry() -> str | None:
@@ -13,8 +16,10 @@ def setup_telemetry() -> str | None:
         "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "false"
     )
     if bucket and capture_content != "false":
-        logging.info(
-            "Prompt-response logging enabled - mode: NO_CONTENT (metadata only, no prompts/responses)"
+        log.info(
+            "telemetry.genai_capture",
+            enabled=True,
+            mode="NO_CONTENT",
         )
         os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = "NO_CONTENT"
         os.environ.setdefault("OTEL_INSTRUMENTATION_GENAI_UPLOAD_FORMAT", "jsonl")
@@ -33,8 +38,10 @@ def setup_telemetry() -> str | None:
             f"gs://{bucket}/{path}",
         )
     else:
-        logging.info(
-            "Prompt-response logging disabled (set LOGS_BUCKET_NAME=gs://your-bucket and OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=NO_CONTENT to enable)"
+        log.info(
+            "telemetry.genai_capture",
+            enabled=False,
+            hint="set LOGS_BUCKET_NAME and OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=NO_CONTENT to enable",
         )
 
     return bucket

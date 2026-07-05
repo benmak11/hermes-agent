@@ -16,7 +16,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 from models.job import Job
 from models.profile import MasterProfile
-from obs.logging import get_logger
+from obs.logging import bind_run_context, get_logger
 from tools.matching.pipeline import match_job
 
 load_dotenv()
@@ -31,6 +31,7 @@ async def main() -> None:
     )
     parser.add_argument("--concurrency", type=int, default=5)
     args = parser.parse_args()
+    bind_run_context("matching", user_id=args.user_id)
 
     db = firestore.AsyncClient()
 

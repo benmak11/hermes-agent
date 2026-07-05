@@ -194,6 +194,20 @@ def bind_request_context(**kwargs: Any) -> None:
     structlog.contextvars.bind_contextvars(**kwargs)
 
 
+def bind_run_context(runner: str, **kwargs: Any) -> str:
+    """Bind a batch-run correlation context; returns the generated ``run_id``.
+
+    The batch counterpart of the request middleware: every ``python -m cli.*``
+    invocation (cron discovery, matching, tailoring, ...) binds one ``run_id``
+    so all log lines of that run — across the pipelines and fetchers it calls —
+    are stitched together, exactly like ``request_id`` does for HTTP requests.
+    Filter in Cloud Logging with ``jsonPayload.run_id="..."``.
+    """
+    run_id = new_request_id()
+    structlog.contextvars.bind_contextvars(run_id=run_id, runner=runner, **kwargs)
+    return run_id
+
+
 def clear_request_context() -> None:
     """Drop all context-bound values (call at the start of each request)."""
     structlog.contextvars.clear_contextvars()
