@@ -77,10 +77,22 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
         job = Job.model_validate(job_doc.to_dict())
 
         app = await tailor_application(job, profile, upload=True)
+
+        # The user may have reverted the approval (undo) while tailoring ran —
+        # don't resurrect an application that decide() already discarded.
+        decision = (
+            user_ref.collection("jobs").document(job_id).get().to_dict() or {}
+        ).get("user_decision")
+        if decision != "approved":
+            task_log.info("tailoring.discarded", decision=decision)
+            return
+
         app_ref.set(app.model_dump(mode="json"))
         task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
     except Exception as e:  # persist failure for the UI, surface in timeline
         task_log.exception("tailoring.failed")
+        if not app_ref.get().exists:
+            return  # discarded by a revert while we ran — don't resurrect a stub
         app_ref.set(
             {
                 "status": "failed",

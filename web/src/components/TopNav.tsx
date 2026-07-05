@@ -8,10 +8,17 @@ import Link from "next/link";
 import { UserAvatar } from "@/components/UserAvatar";
 import { auth } from "@/lib/firebase";
 
-type Section = "review" | "companies" | "applications" | "profile" | "interviews";
+type Section =
+  | "review"
+  | "companies"
+  | "applications"
+  | "profile"
+  | "interviews"
+  | "tracking";
 
 const LINKS: { section: Section; href: string; label: string }[] = [
   { section: "review", href: "/", label: "Review" },
+  { section: "tracking", href: "/tracking", label: "Tracking" },
   { section: "interviews", href: "/interviews", label: "Interviews" },
   { section: "companies", href: "/settings/companies", label: "Companies" },
 ];

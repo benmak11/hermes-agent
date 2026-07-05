@@ -116,6 +116,8 @@ export type ProfileResponse = {
 };
 
 export type Decision = "approved" | "rejected" | "starred";
+/** What POST /jobs/{id}/decide accepts — "pending" reverts a decision. */
+export type DecideValue = Decision | "pending";
 export type CompanyActionType = "promote" | "block" | "dismiss" | "pause";
 
 export type RoleBullets = {
