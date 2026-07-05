@@ -7,7 +7,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from google.api_core.exceptions import NotFound
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 from pydantic import BaseModel
@@ -55,8 +56,38 @@ def list_pending_jobs(
     return {"jobs": jobs}
 
 
+@router.get("/jobs/decided")
+def list_decided_jobs(
+    decision: Literal["approved", "rejected", "starred"],
+    user_id: str = Depends(verify_user),
+) -> dict:
+    """Jobs the user already decided on (the starred / skipped shelves).
+
+    Scored jobs only, ranked high to low — same shape as /jobs/pending so the
+    web app can reuse its card rendering.
+    """
+    snaps = (
+        _client()
+        .collection("users")
+        .document(user_id)
+        .collection("jobs")
+        .where(filter=FieldFilter("user_decision", "==", decision))
+        .stream()
+    )
+    jobs = []
+    for snap in snaps:
+        d = snap.to_dict()
+        if not d.get("match"):
+            continue
+        jobs.append({"id": snap.id, **d})
+    jobs.sort(key=lambda j: j["match"]["overall_score"], reverse=True)
+    return {"jobs": jobs}
+
+
 class Decision(BaseModel):
-    decision: Literal["approved", "rejected", "starred"]
+    # "pending" reverts a prior decision — the undo path and the
+    # starred/skipped "restore to queue" action.
+    decision: Literal["approved", "rejected", "starred", "pending"]
 
 
 @router.post("/jobs/{job_id}/decide")
@@ -71,12 +102,30 @@ def decide(
     Approving a job kicks off tailoring: create the Application in ``tailoring``
     state and schedule the (LLM + render + upload) pipeline as a background task.
     Idempotent — an existing Application is left untouched.
+
+    Reverting (``pending``) puts the job back in the review queue; an
+    application the agent hasn't submitted yet is discarded so the pipeline
+    view matches. A submitted/responded application is history and stays.
     """
     user_ref = _client().collection("users").document(user_id)
-    user_ref.collection("jobs").document(job_id).update(
-        {"user_decision": body.decision}
-    )
+    try:
+        user_ref.collection("jobs").document(job_id).update(
+            {"user_decision": body.decision}
+        )
+    except NotFound:
+        raise HTTPException(status_code=404, detail="job not found") from None
     log.info("job.decided", job_id=job_id, decision=body.decision)
+
+    if body.decision == "pending":
+        app_ref = user_ref.collection("applications").document(application_id(job_id))
+        snap = app_ref.get()
+        if snap.exists and snap.to_dict().get("status") not in (
+            "submitting",
+            "submitted",
+            "responded",
+        ):
+            app_ref.delete()
+            log.info("application.discarded", job_id=job_id, reason="decision_reverted")
 
     if body.decision == "approved":
         app_ref = user_ref.collection("applications").document(application_id(job_id))

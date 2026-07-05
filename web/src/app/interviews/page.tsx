@@ -146,7 +146,7 @@ export default function InterviewsPage() {
 
         <p className="mt-5 text-center">
           <Link
-            href="/applications"
+            href="/tracking"
             className="font-mono text-[11px] font-medium"
             style={{ color: "var(--subtle)" }}
           >

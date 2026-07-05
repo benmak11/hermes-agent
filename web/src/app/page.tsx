@@ -3,6 +3,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -22,7 +23,7 @@ import {
   useSessionStats,
   type SessionStats,
 } from "@/lib/session";
-import type { Decision, Job, ProfileResponse } from "@/lib/types";
+import type { DecideValue, Decision, Job, ProfileResponse } from "@/lib/types";
 import { avatarColor, barColor, initial, recPill, scoreColor } from "@/lib/ui";
 import { TopNav } from "@/components/TopNav";
 
@@ -51,6 +52,9 @@ export default function VettingPage() {
   const [pending, setPending] = useState<PendingCommit | null>(null);
   const commitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingRef = useRef<PendingCommit | null>(null);
+  // Landed decisions this session, newest last — `z` walks back through them
+  // even after the soft-commit window (server-side revert).
+  const historyRef = useRef<PendingCommit[]>([]);
 
   useEffect(() => {
     if (!loading && !user) router.push("/login");
@@ -82,7 +86,7 @@ export default function VettingPage() {
   });
 
   const decide = useMutation({
-    mutationFn: ({ id, decision }: { id: string; decision: Decision }) =>
+    mutationFn: ({ id, decision }: { id: string; decision: DecideValue }) =>
       apiFetch(`/jobs/${id}/decide`, {
         method: "POST",
         body: JSON.stringify({ decision }),
@@ -111,6 +115,7 @@ export default function VettingPage() {
     pendingRef.current = null;
     setPending(null);
     mutateDecide({ id: p.job.id, decision: p.decision });
+    historyRef.current.push(p);
   }, [mutateDecide]);
 
   const softDecide = useCallback(
@@ -131,18 +136,34 @@ export default function VettingPage() {
   );
 
   const undo = useCallback(() => {
+    const restore = (p: PendingCommit) => {
+      queryClient.setQueryData<PendingResponse>(queryKey, (old) =>
+        old
+          ? { jobs: [p.job, ...old.jobs.filter((j) => j.id !== p.job.id)] }
+          : old,
+      );
+      bumpStats((s) => revertDecision(s, p.decision));
+    };
+
     const p = pendingRef.current;
-    if (!p) return;
-    if (commitTimer.current) clearTimeout(commitTimer.current);
-    commitTimer.current = null;
-    pendingRef.current = null;
-    setPending(null);
-    queryClient.setQueryData<PendingResponse>(queryKey, (old) =>
-      old ? { jobs: [p.job, ...old.jobs.filter((j) => j.id !== p.job.id)] } : old,
-    );
-    bumpStats((s) => revertDecision(s, p.decision));
+    if (p) {
+      // Still in the soft-commit window: cancel before it reaches the server.
+      if (commitTimer.current) clearTimeout(commitTimer.current);
+      commitTimer.current = null;
+      pendingRef.current = null;
+      setPending(null);
+      restore(p);
+      return;
+    }
+
+    // Already landed — walk the session history and revert server-side
+    // (mock 03: z reverses the last decision any time this session).
+    const last = historyRef.current.pop();
+    if (!last) return;
+    mutateDecide({ id: last.job.id, decision: "pending" });
+    restore(last);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queryClient, minScore, bumpStats]);
+  }, [queryClient, minScore, bumpStats, mutateDecide]);
 
   // Leaving the page lands any decision still in its window (unmount only —
   // a ref keeps render-to-render identity churn from flushing the timer).
@@ -296,12 +317,21 @@ export default function VettingPage() {
             className="mt-4 flex items-center gap-3.5 font-mono text-xs font-medium"
             style={{ color: "var(--muted)" }}
           >
-            <CountDot color="var(--good)" label={`${stats.approved} approved`} />
+            <CountDot
+              color="var(--good)"
+              label={`${stats.approved} approved`}
+              href="/tracking"
+            />
             <CountDot
               color="var(--border-mid)"
               label={`${stats.skipped} skipped`}
+              href="/tracking?tab=skipped"
             />
-            <CountDot color="var(--star)" label={`${stats.starred} starred`} />
+            <CountDot
+              color="var(--star)"
+              label={`${stats.starred} starred`}
+              href="/tracking?tab=starred"
+            />
             <span className="ml-auto" style={{ color: "var(--subtle)" }}>
               {remaining} remaining
               {pace != null ? ` · ~${pace} min at your pace` : ""}
@@ -403,16 +433,29 @@ function ScoringCard() {
   );
 }
 
-function CountDot({ color, label }: { color: string; label: string }) {
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      <span
-        className="h-2 w-2 rounded-full"
-        style={{ background: color }}
-      />
+function CountDot({
+  color,
+  label,
+  href,
+}: {
+  color: string;
+  label: string;
+  href?: string;
+}) {
+  const body = (
+    <>
+      <span className="h-2 w-2 rounded-full" style={{ background: color }} />
       {label}
-    </span>
+    </>
   );
+  if (href) {
+    return (
+      <Link href={href} className="inline-flex items-center gap-1.5">
+        {body}
+      </Link>
+    );
+  }
+  return <span className="inline-flex items-center gap-1.5">{body}</span>;
 }
 
 /**
