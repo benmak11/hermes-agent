@@ -319,6 +319,24 @@ function pipelineView(app: Application): PipelineView {
         },
         card: { bg: "var(--warn-bg)", border: "var(--warn-border)" },
       };
+    case "posting_removed": {
+      // The listing was taken down before we could submit — dismissed by the
+      // agent, nothing to retry. Which segment died mirrors the failed case.
+      const deadSeg = app.last_submitted_at ? 2 : 1;
+      return {
+        segments: [0, 1, 2, 3].map((i) => ({
+          color: i < deadSeg ? good : i === deadSeg ? "var(--danger)" : IDLE,
+        })),
+        label: "listing taken down — dismissed",
+        labelColor: "var(--muted)",
+        pill: {
+          text: "posting removed",
+          bg: "var(--danger-bg)",
+          border: "var(--danger-border)",
+          color: "var(--danger)",
+        },
+      };
+    }
     case "failed":
     default: {
       // Failed after a submit attempt → the applied segment broke; otherwise

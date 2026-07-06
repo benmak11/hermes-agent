@@ -15,7 +15,9 @@ from pydantic import BaseModel
 
 from api.deps import verify_user
 from api.routes.applications import application_id, run_tailoring
+from models.job import Job
 from obs.logging import get_logger
+from tools.ats.validate import check_posting
 
 router = APIRouter(tags=["jobs"])
 log = get_logger("api.jobs")
@@ -84,6 +86,39 @@ def list_decided_jobs(
     return {"jobs": jobs}
 
 
+async def dismiss_skipped_if_posting_removed(user_id: str, job_id: str) -> None:
+    """Background task: validate a freshly skipped job's posting.
+
+    A skipped job sits on the Skipped shelf offering restore/approve — if the
+    posting has died there is nothing left to act on, so dismiss it outright.
+    Same fail-open contract as the application path: only a definitive removal
+    dismisses. (Approvals are covered by the check at the top of tailoring.)
+    """
+    task_log = log.bind(user_id=user_id, job_id=job_id, task="skip_validation")
+    job_ref = (
+        _client().collection("users").document(user_id).collection("jobs")
+        .document(job_id)
+    )
+    snap = job_ref.get()
+    if not snap.exists:
+        return
+    job = Job.model_validate(snap.to_dict())
+    if await check_posting(job) != "removed":
+        return
+    # The user may have restored or approved the job while we probed; the
+    # approval path runs its own check, so only dismiss a still-skipped job.
+    if (job_ref.get().to_dict() or {}).get("user_decision") != "rejected":
+        task_log.info("job.posting_removed_but_redecided", url=job.url)
+        return
+    job_ref.update(
+        {
+            "user_decision": "dismissed",
+            "posting_removed_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    task_log.info("job.posting_removed", url=job.url)
+
+
 class Decision(BaseModel):
     # "pending" reverts a prior decision — the undo path and the
     # starred/skipped "restore to queue" action.
@@ -106,6 +141,10 @@ def decide(
     Reverting (``pending``) puts the job back in the review queue; an
     application the agent hasn't submitted yet is discarded so the pipeline
     view matches. A submitted/responded application is history and stays.
+
+    Skipping (``rejected``) schedules a posting-liveness check in the
+    background — a posting that has already died is dismissed rather than
+    shelved. (Approvals get the same check at the top of tailoring.)
     """
     user_ref = _client().collection("users").document(user_id)
     try:
@@ -126,6 +165,9 @@ def decide(
         ):
             app_ref.delete()
             log.info("application.discarded", job_id=job_id, reason="decision_reverted")
+
+    if body.decision == "rejected":
+        background_tasks.add_task(dismiss_skipped_if_posting_removed, user_id, job_id)
 
     if body.decision == "approved":
         app_ref = user_ref.collection("applications").document(application_id(job_id))

@@ -83,6 +83,8 @@ class Job(BaseModel):
     discovered_at: datetime
     # "first time seeing this company" badge in the UI is driven by this.
     discovered_via: Literal["known", "unvetted", "manual"] = "known"
+    # "dismissed" is set by the system (never the user) when the posting
+    # disappears from the ATS — it drops the job from the queue and shelves.
     user_decision: Literal[
-        "pending", "approved", "rejected", "starred", "applied"
+        "pending", "approved", "rejected", "starred", "applied", "dismissed"
     ] = "pending"

@@ -25,6 +25,7 @@ from api.deps import verify_user, verify_user_query
 from models.job import Job
 from models.profile import MasterProfile
 from obs.logging import get_logger
+from tools.ats.validate import check_posting
 from tools.submitters.router import submit_application
 from tools.submitters.storage import download_resume, upload_screenshot
 from tools.tailoring.pipeline import application_id, tailor_application
@@ -33,7 +34,7 @@ log = get_logger("api.applications")
 
 # Statuses from which a fresh submission is allowed (failed permits a retry).
 SUBMITTABLE = {"ready_for_review", "failed"}
-TERMINAL = {"submitted", "responded"}
+TERMINAL = {"submitted", "responded", "posting_removed"}
 
 router = APIRouter(tags=["applications"])
 
@@ -53,6 +54,42 @@ def _apps(user_id: str):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+async def _dismiss_if_posting_removed(user_ref, app_ref, job: Job, task_log) -> bool:
+    """Verify the posting is still live before spending work on it.
+
+    Only a definitive "gone" from the ATS dismisses (check_posting fails open on
+    transient errors). On removal: the job drops out of the queue/shelves via
+    ``user_decision: dismissed`` and the application flips to the terminal
+    ``posting_removed`` status, which is the user-facing notification on the
+    tracking page. Returns True when the caller should stop.
+    """
+    if await check_posting(job) != "removed":
+        return False
+    task_log.warning("application.posting_removed", url=job.url)
+    user_ref.collection("jobs").document(job.id).update(
+        {"user_decision": "dismissed", "posting_removed_at": _now()}
+    )
+    app_ref.set(
+        {
+            "status": "posting_removed",
+            "timeline": firestore.ArrayUnion(
+                [
+                    {
+                        "at": _now(),
+                        "status": "posting_removed",
+                        "note": (
+                            f"posting no longer available at {job.url}"
+                            " — application dismissed"
+                        ),
+                    }
+                ]
+            ),
+        },
+        merge=True,
+    )
+    return True
 
 
 async def run_tailoring(user_id: str, job_id: str) -> None:
@@ -75,6 +112,11 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
         if not job_doc.exists:
             raise ValueError(f"Job {job_id} not found")
         job = Job.model_validate(job_doc.to_dict())
+
+        # The posting may have died between discovery and approval — don't
+        # spend an LLM run tailoring for a page that no longer exists.
+        if await _dismiss_if_posting_removed(user_ref, app_ref, job, task_log):
+            return
 
         app = await tailor_application(job, profile, upload=True)
 
@@ -242,6 +284,12 @@ async def run_submission(user_id: str, app_id: str) -> None:
         job = Job.model_validate(
             user_ref.collection("jobs").document(job_id).get().to_dict()
         )
+
+        # Last-line check: never drive a browser at a posting the ATS says is
+        # gone. Fail-open — a flaky board proceeds and fails visibly instead.
+        if await _dismiss_if_posting_removed(user_ref, ref, job, task_log):
+            return
+
         resume_path = download_resume(resume_uri)
 
         result = await submit_application(
