@@ -34,6 +34,13 @@ export function statusPill(status: ApplicationStatus): StatusPill {
         border: "var(--warn-border)",
         color: "var(--danger)",
       };
+    case "posting_removed":
+      return {
+        label: "posting removed",
+        bg: "var(--danger-bg)",
+        border: "var(--danger-border)",
+        color: "var(--danger)",
+      };
     case "tailoring":
     case "submitting":
     case "queued":

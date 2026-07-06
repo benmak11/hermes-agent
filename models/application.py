@@ -17,6 +17,8 @@ ApplicationStatus = Literal[
     "submitted",
     "failed",
     "responded",
+    # Terminal: the ATS reported the posting gone before we could submit.
+    "posting_removed",
 ]
 
 

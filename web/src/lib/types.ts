@@ -139,7 +139,8 @@ export type ApplicationStatus =
   | "submitting"
   | "submitted"
   | "failed"
-  | "responded";
+  | "responded"
+  | "posting_removed";
 
 export type Confirmation = {
   submitted_at: string;
