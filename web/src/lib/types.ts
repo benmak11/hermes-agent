@@ -115,6 +115,29 @@ export type ProfileResponse = {
   onboarding_complete: boolean;
 };
 
+// ---- Auto-discovery settings (mirrors models/settings.py) ----
+
+export type DiscoverySettings = {
+  auto_discovery: boolean;
+  discovery_interval_hours: number;
+  liveness_sweep: boolean;
+  sweep_interval_hours: number;
+};
+
+export type DiscoveryState = {
+  last_discovery_at?: string | null;
+  last_sweep_at?: string | null;
+  last_discovery?: { new_jobs: number; scored: number; failed: number } | null;
+  last_sweep?: { checked: number; removed: number; boards_failed: number } | null;
+};
+
+export type DiscoverySettingsResponse = {
+  settings: DiscoverySettings;
+  state: DiscoveryState;
+  next_discovery_at?: string | null;
+  next_sweep_at?: string | null;
+};
+
 export type Decision = "approved" | "rejected" | "starred";
 /** What POST /jobs/{id}/decide accepts — "pending" reverts a decision. */
 export type DecideValue = Decision | "pending";

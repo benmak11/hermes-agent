@@ -20,6 +20,7 @@ from api.app_utils.telemetry import setup_telemetry
 from api.app_utils.typing import Feedback
 from api.routes import applications as applications_routes
 from api.routes import companies as companies_routes
+from api.routes import discovery as discovery_routes
 from api.routes import jobs as jobs_routes
 from api.routes import profile as profile_routes
 from obs.logging import configure_logging, get_logger
@@ -97,6 +98,7 @@ app.include_router(jobs_routes.router)
 app.include_router(companies_routes.router)
 app.include_router(applications_routes.router)
 app.include_router(profile_routes.router)
+app.include_router(discovery_routes.router)
 
 
 @app.post("/feedback")

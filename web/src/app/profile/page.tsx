@@ -2,7 +2,7 @@
 // Unauthorized copying, distribution, or use is prohibited.
 "use client";
 
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
@@ -10,7 +10,13 @@ import { useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { saveMinScore, useMinScore } from "@/lib/session";
-import type { Profile, ProfileResponse, RemoteStyle } from "@/lib/types";
+import type {
+  DiscoverySettings,
+  DiscoverySettingsResponse,
+  Profile,
+  ProfileResponse,
+  RemoteStyle,
+} from "@/lib/types";
 import { avatarColor, initial, resolveUserAvatar } from "@/lib/ui";
 import {
   ChipEditor,
@@ -285,6 +291,8 @@ export default function ProfilePage() {
                 />
               </div>
             </Card>
+
+            <AutoDiscoveryCard />
           </div>
 
           {/* Right column */}
@@ -342,6 +350,233 @@ export default function ProfilePage() {
         </p>
       </main>
     </>
+  );
+}
+
+const INTERVALS: { hours: number; label: string }[] = [
+  { hours: 6, label: "6h" },
+  { hours: 12, label: "12h" },
+  { hours: 24, label: "24h" },
+  { hours: 72, label: "3d" },
+];
+
+function relPast(iso?: string | null): string {
+  if (!iso) return "never";
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  if (mins < 48 * 60) return `${Math.floor(mins / 60)}h ago`;
+  return `${Math.floor(mins / (24 * 60))}d ago`;
+}
+
+function relNext(iso?: string | null): string {
+  if (!iso) return "on next visit";
+  const mins = Math.floor((new Date(iso).getTime() - Date.now()) / 60_000);
+  if (mins <= 0) return "due now";
+  if (mins < 60) return `in ${mins}m`;
+  if (mins < 48 * 60) return `in ${Math.floor(mins / 60)}h`;
+  return `in ${Math.floor(mins / (24 * 60))}d`;
+}
+
+/**
+ * Auto-discovery (user request on top of mock 09): the agents' unattended
+ * cadence, regulated from the profile. Two opt-in loops — discover+score new
+ * jobs, and the liveness sweep that dismisses postings their ATS took down
+ * (so the queue, shelves, and tracking never serve a dead posting).
+ */
+function AutoDiscoveryCard() {
+  const queryClient = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["discovery-settings"],
+    queryFn: () => apiFetch<DiscoverySettingsResponse>("/settings/discovery"),
+    // Runs finish in the background — keep the status line fresh.
+    refetchInterval: 30_000,
+  });
+
+  const save = useMutation({
+    mutationFn: (s: DiscoverySettings) =>
+      apiFetch("/settings/discovery", { method: "PUT", body: JSON.stringify(s) }),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ["discovery-settings"] }),
+  });
+  const trigger = useMutation({
+    mutationFn: (kind: "run" | "sweep") =>
+      apiFetch(`/settings/discovery/${kind}`, { method: "POST" }),
+    onSuccess: () =>
+      setTimeout(
+        () =>
+          queryClient.invalidateQueries({ queryKey: ["discovery-settings"] }),
+        5000,
+      ),
+  });
+
+  if (!data) {
+    return (
+      <Card>
+        <MonoLabel>Auto-discovery</MonoLabel>
+        <p className="mt-3 text-[13px]" style={{ color: "var(--subtle)" }}>
+          Loading…
+        </p>
+      </Card>
+    );
+  }
+
+  const s = data.settings;
+  const patch = (next: Partial<DiscoverySettings>) => save.mutate({ ...s, ...next });
+  const sweep = data.state.last_sweep;
+
+  return (
+    <Card>
+      <MonoLabel>Auto-discovery</MonoLabel>
+
+      <div className="mt-3 flex items-center gap-2.5">
+        <span
+          className="flex-1 text-[13px] font-medium"
+          style={{ color: "var(--label)" }}
+        >
+          Find new jobs
+        </span>
+        <Toggle
+          on={s.auto_discovery}
+          onClick={() => patch({ auto_discovery: !s.auto_discovery })}
+        />
+      </div>
+      {s.auto_discovery && (
+        <IntervalChips
+          value={s.discovery_interval_hours}
+          onChange={(h) => patch({ discovery_interval_hours: h })}
+        />
+      )}
+      <div
+        className="mt-2 font-mono text-[11px] font-medium"
+        style={{ color: "var(--subtle)" }}
+      >
+        {s.auto_discovery
+          ? `last ${relPast(data.state.last_discovery_at)} · next ${relNext(data.next_discovery_at)}`
+          : "off — run from the CLI or the button below"}
+      </div>
+
+      <Divider my={13} />
+
+      <div className="flex items-center gap-2.5">
+        <span
+          className="flex-1 text-[13px] font-medium"
+          style={{ color: "var(--label)" }}
+        >
+          Invalidate stale postings
+        </span>
+        <Toggle
+          on={s.liveness_sweep}
+          onClick={() => patch({ liveness_sweep: !s.liveness_sweep })}
+        />
+      </div>
+      {s.liveness_sweep && (
+        <IntervalChips
+          value={s.sweep_interval_hours}
+          onChange={(h) => patch({ sweep_interval_hours: h })}
+        />
+      )}
+      <div
+        className="mt-2 font-mono text-[11px] font-medium"
+        style={{ color: "var(--subtle)" }}
+      >
+        {s.liveness_sweep
+          ? `last ${relPast(data.state.last_sweep_at)} · next ${relNext(data.next_sweep_at)}`
+          : "off — taken-down postings stay until acted on"}
+        {sweep && ` · ${sweep.removed} removed of ${sweep.checked} checked`}
+      </div>
+
+      <Divider my={13} />
+
+      <div className="flex gap-2">
+        <button
+          onClick={() => trigger.mutate("run")}
+          disabled={trigger.isPending}
+          className="h-[30px] flex-1 rounded-[7px] border text-xs font-semibold"
+          style={{
+            background: "var(--surface)",
+            borderColor: "var(--border)",
+            color: "var(--label)",
+          }}
+        >
+          Run discovery now
+        </button>
+        <button
+          onClick={() => trigger.mutate("sweep")}
+          disabled={trigger.isPending}
+          className="h-[30px] flex-1 rounded-[7px] border text-xs font-semibold"
+          style={{
+            background: "var(--surface)",
+            borderColor: "var(--border)",
+            color: "var(--label)",
+          }}
+        >
+          Sweep now
+        </button>
+      </div>
+      {trigger.isSuccess && (
+        <p
+          className="mt-2 font-mono text-[11px] font-medium"
+          style={{ color: "var(--good)" }}
+        >
+          started — results land here as the agent finishes
+        </p>
+      )}
+    </Card>
+  );
+}
+
+function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-pressed={on}
+      className="relative h-5 w-9 flex-none rounded-full transition-colors"
+      style={{ background: on ? "var(--accent)" : "var(--border-mid)" }}
+    >
+      <span
+        className="absolute top-[2px] h-4 w-4 rounded-full transition-all"
+        style={{ left: on ? 18 : 2, background: "var(--surface)" }}
+      />
+    </button>
+  );
+}
+
+function IntervalChips({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (hours: number) => void;
+}) {
+  return (
+    <div className="mt-2 flex gap-1.5">
+      {INTERVALS.map(({ hours, label }) => {
+        const active = hours === value;
+        return (
+          <button
+            key={hours}
+            onClick={() => onChange(hours)}
+            className="rounded-[7px] border px-2.5 py-1 font-mono text-[11px] font-semibold"
+            style={
+              active
+                ? {
+                    background: "var(--text)",
+                    borderColor: "var(--text)",
+                    color: "var(--surface)",
+                  }
+                : {
+                    background: "var(--surface-2)",
+                    borderColor: "var(--border)",
+                    color: "var(--subtle)",
+                  }
+            }
+          >
+            every {label}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 

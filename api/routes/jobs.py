@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from api.deps import verify_user
 from api.routes.applications import application_id, run_tailoring
+from api.routes.discovery import tick_user
 from models.job import Job
 from obs.logging import get_logger
 from tools.ats.validate import check_posting
@@ -34,9 +35,14 @@ def _client() -> firestore.Client:
 
 @router.get("/jobs/pending")
 def list_pending_jobs(
-    user_id: str = Depends(verify_user), min_score: int = 60
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(verify_user),
+    min_score: int = 60,
 ) -> dict:
     """Return scored, still-pending jobs above min_score, ranked high to low."""
+    # Opportunistic scheduler tick (throttled in-process): opening the review
+    # queue runs any due auto-discovery/sweep loop without external cron infra.
+    background_tasks.add_task(tick_user, user_id)
     snaps = (
         _client()
         .collection("users")
