@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from api.deps import verify_user
 from obs.logging import get_logger
 from tools.companies import (
+    Platform,
     apply_company_action,
     load_blocklist_detailed,
     load_known,
@@ -39,7 +40,7 @@ def list_companies(user_id: str = Depends(verify_user)) -> dict:
 
 
 class CompanyAction(BaseModel):
-    platform: Literal["greenhouse", "lever", "ashby"]
+    platform: Platform
     slug: str
     action: Literal["promote", "block", "dismiss", "pause"]
     reason: str | None = None

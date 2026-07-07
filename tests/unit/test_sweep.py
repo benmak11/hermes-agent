@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from models.settings import DiscoverySettings
-from tools.ats.sweep import BOARD_URLS, live_ids
+from tools.ats.validate import BOARD_URLS, live_ids
 
 
 def test_live_ids_greenhouse_and_ashby_wrap_jobs() -> None:
@@ -19,16 +19,31 @@ def test_live_ids_lever_bare_array() -> None:
     assert live_ids("lever", [{"id": "x1"}, {"id": "x2"}]) == {"x1", "x2"}
 
 
+def test_live_ids_workable_uses_shortcode() -> None:
+    data = {"jobs": [{"shortcode": "38ABFA8E0D"}, {"id": "not-a-shortcode"}]}
+    assert live_ids("workable", data) == {"38ABFA8E0D"}
+
+
+def test_live_ids_recruitee_uses_offers() -> None:
+    assert live_ids("recruitee", {"offers": [{"id": 2429738}]}) == {"2429738"}
+
+
 def test_live_ids_empty_or_missing() -> None:
     assert live_ids("greenhouse", {}) == set()
     assert live_ids("greenhouse", None) == set()
     assert live_ids("lever", None) == set()
+    assert live_ids("recruitee", None) == set()
 
 
 def test_board_urls_cover_board_platforms() -> None:
     assert BOARD_URLS["greenhouse"]("acme").endswith("/acme/jobs")
     assert "acme?mode=json" in BOARD_URLS["lever"]("acme")
     assert BOARD_URLS["ashby"]("acme").endswith("/acme")
+    assert BOARD_URLS["workable"]("acme").endswith("/accounts/acme")
+    assert BOARD_URLS["recruitee"]("acme") == "https://acme.recruitee.com/api/offers/"
+    # SmartRecruiters listing is paginated — membership checks would be wrong,
+    # so it must NOT be board-batched (it has a per-posting endpoint instead).
+    assert "smartrecruiters" not in BOARD_URLS
 
 
 def test_discovery_settings_defaults_off() -> None:

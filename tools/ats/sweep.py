@@ -18,17 +18,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from typing import Any
 
 from google.cloud import firestore
 
 from models.job import Job
 from obs.logging import get_logger
 from tools.ats._http import fetch_board_json
-from tools.ats.ashby import BASE as ASHBY_BASE
-from tools.ats.greenhouse import BASE as GREENHOUSE_BASE
-from tools.ats.lever import BASE as LEVER_BASE
-from tools.ats.validate import check_posting
+from tools.ats.validate import BOARD_URLS, check_posting, live_ids
 from tools.tailoring.pipeline import application_id
 
 log = get_logger("tools.ats")
@@ -37,21 +33,6 @@ log = get_logger("tools.ats")
 SWEEPABLE_DECISIONS = {"pending", "approved", "starred", "rejected"}
 # Application statuses that are still pre-submission — safe to invalidate.
 ACTIVE_APP_STATUSES = {"queued", "tailoring", "ready_for_review", "failed"}
-
-BOARD_URLS = {
-    "greenhouse": lambda slug: f"{GREENHOUSE_BASE}/{slug}/jobs",
-    "lever": lambda slug: f"{LEVER_BASE}/{slug}?mode=json",
-    "ashby": lambda slug: f"{ASHBY_BASE}/{slug}",
-}
-
-
-def live_ids(platform: str, data: Any) -> set[str]:
-    """Extract the set of live posting ids from a board API response."""
-    if platform == "lever":  # lever returns a bare JSON array
-        rows = data or []
-    else:  # greenhouse + ashby wrap the list in {"jobs": [...]}
-        rows = (data or {}).get("jobs", [])
-    return {str(r.get("id")) for r in rows if r.get("id") is not None}
 
 
 async def sweep_postings(user_id: str) -> dict:

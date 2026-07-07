@@ -15,8 +15,17 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel
 
-Platform = Literal["greenhouse", "lever", "ashby"]
-PLATFORMS: list[Platform] = ["greenhouse", "lever", "ashby"]
+Platform = Literal[
+    "greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee"
+]
+PLATFORMS: list[Platform] = [
+    "greenhouse",
+    "lever",
+    "ashby",
+    "workable",
+    "smartrecruiters",
+    "recruitee",
+]
 
 DATA_DIR = Path("data/companies")
 

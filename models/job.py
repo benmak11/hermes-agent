@@ -71,7 +71,16 @@ class Job(BaseModel):
     id: str  # hash(source + source_id) for dedup
     user_id: str
     source: Literal[
-        "greenhouse", "lever", "ashby", "workday", "google_jobs", "gmail_alert", "manual"
+        "greenhouse",
+        "lever",
+        "ashby",
+        "workable",
+        "smartrecruiters",
+        "recruitee",
+        "workday",
+        "google_jobs",
+        "gmail_alert",
+        "manual",
     ]
     source_id: str  # the ID from the source system
     company: str
