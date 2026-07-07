@@ -28,20 +28,29 @@ PLATFORM_DOMAINS: dict[Platform, list[str]] = {
     "greenhouse": ["boards.greenhouse.io", "job-boards.greenhouse.io"],
     "lever": ["jobs.lever.co"],
     "ashby": ["jobs.ashbyhq.com"],
+    "workable": ["apply.workable.com"],
+    "smartrecruiters": ["jobs.smartrecruiters.com"],
+    "recruitee": ["recruitee.com"],
 }
 
 # URL patterns to extract company slug. Tested against real URLs from each
 # platform. Greenhouse matches legacy, new, and EU (job-boards.eu) hosts.
+# Workable job links (apply.workable.com/j/{shortcode}) are excluded via
+# _NON_SLUGS ("j"); recruitee slugs are subdomains. SmartRecruiters
+# identifiers are case-sensitive, so slugs are NOT lowercased anywhere.
 SLUG_REGEXES: dict[Platform, re.Pattern] = {
     "greenhouse": re.compile(
         r"(?:job-)?boards(?:\.eu)?\.greenhouse\.io/([a-zA-Z0-9_-]+)"
     ),
     "lever": re.compile(r"jobs\.lever\.co/([a-zA-Z0-9_-]+)"),
     "ashby": re.compile(r"jobs\.ashbyhq\.com/([a-zA-Z0-9_-]+)"),
+    "workable": re.compile(r"apply\.workable\.com/([a-zA-Z0-9_-]+)"),
+    "smartrecruiters": re.compile(r"jobs\.smartrecruiters\.com/([a-zA-Z0-9_-]+)"),
+    "recruitee": re.compile(r"https?://([a-z0-9-]+)\.recruitee\.com"),
 }
 
 # Platform-internal paths that look like slugs but aren't real companies.
-_NON_SLUGS = {"jobs", "search", "api", "v1", "boards"}
+_NON_SLUGS = {"jobs", "search", "api", "v1", "boards", "j", "www", "careers", "app"}
 
 
 class SearchBackend(ABC):

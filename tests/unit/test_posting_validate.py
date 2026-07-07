@@ -57,6 +57,10 @@ def _timeout_transport() -> httpx.MockTransport:
     [
         ("greenhouse", "https://boards-api.greenhouse.io/v1/boards/acme/jobs/1"),
         ("lever", "https://api.lever.co/v0/postings/acme/1"),
+        (
+            "smartrecruiters",
+            "https://api.smartrecruiters.com/v1/companies/acme/postings/1",
+        ),
         ("manual", "https://example.com/job"),
     ],
 )
@@ -68,7 +72,7 @@ async def test_live_posting_and_probe_url(source: str, expected_url: str) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["greenhouse", "lever", "manual"])
+@pytest.mark.parametrize("source", ["greenhouse", "lever", "smartrecruiters", "manual"])
 @pytest.mark.parametrize("status", [404, 410])
 async def test_gone_status_means_removed(source: str, status: int) -> None:
     res = await check_posting(_job(source), transport=_transport(status))
@@ -76,7 +80,10 @@ async def test_gone_status_means_removed(source: str, status: int) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["greenhouse", "lever", "ashby", "manual"])
+@pytest.mark.parametrize(
+    "source",
+    ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee", "manual"],
+)
 @pytest.mark.parametrize("status", [429, 500, 503])
 async def test_server_errors_fail_open(source: str, status: int) -> None:
     res = await check_posting(_job(source), transport=_transport(status))
@@ -91,17 +98,22 @@ async def test_transport_errors_fail_open(source: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ashby_posting_still_on_board() -> None:
-    board = {"jobs": [{"id": "1"}, {"id": "2"}]}
-    res = await check_posting(_job("ashby"), transport=_transport(200, board))
-    assert res == "live"
-
-
-@pytest.mark.asyncio
-async def test_ashby_posting_absent_from_board() -> None:
-    board = {"jobs": [{"id": "2"}]}
-    res = await check_posting(_job("ashby"), transport=_transport(200, board))
-    assert res == "removed"
+@pytest.mark.parametrize(
+    ("source", "present", "absent"),
+    [
+        ("ashby", {"jobs": [{"id": "1"}]}, {"jobs": [{"id": "2"}]}),
+        ("workable", {"jobs": [{"shortcode": "1"}]}, {"jobs": [{"shortcode": "2"}]}),
+        ("recruitee", {"offers": [{"id": "1"}]}, {"offers": [{"id": "2"}]}),
+    ],
+)
+async def test_board_membership_platforms(
+    source: str, present: dict, absent: dict
+) -> None:
+    assert await check_posting(_job(source), transport=_transport(200, present)) == "live"
+    assert (
+        await check_posting(_job(source), transport=_transport(200, absent))
+        == "removed"
+    )
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,9 @@ from obs.logging import get_logger
 from tools.ats.ashby import fetch_ashby_jobs
 from tools.ats.greenhouse import fetch_greenhouse_jobs
 from tools.ats.lever import fetch_lever_jobs
+from tools.ats.recruitee import fetch_recruitee_jobs
+from tools.ats.smartrecruiters import fetch_smartrecruiters_jobs
+from tools.ats.workable import fetch_workable_jobs
 from tools.companies import Platform, all_active_companies
 
 log = get_logger("tools.discovery")
@@ -28,6 +31,9 @@ FETCHERS: dict[Platform, Callable[[str, str], Awaitable[list[Job]]]] = {
     "greenhouse": fetch_greenhouse_jobs,
     "lever": fetch_lever_jobs,
     "ashby": fetch_ashby_jobs,
+    "workable": fetch_workable_jobs,
+    "smartrecruiters": fetch_smartrecruiters_jobs,
+    "recruitee": fetch_recruitee_jobs,
 }
 
 
