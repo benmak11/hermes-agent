@@ -127,8 +127,26 @@ export type DiscoverySettings = {
 export type DiscoveryState = {
   last_discovery_at?: string | null;
   last_sweep_at?: string | null;
-  last_discovery?: { new_jobs: number; scored: number; failed: number } | null;
-  last_sweep?: { checked: number; removed: number; boards_failed: number } | null;
+  last_discovery?: {
+    new_jobs: number;
+    scored: number;
+    failed: number;
+    jobs_fetched?: number;
+    jobs_by_platform?: Record<string, number>;
+    boards_failed?: number;
+    empty_boards?: number;
+    duration_ms?: number;
+    run_id?: string;
+    trigger?: string;
+  } | null;
+  last_sweep?: {
+    checked: number;
+    removed: number;
+    boards_failed: number;
+    duration_ms?: number;
+    run_id?: string;
+    trigger?: string;
+  } | null;
 };
 
 export type DiscoverySettingsResponse = {

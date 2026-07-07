@@ -24,7 +24,7 @@ from sse_starlette.sse import EventSourceResponse
 from api.deps import verify_user, verify_user_query
 from models.job import Job
 from models.profile import MasterProfile
-from obs.logging import get_logger
+from obs.logging import get_logger, run_context
 from tools.ats.validate import check_posting
 from tools.submitters.router import submit_application
 from tools.submitters.storage import download_resume, upload_screenshot
@@ -100,50 +100,53 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
     flipped to ``failed`` with a timeline note so the UI can surface it.
     """
     # Background tasks run after the response, outside the request context, so
-    # bind the ids onto this logger explicitly to keep the trail intact.
+    # bind the ids onto this logger explicitly to keep the trail intact. The
+    # run_context adds a run_id that the tailoring pipeline's own log lines
+    # (tools.tailoring) inherit via contextvars.
     task_log = log.bind(user_id=user_id, job_id=job_id, task="tailoring")
     db = _client()
     user_ref = db.collection("users").document(user_id)
     app_ref = user_ref.collection("applications").document(application_id(job_id))
-    task_log.info("tailoring.start")
-    try:
-        profile = MasterProfile.model_validate(user_ref.get().to_dict())
-        job_doc = user_ref.collection("jobs").document(job_id).get()
-        if not job_doc.exists:
-            raise ValueError(f"Job {job_id} not found")
-        job = Job.model_validate(job_doc.to_dict())
+    with run_context("tailoring", user_id=user_id, job_id=job_id):
+        task_log.info("tailoring.start")
+        try:
+            profile = MasterProfile.model_validate(user_ref.get().to_dict())
+            job_doc = user_ref.collection("jobs").document(job_id).get()
+            if not job_doc.exists:
+                raise ValueError(f"Job {job_id} not found")
+            job = Job.model_validate(job_doc.to_dict())
 
-        # The posting may have died between discovery and approval — don't
-        # spend an LLM run tailoring for a page that no longer exists.
-        if await _dismiss_if_posting_removed(user_ref, app_ref, job, task_log):
-            return
+            # The posting may have died between discovery and approval — don't
+            # spend an LLM run tailoring for a page that no longer exists.
+            if await _dismiss_if_posting_removed(user_ref, app_ref, job, task_log):
+                return
 
-        app = await tailor_application(job, profile, upload=True)
+            app = await tailor_application(job, profile, upload=True)
 
-        # The user may have reverted the approval (undo) while tailoring ran —
-        # don't resurrect an application that decide() already discarded.
-        decision = (
-            user_ref.collection("jobs").document(job_id).get().to_dict() or {}
-        ).get("user_decision")
-        if decision != "approved":
-            task_log.info("tailoring.discarded", decision=decision)
-            return
+            # The user may have reverted the approval (undo) while tailoring
+            # ran — don't resurrect an application decide() already discarded.
+            decision = (
+                user_ref.collection("jobs").document(job_id).get().to_dict() or {}
+            ).get("user_decision")
+            if decision != "approved":
+                task_log.info("tailoring.discarded", decision=decision)
+                return
 
-        app_ref.set(app.model_dump(mode="json"))
-        task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
-    except Exception as e:  # persist failure for the UI, surface in timeline
-        task_log.exception("tailoring.failed")
-        if not app_ref.get().exists:
-            return  # discarded by a revert while we ran — don't resurrect a stub
-        app_ref.set(
-            {
-                "status": "failed",
-                "timeline": firestore.ArrayUnion(
-                    [{"at": _now(), "status": "failed", "note": str(e)[:300]}]
-                ),
-            },
-            merge=True,
-        )
+            app_ref.set(app.model_dump(mode="json"))
+            task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
+        except Exception as e:  # persist failure for the UI, surface in timeline
+            task_log.exception("tailoring.failed")
+            if not app_ref.get().exists:
+                return  # discarded by a revert while we ran — don't resurrect
+            app_ref.set(
+                {
+                    "status": "failed",
+                    "timeline": firestore.ArrayUnion(
+                        [{"at": _now(), "status": "failed", "note": str(e)[:300]}]
+                    ),
+                },
+                merge=True,
+            )
 
 
 def _backfill_job_url(user_id: str, app: dict) -> dict:
@@ -219,6 +222,12 @@ def update_objective(
     if not ref.get().exists:
         raise HTTPException(status_code=404, detail="application not found")
     ref.update({"objective_text": body.objective_text})
+    log.info(
+        "application.objective_updated",
+        app_id=app_id,
+        user_id=user_id,
+        chars=len(body.objective_text),
+    )
     return {"ok": True}
 
 
@@ -243,6 +252,9 @@ def regenerate(
         },
         merge=True,
     )
+    log.info(
+        "application.regenerate", app_id=app_id, job_id=job_id, user_id=user_id
+    )
     background_tasks.add_task(run_tailoring, user_id, job_id)
     return {"ok": True}
 
@@ -263,7 +275,6 @@ async def run_submission(user_id: str, app_id: str) -> None:
     task_log = log.bind(
         user_id=user_id, app_id=app_id, job_id=job_id, task="submission"
     )
-    task_log.info("submission.start", source=app.get("job_source"))
     user_ref = _client().collection("users").document(user_id)
 
     def progress(message: str, status: str) -> None:
@@ -276,89 +287,93 @@ async def run_submission(user_id: str, app_id: str) -> None:
             merge=True,
         )
 
-    try:
-        resume_uri = app.get("resume_variant_uri")
-        if not resume_uri:
-            raise ValueError("No tailored resume to submit — run tailoring first.")
-        profile = MasterProfile.model_validate(user_ref.get().to_dict())
-        job = Job.model_validate(
-            user_ref.collection("jobs").document(job_id).get().to_dict()
-        )
+    # run_id context so the submitter's own log lines (tools.submitters, the
+    # Playwright steps) stitch to this submission in Cloud Logging.
+    with run_context("submission", user_id=user_id, app_id=app_id, job_id=job_id):
+        task_log.info("submission.start", source=app.get("job_source"))
+        try:
+            resume_uri = app.get("resume_variant_uri")
+            if not resume_uri:
+                raise ValueError("No tailored resume to submit — run tailoring first.")
+            profile = MasterProfile.model_validate(user_ref.get().to_dict())
+            job = Job.model_validate(
+                user_ref.collection("jobs").document(job_id).get().to_dict()
+            )
 
-        # Last-line check: never drive a browser at a posting the ATS says is
-        # gone. Fail-open — a flaky board proceeds and fails visibly instead.
-        if await _dismiss_if_posting_removed(user_ref, ref, job, task_log):
-            return
+            # Last-line check: never drive a browser at a posting the ATS says
+            # is gone. Fail-open — a flaky board proceeds and fails visibly.
+            if await _dismiss_if_posting_removed(user_ref, ref, job, task_log):
+                return
 
-        resume_path = download_resume(resume_uri)
+            resume_path = download_resume(resume_uri)
 
-        result = await submit_application(
-            job, profile, resume_path, dry_run=False, headless=True, on_progress=progress
-        )
+            result = await submit_application(
+                job, profile, resume_path, dry_run=False, headless=True, on_progress=progress
+            )
 
-        shots: list[dict] = []
-        for key, name in (
-            ("pre_submit_screenshot", "pre_submit.png"),
-            ("confirmation_screenshot", "confirmation.png"),
-        ):
-            local = result.get(key)
-            if local and os.path.exists(local):
-                shots.append(
-                    {"name": name, "uri": upload_screenshot(Path(local), user_id, job_id, name)}
+            shots: list[dict] = []
+            for key, name in (
+                ("pre_submit_screenshot", "pre_submit.png"),
+                ("confirmation_screenshot", "confirmation.png"),
+            ):
+                local = result.get(key)
+                if local and os.path.exists(local):
+                    shots.append(
+                        {"name": name, "uri": upload_screenshot(Path(local), user_id, job_id, name)}
+                    )
+
+            task_log.info(
+                "submission.result",
+                success=bool(result.get("success")),
+                error=result.get("error"),
+                screenshots=len(shots),
+            )
+            if result.get("success"):
+                confirm_uri = next(
+                    (s["uri"] for s in shots if s["name"] == "confirmation.png"), None
                 )
-
-        task_log.info(
-            "submission.result",
-            success=bool(result.get("success")),
-            error=result.get("error"),
-            screenshots=len(shots),
-        )
-        if result.get("success"):
-            confirm_uri = next(
-                (s["uri"] for s in shots if s["name"] == "confirmation.png"), None
-            )
-            ref.set(
-                {
-                    "status": "submitted",
-                    "screenshots": shots,
-                    "confirmation": {
-                        "submitted_at": _now(),
-                        "screenshot_uri": confirm_uri,
+                ref.set(
+                    {
+                        "status": "submitted",
+                        "screenshots": shots,
+                        "confirmation": {
+                            "submitted_at": _now(),
+                            "screenshot_uri": confirm_uri,
+                        },
+                        "timeline": firestore.ArrayUnion(
+                            [{"at": _now(), "status": "submitted"}]
+                        ),
                     },
-                    "timeline": firestore.ArrayUnion(
-                        [{"at": _now(), "status": "submitted"}]
-                    ),
-                },
-                merge=True,
-            )
-        else:
+                    merge=True,
+                )
+            else:
+                ref.set(
+                    {
+                        "status": "failed",
+                        "screenshots": shots,
+                        "timeline": firestore.ArrayUnion(
+                            [
+                                {
+                                    "at": _now(),
+                                    "status": "failed",
+                                    "note": (result.get("error") or "submission failed")[:300],
+                                }
+                            ]
+                        ),
+                    },
+                    merge=True,
+                )
+        except Exception as e:  # record failure for the UI
+            task_log.exception("submission.failed")
             ref.set(
                 {
                     "status": "failed",
-                    "screenshots": shots,
                     "timeline": firestore.ArrayUnion(
-                        [
-                            {
-                                "at": _now(),
-                                "status": "failed",
-                                "note": (result.get("error") or "submission failed")[:300],
-                            }
-                        ]
+                        [{"at": _now(), "status": "failed", "note": str(e)[:300]}]
                     ),
                 },
                 merge=True,
             )
-    except Exception as e:  # record failure for the UI
-        task_log.exception("submission.failed")
-        ref.set(
-            {
-                "status": "failed",
-                "timeline": firestore.ArrayUnion(
-                    [{"at": _now(), "status": "failed", "note": str(e)[:300]}]
-                ),
-            },
-            merge=True,
-        )
 
 
 @router.post("/applications/{app_id}/submit")
@@ -391,6 +406,12 @@ def submit(
             ),
         },
         merge=True,
+    )
+    log.info(
+        "application.submit_requested",
+        app_id=app_id,
+        user_id=user_id,
+        status_was=status,
     )
     background_tasks.add_task(run_submission, user_id, app_id)
     return {"ok": True}

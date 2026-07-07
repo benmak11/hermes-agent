@@ -124,4 +124,10 @@ def save_profile(
     _user_ref(user_id).set(
         {**body.model_dump(mode="json"), "onboarding_complete": True}, merge=True
     )
+    log.info(
+        "profile.saved",
+        user_id=user_id,
+        roles=len(body.experience),
+        skill_groups=len(body.skills),
+    )
     return {"ok": True}

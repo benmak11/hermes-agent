@@ -17,6 +17,7 @@ tracking page stops serving it.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -57,8 +58,9 @@ def live_ids(platform: str, data: Any) -> set[str]:
 async def sweep_postings(user_id: str) -> dict:
     """Re-check every still-served posting for this user; dismiss dead ones.
 
-    Returns ``{"checked": n, "removed": n, "boards_failed": n}``.
+    Returns ``{"checked": n, "removed": n, "boards_failed": n, "duration_ms": n}``.
     """
+    started = time.monotonic()
     db = firestore.Client()
     user_ref = db.collection("users").document(user_id)
     jobs_ref = user_ref.collection("jobs")
@@ -144,5 +146,12 @@ async def sweep_postings(user_id: str) -> dict:
             decision_was=job.user_decision,
         )
 
-    log.info("sweep.done", user_id=user_id, **counts)
+    counts["duration_ms"] = int((time.monotonic() - started) * 1000)
+    log.info(
+        "sweep.done",
+        user_id=user_id,
+        boards=len(boards),
+        singles=len(singles),
+        **counts,
+    )
     return counts

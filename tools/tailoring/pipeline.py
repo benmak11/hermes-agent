@@ -51,7 +51,9 @@ async def tailor_application(
         raise ValueError(f"Job {job.id} has no jd_parsed; run matching first.")
 
     reranked = rerank_experience(profile.experience, job.jd_parsed)
+    job_log.info("tailoring.reranked", roles=len(reranked))
     objective = await generate_objective(profile, job)
+    job_log.info("tailoring.objective_generated", chars=len(objective))
 
     with tempfile.TemporaryDirectory() as tmp:
         local_path = render_resume_docx(
@@ -76,7 +78,11 @@ async def tailor_application(
         ]
 
     ready_at = datetime.now(UTC)
-    job_log.info("tailoring.done", resume_uri=resume_uri)
+    job_log.info(
+        "tailoring.done",
+        resume_uri=resume_uri,
+        duration_ms=int((ready_at - created_at).total_seconds() * 1000),
+    )
     return Application(
         id=application_id(job.id),
         user_id=profile.user_id,

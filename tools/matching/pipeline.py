@@ -9,6 +9,8 @@ call. Models are kept in sync with agents/_shared.py.
 
 from __future__ import annotations
 
+import time
+
 from google import genai
 from google.genai import types
 
@@ -195,6 +197,7 @@ async def match_job(
     approval_patterns: str = "",
 ) -> JobMatch:
     """Parse (if needed), family pre-filter, then full Pro scoring."""
+    started = time.monotonic()
     job_log = log.bind(job_id=job.id, company=job.company)
     if job.jd_parsed is None:
         job.jd_parsed = await parse_jd(job)
@@ -243,5 +246,6 @@ async def match_job(
         "matching.scored",
         score=match.overall_score,
         recommendation=match.recommendation,
+        duration_ms=int((time.monotonic() - started) * 1000),
     )
     return match
