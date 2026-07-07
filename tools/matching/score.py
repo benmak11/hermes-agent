@@ -9,6 +9,7 @@ CLI share one implementation.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 
 from google.cloud import firestore
@@ -58,6 +59,7 @@ async def score_pending_jobs(
         if limit and len(pending) >= limit:
             break
 
+    started = time.monotonic()
     log.info("matching.start", pending=len(pending), concurrency=concurrency)
     sem = asyncio.Semaphore(concurrency)
     counts = {"scored": 0, "failed": 0, "pending": len(pending)}
@@ -86,5 +88,9 @@ async def score_pending_jobs(
                     on_result(job, None, str(e))
 
     await asyncio.gather(*(_score(ref, job) for ref, job in pending))
-    log.info("matching.done", **counts)
+    log.info(
+        "matching.done",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        **counts,
+    )
     return counts

@@ -10,6 +10,8 @@ engine (run via cli/run_discovery.py); it is intentionally not an LLM agent.
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
 
 from google.cloud import firestore
@@ -46,6 +48,7 @@ async def run_discovery(user_id: str) -> dict:
 
     Returns a summary dict for SLI tracking later.
     """
+    started = time.monotonic()
     companies = all_active_companies()
     log.info("discovery.start", company_count=len(companies))
 
@@ -58,6 +61,7 @@ async def run_discovery(user_id: str) -> dict:
     jobs: list[Job] = []
     failures: list[dict] = []
     empty_boards: list[dict] = []
+    jobs_by_platform: Counter[str] = Counter()
 
     for (platform, slug, source), result in zip(companies, results, strict=True):
         if isinstance(result, Exception):
@@ -79,15 +83,25 @@ async def run_discovery(user_id: str) -> dict:
         # Attach provenance to each job (useful in matching + UI).
         for j in fetched:
             j.discovered_via = source
+        jobs_by_platform[platform] += len(fetched)
         jobs.extend(fetched)
 
+    duration_ms = int((time.monotonic() - started) * 1000)
     log.info(
         "discovery.complete",
         jobs_fetched=len(jobs),
         failures=len(failures),
         empty_boards=len(empty_boards),
+        jobs_by_platform=dict(jobs_by_platform),
+        duration_ms=duration_ms,
     )
-    return {"jobs": jobs, "failures": failures, "empty_boards": empty_boards}
+    return {
+        "jobs": jobs,
+        "failures": failures,
+        "empty_boards": empty_boards,
+        "jobs_by_platform": dict(jobs_by_platform),
+        "duration_ms": duration_ms,
+    }
 
 
 async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:

@@ -19,6 +19,7 @@ triggers never double-run a loop.
 from __future__ import annotations
 
 import os
+import time
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
@@ -26,7 +27,7 @@ from google.cloud import firestore
 
 from api.deps import verify_user
 from models.settings import DiscoverySettings
-from obs.logging import get_logger
+from obs.logging import get_logger, run_context
 from tools.ats.sweep import sweep_postings
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.matching.score import score_pending_jobs
@@ -78,49 +79,64 @@ def _next_iso(last_iso: str | None, interval_hours: int) -> str | None:
         return None
 
 
-async def run_discovery_cycle(user_id: str) -> None:
-    """Background: discover new jobs, then score them so they reach the queue."""
-    task_log = log.bind(user_id=user_id, task="auto_discovery")
-    task_log.info("auto_discovery.start")
-    try:
-        summary = await run_discovery(user_id)
-        new = await persist_new_jobs(summary["jobs"])
-        counts = await score_pending_jobs(user_id)
-        _user_ref(user_id).set(
-            {
-                "discovery_state": {
-                    "last_discovery_at": _now().isoformat(),
-                    "last_discovery": {
-                        "new_jobs": new,
-                        "scored": counts["scored"],
-                        "failed": counts["failed"],
-                    },
-                }
-            },
-            merge=True,
-        )
-        task_log.info("auto_discovery.done", new_jobs=new, **counts)
-    except Exception:
-        task_log.exception("auto_discovery.failed")
+async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
+    """Background: discover new jobs, then score them so they reach the queue.
+
+    Runs under a ``run_id`` log context, so every line the cycle emits — the
+    discovery fetches, the per-job ``matching.scored`` events, the summary —
+    can be pulled up with ``jsonPayload.run_id="..."`` in Cloud Logging.
+    """
+    with run_context("auto_discovery", user_id=user_id, trigger=trigger) as run_id:
+        started = time.monotonic()
+        log.info("auto_discovery.start")
+        try:
+            summary = await run_discovery(user_id)
+            new = await persist_new_jobs(summary["jobs"])
+            counts = await score_pending_jobs(user_id)
+            metrics = {
+                "run_id": run_id,
+                "trigger": trigger,
+                "jobs_fetched": len(summary["jobs"]),
+                "jobs_by_platform": summary["jobs_by_platform"],
+                "boards_failed": len(summary["failures"]),
+                "empty_boards": len(summary["empty_boards"]),
+                "new_jobs": new,
+                "scored": counts["scored"],
+                "failed": counts["failed"],
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+            _user_ref(user_id).set(
+                {
+                    "discovery_state": {
+                        "last_discovery_at": _now().isoformat(),
+                        "last_discovery": metrics,
+                    }
+                },
+                merge=True,
+            )
+            # The one line to watch per auto search: how the run performed.
+            log.info("auto_discovery.metrics", **metrics)
+        except Exception:
+            log.exception("auto_discovery.failed")
 
 
-async def run_sweep_cycle(user_id: str) -> None:
+async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
     """Background: re-check served postings; dismiss ones the ATS took down."""
-    task_log = log.bind(user_id=user_id, task="liveness_sweep")
-    task_log.info("sweep.start")
-    try:
-        counts = await sweep_postings(user_id)
-        _user_ref(user_id).set(
-            {
-                "discovery_state": {
-                    "last_sweep_at": _now().isoformat(),
-                    "last_sweep": counts,
-                }
-            },
-            merge=True,
-        )
-    except Exception:
-        task_log.exception("sweep.failed")
+    with run_context("liveness_sweep", user_id=user_id, trigger=trigger) as run_id:
+        log.info("sweep.start")
+        try:
+            counts = await sweep_postings(user_id)
+            _user_ref(user_id).set(
+                {
+                    "discovery_state": {
+                        "last_sweep_at": _now().isoformat(),
+                        "last_sweep": {**counts, "run_id": run_id, "trigger": trigger},
+                    }
+                },
+                merge=True,
+            )
+        except Exception:
+            log.exception("sweep.failed")
 
 
 async def tick_user(user_id: str, *, force_check: bool = False) -> None:
@@ -140,21 +156,25 @@ async def tick_user(user_id: str, *, force_check: bool = False) -> None:
     settings = DiscoverySettings.model_validate(doc.get("discovery_settings") or {})
     state = doc.get("discovery_state") or {}
 
+    trigger = "cron" if force_check else "opportunistic"
+
     if settings.auto_discovery and _due(
         state.get("last_discovery_at"), settings.discovery_interval_hours, now
     ):
+        log.info("tick.discovery_due", user_id=user_id, trigger=trigger)
         _user_ref(user_id).set(
             {"discovery_state": {"last_discovery_at": now.isoformat()}}, merge=True
         )
-        await run_discovery_cycle(user_id)
+        await run_discovery_cycle(user_id, trigger=trigger)
 
     if settings.liveness_sweep and _due(
         state.get("last_sweep_at"), settings.sweep_interval_hours, now
     ):
+        log.info("tick.sweep_due", user_id=user_id, trigger=trigger)
         _user_ref(user_id).set(
             {"discovery_state": {"last_sweep_at": now.isoformat()}}, merge=True
         )
-        await run_sweep_cycle(user_id)
+        await run_sweep_cycle(user_id, trigger=trigger)
 
 
 @router.get("/settings/discovery")
@@ -197,7 +217,8 @@ def run_discovery_now(
     background_tasks: BackgroundTasks, user_id: str = Depends(verify_user)
 ) -> dict:
     """Explicit user action: run discovery + scoring immediately."""
-    background_tasks.add_task(run_discovery_cycle, user_id)
+    log.info("discovery.run_now", user_id=user_id)
+    background_tasks.add_task(run_discovery_cycle, user_id, trigger="manual")
     return {"ok": True}
 
 
@@ -206,7 +227,8 @@ def run_sweep_now(
     background_tasks: BackgroundTasks, user_id: str = Depends(verify_user)
 ) -> dict:
     """Explicit user action: run the liveness sweep immediately."""
-    background_tasks.add_task(run_sweep_cycle, user_id)
+    log.info("sweep.run_now", user_id=user_id)
+    background_tasks.add_task(run_sweep_cycle, user_id, trigger="manual")
     return {"ok": True}
 
 

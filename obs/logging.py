@@ -24,6 +24,8 @@ import logging
 import os
 import sys
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import structlog
@@ -206,6 +208,20 @@ def bind_run_context(runner: str, **kwargs: Any) -> str:
     run_id = new_request_id()
     structlog.contextvars.bind_contextvars(run_id=run_id, runner=runner, **kwargs)
     return run_id
+
+
+@contextmanager
+def run_context(runner: str, **kwargs: Any) -> Iterator[str]:
+    """Scoped variant of :func:`bind_run_context` for in-process background runs.
+
+    FastAPI background tasks run sequentially in the request's (copied) context,
+    so a bare ``bind_contextvars`` would leak one run's ``run_id`` into the next
+    task. This binds ``run_id`` + ``runner`` (+ extras) only for the ``with``
+    block and restores the previous context on exit. Yields the ``run_id``.
+    """
+    run_id = new_request_id()
+    with structlog.contextvars.bound_contextvars(run_id=run_id, runner=runner, **kwargs):
+        yield run_id
 
 
 def clear_request_context() -> None:
