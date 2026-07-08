@@ -30,6 +30,12 @@ variable "feedback_logs_filter" {
   default     = "jsonPayload.log_type=\"feedback\" jsonPayload.service_name=\"hermes\""
 }
 
+variable "llm_cost_logs_filter" {
+  type        = string
+  description = "Log Sink filter for per-call LLM cost telemetry. Captures the structured `llm.call` events emitted by obs.llm_cost.record_llm_call (token counts + computed USD cost per matching/tailoring/profile-extract call)."
+  default     = "jsonPayload.message=\"llm.call\""
+}
+
 variable "app_sa_roles" {
   description = "List of roles to assign to the application service account"
   type        = list(string)

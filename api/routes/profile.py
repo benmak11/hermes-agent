@@ -22,7 +22,7 @@ from google.cloud import firestore
 
 from api.deps import verify_user
 from models.profile import MasterProfile
-from obs.logging import get_logger
+from obs.logging import get_logger, run_context
 from tools.profile.extract import extract_profile, read_resume_text
 
 log = get_logger("api.profile")
@@ -98,7 +98,8 @@ async def extract(
         chars=len(resume_text),
     )
     try:
-        profile = await asyncio.to_thread(extract_profile, resume_text, user_id)
+        with run_context("profile_extract", user_id=user_id):
+            profile = await asyncio.to_thread(extract_profile, resume_text, user_id)
     except Exception as e:  # extraction/validation failure → 422 for the UI
         log.exception("profile.extract.failed", chars=len(resume_text))
         raise HTTPException(

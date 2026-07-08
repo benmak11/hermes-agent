@@ -9,6 +9,7 @@ from google.genai import types
 
 from models.job import Job
 from models.profile import MasterProfile
+from obs.llm_cost import record_llm_call
 
 # Objective writing is low-volume and benefits from a little warmth/variation, so
 # Flash at a higher temperature is the right cost/quality point.
@@ -68,4 +69,5 @@ async def generate_objective(profile: MasterProfile, job: Job) -> str:
         ],
         config=types.GenerateContentConfig(temperature=0.6),
     )
+    record_llm_call(step="tailoring.objective", response=response, job_id=job.id)
     return response.text.strip()
