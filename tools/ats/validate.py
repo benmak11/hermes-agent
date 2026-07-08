@@ -22,6 +22,9 @@ import httpx
 from models.job import Job
 from obs.logging import get_logger
 from tools.ats.ashby import BASE as ASHBY_BASE
+from tools.ats.google_jobs import BASE as GOOGLE_BASE
+from tools.ats.google_jobs import HEADERS as GOOGLE_HEADERS
+from tools.ats.google_jobs import extract_ds
 from tools.ats.greenhouse import BASE as GREENHOUSE_BASE
 from tools.ats.lever import BASE as LEVER_BASE
 
@@ -39,9 +42,10 @@ async def check_posting(
     """Ask the job's ATS whether the posting is still up.
 
     Greenhouse and Lever expose per-posting endpoints; Ashby only lists the
-    whole board, so we refetch it and look for the posting's id. Anything
-    else (workday, google_jobs, manual, …) falls back to probing ``job.url``
-    directly.
+    whole board, so we refetch it and look for the posting's id. Google
+    Careers always answers 200, so its detail page's embedded data blob is
+    inspected instead. Anything else — including meta_jobs, whose dead
+    postings redirect to a real 404 — falls back to probing ``job.url``.
 
     ``transport`` is injectable for tests only.
     """
@@ -54,6 +58,8 @@ async def check_posting(
             url = f"{LEVER_BASE}/{job.company}/{job.source_id}"
         elif job.source == "ashby":
             return await _check_ashby_board(client, job)
+        elif job.source == "google_jobs":
+            return await _check_google_detail(client, job)
         else:
             url = job.url
         return await _probe(client, job, url)
@@ -92,6 +98,34 @@ async def _check_ashby_board(client: httpx.AsyncClient, job: Job) -> Liveness:
     if job.source_id in listed:
         return _log_result(job, "live", status=response.status_code)
     return _log_result(job, "removed", reason="absent from board")
+
+
+async def _check_google_detail(client: httpx.AsyncClient, job: Job) -> Liveness:
+    """Google Careers soft-404s: dead ids still render 200 with a generic
+    "Jobs search" page. The discriminator is the ``ds:0`` data blob — a live
+    detail page embeds the job record (``[["<id>", ...]]``); a dead one embeds
+    an ErrorDetails structure. Only a parsed, mismatching blob counts as
+    removed; anything unparseable is ``unknown`` per the fail-open contract.
+    """
+    try:
+        response = await client.get(
+            f"{GOOGLE_BASE}/{job.source_id}", headers=GOOGLE_HEADERS
+        )
+    except httpx.HTTPError as e:
+        return _log_result(job, "unknown", error=f"{type(e).__name__}: {e}")
+    if response.status_code in _GONE:
+        return _log_result(job, "removed", status=response.status_code)
+    if not response.is_success:
+        return _log_result(job, "unknown", status=response.status_code)
+    try:
+        ds0 = extract_ds(response.text, "ds:0")
+    except ValueError:
+        ds0 = None
+    if ds0 is None:
+        return _log_result(job, "unknown", error="ds:0 blob missing/unparseable")
+    if ds0 and isinstance(ds0[0], list) and ds0[0] and str(ds0[0][0]) == job.source_id:
+        return _log_result(job, "live", status=response.status_code)
+    return _log_result(job, "removed", reason="detail page has no job record")
 
 
 def _log_result(job: Job, result: Liveness, **fields: object) -> Liveness:
