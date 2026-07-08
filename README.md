@@ -14,9 +14,9 @@ The end-to-end funnel:
 
 ```
 onboarding → discovery → matching / vetting → tailoring → application → tracking
- (résumé →     (scout      (rank vs. profile,   (rerank      (submit to     (status,
-  profile)      sources)    geo-eligibility)     bullets +    the ATS)       deferred)
-                                                 objective +
+ (résumé →     (scout      (rank vs. profile,   (rerank      (submit to     (status +
+  profile)      sources)    geo-eligibility)     bullets +    the ATS)       interview
+                                                 objective +                  journal)
                                                  ATS docx)
 ```
 
@@ -24,6 +24,39 @@ An ADK **Coordinator** orchestrates five specialists. In practice the heavy
 lifting for discovery, matching, tailoring, and application runs as
 **deterministic pipelines** (`tools/` + `cli/` runners) that mirror each agent's
 contract; the ADK agents in `agents/` keep the Coordinator and playground wiring.
+
+### Screens
+
+The web app (`web/`, Next.js) is where a user rides that funnel:
+
+| Login | Onboarding — résumé parse review |
+|---|---|
+| ![Login: Google or email sign-in, gated to invited reviewers](docs/screenshots/login.png) | ![Onboarding: confirm and correct what Hermes parsed from the résumé](docs/screenshots/onboarding-profile-review.png) |
+
+| Discovery — companies | Matching / vetting — job review |
+|---|---|
+| ![Discovery: companies scouted in the background from the résumé](docs/screenshots/discovery-companies.png) | ![Job review: approve, skip, or star ranked postings with a score and recommendation](docs/screenshots/matching-job-review.png) |
+
+| Matching — score breakdown | Tracking — interview journal |
+|---|---|
+| ![Score breakdown, empty, and loading states for the job review card](docs/screenshots/matching-job-review-detail.png) | ![Interview journal: user-logged stages, outcomes, and reflections per application](docs/screenshots/tracking-interviews.png) |
+
+| Profile |
+|---|
+| ![Profile: résumé versions, match preferences, skills, and experience](docs/screenshots/profile.png) |
+
+`/` is job review (approve/skip/star, keyboard-driven, a running score/recommendation
+per posting); `/tracking` is the live application pipeline, filled in as the
+Application agent submits; `/interviews` is a separate, user-owned journal —
+Hermes logs the score, the user logs stages, outcomes, and what to improve;
+`/settings/companies` is the discovery source list (rescan/block per company);
+`/profile` holds résumé versions, match preferences, skills, and experience.
+Tailored résumés are reviewed and downloaded per application at
+`/applications/{id}/review`.
+
+(Screens above are drawn from current design mocks, not live-app screenshots.
+Paywall/monetization UI is in progress and intentionally left out of this
+overview.)
 
 | Agent | Model | Role |
 |-------|-------|------|
@@ -58,13 +91,20 @@ contract; the ADK agents in `agents/` keep the Coordinator and playground wiring
 
 ## Current state
 
-- **Live:** onboarding (résumé → profile), discovery, matching with a
-  location-eligibility gate, the job-vetting web UI, tailoring (bullets +
-  objective + ATS-safe résumé to GCS with a diff/review screen), and the
-  Application agent's Greenhouse path (Playwright submit with SSE progress,
-  screenshots, idempotency, and a manual-apply fallback).
+- **Live:** Firebase-auth login, onboarding (résumé → profile, with an
+  editable parse-review step), discovery (background company/job scouting
+  with rescan/block controls), matching with a location-eligibility gate, the
+  job-vetting web UI (`/`, approve/skip/star with a score breakdown),
+  tailoring (bullets + objective + ATS-safe résumé to GCS with a diff/review
+  screen at `/applications/{id}/review`), the Application agent's Greenhouse
+  path (Playwright submit with SSE progress, screenshots, idempotency, and a
+  manual-apply fallback), the `/tracking` application-status pipeline (filled
+  in as agents write status), and the `/interviews` journal (user-logged
+  interview stages/outcomes/reflections — Hermes contributes only the match
+  score, never auto-tracks).
 - **Deferred:** the Application "Computer Use" browser path for non-Greenhouse
-  ATSes, and the Tracking agent (Gmail response tracking).
+  ATSes, and the Tracking agent's automatic Gmail-based response detection.
+- **In progress (not covered here):** monetization/paywall.
 
 ## Deployment
 
