@@ -31,3 +31,14 @@ ashby:
     added: "2026-06-01"
   - slug: retool
     added: "2026-06-01"
+
+# Single-company career sites: the "slug" is a search query, not a company.
+google_jobs:
+  - slug: software engineer
+    added: "2026-07-07"
+    notes: "careers site search query; results restricted to United States"
+
+meta_jobs:
+  - slug: software engineer
+    added: "2026-07-07"
+    notes: "metacareers.com search query"

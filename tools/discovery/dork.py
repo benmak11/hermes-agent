@@ -143,6 +143,10 @@ async def run_sweep(backend: SearchBackend) -> dict[Platform, int]:
     added: dict[Platform, int] = dict.fromkeys(PLATFORMS, 0)
 
     for platform in PLATFORMS:
+        # Single-company career sites (google_jobs, meta_jobs) have no company
+        # slugs to dork for — their "slugs" are search queries managed by hand.
+        if platform not in PLATFORM_DOMAINS:
+            continue
         platform_slugs: set[str] = set()
 
         for domain in PLATFORM_DOMAINS[platform]:

@@ -58,6 +58,9 @@ def _timeout_transport() -> httpx.MockTransport:
         ("greenhouse", "https://boards-api.greenhouse.io/v1/boards/acme/jobs/1"),
         ("lever", "https://api.lever.co/v0/postings/acme/1"),
         ("manual", "https://example.com/job"),
+        # meta_jobs relies on the plain URL probe: dead postings 301 to a
+        # real 404 page, so no special casing is needed (or wanted).
+        ("meta_jobs", "https://example.com/job"),
     ],
 )
 async def test_live_posting_and_probe_url(source: str, expected_url: str) -> None:
@@ -68,7 +71,7 @@ async def test_live_posting_and_probe_url(source: str, expected_url: str) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["greenhouse", "lever", "manual"])
+@pytest.mark.parametrize("source", ["greenhouse", "lever", "manual", "meta_jobs"])
 @pytest.mark.parametrize("status", [404, 410])
 async def test_gone_status_means_removed(source: str, status: int) -> None:
     res = await check_posting(_job(source), transport=_transport(status))
@@ -76,7 +79,9 @@ async def test_gone_status_means_removed(source: str, status: int) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["greenhouse", "lever", "ashby", "manual"])
+@pytest.mark.parametrize(
+    "source", ["greenhouse", "lever", "ashby", "manual", "meta_jobs"]
+)
 @pytest.mark.parametrize("status", [429, 500, 503])
 async def test_server_errors_fail_open(source: str, status: int) -> None:
     res = await check_posting(_job(source), transport=_transport(status))

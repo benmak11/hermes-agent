@@ -15,8 +15,10 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel
 
-Platform = Literal["greenhouse", "lever", "ashby"]
-PLATFORMS: list[Platform] = ["greenhouse", "lever", "ashby"]
+# Multi-tenant ATS platforms use a company slug; the single-company career
+# sites (google_jobs, meta_jobs) reuse the slot as a *search query* instead.
+Platform = Literal["greenhouse", "lever", "ashby", "google_jobs", "meta_jobs"]
+PLATFORMS: list[Platform] = ["greenhouse", "lever", "ashby", "google_jobs", "meta_jobs"]
 
 DATA_DIR = Path("data/companies")
 
