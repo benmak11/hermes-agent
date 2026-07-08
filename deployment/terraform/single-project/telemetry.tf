@@ -91,6 +91,35 @@ resource "google_bigquery_dataset_iam_member" "feedback_logs_bq_writer" {
   member     = google_logging_project_sink.feedback_logs_to_bq.writer_identity
 }
 
+# Log sink for per-call LLM cost telemetry (obs.llm_cost.record_llm_call) —
+# routes to the same BigQuery dataset. No table is pre-created here (unlike
+# the GenAI/completions tables above): this event is self-contained — no join
+# against GCS-stored prompt/response data is needed to compute cost — so
+# Cloud Logging's default auto-created-and-schema-evolved table is sufficient.
+# Query cost-per-application-run with `GROUP BY run_id`, cost-per-job with
+# `GROUP BY job_id` (see the query in the root README's cost-telemetry section).
+resource "google_logging_project_sink" "llm_cost_logs_to_bq" {
+  name        = "${var.project_name}-llm-cost"
+  project     = var.project_id
+  destination = "bigquery.googleapis.com/projects/${var.project_id}/datasets/${google_bigquery_dataset.telemetry_dataset.dataset_id}"
+  filter      = var.llm_cost_logs_filter
+
+  unique_writer_identity = true
+
+  bigquery_options {
+    use_partitioned_tables = true
+  }
+
+  depends_on = [google_bigquery_dataset.telemetry_dataset]
+}
+
+resource "google_bigquery_dataset_iam_member" "llm_cost_logs_bq_writer" {
+  project    = var.project_id
+  dataset_id = google_bigquery_dataset.telemetry_dataset.dataset_id
+  role       = "roles/bigquery.dataEditor"
+  member     = google_logging_project_sink.llm_cost_logs_to_bq.writer_identity
+}
+
 # ====================================================================
 # Completions External Table (GCS-based)
 # ====================================================================

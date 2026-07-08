@@ -17,6 +17,7 @@ from google import genai
 from google.genai import types
 
 from models.profile import MasterProfile
+from obs.llm_cost import record_llm_call
 from obs.logging import get_logger
 
 log = get_logger("tools.profile.extract")
@@ -99,6 +100,7 @@ def extract_profile(raw_text: str, user_id: str) -> MasterProfile:
                 temperature=0.1,  # we want determinism here
             ),
         )
+        record_llm_call(step="profile.extract", response=response)
         profile = MasterProfile.model_validate_json(response.text)
     except Exception:
         call_log.exception("extract.gemini.failed")

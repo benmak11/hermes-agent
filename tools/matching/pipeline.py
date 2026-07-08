@@ -17,6 +17,7 @@ from google.genai import types
 from models.job import Job, ParsedJD
 from models.match import JobMatch, ScoreBreakdown
 from models.profile import MasterProfile
+from obs.llm_cost import record_llm_call
 from obs.logging import get_logger
 
 log = get_logger("tools.matching")
@@ -184,6 +185,7 @@ async def parse_jd(job: Job) -> ParsedJD:
                 temperature=0.1,
             ),
         )
+        record_llm_call(step="matching.parse_jd", response=response, job_id=job.id)
         return ParsedJD.model_validate_json(response.text)
     except Exception:
         log.exception("matching.parse_jd.failed", job_id=job.id, company=job.company)
@@ -237,6 +239,7 @@ async def match_job(
                 temperature=0.2,
             ),
         )
+        record_llm_call(step="matching.score", response=response, job_id=job.id)
         match = JobMatch.model_validate_json(response.text)
     except Exception:
         job_log.exception("matching.score.failed")
