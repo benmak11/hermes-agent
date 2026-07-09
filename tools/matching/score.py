@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
@@ -26,6 +27,36 @@ log = get_logger("tools.matching")
 # (job, match, error) — match is None when scoring failed and error says why.
 OnResult = Callable[[Job, JobMatch | None, str | None], None]
 
+# Jobs scoring at or below this never stay in the `jobs` collection: 0 is the
+# out-of-family sentinel and the matching prompt caps geographically
+# ineligible roles at 20, so everything down here is a job the user cannot or
+# would not take. (The UI already hides anything under 60.)
+DISCARD_AT_OR_BELOW = 20
+
+
+def should_discard(match: JobMatch) -> bool:
+    """True when the job is not worth keeping in the user's jobs collection."""
+    return match.overall_score <= DISCARD_AT_OR_BELOW
+
+
+def discard_tombstone(job: Job, match: JobMatch) -> dict:
+    """Minimal `discarded_jobs` record.
+
+    Exists so discovery's seen-check still recognizes the posting and never
+    re-persists (and re-pays Flash/Pro to re-score) it while it stays live on
+    the board.
+    """
+    return {
+        "job_id": job.id,
+        "company": job.company,
+        "title": job.title,
+        "url": job.url,
+        "score": match.overall_score,
+        "recommendation": match.recommendation,
+        "reasoning": match.reasoning,
+        "discarded_at": datetime.now(UTC).isoformat(),
+    }
+
 
 async def score_pending_jobs(
     user_id: str,
@@ -36,8 +67,11 @@ async def score_pending_jobs(
 ) -> dict:
     """Score every pending, unscored job against the user's profile.
 
-    Persists ``match`` (and the parsed JD) onto each job doc. Returns
-    ``{"scored": n, "failed": n, "pending": n}``. Raises ``ValueError`` when
+    Persists ``match`` (and the parsed JD) onto each job doc — unless the job
+    scores at/below ``DISCARD_AT_OR_BELOW``, in which case the doc is replaced
+    by a tombstone in ``discarded_jobs`` so it never reaches the queue but is
+    still deduped on future discovery runs. Returns ``{"scored": n,
+    "discarded": n, "failed": n, "pending": n}``. Raises ``ValueError`` when
     the user has no profile to match against.
     """
     db = firestore.AsyncClient()
@@ -62,12 +96,30 @@ async def score_pending_jobs(
     started = time.monotonic()
     log.info("matching.start", pending=len(pending), concurrency=concurrency)
     sem = asyncio.Semaphore(concurrency)
-    counts = {"scored": 0, "failed": 0, "pending": len(pending)}
+    counts = {"scored": 0, "discarded": 0, "failed": 0, "pending": len(pending)}
 
     async def _score(ref, job: Job) -> None:
         async with sem:
             try:
                 match = await match_job(job, profile)
+                if should_discard(match):
+                    # ref.parent is the jobs collection; its parent is the
+                    # user doc.
+                    user_ref = ref.parent.parent
+                    await user_ref.collection("discarded_jobs").document(job.id).set(
+                        discard_tombstone(job, match)
+                    )
+                    await ref.delete()
+                    counts["discarded"] += 1
+                    log.info(
+                        "matching.discarded",
+                        job_id=job.id,
+                        company=job.company,
+                        score=match.overall_score,
+                    )
+                    if on_result:
+                        on_result(job, match, None)
+                    return
                 await ref.update(
                     {
                         "match": match.model_dump(mode="json"),

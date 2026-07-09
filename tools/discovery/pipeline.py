@@ -109,22 +109,29 @@ async def run_discovery(user_id: str) -> dict:
 
 
 async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
-    """Write only previously-unseen jobs to Firestore. Returns count of new jobs."""
+    """Write only previously-unseen jobs to Firestore. Returns count of new jobs.
+
+    "Seen" includes discarded jobs: matching moves zero/ineligible-scored jobs
+    to a ``discarded_jobs`` tombstone, and postings stay live on boards for
+    weeks — without this check every run would re-persist and re-score them.
+    """
     # De-dupe within this run (a slug can appear in both known + unvetted).
     unique = {j.id: j for j in jobs}
     db = firestore.AsyncClient()
     sem = asyncio.Semaphore(concurrency)
-    counter = {"new": 0}
+    counter = {"new": 0, "discarded": 0}
 
     async def _persist_one(job: Job) -> None:
         async with sem:
-            doc_ref = (
-                db.collection("users")
-                .document(job.user_id)
-                .collection("jobs")
-                .document(job.id)
+            user_ref = db.collection("users").document(job.user_id)
+            doc_ref = user_ref.collection("jobs").document(job.id)
+            discarded_ref = user_ref.collection("discarded_jobs").document(job.id)
+            snap, discarded = await asyncio.gather(
+                doc_ref.get(), discarded_ref.get()
             )
-            snap = await doc_ref.get()
+            if discarded.exists:
+                counter["discarded"] += 1
+                return
             if snap.exists:
                 return
             await doc_ref.set(job.model_dump(mode="json"))
@@ -134,6 +141,7 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
     log.info(
         "discovery.persisted",
         new_jobs=counter["new"],
-        seen_before=len(unique) - counter["new"],
+        seen_before=len(unique) - counter["new"] - counter["discarded"],
+        previously_discarded=counter["discarded"],
     )
     return counter["new"]

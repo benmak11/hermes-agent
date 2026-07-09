@@ -50,7 +50,10 @@ async def main() -> None:
         )
     except ValueError as e:
         raise SystemExit(f"{e} Run `cli.sync_profile` first.") from None
-    print(f"✓ Scored {counts['scored']}, failed {counts['failed']}")
+    print(
+        f"✓ Scored {counts['scored']}, discarded {counts['discarded']},"
+        f" failed {counts['failed']}"
+    )
 
 
 if __name__ == "__main__":

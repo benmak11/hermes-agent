@@ -102,6 +102,7 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
                 "empty_boards": len(summary["empty_boards"]),
                 "new_jobs": new,
                 "scored": counts["scored"],
+                "discarded": counts["discarded"],
                 "failed": counts["failed"],
                 "duration_ms": int((time.monotonic() - started) * 1000),
             }
