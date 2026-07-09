@@ -217,3 +217,7 @@ CLAUDE.md
 
 # Local Firestore job-data backups (not for VCS)
 data/backups/
+
+# Terraform state (contains secrets/resource IDs, not for VCS)
+*.tfstate
+*.tfstate.backup
