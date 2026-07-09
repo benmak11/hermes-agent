@@ -45,6 +45,14 @@ PRO_MODEL = "gemini-3.1-pro-preview"
 _PARSE_JD_THINKING = types.ThinkingConfig(thinking_budget=512)
 _MATCH_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MEDIUM)
 
+# Ceiling on what one Pro scoring call may generate — thinking counts toward
+# max_output_tokens, so this must cover answer + thinking. All-time telemetry
+# worst is ~3.0K combined (427 answer, 2,622 thinking); 4096 leaves headroom
+# while capping a runaway generation at ~$0.05 instead of the model's ~64K
+# default (~$0.79). Hitting the cap truncates the JSON, which fails schema
+# validation and surfaces as match.failed rather than a silent wrong score.
+_MATCH_MAX_OUTPUT_TOKENS = 4096
+
 PARSE_JD_PROMPT = """Extract structured info from this job description.
 
 For role_family, classify into exactly one of: engineering, product, design, data,
@@ -335,6 +343,7 @@ async def match_job(
         response_schema=JobMatch,
         temperature=0.2,
         thinking_config=_MATCH_THINKING,
+        max_output_tokens=_MATCH_MAX_OUTPUT_TOKENS,
     )
 
     def _uncached_args() -> tuple[list[str], types.GenerateContentConfig]:
