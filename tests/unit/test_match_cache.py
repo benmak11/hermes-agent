@@ -128,6 +128,7 @@ def test_uncached_call_sends_full_prompt(monkeypatch):
     assert "Terry Tester" in call["contents"][0]  # static block inlined
     assert "Company: Acme" in call["contents"][0]
     assert call["config"].cached_content is None
+    assert call["config"].max_output_tokens == pipeline._MATCH_MAX_OUTPUT_TOKENS
 
 
 def test_cached_call_sends_only_job_block(monkeypatch):
@@ -141,6 +142,7 @@ def test_cached_call_sends_only_job_block(monkeypatch):
     assert call["config"].cached_content == "caches/abc"
     assert "Company: Acme" in call["contents"][0]
     assert "Terry Tester" not in call["contents"][0]  # static block NOT resent
+    assert call["config"].max_output_tokens == pipeline._MATCH_MAX_OUTPUT_TOKENS
 
 
 def test_expired_cache_falls_back_to_uncached(monkeypatch):

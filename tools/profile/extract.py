@@ -29,6 +29,15 @@ log = get_logger("tools.profile.extract")
 # thinking_tokens actually dropped before going lower.
 _EXTRACT_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
 
+# Ceiling on what one extraction call may generate — thinking counts toward
+# max_output_tokens, so this must cover answer + thinking. Telemetry worst so
+# far is ~4.2K combined (1,529 answer, 2,683 thinking) on a normal resume;
+# output scales with resume length, so 8192 gives ~2x headroom while capping a
+# runaway generation at ~$0.10 instead of the model's ~64K default (~$0.79).
+# Hitting the cap truncates the JSON, which fails MasterProfile validation and
+# surfaces as extract.gemini.failed rather than a silent partial profile.
+_EXTRACT_MAX_OUTPUT_TOKENS = 8192
+
 SYSTEM_PROMPT = """You extract structured career data from resumes.
 
 Rules:
@@ -106,6 +115,7 @@ def extract_profile(raw_text: str, user_id: str) -> MasterProfile:
                 response_schema=MasterProfile,
                 temperature=0.1,  # we want determinism here
                 thinking_config=_EXTRACT_THINKING,
+                max_output_tokens=_EXTRACT_MAX_OUTPUT_TOKENS,
             ),
         )
         record_llm_call(step="profile.extract", response=response)
