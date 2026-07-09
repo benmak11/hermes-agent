@@ -28,14 +28,21 @@ log = get_logger("tools.matching")
 FLASH_MODEL = "gemini-flash-latest"
 PRO_MODEL = "gemini-3.1-pro-preview"
 
-# Thinking is "high" by default on Gemini 3.x and bills as output tokens at the
-# full output rate — telemetry showed it running 1.5x-4x the answer size on
-# both calls below with no thinking_config set at all. Both tasks still need
-# real judgment (role/seniority classification here; weighted scoring +
-# geo-eligibility gating in match_job), so this trims the default rather than
-# disabling thinking outright — see obs/llm_cost.py output post-deploy to
-# confirm thinking_tokens actually dropped before going lower.
-_PARSE_JD_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+# Thinking bills as output tokens at the full output rate — telemetry showed it
+# running 1.5x-4x the answer size on both calls below with no thinking_config
+# set at all. Both tasks still need real judgment (role/seniority classification
+# here; weighted scoring + geo-eligibility gating in match_job), so this trims
+# the default rather than disabling thinking outright — see obs/llm_cost.py
+# output post-deploy to confirm thinking_tokens actually dropped before going
+# lower.
+#
+# gemini-flash-latest currently serves a 2.5-generation model: it 400s on
+# thinking_level ("not supported by this model") and takes the older
+# thinking_budget knob instead — verified live 2026-07-08 after every parse_jd
+# call in a backlog run failed with that 400. 512 tokens caps thinking near the
+# thinking_level=LOW intent. If the alias moves to a 3.x Flash, thinking_budget
+# still works (3.x accepts either knob, just not both).
+_PARSE_JD_THINKING = types.ThinkingConfig(thinking_budget=512)
 _MATCH_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MEDIUM)
 
 PARSE_JD_PROMPT = """Extract structured info from this job description.

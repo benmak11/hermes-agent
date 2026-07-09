@@ -15,13 +15,13 @@ from obs.llm_cost import record_llm_call
 # Flash at a higher temperature is the right cost/quality point.
 OBJECTIVE_MODEL = "gemini-flash-latest"
 
-# Thinking bills as output tokens at the full output rate, and defaults to
-# "high" on Gemini 3.x (we haven't confirmed which concrete model
-# gemini-flash-latest currently resolves to — check response.model_version
-# in obs/llm_cost.py telemetry post-deploy). Filling a 2-sentence template is
-# light stylistic judgment, not deep reasoning — trim rather than disable,
-# and confirm thinking_tokens actually dropped before considering MINIMAL.
-_OBJECTIVE_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+# Thinking bills as output tokens at the full output rate. gemini-flash-latest
+# currently serves a 2.5-generation model that 400s on thinking_level ("not
+# supported by this model") and takes the older thinking_budget knob instead —
+# verified live 2026-07-08. Filling a 2-sentence template is light stylistic
+# judgment, not deep reasoning — 512 tokens trims rather than disables; confirm
+# thinking_tokens actually dropped before cutting toward 0.
+_OBJECTIVE_THINKING = types.ThinkingConfig(thinking_budget=512)
 
 OBJECTIVE_PROMPT = """Fill in this objective template for a specific role.
 
