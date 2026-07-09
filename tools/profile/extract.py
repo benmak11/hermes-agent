@@ -22,6 +22,13 @@ from obs.logging import get_logger
 
 log = get_logger("tools.profile.extract")
 
+# Thinking is "high" by default on Gemini 3.x and bills as output tokens at
+# the full output rate. This task tags bullets and infers a few classifications
+# but is fundamentally extraction, not open-ended reasoning, so trim rather
+# than disable — check obs/llm_cost.py telemetry post-deploy to confirm
+# thinking_tokens actually dropped before going lower.
+_EXTRACT_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+
 SYSTEM_PROMPT = """You extract structured career data from resumes.
 
 Rules:
@@ -98,6 +105,7 @@ def extract_profile(raw_text: str, user_id: str) -> MasterProfile:
                 response_mime_type="application/json",
                 response_schema=MasterProfile,
                 temperature=0.1,  # we want determinism here
+                thinking_config=_EXTRACT_THINKING,
             ),
         )
         record_llm_call(step="profile.extract", response=response)

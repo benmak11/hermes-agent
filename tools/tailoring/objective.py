@@ -15,6 +15,14 @@ from obs.llm_cost import record_llm_call
 # Flash at a higher temperature is the right cost/quality point.
 OBJECTIVE_MODEL = "gemini-flash-latest"
 
+# Thinking bills as output tokens at the full output rate, and defaults to
+# "high" on Gemini 3.x (we haven't confirmed which concrete model
+# gemini-flash-latest currently resolves to — check response.model_version
+# in obs/llm_cost.py telemetry post-deploy). Filling a 2-sentence template is
+# light stylistic judgment, not deep reasoning — trim rather than disable,
+# and confirm thinking_tokens actually dropped before considering MINIMAL.
+_OBJECTIVE_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+
 OBJECTIVE_PROMPT = """Fill in this objective template for a specific role.
 
 Template: {template}
@@ -67,7 +75,9 @@ async def generate_objective(profile: MasterProfile, job: Job) -> str:
                 jd_summary=jd_summary,
             )
         ],
-        config=types.GenerateContentConfig(temperature=0.6),
+        config=types.GenerateContentConfig(
+            temperature=0.6, thinking_config=_OBJECTIVE_THINKING
+        ),
     )
     record_llm_call(step="tailoring.objective", response=response, job_id=job.id)
     return response.text.strip()
