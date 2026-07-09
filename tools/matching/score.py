@@ -20,7 +20,11 @@ from models.job import Job
 from models.match import JobMatch
 from models.profile import MasterProfile
 from obs.logging import get_logger
-from tools.matching.pipeline import match_job
+from tools.matching.pipeline import (
+    create_match_cache,
+    delete_match_cache,
+    match_job,
+)
 
 log = get_logger("tools.matching")
 
@@ -94,14 +98,32 @@ async def score_pending_jobs(
             break
 
     started = time.monotonic()
-    log.info("matching.start", pending=len(pending), concurrency=concurrency)
+
+    # One Vertex context cache for the static scoring block (profile + rules),
+    # shared by every job in this run — the block dominates input tokens and
+    # cached input bills at a tenth of the standard rate. TTL is scaled to the
+    # backlog (~30s per Pro call per concurrency slot, capped at 24h);
+    # match_job falls back to the uncached prompt if the cache expires
+    # mid-run, and create_match_cache returning None (e.g. block under the
+    # model's minimum cacheable size) just means the run prices like before.
+    cache_name: str | None = None
+    if len(pending) >= 2:
+        ttl_seconds = min(max(3600, len(pending) * 30 // concurrency), 86_400)
+        cache_name = await create_match_cache(profile, ttl_seconds=ttl_seconds)
+
+    log.info(
+        "matching.start",
+        pending=len(pending),
+        concurrency=concurrency,
+        context_cache=cache_name is not None,
+    )
     sem = asyncio.Semaphore(concurrency)
     counts = {"scored": 0, "discarded": 0, "failed": 0, "pending": len(pending)}
 
     async def _score(ref, job: Job) -> None:
         async with sem:
             try:
-                match = await match_job(job, profile)
+                match = await match_job(job, profile, cached_content=cache_name)
                 if should_discard(match):
                     # ref.parent is the jobs collection; its parent is the
                     # user doc.
@@ -139,7 +161,11 @@ async def score_pending_jobs(
                 if on_result:
                     on_result(job, None, str(e))
 
-    await asyncio.gather(*(_score(ref, job) for ref, job in pending))
+    try:
+        await asyncio.gather(*(_score(ref, job) for ref, job in pending))
+    finally:
+        if cache_name:
+            await delete_match_cache(cache_name)
     log.info(
         "matching.done",
         duration_ms=int((time.monotonic() - started) * 1000),
