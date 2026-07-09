@@ -15,12 +15,18 @@ merges bound contextvars into every log line automatically. Aggregating cost
 per application run downstream is therefore just "GROUP BY run_id" over these
 log lines — see ``deployment/terraform/shared/llm_cost.sql``.
 
-Pricing is looked up by ``response.model_version`` (the concrete model Vertex
-actually served), not the model name/alias we requested — ``gemini-flash-latest``
-is an alias and can point at different concrete models over time. A model
-version missing from ``_PRICING_PER_MILLION`` still gets its token counts
-logged, just with ``cost_usd=None`` and a warning, rather than silently
-reporting a wrong number.
+Pricing is looked up by ``response.model_version``. For the Pro call sites
+this is the concrete pinned model id (``gemini-3.1-pro-preview``). For the
+Flash call sites it is **not** resolved to a concrete model — Vertex just
+echoes back the requested alias ``gemini-flash-latest`` verbatim (confirmed
+live 2026-07-08; an earlier version of this module assumed the opposite).
+So the pricing table is keyed by whatever string actually shows up in
+``model_version``, alias or not — if ``gemini-flash-latest`` is ever
+repointed at a different concrete model with different pricing, this table
+needs a matching update, since there's no way to detect that from the
+response alone. A model string missing from ``_PRICING_PER_MILLION`` still
+gets its token counts logged, just with ``cost_usd=None`` and a warning,
+rather than silently reporting a wrong number.
 """
 
 from __future__ import annotations
@@ -39,6 +45,11 @@ log = get_logger("llm.cost")
 # before relying on it for paywall pricing.
 _PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     "gemini-3.1-pro-preview": {"input": 2.00, "output": 12.00, "cached": 0.20},
+    # Keyed by the literal alias, not a resolved model id — see module
+    # docstring. gemini-flash-latest currently serves a 2.5-generation model;
+    # 2.5 Flash has no long-context pricing tier (flat rate at any input
+    # size), unlike Pro, so no matching entry below is needed for it.
+    "gemini-flash-latest": {"input": 0.30, "output": 2.50, "cached": 0.03},
 }
 # Long-context (>200K prompt tokens) rates for the same models, keyed by
 # "<model>:long". None of our current prompts get near 200K, but the lookup
