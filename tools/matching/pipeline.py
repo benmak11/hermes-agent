@@ -28,6 +28,16 @@ log = get_logger("tools.matching")
 FLASH_MODEL = "gemini-flash-latest"
 PRO_MODEL = "gemini-3.1-pro-preview"
 
+# Thinking is "high" by default on Gemini 3.x and bills as output tokens at the
+# full output rate — telemetry showed it running 1.5x-4x the answer size on
+# both calls below with no thinking_config set at all. Both tasks still need
+# real judgment (role/seniority classification here; weighted scoring +
+# geo-eligibility gating in match_job), so this trims the default rather than
+# disabling thinking outright — see obs/llm_cost.py output post-deploy to
+# confirm thinking_tokens actually dropped before going lower.
+_PARSE_JD_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+_MATCH_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MEDIUM)
+
 PARSE_JD_PROMPT = """Extract structured info from this job description.
 
 For role_family, classify into exactly one of: engineering, product, design, data,
@@ -183,6 +193,7 @@ async def parse_jd(job: Job) -> ParsedJD:
                 response_mime_type="application/json",
                 response_schema=ParsedJD,
                 temperature=0.1,
+                thinking_config=_PARSE_JD_THINKING,
             ),
         )
         record_llm_call(step="matching.parse_jd", response=response, job_id=job.id)
@@ -237,6 +248,7 @@ async def match_job(
                 response_mime_type="application/json",
                 response_schema=JobMatch,
                 temperature=0.2,
+                thinking_config=_MATCH_THINKING,
             ),
         )
         record_llm_call(step="matching.score", response=response, job_id=job.id)
