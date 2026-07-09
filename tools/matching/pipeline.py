@@ -76,25 +76,22 @@ For location, extract the job's geography from the posting and the location line
   Do not infer this from the company being US-headquartered; require an explicit statement.
 """
 
-MATCH_PROMPT_TEMPLATE = """You are a careful, skeptical career advisor scoring this job against the candidate's profile.
+# The scoring prompt is split into a per-user static block and a per-job block
+# so the static block (profile JSON + geography + decision patterns + scoring
+# rules — it dominates input tokens and was resent on every call) can be
+# uploaded once per scoring run as Vertex cached content and reused across all
+# jobs in the run; cached input bills at a tenth of the standard rate (see
+# obs/llm_cost.py). With or without a cache the model sees the same
+# information; the only semantic change from the pre-split prompt is ordering
+# (the job now comes after the rules, since a cache must be a strict prefix).
+MATCH_CONTEXT_TEMPLATE = """You are a careful, skeptical career advisor scoring jobs against the candidate's profile.
 
 # Candidate Profile
 {profile_json}
 
-# Job
-Company: {company}
-Title: {title}
-Location: {location}
-
 # Candidate Geography
 Residence: {residence}
 Accepted work styles: {remote_policy}
-
-## Parsed JD
-{parsed_jd_json}
-
-## Full JD
-{jd_text}
 
 # Recent Decisions
 The candidate recently rejected jobs with these patterns:
@@ -154,7 +151,99 @@ recommendation thresholds:
   < 55: skip
 
 Be honest. Skeptical scoring is more useful than charitable scoring.
+
+Score the job that follows against this profile.
 """
+
+MATCH_JOB_TEMPLATE = """# Job
+Company: {company}
+Title: {title}
+Location: {location}
+
+## Parsed JD
+{parsed_jd_json}
+
+## Full JD
+{jd_text}
+"""
+
+
+def build_match_context(
+    profile: MasterProfile,
+    rejection_patterns: str = "",
+    approval_patterns: str = "",
+) -> str:
+    """The static (per-user, per-run) block of the scoring prompt."""
+    return MATCH_CONTEXT_TEMPLATE.format(
+        profile_json=profile.model_dump_json(indent=2),
+        residence=_residence_str(profile),
+        remote_policy=", ".join(profile.preferences.remote_policy) or "unspecified",
+        rejection_patterns=rejection_patterns or "(none yet)",
+        approval_patterns=approval_patterns or "(none yet)",
+    )
+
+
+def build_match_job_block(job: Job) -> str:
+    """The per-job block of the scoring prompt."""
+    return MATCH_JOB_TEMPLATE.format(
+        company=job.company,
+        title=job.title,
+        location=job.location or "unspecified",
+        parsed_jd_json=job.jd_parsed.model_dump_json(indent=2) if job.jd_parsed else "{}",
+        jd_text=job.jd_raw[:4000],  # truncate
+    )
+
+
+async def create_match_cache(
+    profile: MasterProfile,
+    rejection_patterns: str = "",
+    approval_patterns: str = "",
+    *,
+    ttl_seconds: int = 3600,
+) -> str | None:
+    """Upload the static scoring block as Vertex cached content.
+
+    Returns the cache resource name to pass as ``match_job(...,
+    cached_content=)``, or ``None`` when creation fails — e.g. the block is
+    under the model's minimum cacheable size for a thin profile. Callers just
+    run uncached in that case; scoring behavior is identical either way.
+    """
+    client = genai.Client(vertexai=True)
+    try:
+        cache = await client.aio.caches.create(
+            model=PRO_MODEL,
+            config=types.CreateCachedContentConfig(
+                contents=[
+                    build_match_context(profile, rejection_patterns, approval_patterns)
+                ],
+                ttl=f"{ttl_seconds}s",
+                display_name=f"hermes-match-{profile.user_id}",
+            ),
+        )
+    except Exception as e:
+        log.warning("matching.cache.create_failed", error=str(e)[:300])
+        return None
+    tokens = cache.usage_metadata.total_token_count if cache.usage_metadata else None
+    log.info(
+        "matching.cache.created",
+        cache=cache.name,
+        cached_tokens=tokens,
+        ttl_seconds=ttl_seconds,
+    )
+    return cache.name
+
+
+async def delete_match_cache(cache_name: str) -> None:
+    """Best-effort delete; a cache that outlives this also ages out on TTL."""
+    client = genai.Client(vertexai=True)
+    try:
+        await client.aio.caches.delete(name=cache_name)
+        log.info("matching.cache.deleted", cache=cache_name)
+    except Exception as e:
+        log.warning(
+            "matching.cache.delete_failed", cache=cache_name, error=str(e)[:200]
+        )
+
 
 def _residence_str(profile: MasterProfile) -> str:
     """Human-readable residence for the prompt, with country-level fallback.
@@ -215,8 +304,16 @@ async def match_job(
     profile: MasterProfile,
     rejection_patterns: str = "",
     approval_patterns: str = "",
+    cached_content: str | None = None,
 ) -> JobMatch:
-    """Parse (if needed), family pre-filter, then full Pro scoring."""
+    """Parse (if needed), family pre-filter, then full Pro scoring.
+
+    ``cached_content`` is a Vertex cache resource name from
+    :func:`create_match_cache`; when set, only the per-job block is sent and
+    the static block is read from the cache at the discounted rate. The cache
+    must have been built from the same profile/patterns, or the model will
+    score against stale context.
+    """
     started = time.monotonic()
     job_log = log.bind(job_id=job.id, company=job.company)
     if job.jd_parsed is None:
@@ -232,32 +329,47 @@ async def match_job(
         m.job_id = job.id
         return m
 
-    prompt = MATCH_PROMPT_TEMPLATE.format(
-        profile_json=profile.model_dump_json(indent=2),
-        company=job.company,
-        title=job.title,
-        location=job.location or "unspecified",
-        residence=_residence_str(profile),
-        remote_policy=", ".join(profile.preferences.remote_policy) or "unspecified",
-        parsed_jd_json=job.jd_parsed.model_dump_json(indent=2),
-        jd_text=job.jd_raw[:4000],  # truncate
-        rejection_patterns=rejection_patterns or "(none yet)",
-        approval_patterns=approval_patterns or "(none yet)",
+    job_block = build_match_job_block(job)
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=JobMatch,
+        temperature=0.2,
+        thinking_config=_MATCH_THINKING,
     )
+
+    def _uncached_args() -> tuple[list[str], types.GenerateContentConfig]:
+        context = build_match_context(profile, rejection_patterns, approval_patterns)
+        return [f"{context}\n\n{job_block}"], config
 
     # Full scoring uses Pro — this is the call worth paying for.
     client = genai.Client(vertexai=True)
     try:
-        response = await client.aio.models.generate_content(
-            model=PRO_MODEL,
-            contents=[prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=JobMatch,
-                temperature=0.2,
-                thinking_config=_MATCH_THINKING,
-            ),
-        )
+        if cached_content:
+            try:
+                response = await client.aio.models.generate_content(
+                    model=PRO_MODEL,
+                    contents=[job_block],
+                    config=config.model_copy(update={"cached_content": cached_content}),
+                )
+            except Exception as e:
+                # A cache can expire/evict mid-run (long backlog > TTL). Only
+                # cache-shaped errors fall back to the uncached prompt —
+                # anything else (429s, invalid schema, ...) would fail again
+                # uncached, so re-raise rather than double-spend on it.
+                if "cach" not in str(e).lower():
+                    raise
+                job_log.warning(
+                    "matching.score.cache_fallback", error=str(e)[:200]
+                )
+                contents, cfg = _uncached_args()
+                response = await client.aio.models.generate_content(
+                    model=PRO_MODEL, contents=contents, config=cfg
+                )
+        else:
+            contents, cfg = _uncached_args()
+            response = await client.aio.models.generate_content(
+                model=PRO_MODEL, contents=contents, config=cfg
+            )
         record_llm_call(step="matching.score", response=response, job_id=job.id)
         match = JobMatch.model_validate_json(response.text)
     except Exception:
