@@ -30,6 +30,7 @@ from models.settings import DiscoverySettings
 from obs.logging import get_logger, run_context
 from tools.ats.sweep import sweep_postings
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
+from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
 from tools.matching.score import score_pending_jobs
 
 log = get_logger("api.discovery")
@@ -91,12 +92,17 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
         log.info("auto_discovery.start")
         try:
             summary = await run_discovery(user_id)
-            new = await persist_new_jobs(summary["jobs"])
+            # Free title pre-filter: confidently out-of-family jobs never get
+            # persisted, so they never cost a Flash parse downstream.
+            preferences = await load_job_preferences(user_id)
+            jobs, title_dropped = prefilter_jobs(summary["jobs"], preferences)
+            new = await persist_new_jobs(jobs)
             counts = await score_pending_jobs(user_id)
             metrics = {
                 "run_id": run_id,
                 "trigger": trigger,
                 "jobs_fetched": len(summary["jobs"]),
+                "title_filtered": sum(title_dropped.values()),
                 "jobs_by_platform": summary["jobs_by_platform"],
                 "boards_failed": len(summary["failures"]),
                 "empty_boards": len(summary["empty_boards"]),
