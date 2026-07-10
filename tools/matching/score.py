@@ -24,6 +24,7 @@ from tools.matching.pipeline import (
     create_match_cache,
     delete_match_cache,
     match_job,
+    parse_jd,
 )
 
 log = get_logger("tools.matching")
@@ -88,6 +89,23 @@ async def load_profile_and_pending(
         if limit and len(pending) >= limit:
             break
     return profile, pending
+
+
+async def persist_jd_parsed(ref, job: Job) -> None:
+    """Persist the parse result the moment it exists, ahead of scoring.
+
+    The Flash parse is paid work; until this write it lives only in process
+    memory, so a scoring failure (or a dead process, in batch mode) re-pays it
+    on the next run — 467 such re-pays observed in the 12K backlog. Best-effort
+    by design: scoring can proceed without the write, so a Firestore hiccup
+    here must not fail the job.
+    """
+    if job.jd_parsed is None:
+        return
+    try:
+        await ref.update({"jd_parsed": job.jd_parsed.model_dump(mode="json")})
+    except Exception:
+        log.warning("matching.persist_jd_parsed_failed", job_id=job.id)
 
 
 async def persist_result(ref, job: Job, match: JobMatch) -> str:
@@ -169,6 +187,11 @@ async def score_pending_jobs(
     async def _score(ref, job: Job) -> None:
         async with sem:
             try:
+                # Parse here (not inside match_job) so the result is durable
+                # before the Pro call gets a chance to fail.
+                if job.jd_parsed is None:
+                    job.jd_parsed = await parse_jd(job)
+                    await persist_jd_parsed(ref, job)
                 match = await match_job(job, profile, cached_content=cache_name)
                 outcome = await persist_result(ref, job, match)
                 counts[outcome] += 1

@@ -54,6 +54,7 @@ from tools.matching.pipeline import (
 from tools.matching.score import (
     OnResult,
     load_profile_and_pending,
+    persist_jd_parsed,
     persist_result,
 )
 
@@ -397,6 +398,22 @@ async def batch_score_pending_jobs(
         )
         for job in join_parse_responses(out_lines, to_parse):
             _fail(job, "parse_jd failed in batch")
+        # Make the Flash spend durable before the Pro stage gets hours to
+        # fail (or this process to die) — the next run then skips stage 1.
+        parsed_now = [
+            job
+            for jobs in to_parse.values()
+            for job in jobs
+            if job.jd_parsed is not None
+        ]
+        psem = asyncio.Semaphore(_PERSIST_CONCURRENCY)
+
+        async def _save_parse(job: Job) -> None:
+            async with psem:
+                await persist_jd_parsed(ref_by_job_id[job.id], job)
+
+        await asyncio.gather(*(_save_parse(job) for job in parsed_now))
+        log.info("matching.batch.parses_persisted", count=len(parsed_now))
 
     # Stage 2 — free local family pre-filter; out-of-family goes straight to
     # tombstones through the same persistence path the online scorer uses.
