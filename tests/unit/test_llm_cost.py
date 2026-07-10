@@ -82,7 +82,9 @@ def test_compute_cost_usd_unknown_model_returns_none() -> None:
 
 
 def test_record_llm_call_extracts_all_token_fields() -> None:
-    fields = record_llm_call(step="matching.score", response=_response(), job_id="job-1")
+    fields = record_llm_call(
+        step="matching.score", response=_response(), job_id="job-1"
+    )
     assert fields["step"] == "matching.score"
     assert fields["job_id"] == "job-1"
     assert fields["model"] == "gemini-3.1-pro-preview"
@@ -105,6 +107,7 @@ def test_record_llm_call_handles_missing_usage_metadata() -> None:
 
 def test_record_llm_call_unknown_model_logs_none_cost() -> None:
     fields = record_llm_call(
-        step="matching.parse_jd", response=_response(model_version="gemini-flash-mystery")
+        step="matching.parse_jd",
+        response=_response(model_version="gemini-flash-mystery"),
     )
     assert fields["cost_usd"] is None

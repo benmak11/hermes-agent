@@ -28,8 +28,7 @@ def list_companies(user_id: str = Depends(verify_user)) -> dict:
     """Return the known / unvetted / blocklist company sets."""
     return {
         "known": {
-            p: [c.model_dump(mode="json") for c in v]
-            for p, v in load_known().items()
+            p: [c.model_dump(mode="json") for c in v] for p, v in load_known().items()
         },
         "unvetted": {
             p: [c.model_dump(mode="json") for c in v]

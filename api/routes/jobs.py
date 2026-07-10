@@ -102,7 +102,10 @@ async def dismiss_skipped_if_posting_removed(user_id: str, job_id: str) -> None:
     """
     task_log = log.bind(user_id=user_id, job_id=job_id, task="skip_validation")
     job_ref = (
-        _client().collection("users").document(user_id).collection("jobs")
+        _client()
+        .collection("users")
+        .document(user_id)
+        .collection("jobs")
         .document(job_id)
     )
     snap = job_ref.get()

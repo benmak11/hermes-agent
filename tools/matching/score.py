@@ -100,8 +100,10 @@ async def persist_result(ref, job: Job, match: JobMatch) -> str:
     if should_discard(match):
         # ref.parent is the jobs collection; its parent is the user doc.
         user_ref = ref.parent.parent
-        await user_ref.collection("discarded_jobs").document(job.id).set(
-            discard_tombstone(job, match)
+        await (
+            user_ref.collection("discarded_jobs")
+            .document(job.id)
+            .set(discard_tombstone(job, match))
         )
         await ref.delete()
         log.info(

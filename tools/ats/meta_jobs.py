@@ -44,9 +44,7 @@ MAX_POSTINGS = 300
 DETAIL_CONCURRENCY = 10
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    )
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
 }
 
 
@@ -170,9 +168,9 @@ async def fetch_meta_jobs(query: str, user_id: str) -> list[Job]:
                 return
             jobs.append(
                 Job(
-                    id=hashlib.sha256(
-                        f"meta_jobs:{source_id}".encode()
-                    ).hexdigest()[:16],
+                    id=hashlib.sha256(f"meta_jobs:{source_id}".encode()).hexdigest()[
+                        :16
+                    ],
                     user_id=user_id,
                     source="meta_jobs",
                     source_id=source_id,

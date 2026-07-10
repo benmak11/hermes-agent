@@ -36,9 +36,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="src", default="me", help="source user_id")
     ap.add_argument("--to", dest="dst", required=True, help="destination user_id (uid)")
-    ap.add_argument(
-        "--dry-run", action="store_true", help="count docs without writing"
-    )
+    ap.add_argument("--dry-run", action="store_true", help="count docs without writing")
     args = ap.parse_args()
 
     if args.src == args.dst:
@@ -49,7 +47,9 @@ def main() -> None:
     # Copy the parent user doc fields (profile pointer, settings, etc.).
     src_doc = db.collection("users").document(args.src).get()
     if src_doc.exists and not args.dry_run:
-        db.collection("users").document(args.dst).set(src_doc.to_dict() or {}, merge=True)
+        db.collection("users").document(args.dst).set(
+            src_doc.to_dict() or {}, merge=True
+        )
 
     jobs = _copy_subcollection(db, args.src, args.dst, "jobs", args.dry_run)
     verb = "would copy" if args.dry_run else "copied"

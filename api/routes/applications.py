@@ -173,9 +173,7 @@ def _backfill_job_url(user_id: str, app: dict) -> dict:
 def list_applications(user_id: str = Depends(verify_user)) -> dict:
     """All applications for the user, newest activity first."""
     apps = [_backfill_job_url(user_id, s.to_dict()) for s in _apps(user_id).stream()]
-    apps.sort(
-        key=lambda a: (a.get("timeline") or [{}])[-1].get("at", ""), reverse=True
-    )
+    apps.sort(key=lambda a: (a.get("timeline") or [{}])[-1].get("at", ""), reverse=True)
     return {"applications": apps}
 
 
@@ -252,9 +250,7 @@ def regenerate(
         },
         merge=True,
     )
-    log.info(
-        "application.regenerate", app_id=app_id, job_id=job_id, user_id=user_id
-    )
+    log.info("application.regenerate", app_id=app_id, job_id=job_id, user_id=user_id)
     background_tasks.add_task(run_tailoring, user_id, job_id)
     return {"ok": True}
 
@@ -308,7 +304,12 @@ async def run_submission(user_id: str, app_id: str) -> None:
             resume_path = download_resume(resume_uri)
 
             result = await submit_application(
-                job, profile, resume_path, dry_run=False, headless=True, on_progress=progress
+                job,
+                profile,
+                resume_path,
+                dry_run=False,
+                headless=True,
+                on_progress=progress,
             )
 
             shots: list[dict] = []
@@ -319,7 +320,12 @@ async def run_submission(user_id: str, app_id: str) -> None:
                 local = result.get(key)
                 if local and os.path.exists(local):
                     shots.append(
-                        {"name": name, "uri": upload_screenshot(Path(local), user_id, job_id, name)}
+                        {
+                            "name": name,
+                            "uri": upload_screenshot(
+                                Path(local), user_id, job_id, name
+                            ),
+                        }
                     )
 
             task_log.info(
@@ -356,7 +362,9 @@ async def run_submission(user_id: str, app_id: str) -> None:
                                 {
                                     "at": _now(),
                                     "status": "failed",
-                                    "note": (result.get("error") or "submission failed")[:300],
+                                    "note": (
+                                        result.get("error") or "submission failed"
+                                    )[:300],
                                 }
                             ]
                         ),
@@ -401,9 +409,7 @@ def submit(
         {
             "status": "submitting",
             "last_submitted_at": _now(),
-            "timeline": firestore.ArrayUnion(
-                [{"at": _now(), "status": "submitting"}]
-            ),
+            "timeline": firestore.ArrayUnion([{"at": _now(), "status": "submitting"}]),
         },
         merge=True,
     )
