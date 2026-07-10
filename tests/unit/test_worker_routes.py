@@ -28,7 +28,9 @@ def test_task_routes_404_without_worker_mode(client, monkeypatch):
     monkeypatch.delenv("WORKER_MODE", raising=False)
     for path in ("/tasks/discovery", "/tasks/sweep"):
         assert client.post(path, json={"user_id": "u1"}).status_code == 404
-    assert client.post("/tasks/score", json={"user_id": "u1"}).status_code == 404
+    for path in ("/tasks/score", "/tasks/batch/start"):
+        assert client.post(path, json={"user_id": "u1"}).status_code == 404
+    assert client.post("/tasks/batch/resume").status_code == 404
 
 
 def test_task_discovery_runs_cycle_inline(client, monkeypatch):
@@ -55,6 +57,77 @@ def test_task_score_returns_counts(client, monkeypatch):
     resp = client.post("/tasks/score", json={"user_id": "u1", "limit": 50})
     assert resp.status_code == 200
     assert resp.json()["scored"] == 3
+
+
+def test_task_batch_start_and_resume_call_through(client, monkeypatch):
+    monkeypatch.setenv("WORKER_MODE", "1")
+    calls = []
+
+    async def fake_start(user_id, *, limit=None):
+        calls.append(("start", user_id, limit))
+        return {"started": True, "run": "r1", "stage": "parse", "pending": 9}
+
+    async def fake_resume():
+        calls.append(("resume",))
+        return {"checked": 1, "running": 0, "advanced": 0, "completed": 1, "failed": 0}
+
+    monkeypatch.setattr(worker.batch_runs, "start", fake_start)
+    monkeypatch.setattr(worker.batch_runs, "resume", fake_resume)
+
+    resp = client.post("/tasks/batch/start", json={"user_id": "u1", "limit": 9})
+    assert resp.status_code == 200 and resp.json()["run"] == "r1"
+    resp = client.post("/tasks/batch/resume")
+    assert resp.status_code == 200 and resp.json()["completed"] == 1
+    assert calls == [("start", "u1", 9), ("resume",)]
+
+
+def test_cron_tick_enqueues_batch_resume_only_when_runs_in_flight(monkeypatch):
+    monkeypatch.setenv("WORKER_MODE", "1")
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    enqueued = []
+    monkeypatch.setattr(
+        discovery.queues,
+        "enqueue",
+        lambda q, p, b, *, task_id=None: enqueued.append((q, p, task_id)) or True,
+    )
+
+    class _FakeQuery:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def where(self, filter=None):
+            return self
+
+        def limit(self, n):
+            return self
+
+        def get(self):
+            return self._docs
+
+    class _FakeClient:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def collection(self, name):
+            assert name == "batch_runs"
+            return _FakeQuery(self._docs)
+
+    monkeypatch.setattr(discovery, "_client", lambda: _FakeClient([]))
+    assert discovery.maybe_enqueue_batch_resume() is False
+    assert enqueued == []
+
+    monkeypatch.setattr(discovery, "_client", lambda: _FakeClient([object()]))
+    assert discovery.maybe_enqueue_batch_resume() is True
+    queue, path, task_id = enqueued[0]
+    assert (queue, path) == ("score", "/tasks/batch/resume")
+    assert task_id.startswith("batch-resume-") and len(task_id.split("-")[-1]) == 10
+
+    # Not on the worker (or queues off): the tick never touches Firestore.
+    monkeypatch.delenv("WORKER_MODE")
+    monkeypatch.setattr(
+        discovery, "_client", lambda: (_ for _ in ()).throw(AssertionError)
+    )
+    assert discovery.maybe_enqueue_batch_resume() is False
 
 
 def test_dispatch_cycle_enqueues_when_queue_mode_on(monkeypatch):

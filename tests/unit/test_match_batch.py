@@ -250,14 +250,28 @@ def test_run_batch_raises_on_failed_job(monkeypatch):
 
     class _FakeBatches:
         async def create(self, *, model, src, config):
+            # Real Vertex creates PENDING; _run_batch learns terminal state
+            # only from polls, so failure must come back through get().
             return SimpleNamespace(
                 name="batch/123",
+                state=types.JobState.JOB_STATE_PENDING,
+                error=None,
+            )
+
+        async def get(self, *, name):
+            return SimpleNamespace(
+                name=name,
                 state=types.JobState.JOB_STATE_FAILED,
                 error="quota",
             )
 
     fake = SimpleNamespace(aio=SimpleNamespace(batches=_FakeBatches()))
     monkeypatch.setattr(batch.genai, "Client", lambda **kw: fake)
+
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr(batch.asyncio, "sleep", _no_sleep)
 
     with pytest.raises(RuntimeError, match="quota"):
         asyncio.run(

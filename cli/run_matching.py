@@ -6,10 +6,18 @@ Score pending, unscored jobs against the user's profile and persist the result.
 Usage:
     python -m cli.run_matching --user-id me [--limit N] [--concurrency K]
     python -m cli.run_matching --user-id me --batch [--poll-seconds S]
+    python -m cli.run_matching --user-id me --batch-async
+    python -m cli.run_matching --user-id me --batch-resume
 
 ``--batch`` runs the LLM legs as Vertex batch prediction jobs — half price on
 both models, but async: expect minutes to hours before results land. Right
 for big backlogs, wrong for "score what discovery just found".
+
+``--batch-async`` is the fire-and-forget version: submit a resumable run
+(tracked in the ``batch_runs`` collection) and exit; the hermes-worker's
+hourly ticks poll and ingest it. ``--batch-resume`` runs one such
+poll-and-ingest pass locally, for watching a run land without waiting on the
+worker.
 """
 
 import argparse
@@ -20,6 +28,7 @@ from dotenv import load_dotenv
 from models.job import Job
 from models.match import JobMatch
 from obs.logging import bind_run_context
+from tools.matching import batch_runs
 from tools.matching.batch import batch_score_pending_jobs
 from tools.matching.score import score_pending_jobs
 
@@ -54,8 +63,41 @@ async def main() -> None:
         default=60,
         help="Batch mode: how often to poll the batch job state",
     )
+    parser.add_argument(
+        "--batch-async",
+        action="store_true",
+        help="Submit a resumable batch run and exit; worker ticks ingest it",
+    )
+    parser.add_argument(
+        "--batch-resume",
+        action="store_true",
+        help="One resume pass over in-flight batch runs, then exit",
+    )
     args = parser.parse_args()
     bind_run_context("matching", user_id=args.user_id)
+
+    if args.batch_resume:
+        summary = await batch_runs.resume(user_id=args.user_id)
+        print(
+            f"✓ Checked {summary['checked']} run(s): {summary['running']} still "
+            f"running, {summary['advanced']} advanced to scoring, "
+            f"{summary['completed']} completed, {summary['failed']} failed"
+        )
+        return
+
+    if args.batch_async:
+        result = await batch_runs.start(args.user_id, limit=args.limit)
+        counts = result["counts"]
+        print(
+            f"✓ Batch run {result['run']} submitted at stage "
+            f"{result['stage']!r} for {result['pending']} pending job(s)"
+            f" ({counts['discarded']} tombstoned pre-submit)."
+        )
+        print(
+            "  The worker's hourly ticks will ingest it; or run "
+            "--batch-resume to poll now."
+        )
+        return
 
     try:
         if args.batch:
