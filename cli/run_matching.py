@@ -77,6 +77,12 @@ async def main() -> None:
                 on_result=_print_result,
             )
     except ValueError as e:
+        # Only the missing-profile ValueError gets the friendly exit;
+        # JSONDecodeError is also a ValueError and must surface as itself
+        # (a batch run once died mid-poll and was misreported as "no
+        # profile" by this handler).
+        if "No profile" not in str(e):
+            raise
         raise SystemExit(f"{e} Run `cli.sync_profile` first.") from None
     print(
         f"✓ Scored {counts['scored']}, discarded {counts['discarded']},"

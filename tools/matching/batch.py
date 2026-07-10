@@ -240,7 +240,15 @@ async def _run_batch(
                 "Vertex console; its output can be ingested by a later run."
             )
         await asyncio.sleep(poll_seconds)
-        job = await client.aio.batches.get(name=job.name)
+        try:
+            job = await client.aio.batches.get(name=job.name)
+        except Exception as e:
+            # One flaky poll (network blip, truncated JSON body — seen live
+            # 2026-07-10) must not kill an hours-long run; keep the last known
+            # state and ask again next tick. The deadline still bounds us.
+            log.warning(
+                "matching.batch.poll_retry", name=job.name, error=str(e)[:200]
+            )
     if job.state not in _USABLE_STATES:
         raise RuntimeError(f"Batch job {job.name} ended {job.state}: {job.error}")
 
@@ -249,7 +257,11 @@ async def _run_batch(
         if not blob.name.endswith(".jsonl"):
             continue
         text = await asyncio.to_thread(blob.download_as_text)
-        out_lines.extend(json.loads(raw) for raw in text.splitlines() if raw.strip())
+        # JSONL's delimiter is strictly "\n" — echoed JD text can contain
+        # U+2028/U+2029, which Vertex leaves unescaped and str.splitlines()
+        # treats as line breaks, shattering a JSON line mid-string (crashed a
+        # live run 2026-07-10).
+        out_lines.extend(json.loads(raw) for raw in text.split("\n") if raw.strip())
     log.info(
         "matching.batch.job_done",
         name=job.name,

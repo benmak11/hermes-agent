@@ -162,8 +162,12 @@ def test_record_llm_call_carries_batch_flag():
 
 
 def test_run_batch_polls_to_success_and_reads_output(monkeypatch):
-    lines_in = [batch.build_parse_request("JD text")]
-    out_line = _output_line("JD text", "{}")
+    # The JD carries U+2028: Vertex echoes it unescaped in the output JSONL,
+    # and str.splitlines() would shatter the line mid-string (seen live) —
+    # only "\n" delimits JSONL.
+    jd_text = "JD line one\u2028still the same JD"
+    lines_in = [batch.build_parse_request(jd_text)]
+    out_line = _output_line(jd_text, "{}")
     uploaded = {}
 
     class _FakeBlob:
@@ -174,7 +178,7 @@ def test_run_batch_polls_to_success_and_reads_output(monkeypatch):
             uploaded[self.name] = payload
 
         def download_as_text(self):
-            return json.dumps(out_line) + "\n"
+            return json.dumps(out_line, ensure_ascii=False) + "\n"
 
     class _FakeBucket:
         def blob(self, name):
