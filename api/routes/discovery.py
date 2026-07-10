@@ -28,6 +28,7 @@ from google.cloud import firestore
 from api.deps import verify_user
 from models.settings import DiscoverySettings
 from obs.logging import get_logger, run_context
+from tools import queues
 from tools.ats.sweep import sweep_postings
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
@@ -146,6 +147,29 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
             log.exception("sweep.failed")
 
 
+async def dispatch_cycle(kind: str, user_id: str, *, trigger: str) -> bool:
+    """Run a discovery/sweep cycle — on the worker via queue when enabled.
+
+    With QUEUE_MODE on, the cycle becomes a named Cloud Tasks task pushed to
+    the worker service: hour-granular ids for scheduled work (one per user
+    per hour no matter how many triggers race) and minute-granular ids for
+    manual runs (double-click dedupe). Returns False when the queue deduped.
+    Without QUEUE_MODE the cycle runs in-process, exactly as before.
+    """
+    if queues.enabled():
+        now = _now()
+        grain = "%Y%m%d%H%M" if trigger == "manual" else "%Y%m%d%H"
+        return queues.enqueue(
+            "discovery",
+            f"/tasks/{kind}",
+            {"user_id": user_id, "trigger": trigger},
+            task_id=f"{trigger}-{kind}-{user_id}-{now.strftime(grain)}",
+        )
+    cycle = run_discovery_cycle if kind == "discovery" else run_sweep_cycle
+    await cycle(user_id, trigger=trigger)
+    return True
+
+
 async def tick_user(user_id: str, *, force_check: bool = False) -> None:
     """Run whichever opted-in loops are due for this user.
 
@@ -172,7 +196,7 @@ async def tick_user(user_id: str, *, force_check: bool = False) -> None:
         _user_ref(user_id).set(
             {"discovery_state": {"last_discovery_at": now.isoformat()}}, merge=True
         )
-        await run_discovery_cycle(user_id, trigger=trigger)
+        await dispatch_cycle("discovery", user_id, trigger=trigger)
 
     if settings.liveness_sweep and _due(
         state.get("last_sweep_at"), settings.sweep_interval_hours, now
@@ -181,7 +205,7 @@ async def tick_user(user_id: str, *, force_check: bool = False) -> None:
         _user_ref(user_id).set(
             {"discovery_state": {"last_sweep_at": now.isoformat()}}, merge=True
         )
-        await run_sweep_cycle(user_id, trigger=trigger)
+        await dispatch_cycle("sweep", user_id, trigger=trigger)
 
 
 @router.get("/settings/discovery")
@@ -220,21 +244,28 @@ def save_discovery_settings(
 
 
 @router.post("/settings/discovery/run")
-def run_discovery_now(
+async def run_discovery_now(
     background_tasks: BackgroundTasks, user_id: str = Depends(verify_user)
 ) -> dict:
     """Explicit user action: run discovery + scoring immediately."""
     log.info("discovery.run_now", user_id=user_id)
+    if queues.enabled():
+        queued = await dispatch_cycle("discovery", user_id, trigger="manual")
+        return {"ok": True, "deduped": not queued}
+    # No queue infra: run in-process, after the response goes out.
     background_tasks.add_task(run_discovery_cycle, user_id, trigger="manual")
     return {"ok": True}
 
 
 @router.post("/settings/discovery/sweep")
-def run_sweep_now(
+async def run_sweep_now(
     background_tasks: BackgroundTasks, user_id: str = Depends(verify_user)
 ) -> dict:
     """Explicit user action: run the liveness sweep immediately."""
     log.info("sweep.run_now", user_id=user_id)
+    if queues.enabled():
+        queued = await dispatch_cycle("sweep", user_id, trigger="manual")
+        return {"ok": True, "deduped": not queued}
     background_tasks.add_task(run_sweep_cycle, user_id, trigger="manual")
     return {"ok": True}
 
@@ -247,13 +278,17 @@ def cron_tick(
     """External scheduler entry point (Cloud Scheduler / GH Actions cron).
 
     Ticks every user; per-user settings decide whether anything actually runs.
-    Guarded by the ``CRON_SECRET`` env var — unset disables the endpoint.
+    On the worker service no app-level guard is needed: the service is
+    private, so Cloud Run has already verified the scheduler's OIDC token.
+    Elsewhere (public hermes-api) the ``CRON_SECRET`` header guards it —
+    unset disables the endpoint.
     """
-    secret = os.getenv("CRON_SECRET")
-    if not secret:
-        raise HTTPException(status_code=503, detail="cron not configured")
-    if x_cron_secret != secret:
-        raise HTTPException(status_code=403, detail="forbidden")
+    if not queues.worker_mode():
+        secret = os.getenv("CRON_SECRET")
+        if not secret:
+            raise HTTPException(status_code=503, detail="cron not configured")
+        if x_cron_secret != secret:
+            raise HTTPException(status_code=403, detail="forbidden")
     users = [snap.id for snap in _client().collection("users").stream()]
     for uid in users:
         background_tasks.add_task(tick_user, uid, force_check=True)

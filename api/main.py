@@ -23,6 +23,7 @@ from api.routes import companies as companies_routes
 from api.routes import discovery as discovery_routes
 from api.routes import jobs as jobs_routes
 from api.routes import profile as profile_routes
+from api.routes import worker as worker_routes
 from obs.logging import configure_logging, get_logger
 
 # Load local .env for dev (GOOGLE_CLOUD_*, AUTH_DEV_MODE, WEB_ORIGINS). No-op in
@@ -99,6 +100,8 @@ app.include_router(companies_routes.router)
 app.include_router(applications_routes.router)
 app.include_router(profile_routes.router)
 app.include_router(discovery_routes.router)
+# /tasks/* handlers; they 404 unless this deployment sets WORKER_MODE=1.
+app.include_router(worker_routes.router)
 
 
 @app.post("/feedback")
