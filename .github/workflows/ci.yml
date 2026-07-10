@@ -122,6 +122,7 @@ jobs:
     env:
       GCP_PROJECT: hermes-agent-btm-001
       GCP_REGION: us-central1
+      IMAGE: us-central1-docker.pkg.dev/hermes-agent-btm-001/hermes/hermes-api
     steps:
       - uses: actions/checkout@v4
 
@@ -135,13 +136,50 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2
 
+      # Build in Actions with a layer cache instead of `deploy --source`
+      # (Cloud Build), which re-pulled the ~2GB Playwright base and re-ran
+      # `uv sync` from scratch on every deploy. With warm caches a code-only
+      # change rebuilds only the COPY layers.
+      - name: Authenticate Docker to Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Deploy hermes-api
         run: |
           gcloud run deploy hermes-api \
-            --source . \
+            --image "$IMAGE:${{ github.sha }}" \
             --region "$GCP_REGION" \
             --project "$GCP_PROJECT" \
             --quiet
+
+      # hermes-worker runs the same image (WORKER_MODE=1 is what makes it the
+      # worker). Its first deploy is manual — see worker.tf — so skip until
+      # the service exists rather than create it here with default flags.
+      - name: Deploy hermes-worker (same image)
+        run: |
+          if gcloud run services describe hermes-worker \
+               --region "$GCP_REGION" --project "$GCP_PROJECT" \
+               --format 'value(metadata.name)' >/dev/null 2>&1; then
+            gcloud run deploy hermes-worker \
+              --image "$IMAGE:${{ github.sha }}" \
+              --region "$GCP_REGION" \
+              --project "$GCP_PROJECT" \
+              --quiet
+          else
+            echo "hermes-worker not created yet; skipping (first deploy is manual)"
+          fi
 
   deploy-web:
     name: Deploy hermes-web

@@ -14,7 +14,13 @@ locals {
     "cloudtrace.googleapis.com",
     "telemetry.googleapis.com",
     "sqladmin.googleapis.com",
-    "secretmanager.googleapis.com"
+    "secretmanager.googleapis.com",
+    # Phase B (queues + worker + scheduler + image registry). Appended at the
+    # end on purpose: google_project_service.services is count-indexed, so
+    # inserting earlier would re-key (destroy/recreate) existing entries.
+    "cloudtasks.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "artifactregistry.googleapis.com"
   ]
 }
 
