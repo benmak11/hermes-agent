@@ -54,10 +54,14 @@ async def main() -> None:
             kept += 1
             continue
         job = Job.model_validate(d)
-        print(f"  discard  {match.overall_score:5.0f}  {job.company} - {job.title[:50]}")
+        print(
+            f"  discard  {match.overall_score:5.0f}  {job.company} - {job.title[:50]}"
+        )
         if not args.dry_run:
-            await user_ref.collection("discarded_jobs").document(job.id).set(
-                discard_tombstone(job, match)
+            await (
+                user_ref.collection("discarded_jobs")
+                .document(job.id)
+                .set(discard_tombstone(job, match))
             )
             await snap.reference.delete()
         moved += 1
@@ -65,7 +69,10 @@ async def main() -> None:
     verb = "would move" if args.dry_run else "moved"
     print(f"✓ {verb} {moved} to discarded_jobs; kept {kept}, unscored {unscored}")
     log.info(
-        "purge_discarded.done", moved=moved, kept=kept, unscored=unscored,
+        "purge_discarded.done",
+        moved=moved,
+        kept=kept,
+        unscored=unscored,
         dry_run=args.dry_run,
     )
 

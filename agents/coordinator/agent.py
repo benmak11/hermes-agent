@@ -23,9 +23,7 @@ def create_coordinator() -> Agent:
     return Agent(
         name="Coordinator",
         model=flash(),
-        description=(
-            "Coordinates the end-to-end job discovery and application flow."
-        ),
+        description=("Coordinates the end-to-end job discovery and application flow."),
         instruction=(
             "You are the coordinator for hermes, a job discovery and "
             "application assistant. Orchestrate the workflow by delegating to "

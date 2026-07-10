@@ -197,7 +197,9 @@ def build_match_job_block(job: Job) -> str:
         company=job.company,
         title=job.title,
         location=job.location or "unspecified",
-        parsed_jd_json=job.jd_parsed.model_dump_json(indent=2) if job.jd_parsed else "{}",
+        parsed_jd_json=job.jd_parsed.model_dump_json(indent=2)
+        if job.jd_parsed
+        else "{}",
         jd_text=job.jd_raw[:4000],  # truncate
     )
 
@@ -367,9 +369,7 @@ async def match_job(
                 # uncached, so re-raise rather than double-spend on it.
                 if "cach" not in str(e).lower():
                     raise
-                job_log.warning(
-                    "matching.score.cache_fallback", error=str(e)[:200]
-                )
+                job_log.warning("matching.score.cache_fallback", error=str(e)[:200])
                 contents, cfg = _uncached_args()
                 response = await client.aio.models.generate_content(
                     model=PRO_MODEL, contents=contents, config=cfg

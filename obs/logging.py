@@ -220,7 +220,9 @@ def run_context(runner: str, **kwargs: Any) -> Iterator[str]:
     block and restores the previous context on exit. Yields the ``run_id``.
     """
     run_id = new_request_id()
-    with structlog.contextvars.bound_contextvars(run_id=run_id, runner=runner, **kwargs):
+    with structlog.contextvars.bound_contextvars(
+        run_id=run_id, runner=runner, **kwargs
+    ):
         yield run_id
 
 

@@ -38,9 +38,7 @@ MAX_JOBS = 100  # pages are sequential fetches; cap the crawl per query
 # The results page serves a consent interstitial to clients without a
 # browser-looking User-Agent.
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    )
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
 }
 
 # Listing-entry field offsets in the ds:1 blob (verified live).
@@ -153,7 +151,5 @@ async def fetch_google_jobs(query: str, user_id: str) -> list[Job]:
                 break
             page += 1
     if total and total > MAX_JOBS:
-        log.info(
-            "ats.google_jobs.capped", slug=query, total=total, fetched=len(jobs)
-        )
+        log.info("ats.google_jobs.capped", slug=query, total=total, fetched=len(jobs))
     return jobs[:MAX_JOBS]

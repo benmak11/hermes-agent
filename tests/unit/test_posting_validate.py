@@ -37,9 +37,7 @@ def _transport(
     def handler(request: httpx.Request) -> httpx.Response:
         if seen is not None:
             seen.append(str(request.url))
-        return httpx.Response(
-            status, json=json_body if json_body is not None else {}
-        )
+        return httpx.Response(status, json=json_body if json_body is not None else {})
 
     return httpx.MockTransport(handler)
 
@@ -120,7 +118,5 @@ async def test_ashby_unparseable_board_fails_open() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="not json")
 
-    res = await check_posting(
-        _job("ashby"), transport=httpx.MockTransport(handler)
-    )
+    res = await check_posting(_job("ashby"), transport=httpx.MockTransport(handler))
     assert res == "unknown"

@@ -181,9 +181,7 @@ def _response_of(line: dict, model: str) -> types.GenerateContentResponse | None
     candidates = resp.get("candidates") or []
     slim = {
         "candidates": [
-            {"content": c.get("content")}
-            for c in candidates[:1]
-            if isinstance(c, dict)
+            {"content": c.get("content")} for c in candidates[:1] if isinstance(c, dict)
         ],
         "usageMetadata": resp.get("usageMetadata"),
         "modelVersion": resp.get("modelVersion") or model,
@@ -246,9 +244,7 @@ async def _run_batch(
             # One flaky poll (network blip, truncated JSON body — seen live
             # 2026-07-10) must not kill an hours-long run; keep the last known
             # state and ask again next tick. The deadline still bounds us.
-            log.warning(
-                "matching.batch.poll_retry", name=job.name, error=str(e)[:200]
-            )
+            log.warning("matching.batch.poll_retry", name=job.name, error=str(e)[:200])
     if job.state not in _USABLE_STATES:
         raise RuntimeError(f"Batch job {job.name} ended {job.state}: {job.error}")
 
@@ -341,9 +337,7 @@ def join_score_responses(
             m = match.model_copy(deep=True)
             m.job_id = job.id
             matches[job.id] = m
-    failed = [
-        j for jobs in by_block.values() for j in jobs if j.id not in matches
-    ]
+    failed = [j for jobs in by_block.values() for j in jobs if j.id not in matches]
     return matches, failed
 
 
@@ -367,9 +361,7 @@ async def batch_score_pending_jobs(
     started = time.monotonic()
     run_tag = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     gcs_root = f"gs://{batch_bucket_name()}/vertex-batch/{run_tag}"
-    log.info(
-        "matching.batch.start", pending=len(pending), gcs=gcs_root, mode="batch"
-    )
+    log.info("matching.batch.start", pending=len(pending), gcs=gcs_root, mode="batch")
     if not pending:
         return counts
 

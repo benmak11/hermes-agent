@@ -58,7 +58,9 @@ def main():
     print(f"  - {sum(len(v) for v in profile.skills.values())} skills")
     print()
     print("⚠ Now manually review data/profile.yaml. The LLM will get some tags wrong.")
-    print("  Pay particular attention to: bullet tags, preferences (likely empty), objective_template.")
+    print(
+        "  Pay particular attention to: bullet tags, preferences (likely empty), objective_template."
+    )
 
 
 if __name__ == "__main__":

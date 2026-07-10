@@ -60,9 +60,7 @@ def _select_template(profile: MasterProfile, job: Job) -> str:
 async def generate_objective(profile: MasterProfile, job: Job) -> str:
     """Generate a tailored, ~2-sentence objective for this job."""
     template = _select_template(profile, job)
-    jd_summary = (
-        job.jd_parsed.summary if job.jd_parsed else job.jd_raw[:1000]
-    )
+    jd_summary = job.jd_parsed.summary if job.jd_parsed else job.jd_raw[:1000]
 
     client = genai.Client(vertexai=True)
     response = await client.aio.models.generate_content(

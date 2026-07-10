@@ -15,6 +15,10 @@ from pathlib import Path
 
 from docx import Document
 
+# `Document` above is a factory *function*; the object it returns lives in
+# docx.document, and that's the only valid name for annotations.
+from docx.document import Document as DocxDocument
+
 from models.profile import Experience, MasterProfile
 
 
@@ -28,7 +32,7 @@ def build_resume_doc(
     profile: MasterProfile,
     experience: list[Experience],
     objective: str,
-) -> Document:
+) -> DocxDocument:
     """Build (but do not save) the tailored resume document."""
     doc = Document()
 
@@ -59,9 +63,13 @@ def build_resume_doc(
         doc.add_heading("Education", level=1)
         for edu in profile.education:
             years = (
-                f"{edu.start_year}-{edu.end_year}" if edu.end_year else f"{edu.start_year}"
+                f"{edu.start_year}-{edu.end_year}"
+                if edu.end_year
+                else f"{edu.start_year}"
             )
-            doc.add_paragraph(f"{edu.degree}, {edu.field} — {edu.institution} ({years})")
+            doc.add_paragraph(
+                f"{edu.degree}, {edu.field} — {edu.institution} ({years})"
+            )
 
     if profile.skills:
         doc.add_heading("Skills", level=1)

@@ -23,7 +23,8 @@ def test_score_bullet_weights() -> None:
     assert score_bullet(Bullet(text="x", tags=["python", "aws"]), jd) == 6.0
     # One preferred (1.5) + quantified impact bonus (0.5) = 2.0
     assert (
-        score_bullet(Bullet(text="x", tags=["docker"], impact="cut cost 50%"), jd) == 2.0
+        score_bullet(Bullet(text="x", tags=["docker"], impact="cut cost 50%"), jd)
+        == 2.0
     )
     # No overlap, no impact = 0.0
     assert score_bullet(Bullet(text="x", tags=["banjo"]), jd) == 0.0

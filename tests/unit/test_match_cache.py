@@ -162,9 +162,7 @@ def test_non_cache_error_does_not_double_spend(monkeypatch):
     models = _FakeModels(errors=[Exception("429 RESOURCE_EXHAUSTED")])
     _install_fake_client(monkeypatch, models)
     with pytest.raises(Exception, match="429"):
-        asyncio.run(
-            pipeline.match_job(_job(), _profile(), cached_content="caches/abc")
-        )
+        asyncio.run(pipeline.match_job(_job(), _profile(), cached_content="caches/abc"))
     assert len(models.calls) == 1  # no uncached retry on a non-cache error
 
 

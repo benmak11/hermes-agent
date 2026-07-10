@@ -69,7 +69,10 @@ _BATCH_DISCOUNT = 0.5
 
 
 def _rates(model: str, prompt_tokens: int) -> dict[str, float] | None:
-    if prompt_tokens > _LONG_CONTEXT_THRESHOLD and model in _LONG_CONTEXT_PRICING_PER_MILLION:
+    if (
+        prompt_tokens > _LONG_CONTEXT_THRESHOLD
+        and model in _LONG_CONTEXT_PRICING_PER_MILLION
+    ):
         return _LONG_CONTEXT_PRICING_PER_MILLION[model]
     return _PRICING_PER_MILLION.get(model)
 

@@ -15,8 +15,7 @@ def create_application_agent() -> Agent:
         name="Application",
         model=computer_use_model(),
         description=(
-            "Submits job applications by operating a web browser via Computer "
-            "Use."
+            "Submits job applications by operating a web browser via Computer Use."
         ),
         instruction=(
             "You submit job applications on behalf of the candidate by "

@@ -12,8 +12,7 @@ def create_tailoring_agent() -> Agent:
         name="Tailoring",
         model=flash(),
         description=(
-            "Tailors the candidate's resume and cover letter to a specific job "
-            "posting."
+            "Tailors the candidate's resume and cover letter to a specific job posting."
         ),
         instruction=(
             "Given the shortlisted matches ({matched_jobs?}) and the "

@@ -118,7 +118,7 @@ async def _detect_captcha(page: Page) -> bool:
     for sel in (
         'iframe[src*="recaptcha"]',
         'iframe[title*="captcha" i]',
-        'div.g-recaptcha',
+        "div.g-recaptcha",
         'iframe[src*="hcaptcha"]',
     ):
         if await page.locator(sel).count():
@@ -210,22 +210,22 @@ async def submit_greenhouse(
             fields_stuck = False
             for _ in range(5):
                 await _fill_first(
-                    page, ['input#first_name', 'input[name="first_name"]'], first
+                    page, ["input#first_name", 'input[name="first_name"]'], first
                 )
                 await _fill_first(
-                    page, ['input#last_name', 'input[name="last_name"]'], last
+                    page, ["input#last_name", 'input[name="last_name"]'], last
                 )
                 await _fill_first(
-                    page, ['input#email', 'input[name="email"]'], profile.email
+                    page, ["input#email", 'input[name="email"]'], profile.email
                 )
                 if profile.phone:
                     await _fill_first(
-                        page, ['input#phone', 'input[name="phone"]'], profile.phone
+                        page, ["input#phone", 'input[name="phone"]'], profile.phone
                     )
                 # Semi-standard field on some boards; harmless when absent.
                 await _fill_first(
                     page,
-                    ['input#preferred_name', 'input[name="preferred_name"]'],
+                    ["input#preferred_name", 'input[name="preferred_name"]'],
                     first,
                 )
                 await page.wait_for_timeout(1500)
@@ -278,7 +278,9 @@ async def submit_greenhouse(
                 }
 
             if dry_run:
-                await _emit(on_progress, "Dry run — stopped before Submit", "ready_for_review")
+                await _emit(
+                    on_progress, "Dry run — stopped before Submit", "ready_for_review"
+                )
                 job_log.info("submit.dry_run_ok")
                 return {
                     "success": True,
@@ -311,7 +313,9 @@ async def submit_greenhouse(
             await page.screenshot(path=confirm_path, full_page=True)
             await _emit(
                 on_progress,
-                "Confirmation detected" if confirmed else "Submitted (no confirmation text found)",
+                "Confirmation detected"
+                if confirmed
+                else "Submitted (no confirmation text found)",
                 "submitted" if confirmed else "submitting",
             )
             job_log.info("submit.complete", confirmed=confirmed)

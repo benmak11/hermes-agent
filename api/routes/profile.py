@@ -113,9 +113,7 @@ async def extract(
 
 
 @router.put("/profile")
-def save_profile(
-    body: MasterProfile, user_id: str = Depends(verify_user)
-) -> dict:
+def save_profile(body: MasterProfile, user_id: str = Depends(verify_user)) -> dict:
     """Persist the reviewed/edited profile and mark onboarding complete.
 
     The body is validated as a full :class:`MasterProfile`; ``user_id`` is forced

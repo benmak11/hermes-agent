@@ -42,7 +42,10 @@ def _af_page(key: str, data: object) -> str:
 
 
 def test_extract_ds_balanced_and_missing() -> None:
-    page = _af_page("ds:1", [["a[b]c", '"quoted \\" ]']], )
+    page = _af_page(
+        "ds:1",
+        [["a[b]c", '"quoted \\" ]']],
+    )
     assert extract_ds(page, "ds:1") == [["a[b]c", '"quoted \\" ]']]
     assert extract_ds(page, "ds:0") is None
 
@@ -157,9 +160,7 @@ async def test_fetch_meta_jobs_end_to_end(monkeypatch) -> None:
     search_payload = {
         "data": {
             "job_search_with_featured_jobs": {
-                "all_jobs": [
-                    {"id": "111", "title": "SWE", "locations": ["Austin, TX"]}
-                ]
+                "all_jobs": [{"id": "111", "title": "SWE", "locations": ["Austin, TX"]}]
             }
         }
     }
@@ -180,9 +181,7 @@ async def test_fetch_meta_jobs_end_to_end(monkeypatch) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":  # the /jobsearch/ page with the LSD token
-            return httpx.Response(
-                200, text='... "LSD",[],{"token":"tok123"} ...'
-            )
+            return httpx.Response(200, text='... "LSD",[],{"token":"tok123"} ...')
         body = request.content.decode()
         assert "lsd=tok123" in body
         if "27506805582236862" in body:
