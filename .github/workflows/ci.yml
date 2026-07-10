@@ -68,16 +68,53 @@ jobs:
           NEXT_PUBLIC_FIREBASE_APP_ID: 1:812714701339:web:d258dd8cc3084a76f23ebe
           NEXT_PUBLIC_API_BASE: https://hermes-api-812714701339.us-central1.run.app
 
-  deploy:
-    name: Build & deploy (api + web)
+  changes:
+    name: Detect what changed
     # Merge-to-main (or manual dispatch on main) only, and only when both
-    # gates are green — replaces the old standalone deploy.yml, which fired
-    # on every main push regardless of CI status.
+    # gates are green — the deploy jobs below replace the old standalone
+    # deploy.yml, which fired on every main push regardless of CI status.
+    # Most merges touch one side only, so each service deploys only when its
+    # own inputs changed; a manual dispatch always deploys both.
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: [backend, web]
     runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          # base == the pushed branch, so the diff covers exactly the commits
+          # in this push (i.e. the merged PR).
+          base: main
+          # The api list is everything the API image's Dockerfile COPYs, plus
+          # the Dockerfile itself. Keep in sync with /Dockerfile.
+          filters: |
+            api:
+              - "agents/**"
+              - "api/**"
+              - "models/**"
+              - "tools/**"
+              - "cli/**"
+              - "obs/**"
+              - "pyproject.toml"
+              - "uv.lock"
+              - "Dockerfile"
+              - "README.md"
+            web:
+              - "web/**"
+
+  deploy-api:
+    name: Deploy hermes-api
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.api == 'true')
+    needs: [backend, web, changes]
+    runs-on: ubuntu-latest
     concurrency:
-      group: deploy-main
+      group: deploy-api
       cancel-in-progress: false
     permissions:
       contents: read
@@ -105,6 +142,35 @@ jobs:
             --region "$GCP_REGION" \
             --project "$GCP_PROJECT" \
             --quiet
+
+  deploy-web:
+    name: Deploy hermes-web
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.web == 'true')
+    needs: [backend, web, changes]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-web
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # required for Workload Identity Federation
+    env:
+      GCP_PROJECT: hermes-agent-btm-001
+      GCP_REGION: us-central1
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Deploy hermes-web
         run: |
