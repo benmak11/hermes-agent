@@ -68,7 +68,9 @@ async def run_discovery(user_id: str) -> dict:
     jobs_by_platform: Counter[str] = Counter()
 
     for (platform, slug, source), result in zip(companies, results, strict=True):
-        if isinstance(result, Exception):
+        # gather(return_exceptions=True) can hand back BaseExceptions too;
+        # narrowing to Exception would leave those to crash the unpack below.
+        if isinstance(result, BaseException):
             # HTTP failures are already logged (and absorbed) by the fetchers;
             # an exception here is a parse/programmer error worth a traceback.
             log.error(
@@ -126,9 +128,7 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
             user_ref = db.collection("users").document(job.user_id)
             doc_ref = user_ref.collection("jobs").document(job.id)
             discarded_ref = user_ref.collection("discarded_jobs").document(job.id)
-            snap, discarded = await asyncio.gather(
-                doc_ref.get(), discarded_ref.get()
-            )
+            snap, discarded = await asyncio.gather(doc_ref.get(), discarded_ref.get())
             if discarded.exists:
                 counter["discarded"] += 1
                 return

@@ -1,18 +1,23 @@
-# CI: lint + tests on every PR (and pushes to main). No cloud credentials needed.
+# CI + deploy. Lint/type/test gates run on every PR and on pushes to main;
+# the deploy job runs only on main and only after both gates pass, so a red
+# build can never reach Cloud Run. PR runs need no cloud credentials.
 name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch: # manual deploy: run on main, gates re-run first
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Dedupe force-push spam on PRs, but never cancel a main run — killing an
+  # in-flight gcloud deploy mid-rollout is worse than a queued duplicate.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   backend:
-    name: Backend (ruff + unit tests)
+    name: Backend (ruff + ty + codespell + unit tests)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +26,17 @@ jobs:
         with:
           enable-cache: true
       - name: Sync deps
-        run: uv sync --all-groups --frozen
+        # --extra lint pulls the pinned ruff/ty/codespell from uv.lock so CI
+        # checks with the same versions developers get, not floating uvx ones.
+        run: uv sync --all-groups --extra lint --frozen
       - name: Lint
-        run: uvx ruff check agents api models tools cli obs
+        run: uv run ruff check .
+      - name: Format check
+        run: uv run ruff format --check .
+      - name: Type check
+        run: uv run ty check
+      - name: Spell check
+        run: uv run codespell
       - name: Unit tests
         run: uv run pytest tests/unit -q
 
@@ -54,3 +67,49 @@ jobs:
           NEXT_PUBLIC_FIREBASE_PROJECT_ID: hermes-agent-btm-001
           NEXT_PUBLIC_FIREBASE_APP_ID: 1:812714701339:web:d258dd8cc3084a76f23ebe
           NEXT_PUBLIC_API_BASE: https://hermes-api-812714701339.us-central1.run.app
+
+  deploy:
+    name: Build & deploy (api + web)
+    # Merge-to-main (or manual dispatch on main) only, and only when both
+    # gates are green — replaces the old standalone deploy.yml, which fired
+    # on every main push regardless of CI status.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [backend, web]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-main
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # required for Workload Identity Federation
+    env:
+      GCP_PROJECT: hermes-agent-btm-001
+      GCP_REGION: us-central1
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy hermes-api
+        run: |
+          gcloud run deploy hermes-api \
+            --source . \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT" \
+            --quiet
+
+      - name: Deploy hermes-web
+        run: |
+          gcloud run deploy hermes-web \
+            --source web \
+            --region "$GCP_REGION" \
+            --project "$GCP_PROJECT" \
+            --quiet

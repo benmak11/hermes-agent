@@ -139,9 +139,9 @@ def test_batch_pricing_is_half_the_interactive_rate():
         "thinking_tokens": 300,
         "cached_tokens": 0,
     }
-    assert compute_cost_usd(**kwargs, batch=True) == pytest.approx(
-        compute_cost_usd(**kwargs) / 2
-    )
+    full = compute_cost_usd(**kwargs)
+    assert full is not None
+    assert compute_cost_usd(**kwargs, batch=True) == pytest.approx(full / 2)
 
 
 def test_record_llm_call_carries_batch_flag():
