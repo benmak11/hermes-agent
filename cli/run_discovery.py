@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from obs.logging import bind_run_context
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
+from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
 
 # Load GOOGLE_CLOUD_PROJECT (and friends) so the Firestore client targets the
 # right project.
@@ -32,6 +33,11 @@ async def main() -> None:
         f"  Failures: {len(summary['failures'])},"
         f" Empty boards: {len(summary['empty_boards'])}"
     )
+
+    preferences = await load_job_preferences(args.user_id)
+    jobs, dropped = prefilter_jobs(jobs, preferences)
+    if dropped:
+        print(f"  Title pre-filter dropped {sum(dropped.values())}: {dict(dropped)}")
 
     new = await persist_new_jobs(jobs)
     print(f"✓ {new} new jobs added to Firestore")
