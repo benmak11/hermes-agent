@@ -32,6 +32,7 @@ from tools import queues
 from tools.ats.sweep import sweep_postings
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
+from tools.matching import batch_runs
 from tools.matching.score import score_pending_jobs
 
 log = get_logger("api.discovery")
@@ -98,7 +99,13 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
             preferences = await load_job_preferences(user_id)
             jobs, title_dropped = prefilter_jobs(summary["jobs"], preferences)
             new = await persist_new_jobs(jobs)
-            counts = await score_pending_jobs(user_id)
+            # Big backlogs go to a resumable half-price batch run instead of
+            # online scoring — but only where the worker's resume ticks exist
+            # to ingest it (QUEUE_MODE); in-process mode stays fully online.
+            if queues.enabled():
+                counts = await batch_runs.score_or_start_run(user_id)
+            else:
+                counts = await score_pending_jobs(user_id)
             metrics = {
                 "run_id": run_id,
                 "trigger": trigger,
@@ -113,6 +120,10 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
                 "failed": counts["failed"],
                 "duration_ms": int((time.monotonic() - started) * 1000),
             }
+            if "batch_run" in counts:
+                # Scoring went async: the zeros above are "so far", and this
+                # tag finds the run in batch_runs / its logs.
+                metrics["batch_run"] = counts["batch_run"]
             _user_ref(user_id).set(
                 {
                     "discovery_state": {
@@ -292,5 +303,38 @@ def cron_tick(
     users = [snap.id for snap in _client().collection("users").stream()]
     for uid in users:
         background_tasks.add_task(tick_user, uid, force_check=True)
+    maybe_enqueue_batch_resume()
     log.info("cron.tick", users=len(users))
     return {"ok": True, "users": len(users)}
+
+
+def maybe_enqueue_batch_resume() -> bool:
+    """Queue one batch-runs resume pass if any run is in flight.
+
+    A queue task (not a background task here) so the ingest work gets its own
+    request lifetime and Cloud Tasks retries; the hour-granular name dedupes
+    it against scheduler retries. Never lets a failure here break the tick.
+    """
+    if not (queues.worker_mode() and queues.enabled()):
+        return False
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        running = (
+            _client()
+            .collection("batch_runs")
+            .where(filter=FieldFilter("state", "==", "running"))
+            .limit(1)
+            .get()
+        )
+        if not running:
+            return False
+        return queues.enqueue(
+            "score",
+            "/tasks/batch/resume",
+            {},
+            task_id=f"batch-resume-{_now().strftime('%Y%m%d%H')}",
+        )
+    except Exception:
+        log.exception("cron.batch_resume_enqueue_failed")
+        return False

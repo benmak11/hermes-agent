@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from api.routes.discovery import run_discovery_cycle, run_sweep_cycle
 from obs.logging import get_logger
+from tools.matching import batch_runs
 from tools.matching.score import score_pending_jobs
 from tools.queues import worker_mode
 
@@ -68,3 +69,24 @@ async def task_score(body: ScoreTask) -> dict:
     _require_worker()
     counts = await score_pending_jobs(body.user_id, limit=body.limit)
     return {"ok": True, **counts}
+
+
+@router.post("/batch/start")
+async def task_batch_start(body: ScoreTask) -> dict:
+    """Submit a resumable batch run (Phase C); resume ticks ingest results."""
+    _require_worker()
+    result = await batch_runs.start(body.user_id, limit=body.limit)
+    return {"ok": True, **result}
+
+
+@router.post("/batch/resume")
+async def task_batch_resume() -> dict:
+    """One resume pass: poll in-flight batch runs, ingest whatever finished.
+
+    Enqueued hourly by the cron tick while runs are in flight. Runs inline so
+    a mid-ingest instance death surfaces as a task failure and Cloud Tasks
+    retries it — the claim TTL plus idempotent ingestion make that safe.
+    """
+    _require_worker()
+    summary = await batch_runs.resume()
+    return {"ok": True, **summary}

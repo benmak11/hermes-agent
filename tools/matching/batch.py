@@ -195,26 +195,41 @@ def _response_of(line: dict, model: str) -> types.GenerateContentResponse | None
         return None
 
 
-async def _run_batch(
-    *,
-    model: str,
-    lines: list[dict],
-    gcs_dir: str,
-    display_name: str,
-    poll_seconds: int,
-    timeout_seconds: float,
-) -> list[dict]:
-    """Upload requests, run one batch job to completion, return output lines."""
+def _split_gcs(gcs_path: str) -> tuple[str, str]:
+    """``gs://bucket/some/prefix`` → ``("bucket", "some/prefix")``."""
+    bucket, _, prefix = gcs_path.removeprefix("gs://").partition("/")
+    return bucket, prefix
+
+
+async def upload_text(gcs_path: str, text: str, *, content_type: str = "text/plain"):
     from google.cloud import storage
 
-    bucket_name, _, prefix = gcs_dir.removeprefix("gs://").partition("/")
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
+    bucket_name, blob_name = _split_gcs(gcs_path)
+    blob = storage.Client().bucket(bucket_name).blob(blob_name)
+    await asyncio.to_thread(blob.upload_from_string, text, content_type=content_type)
+
+
+async def download_text(gcs_path: str) -> str:
+    from google.cloud import storage
+
+    bucket_name, blob_name = _split_gcs(gcs_path)
+    blob = storage.Client().bucket(bucket_name).blob(blob_name)
+    return await asyncio.to_thread(blob.download_as_text)
+
+
+async def submit_batch(
+    *, model: str, lines: list[dict], gcs_dir: str, display_name: str
+) -> str:
+    """Upload request lines and create one batch job; returns the job name.
+
+    Submission takes seconds while completion takes minutes-to-hours, which is
+    why this is a separate seam: the resumable pipeline (``batch_runs``)
+    submits here and leaves polling/ingestion to later worker ticks, while
+    ``_run_batch`` below stays the blocking submit-poll-fetch path for the CLI.
+    """
     payload = "\n".join(json.dumps(line) for line in lines)
-    await asyncio.to_thread(
-        bucket.blob(f"{prefix}/input.jsonl").upload_from_string,
-        payload,
-        content_type="application/jsonl",
+    await upload_text(
+        f"{gcs_dir}/input.jsonl", payload, content_type="application/jsonl"
     )
 
     client = genai.Client(vertexai=True)
@@ -225,32 +240,29 @@ async def _run_batch(
             display_name=display_name, dest=f"{gcs_dir}/output"
         ),
     )
+    if not job.name:
+        raise RuntimeError(f"Vertex returned a batch job without a name: {job}")
     log.info(
         "matching.batch.job_created",
         name=job.name,
         model=model,
         requests=len(lines),
     )
+    return job.name
 
-    deadline = time.monotonic() + timeout_seconds
-    while job.state not in _DONE_STATES:
-        if time.monotonic() > deadline:
-            raise TimeoutError(
-                f"Batch job {job.name} still {job.state} after "
-                f"{timeout_seconds / 3600:.1f}h — inspect or cancel it in the "
-                "Vertex console; its output can be ingested by a later run."
-            )
-        await asyncio.sleep(poll_seconds)
-        try:
-            job = await client.aio.batches.get(name=job.name)
-        except Exception as e:
-            # One flaky poll (network blip, truncated JSON body — seen live
-            # 2026-07-10) must not kill an hours-long run; keep the last known
-            # state and ask again next tick. The deadline still bounds us.
-            log.warning("matching.batch.poll_retry", name=job.name, error=str(e)[:200])
-    if job.state not in _USABLE_STATES:
-        raise RuntimeError(f"Batch job {job.name} ended {job.state}: {job.error}")
 
+async def get_batch_job(name: str) -> types.BatchJob:
+    """One state poll — cheap enough to run per tick per in-flight run."""
+    client = genai.Client(vertexai=True)
+    return await client.aio.batches.get(name=name)
+
+
+async def fetch_batch_output(gcs_dir: str) -> list[dict]:
+    """Download and parse every output JSONL line a batch job wrote."""
+    from google.cloud import storage
+
+    bucket_name, prefix = _split_gcs(gcs_dir)
+    storage_client = storage.Client()
     out_lines: list[dict] = []
     for blob in storage_client.list_blobs(bucket_name, prefix=f"{prefix}/output"):
         if not blob.name.endswith(".jsonl"):
@@ -261,9 +273,48 @@ async def _run_batch(
         # treats as line breaks, shattering a JSON line mid-string (crashed a
         # live run 2026-07-10).
         out_lines.extend(json.loads(raw) for raw in text.split("\n") if raw.strip())
+    return out_lines
+
+
+async def _run_batch(
+    *,
+    model: str,
+    lines: list[dict],
+    gcs_dir: str,
+    display_name: str,
+    poll_seconds: int,
+    timeout_seconds: float,
+) -> list[dict]:
+    """Upload requests, run one batch job to completion, return output lines."""
+    name = await submit_batch(
+        model=model, lines=lines, gcs_dir=gcs_dir, display_name=display_name
+    )
+
+    client = genai.Client(vertexai=True)
+    job = None
+    deadline = time.monotonic() + timeout_seconds
+    while job is None or job.state not in _DONE_STATES:
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"Batch job {name} still {job.state if job else 'unknown'} after "
+                f"{timeout_seconds / 3600:.1f}h — inspect or cancel it in the "
+                "Vertex console; its output can be ingested by a later run."
+            )
+        await asyncio.sleep(poll_seconds)
+        try:
+            job = await client.aio.batches.get(name=name)
+        except Exception as e:
+            # One flaky poll (network blip, truncated JSON body — seen live
+            # 2026-07-10) must not kill an hours-long run; keep the last known
+            # state and ask again next tick. The deadline still bounds us.
+            log.warning("matching.batch.poll_retry", name=name, error=str(e)[:200])
+    if job.state not in _USABLE_STATES:
+        raise RuntimeError(f"Batch job {name} ended {job.state}: {job.error}")
+
+    out_lines = await fetch_batch_output(gcs_dir)
     log.info(
         "matching.batch.job_done",
-        name=job.name,
+        name=name,
         state=str(job.state),
         responses=len(out_lines),
     )
