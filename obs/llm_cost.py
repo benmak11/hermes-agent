@@ -50,6 +50,10 @@ _PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     # 2.5 Flash has no long-context pricing tier (flat rate at any input
     # size), unlike Pro, so no matching entry below is needed for it.
     "gemini-flash-latest": {"input": 0.30, "output": 2.50, "cached": 0.03},
+    # The batch scorer (tools/matching/batch.py) pins this concrete id because
+    # batch prediction rejects aliases; it's the same model the alias serves
+    # today, so the rates match the entry above.
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50, "cached": 0.03},
 }
 # Long-context (>200K prompt tokens) rates for the same models, keyed by
 # "<model>:long". None of our current prompts get near 200K, but the lookup
@@ -58,6 +62,10 @@ _LONG_CONTEXT_PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     "gemini-3.1-pro-preview": {"input": 4.00, "output": 18.00, "cached": 0.40},
 }
 _LONG_CONTEXT_THRESHOLD = 200_000
+
+# Vertex batch prediction bills at half the interactive rate on every token
+# class, both models. Source: same pricing page as above, checked 2026-07.
+_BATCH_DISCOUNT = 0.5
 
 
 def _rates(model: str, prompt_tokens: int) -> dict[str, float] | None:
@@ -73,6 +81,7 @@ def compute_cost_usd(
     output_tokens: int,
     thinking_tokens: int,
     cached_tokens: int,
+    batch: bool = False,
 ) -> float | None:
     """USD cost for one call, or ``None`` if ``model`` has no pricing entry.
 
@@ -80,6 +89,7 @@ def compute_cost_usd(
     Gemini API contract, so the non-cached remainder bills at the input rate
     and the cached remainder at the (cheaper) cached rate. Thinking tokens
     bill as output, at the full output rate — that's how Google charges them.
+    ``batch`` applies the batch-prediction discount to the whole call.
     """
     rates = _rates(model, input_tokens)
     if rates is None:
@@ -90,6 +100,8 @@ def compute_cost_usd(
         + cached_tokens * rates["cached"]
         + (output_tokens + thinking_tokens) * rates["output"]
     ) / 1_000_000
+    if batch:
+        cost *= _BATCH_DISCOUNT
     return round(cost, 6)
 
 
@@ -98,6 +110,7 @@ def record_llm_call(
     step: str,
     response: GenerateContentResponse,
     job_id: str | None = None,
+    batch: bool = False,
 ) -> dict[str, Any]:
     """Log token usage + computed cost for one ``generate_content`` call.
 
@@ -126,12 +139,14 @@ def record_llm_call(
         output_tokens=output_tokens,
         thinking_tokens=thinking_tokens,
         cached_tokens=cached_tokens,
+        batch=batch,
     )
 
     fields = {
         "step": step,
         "job_id": job_id,
         "model": model,
+        "batch": batch,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "thinking_tokens": thinking_tokens,

@@ -62,6 +62,66 @@ def discard_tombstone(job: Job, match: JobMatch) -> dict:
     }
 
 
+async def load_profile_and_pending(
+    db: firestore.AsyncClient, user_id: str, limit: int | None = None
+) -> tuple[MasterProfile, list[tuple]]:
+    """The user's profile plus their pending, unscored ``(doc_ref, Job)`` pairs.
+
+    Shared by the online scorer below and the batch scorer in
+    ``tools.matching.batch``. Raises ``ValueError`` when the user has no
+    profile to match against.
+    """
+    profile_doc = await db.collection("users").document(user_id).get()
+    if not profile_doc.exists:
+        raise ValueError(f"No profile at users/{user_id}.")
+    profile = MasterProfile.model_validate(profile_doc.to_dict())
+
+    jobs_ref = db.collection("users").document(user_id).collection("jobs")
+    query = jobs_ref.where(filter=FieldFilter("user_decision", "==", "pending"))
+
+    pending: list[tuple] = []
+    async for snap in query.stream():
+        d = snap.to_dict()
+        if "match" in d:  # already scored
+            continue
+        pending.append((snap.reference, Job.model_validate(d)))
+        if limit and len(pending) >= limit:
+            break
+    return profile, pending
+
+
+async def persist_result(ref, job: Job, match: JobMatch) -> str:
+    """Persist one scoring outcome; returns ``"discarded"`` or ``"scored"``.
+
+    Discarding replaces the job doc with a ``discarded_jobs`` tombstone (see
+    :func:`discard_tombstone`); anything else writes ``match`` + the parsed JD
+    onto the job doc.
+    """
+    if should_discard(match):
+        # ref.parent is the jobs collection; its parent is the user doc.
+        user_ref = ref.parent.parent
+        await user_ref.collection("discarded_jobs").document(job.id).set(
+            discard_tombstone(job, match)
+        )
+        await ref.delete()
+        log.info(
+            "matching.discarded",
+            job_id=job.id,
+            company=job.company,
+            score=match.overall_score,
+        )
+        return "discarded"
+    await ref.update(
+        {
+            "match": match.model_dump(mode="json"),
+            "jd_parsed": (
+                job.jd_parsed.model_dump(mode="json") if job.jd_parsed else None
+            ),
+        }
+    )
+    return "scored"
+
+
 async def score_pending_jobs(
     user_id: str,
     *,
@@ -79,23 +139,7 @@ async def score_pending_jobs(
     the user has no profile to match against.
     """
     db = firestore.AsyncClient()
-
-    profile_doc = await db.collection("users").document(user_id).get()
-    if not profile_doc.exists:
-        raise ValueError(f"No profile at users/{user_id}.")
-    profile = MasterProfile.model_validate(profile_doc.to_dict())
-
-    jobs_ref = db.collection("users").document(user_id).collection("jobs")
-    query = jobs_ref.where(filter=FieldFilter("user_decision", "==", "pending"))
-
-    pending: list[tuple] = []
-    async for snap in query.stream():
-        d = snap.to_dict()
-        if "match" in d:  # already scored
-            continue
-        pending.append((snap.reference, Job.model_validate(d)))
-        if limit and len(pending) >= limit:
-            break
+    profile, pending = await load_profile_and_pending(db, user_id, limit)
 
     started = time.monotonic()
 
@@ -124,35 +168,8 @@ async def score_pending_jobs(
         async with sem:
             try:
                 match = await match_job(job, profile, cached_content=cache_name)
-                if should_discard(match):
-                    # ref.parent is the jobs collection; its parent is the
-                    # user doc.
-                    user_ref = ref.parent.parent
-                    await user_ref.collection("discarded_jobs").document(job.id).set(
-                        discard_tombstone(job, match)
-                    )
-                    await ref.delete()
-                    counts["discarded"] += 1
-                    log.info(
-                        "matching.discarded",
-                        job_id=job.id,
-                        company=job.company,
-                        score=match.overall_score,
-                    )
-                    if on_result:
-                        on_result(job, match, None)
-                    return
-                await ref.update(
-                    {
-                        "match": match.model_dump(mode="json"),
-                        "jd_parsed": (
-                            job.jd_parsed.model_dump(mode="json")
-                            if job.jd_parsed
-                            else None
-                        ),
-                    }
-                )
-                counts["scored"] += 1
+                outcome = await persist_result(ref, job, match)
+                counts[outcome] += 1
                 if on_result:
                     on_result(job, match, None)
             except Exception as e:
