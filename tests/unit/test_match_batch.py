@@ -56,7 +56,12 @@ def _output_line(request_text: str, response_text: str) -> dict:
         "request": {"contents": [{"role": "user", "parts": [{"text": request_text}]}]},
         "response": {
             "candidates": [
-                {"content": {"role": "model", "parts": [{"text": response_text}]}}
+                {
+                    "content": {"role": "model", "parts": [{"text": response_text}]},
+                    # Batch-only field the SDK response model forbids as an
+                    # extra — real output lines carry it (seen live).
+                    "score": -65.78,
+                }
             ],
             "usageMetadata": {
                 "promptTokenCount": 100,

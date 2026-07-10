@@ -169,15 +169,27 @@ def _request_text(line: dict) -> str | None:
 def _response_of(line: dict, model: str) -> types.GenerateContentResponse | None:
     """Parse one output line's response, or None when the line errored.
 
-    Batch output lines don't reliably carry ``modelVersion``; defaulting it to
-    the requested model keeps ``record_llm_call``'s pricing lookup working.
+    Batch output carries fields the SDK's response model *forbids* as extras
+    (per-candidate ``score``, seen live 2026-07-09), so this rebuilds just the
+    shape downstream consumes — text, usage, model — rather than validating
+    the raw line. ``modelVersion`` defaults to the requested model (error
+    lines omit it) so ``record_llm_call``'s pricing lookup keeps working.
     """
     resp = line.get("response")
     if not isinstance(resp, dict):
         return None
-    resp.setdefault("modelVersion", model)
+    candidates = resp.get("candidates") or []
+    slim = {
+        "candidates": [
+            {"content": c.get("content")}
+            for c in candidates[:1]
+            if isinstance(c, dict)
+        ],
+        "usageMetadata": resp.get("usageMetadata"),
+        "modelVersion": resp.get("modelVersion") or model,
+    }
     try:
-        return types.GenerateContentResponse.model_validate(resp)
+        return types.GenerateContentResponse.model_validate(slim)
     except ValidationError:
         return None
 
