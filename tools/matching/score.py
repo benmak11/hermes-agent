@@ -20,7 +20,9 @@ from models.job import Job
 from models.match import JobMatch
 from models.profile import MasterProfile
 from obs.logging import get_logger
+from tools.matching import jd_cache
 from tools.matching.pipeline import (
+    FLASH_MODEL,
     create_match_cache,
     delete_match_cache,
     match_job,
@@ -188,9 +190,15 @@ async def score_pending_jobs(
         async with sem:
             try:
                 # Parse here (not inside match_job) so the result is durable
-                # before the Pro call gets a chance to fail.
+                # before the Pro call gets a chance to fail. Cheapest source
+                # first: the cross-user jd_cache, then Flash.
                 if job.jd_parsed is None:
-                    job.jd_parsed = await parse_jd(job)
+                    job.jd_parsed = await jd_cache.lookup(db, job.jd_raw)
+                    if job.jd_parsed is None:
+                        job.jd_parsed = await parse_jd(job)
+                        await jd_cache.store(
+                            db, job.jd_raw, job.jd_parsed, model=FLASH_MODEL
+                        )
                     await persist_jd_parsed(ref, job)
                 match = await match_job(job, profile, cached_content=cache_name)
                 outcome = await persist_result(ref, job, match)

@@ -8,8 +8,9 @@ in seconds, and batch prediction bills at half the interactive rate on both
 models. This module mirrors ``score_pending_jobs``'s outcome contract
 (``match``/``jd_parsed`` persisted, low scores tombstoned into
 ``discarded_jobs``) but runs the LLM legs as two batch jobs: parse (Flash,
-jobs missing ``jd_parsed``) then score (Pro, in-family jobs), with the free
-family pre-filter applied locally in between.
+jobs missing ``jd_parsed`` after the free cross-user ``jd_cache`` is
+consulted) then score (Pro, in-family jobs), with the free family pre-filter
+applied locally in between.
 
 Batch requests can't use the Phase 3.2 context cache (caches are an
 interactive-API feature), so score requests inline the full static block —
@@ -41,6 +42,7 @@ from models.job import Job, ParsedJD
 from models.match import JobMatch
 from obs.llm_cost import record_llm_call
 from obs.logging import get_logger
+from tools.matching import jd_cache
 from tools.matching.pipeline import (
     _MATCH_MAX_OUTPUT_TOKENS,
     _MATCH_THINKING,
@@ -375,7 +377,9 @@ async def batch_score_pending_jobs(
         if on_result:
             on_result(job, None, why)
 
-    # Stage 1 — parse missing JDs with Flash, deduped on identical raw text.
+    # Stage 1 — parse missing JDs, cheapest source first: the cross-user
+    # jd_cache (free), then one Flash batch for the rest — deduped on
+    # identical raw text either way.
     to_parse: dict[str, list[Job]] = {}
     for _, job in pending:
         if job.jd_parsed is not None:
@@ -387,6 +391,19 @@ async def batch_score_pending_jobs(
             _fail(job, "empty jd_raw")
             continue
         to_parse.setdefault(job.jd_raw, []).append(job)
+    parsed_now: list[Job] = []
+    if to_parse:
+        cached = await jd_cache.lookup_many(db, list(to_parse))
+        for text, parsed in cached.items():
+            for job in to_parse.pop(text):
+                job.jd_parsed = parsed
+                parsed_now.append(job)
+        if cached:
+            log.info(
+                "matching.batch.jd_cache_hits",
+                hits=len(cached),
+                to_flash=len(to_parse),
+            )
     if to_parse:
         out_lines = await _run_batch(
             model=BATCH_FLASH_MODEL,
@@ -398,14 +415,26 @@ async def batch_score_pending_jobs(
         )
         for job in join_parse_responses(out_lines, to_parse):
             _fail(job, "parse_jd failed in batch")
-        # Make the Flash spend durable before the Pro stage gets hours to
-        # fail (or this process to die) — the next run then skips stage 1.
-        parsed_now = [
+        parsed_now.extend(
             job
             for jobs in to_parse.values()
             for job in jobs
             if job.jd_parsed is not None
-        ]
+        )
+        # Fresh parses become shared property: future runs — any user — skip
+        # the Flash call for these postings entirely.
+        await jd_cache.store_many(
+            db,
+            {
+                text: jobs[0].jd_parsed
+                for text, jobs in to_parse.items()
+                if jobs[0].jd_parsed is not None
+            },
+            model=BATCH_FLASH_MODEL,
+        )
+    if parsed_now:
+        # Make the parse results durable before the Pro stage gets hours to
+        # fail (or this process to die) — the next run then skips stage 1.
         psem = asyncio.Semaphore(_PERSIST_CONCURRENCY)
 
         async def _save_parse(job: Job) -> None:
