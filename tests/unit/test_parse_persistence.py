@@ -85,9 +85,17 @@ def test_online_path_persists_parse_before_scoring_failure(monkeypatch):
     async def fake_match(*a, **kw):
         raise RuntimeError("pro call exploded")
 
+    async def cache_miss(db, text):
+        return None
+
+    async def cache_store(db, text, parsed, *, model):
+        pass
+
     monkeypatch.setattr(score, "load_profile_and_pending", fake_load)
     monkeypatch.setattr(score, "parse_jd", fake_parse)
     monkeypatch.setattr(score, "match_job", fake_match)
+    monkeypatch.setattr(score.jd_cache, "lookup", cache_miss)
+    monkeypatch.setattr(score.jd_cache, "store", cache_store)
     monkeypatch.setattr(score.firestore, "AsyncClient", lambda: None)
 
     counts = asyncio.run(score.score_pending_jobs("u1"))
@@ -132,11 +140,19 @@ def test_batch_path_persists_parses_before_score_stage_failure(monkeypatch):
             ]
         raise RuntimeError("pro batch exploded")
 
+    async def cache_miss_many(db, texts):
+        return {}
+
+    async def cache_store_many(db, parses, *, model):
+        pass
+
     monkeypatch.setattr(batch, "load_profile_and_pending", fake_load)
     monkeypatch.setattr(batch, "_run_batch", fake_run_batch)
     monkeypatch.setattr(batch, "build_match_context", lambda p: "CTX")
     monkeypatch.setattr(batch, "build_match_job_block", lambda j: "BLOCK")
     monkeypatch.setattr(batch, "batch_bucket_name", lambda: "test-bucket")
+    monkeypatch.setattr(batch.jd_cache, "lookup_many", cache_miss_many)
+    monkeypatch.setattr(batch.jd_cache, "store_many", cache_store_many)
     monkeypatch.setattr(batch.firestore, "AsyncClient", lambda: None)
 
     with pytest.raises(RuntimeError, match="pro batch exploded"):

@@ -116,9 +116,23 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
     "Seen" includes discarded jobs: matching moves zero/ineligible-scored jobs
     to a ``discarded_jobs`` tombstone, and postings stay live on boards for
     weeks — without this check every run would re-persist and re-score them.
+
+    Jobs with an empty ``jd_raw`` never persist: there is nothing to parse or
+    score (Vertex rejects empty input outright), so they would sit pending and
+    re-fail every scoring run until deleted by hand — 13 such docs observed in
+    the 12K backlog. An empty JD usually means the fetcher got no content for
+    that posting, so drops are logged with their provenance.
     """
     # De-dupe within this run (a slug can appear in both known + unvetted).
     unique = {j.id: j for j in jobs}
+    empty_jd = [j for j in unique.values() if not j.jd_raw.strip()]
+    if empty_jd:
+        unique = {i: j for i, j in unique.items() if j.jd_raw.strip()}
+        log.warning(
+            "discovery.empty_jd_dropped",
+            count=len(empty_jd),
+            postings=[f"{j.source}/{j.company}: {j.title}" for j in empty_jd[:10]],
+        )
     db = firestore.AsyncClient()
     sem = asyncio.Semaphore(concurrency)
     counter = {"new": 0, "discarded": 0}
