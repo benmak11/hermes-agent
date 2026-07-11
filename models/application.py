@@ -17,6 +17,10 @@ ApplicationStatus = Literal[
     "submitted",
     "failed",
     "responded",
+    # The submitter filled everything it could, but required questions need a
+    # human answer — the user finishes on the ATS form (unanswered_questions
+    # lists exactly what's left). Retryable, e.g. after a profile update.
+    "needs_input",
     # Terminal: the ATS reported the posting gone before we could submit.
     "posting_removed",
 ]
@@ -58,6 +62,10 @@ class Application(BaseModel):
     # auto-resubmitted. screenshots holds {name, uri} evidence (pre-submit +
     # confirmation) uploaded to GCS.
     last_submitted_at: datetime | None = None
+    # Human-readable labels of required form questions the submitter couldn't
+    # answer from the profile (set with status=needs_input; the tracking UI
+    # lists them next to the "complete your application" link).
+    unanswered_questions: list[str] = Field(default_factory=list)
     screenshots: list[dict] = Field(default_factory=list)
     confirmation: Confirmation | None = None
     timeline: list[StatusEvent] = Field(default_factory=list)

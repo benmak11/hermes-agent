@@ -2,8 +2,8 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Unit tests for the application submitter router (Phase 7).
 
-Only the routing/guard logic is covered here — the Greenhouse path launches a
-real browser and is validated separately (dry-run), not in CI.
+Only the routing/guard logic is covered here — the per-ATS paths launch a
+real browser and are validated separately (dry-run), not in CI.
 """
 
 from datetime import UTC, datetime
@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import tools.submitters.router as router_mod
 from models.job import Job
 from models.profile import JobPreferences, MasterProfile
 from tools.submitters.router import submit_application
@@ -49,7 +50,24 @@ def _profile() -> MasterProfile:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["lever", "ashby"])
+@pytest.mark.parametrize("source", ["greenhouse", "lever", "ashby"])
+async def test_router_dispatches_supported_sources(source: str, monkeypatch) -> None:
+    seen: dict = {}
+
+    async def fake_submit(job, profile, resume_path, **kwargs):
+        seen["source"] = job.source
+        return {"success": True, "dry_run": True}
+
+    monkeypatch.setitem(router_mod.SUBMITTERS, source, fake_submit)
+    res = await submit_application(
+        _job(source), _profile(), Path("/tmp/x.docx"), dry_run=True
+    )
+    assert res["success"] is True
+    assert seen["source"] == source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["workday", "manual"])
 async def test_router_unsupported_source_fails_gracefully(source: str) -> None:
     res = await submit_application(
         _job(source), _profile(), Path("/tmp/x.docx"), dry_run=True

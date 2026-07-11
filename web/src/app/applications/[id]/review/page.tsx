@@ -239,22 +239,29 @@ export default function ReviewPage() {
         <div className="mt-8 flex items-center gap-3">
           <button
             onClick={() => {
-              const verb = app.status === "failed" ? "Retry submitting" : "Submit";
+              const retry =
+                app.status === "failed" || app.status === "needs_input";
               if (
                 window.confirm(
-                  `${verb} a real application to ${app.job_company ?? "this company"} for "${app.job_title ?? app.job_id}"? This cannot be undone.`,
+                  `${retry ? "Retry submitting" : "Submit"} a real application to ${app.job_company ?? "this company"} for "${app.job_title ?? app.job_id}"? This cannot be undone.`,
                 )
               )
                 submit.mutate();
             }}
             disabled={
-              !(app.status === "ready_for_review" || app.status === "failed") ||
-              submit.isPending
+              !(
+                app.status === "ready_for_review" ||
+                app.status === "failed" ||
+                app.status === "needs_input"
+              ) || submit.isPending
             }
             className="inline-flex h-[40px] items-center gap-2 rounded-[9px] px-5 text-[13px] font-semibold disabled:opacity-40"
             style={{ background: "var(--text)", color: "var(--surface)" }}
           >
-            ✓ {app.status === "failed" ? "Retry Submit" : "Approve & Submit"}
+            ✓{" "}
+            {app.status === "failed" || app.status === "needs_input"
+              ? "Retry Submit"
+              : "Approve & Submit"}
           </button>
           <button
             onClick={() => regenerate.mutate()}
@@ -376,7 +383,9 @@ function SubmissionPanel({ app }: { app: Application }) {
 
   // Submission progress notes, oldest→newest among the submission lifecycle.
   const notes = app.timeline.filter(
-    (e) => e.note && ["submitting", "submitted", "failed"].includes(e.status),
+    (e) =>
+      e.note &&
+      ["submitting", "submitted", "failed", "needs_input"].includes(e.status),
   );
   const lastFailed = [...app.timeline]
     .reverse()
@@ -388,7 +397,9 @@ function SubmissionPanel({ app }: { app: Application }) {
       style={{
         background: "var(--surface)",
         borderColor:
-          app.status === "failed" ? "var(--warn-border)" : "var(--border)",
+          app.status === "failed" || app.status === "needs_input"
+            ? "var(--warn-border)"
+            : "var(--border)",
       }}
     >
       <h2
@@ -399,7 +410,55 @@ function SubmissionPanel({ app }: { app: Application }) {
         {app.status === "submitted" && "Application submitted ✓"}
         {app.status === "responded" && "Employer responded"}
         {app.status === "failed" && "Last attempt failed"}
+        {app.status === "needs_input" && "Almost there — a few questions need you"}
       </h2>
+
+      {app.status === "needs_input" && (
+        <>
+          <p className="mb-3 text-[13px]" style={{ color: "var(--label)" }}>
+            Your details were filled in, but these required questions need your
+            answer on the application form:
+          </p>
+          <ul className="mb-4 space-y-1.5">
+            {(app.unanswered_questions ?? []).map((q, i) => (
+              <li
+                key={i}
+                className="flex gap-2 text-[13px] leading-relaxed"
+                style={{ color: "var(--text)" }}
+              >
+                <span style={{ color: "var(--warn)" }}>•</span>
+                <span>{q}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="mb-4 flex flex-wrap items-center gap-2.5">
+            {app.job_url && (
+              <a
+                href={app.job_url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex h-[34px] items-center gap-1.5 rounded-[8px] px-4 text-[13px] font-semibold"
+                style={{ background: "var(--text)", color: "var(--surface)" }}
+              >
+                Complete application ↗
+              </a>
+            )}
+            <button
+              onClick={() =>
+                downloadResume(app.id, app.job_company ?? "company")
+              }
+              className="inline-flex h-[34px] items-center gap-1.5 rounded-[8px] border px-4 text-[13px] font-semibold"
+              style={{
+                background: "var(--surface)",
+                borderColor: "var(--border)",
+                color: "var(--label)",
+              }}
+            >
+              ↓ Download tailored resume
+            </button>
+          </div>
+        </>
+      )}
 
       {app.status === "failed" && (
         <>

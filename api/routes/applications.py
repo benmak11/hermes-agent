@@ -32,8 +32,9 @@ from tools.tailoring.pipeline import application_id, tailor_application
 
 log = get_logger("api.applications")
 
-# Statuses from which a fresh submission is allowed (failed permits a retry).
-SUBMITTABLE = {"ready_for_review", "failed"}
+# Statuses from which a fresh submission is allowed (failed permits a retry;
+# needs_input permits one after e.g. adding the missing link to the profile).
+SUBMITTABLE = {"ready_for_review", "failed", "needs_input"}
 TERMINAL = {"submitted", "responded", "posting_removed"}
 
 router = APIRouter(tags=["applications"])
@@ -352,6 +353,29 @@ async def run_submission(user_id: str, app_id: str) -> None:
                     },
                     merge=True,
                 )
+            elif result.get("needs_input"):
+                # Everything fillable was filled; the rest is the user's. The
+                # UI lists the questions next to a link to the live form.
+                questions = result.get("unanswered") or []
+                ref.set(
+                    {
+                        "status": "needs_input",
+                        "unanswered_questions": questions,
+                        "timeline": firestore.ArrayUnion(
+                            [
+                                {
+                                    "at": _now(),
+                                    "status": "needs_input",
+                                    "note": (
+                                        f"{len(questions)} question(s) need your "
+                                        "answer on the application form"
+                                    ),
+                                }
+                            ]
+                        ),
+                    },
+                    merge=True,
+                )
             else:
                 ref.set(
                     {
@@ -409,6 +433,8 @@ def submit(
         {
             "status": "submitting",
             "last_submitted_at": _now(),
+            # Stale handoff list from a previous needs_input attempt.
+            "unanswered_questions": [],
             "timeline": firestore.ArrayUnion([{"at": _now(), "status": "submitting"}]),
         },
         merge=True,
@@ -448,7 +474,7 @@ async def events(
             seen = len(timeline)
             status = d.get("status")
             yield {"event": "status", "data": status}
-            if status in TERMINAL or status == "failed":
+            if status in TERMINAL or status in ("failed", "needs_input"):
                 break
             await asyncio.sleep(1.5)
 

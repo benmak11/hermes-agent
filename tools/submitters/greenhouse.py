@@ -19,14 +19,16 @@ mean ``networkidle`` never reliably settles.
 Safety:
 - ``dry_run=True`` fills the form and screenshots but never clicks Submit — used
   to validate against real postings without applying.
-- Unanswered required custom questions abort before submit (escalate to the user).
-- CAPTCHAs are detected and abort; we never attempt to bypass them.
+- Unanswered required custom questions stop before submit and hand off to the
+  user (``needs_input`` result: everything fillable is filled, the remaining
+  question labels are returned so the UI can list exactly what's left).
+- Only a *visible* CAPTCHA challenge stops the attempt (as a ``needs_input``
+  handoff); the invisible badge on many new-form boards never challenges a
+  normal submit. We never attempt to solve one either way.
 """
 
 from __future__ import annotations
 
-import inspect
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from playwright.async_api import Error as PlaywrightError
@@ -37,33 +39,39 @@ from models.job import Job
 from models.profile import MasterProfile
 from obs.logging import get_logger
 
-log = get_logger("tools.submitters.greenhouse")
-
-# Progress sink: called with (message, status) as the submission advances.
-ProgressFn = Callable[[str, str], Awaitable[None] | None]
-
-CONFIRMATION_PHRASES = (
-    "thank you for applying",
-    "application received",
-    "we've received",
-    "we have received",
-    "your application has been submitted",
+from .common import (
+    CAPTCHA_HANDOFF,
+    CONFIRMATION_PHRASES,
+    LABEL_TEXT_JS,
+    ProgressFn,
+    detect_blocking_captcha,
+    fill_labeled_answers,
 )
+from .common import (
+    emit_progress as _emit,
+)
+
+log = get_logger("tools.submitters.greenhouse")
 
 # Required fields must be checked through DOM properties (el.value), never the
 # value *attribute*: the new job-boards React app renders value="" once at SSR
 # and never syncs it, so an attribute check flags every field — filled or not.
 # Returns labels of unanswered required fields; empty list means safe to submit.
-_UNANSWERED_REQUIRED_JS = """
-() => {
+# Labels are the user-facing handoff list, so prefer visible label text
+# (LABEL_TEXT_JS) over element ids.
+_UNANSWERED_REQUIRED_JS = (
+    "() => {"
+    + LABEL_TEXT_JS
+    + """
   const missing = [];
   const seen = new Set();
-  const note = (label) => {
+  const note = (el, fallback) => {
+    const label = labelText(el) || fallback;
     if (label && !seen.has(label)) { seen.add(label); missing.push(label); }
   };
   document.querySelectorAll('[aria-required="true"], [required]').forEach((el) => {
     const tag = el.tagName.toLowerCase();
-    const label = el.id || el.getAttribute("name")
+    const fallback = el.id || el.getAttribute("name")
       || el.getAttribute("aria-labelledby") || el.getAttribute("aria-label")
       || tag;
     // react-select structure: the chosen option renders as a *single-value
@@ -81,49 +89,29 @@ _UNANSWERED_REQUIRED_JS = """
       if (el.querySelector('[class*="__filename"]')) return;
       const manual = el.querySelector("textarea");
       if (manual && manual.value.trim()) return;
-      note(label);
+      note(el, fallback);
     } else if (el.getAttribute("role") === "combobox" || (tag === "input" && shell)) {
       // react-select keeps its inputs permanently empty even when answered.
-      // Label anonymous inner inputs from the react-select-* ids so the two
+      // Name anonymous inner inputs from the react-select-* ids so the two
       // inputs of one dropdown dedupe to a single entry.
       const root = valueRoot || shell;
       if (root && root.querySelector('[class*="single-value"]')) return;
-      let l = label;
-      if (l === tag && shell) {
+      let fb = fallback;
+      if (fb === tag && shell) {
         const rid = shell.querySelector('[id^="react-select-"]');
-        if (rid) l = rid.id.replace("react-select-", "")
+        if (rid) fb = rid.id.replace("react-select-", "")
           .replace(/-(placeholder|input|live-region)$/, "");
       }
-      note(l);
+      note(el, fb);
     } else if (tag === "input" && el.type === "file") {
-      if (!el.files.length) note(label);
+      if (!el.files.length) note(el, fallback);
     } else if (tag === "input" || tag === "textarea" || tag === "select") {
-      if (!el.value || !el.value.trim()) note(label);
+      if (!el.value || !el.value.trim()) note(el, fallback);
     }
   });
   return missing;
-}
-"""
-
-
-async def _emit(on_progress: ProgressFn | None, message: str, status: str) -> None:
-    if on_progress is None:
-        return
-    result = on_progress(message, status)
-    if inspect.isawaitable(result):
-        await result
-
-
-async def _detect_captcha(page: Page) -> bool:
-    for sel in (
-        'iframe[src*="recaptcha"]',
-        'iframe[title*="captcha" i]',
-        "div.g-recaptcha",
-        'iframe[src*="hcaptcha"]',
-    ):
-        if await page.locator(sel).count():
-            return True
-    return False
+}"""
+)
 
 
 async def submit_greenhouse(
@@ -176,13 +164,15 @@ async def submit_greenhouse(
                     except PlaywrightTimeout:
                         pass  # handled by the standard-form check below
 
-            if await _detect_captcha(page):
-                await page.screenshot(path=pre_path, full_page=True)
-                job_log.warning("submit.bail", reason="captcha")
+            # Only a visible challenge blocks — the invisible badge on many
+            # new-form boards never challenges a normal submit (bailing on its
+            # mere presence made vercel-style boards fail 100%).
+            if await detect_blocking_captcha(page):
+                job_log.warning("submit.needs_input", reason="captcha")
                 return {
                     "success": False,
-                    "error": "CAPTCHA present — solve it in a browser, then retry.",
-                    "pre_submit_screenshot": pre_path,
+                    "needs_input": True,
+                    "unanswered": [CAPTCHA_HANDOFF],
                 }
 
             # Confirm this is a standard Greenhouse-hosted form before touching it.
@@ -255,6 +245,10 @@ async def submit_greenhouse(
             if country:
                 await _fill_combobox(page, "input#country", country)
 
+            # Custom questions that map 1:1 to profile data (LinkedIn, GitHub,
+            # portfolio, location) — shrinks the needs_input handoff.
+            await fill_labeled_answers(page, profile)
+
             # Attach the resume only after hydration is stable so the file
             # input isn't recreated out from under us.
             await _emit(on_progress, "Attaching resume", "submitting")
@@ -263,18 +257,17 @@ async def submit_greenhouse(
 
             await page.screenshot(path=pre_path, full_page=True)
 
-            # Abort if required questions are left blank (typically custom
-            # dropdowns Path A can't answer deterministically).
+            # Required questions we couldn't answer deterministically → hand
+            # off: the user finishes on the real form, guided by this list.
             unanswered: list[str] = await page.evaluate(_UNANSWERED_REQUIRED_JS)
             if unanswered:
-                job_log.warning("submit.bail", reason="unanswered", fields=unanswered)
+                job_log.warning(
+                    "submit.needs_input", reason="unanswered", fields=unanswered
+                )
                 return {
                     "success": False,
-                    "error": (
-                        f"{len(unanswered)} required question(s) need answers: "
-                        + ", ".join(unanswered)
-                    ),
-                    "pre_submit_screenshot": pre_path,
+                    "needs_input": True,
+                    "unanswered": unanswered,
                 }
 
             if dry_run:
@@ -302,6 +295,15 @@ async def submit_greenhouse(
             confirmed = False
             for _ in range(20):
                 await page.wait_for_timeout(1000)
+                # An invisible captcha may escalate to a visible challenge on
+                # submit — that's the user's to solve, on the real form.
+                if await detect_blocking_captcha(page):
+                    job_log.warning("submit.needs_input", reason="captcha_challenge")
+                    return {
+                        "success": False,
+                        "needs_input": True,
+                        "unanswered": [CAPTCHA_HANDOFF],
+                    }
                 try:
                     body = (await page.locator("body").inner_text()).lower()
                 except PlaywrightError:
