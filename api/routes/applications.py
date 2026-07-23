@@ -24,7 +24,7 @@ from sse_starlette.sse import EventSourceResponse
 from api.deps import verify_user, verify_user_query
 from models.job import Job
 from models.profile import MasterProfile
-from obs.logging import get_logger, run_context
+from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools.ats.validate import check_posting
 from tools.submitters.router import submit_application
 from tools.submitters.storage import download_resume, upload_screenshot
@@ -108,17 +108,19 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
     user_ref = db.collection("users").document(user_id)
     app_ref = user_ref.collection("applications").document(application_id(job_id))
     with run_context("tailoring", user_id=user_id, job_id=job_id):
-        task_log.info("tailoring.start")
+        started = log_agent_start(task_log, "tailoring")
         try:
             profile = MasterProfile.model_validate(user_ref.get().to_dict())
             job_doc = user_ref.collection("jobs").document(job_id).get()
             if not job_doc.exists:
                 raise ValueError(f"Job {job_id} not found")
             job = Job.model_validate(job_doc.to_dict())
+            task_log = task_log.bind(company=job.company, title=job.title)
 
             # The posting may have died between discovery and approval — don't
             # spend an LLM run tailoring for a page that no longer exists.
             if await _dismiss_if_posting_removed(user_ref, app_ref, job, task_log):
+                log_agent_end(task_log, "tailoring", started, outcome="posting_removed")
                 return
 
             app = await tailor_application(job, profile, upload=True)
@@ -130,13 +132,28 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             ).get("user_decision")
             if decision != "approved":
                 task_log.info("tailoring.discarded", decision=decision)
+                log_agent_end(
+                    task_log,
+                    "tailoring",
+                    started,
+                    outcome="discarded",
+                    decision=decision,
+                )
                 return
 
             app_ref.set(app.model_dump(mode="json"))
             task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
+            log_agent_end(
+                task_log,
+                "tailoring",
+                started,
+                outcome="completed",
+                resume_uri=app.resume_variant_uri,
+            )
         except Exception as e:  # persist failure for the UI, surface in timeline
             task_log.exception("tailoring.failed")
             if not app_ref.get().exists:
+                log_agent_end(task_log, "tailoring", started, outcome="discarded")
                 return  # discarded by a revert while we ran — don't resurrect
             app_ref.set(
                 {
@@ -146,6 +163,9 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                     ),
                 },
                 merge=True,
+            )
+            log_agent_end(
+                task_log, "tailoring", started, outcome="failed", error=str(e)[:300]
             )
 
 
@@ -269,7 +289,12 @@ async def run_submission(user_id: str, app_id: str) -> None:
     app = snap.to_dict()
     job_id = app["job_id"]
     task_log = log.bind(
-        user_id=user_id, app_id=app_id, job_id=job_id, task="submission"
+        user_id=user_id,
+        app_id=app_id,
+        job_id=job_id,
+        task="submission",
+        company=app.get("job_company"),
+        title=app.get("job_title"),
     )
     user_ref = _client().collection("users").document(user_id)
 
@@ -286,7 +311,7 @@ async def run_submission(user_id: str, app_id: str) -> None:
     # run_id context so the submitter's own log lines (tools.submitters, the
     # Playwright steps) stitch to this submission in Cloud Logging.
     with run_context("submission", user_id=user_id, app_id=app_id, job_id=job_id):
-        task_log.info("submission.start", source=app.get("job_source"))
+        started = log_agent_start(task_log, "submission", source=app.get("job_source"))
         try:
             resume_uri = app.get("resume_variant_uri")
             if not resume_uri:
@@ -299,6 +324,9 @@ async def run_submission(user_id: str, app_id: str) -> None:
             # Last-line check: never drive a browser at a posting the ATS says
             # is gone. Fail-open — a flaky board proceeds and fails visibly.
             if await _dismiss_if_posting_removed(user_ref, ref, job, task_log):
+                log_agent_end(
+                    task_log, "submission", started, outcome="posting_removed"
+                )
                 return
 
             resume_path = download_resume(resume_uri)
@@ -333,6 +361,13 @@ async def run_submission(user_id: str, app_id: str) -> None:
                 success=bool(result.get("success")),
                 error=result.get("error"),
                 screenshots=len(shots),
+            )
+            log_agent_end(
+                task_log,
+                "submission",
+                started,
+                outcome="submitted" if result.get("success") else "failed",
+                error=result.get("error"),
             )
             if result.get("success"):
                 confirm_uri = next(
@@ -381,6 +416,9 @@ async def run_submission(user_id: str, app_id: str) -> None:
                     ),
                 },
                 merge=True,
+            )
+            log_agent_end(
+                task_log, "submission", started, outcome="failed", error=str(e)[:300]
             )
 
 

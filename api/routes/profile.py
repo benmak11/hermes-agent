@@ -17,12 +17,20 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
 from google.cloud import firestore
 
 from api.deps import verify_user
 from models.profile import MasterProfile
-from obs.logging import get_logger, run_context
+from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools.profile.extract import extract_profile, read_resume_text
 
 log = get_logger("api.profile")
@@ -92,16 +100,30 @@ async def extract(
             status_code=422, detail="Could not read any text from that resume."
         )
 
-    log.info(
-        "profile.extract.request",
-        source="file" if file is not None else "text",
-        chars=len(resume_text),
-    )
+    source = "file" if file is not None else "text"
+    log.info("profile.extract.request", source=source, chars=len(resume_text))
     try:
         with run_context("profile_extract", user_id=user_id):
+            started = log_agent_start(
+                log,
+                "profile_extract",
+                user_id=user_id,
+                source=source,
+                chars=len(resume_text),
+            )
             profile = await asyncio.to_thread(extract_profile, resume_text, user_id)
+            log_agent_end(
+                log,
+                "profile_extract",
+                started,
+                outcome="completed",
+                roles=len(profile.experience),
+            )
     except Exception as e:  # extraction/validation failure → 422 for the UI
         log.exception("profile.extract.failed", chars=len(resume_text))
+        log_agent_end(
+            log, "profile_extract", started, outcome="failed", error=str(e)[:300]
+        )
         raise HTTPException(
             status_code=422, detail=f"Could not parse that resume: {e}"
         ) from e
@@ -113,12 +135,25 @@ async def extract(
 
 
 @router.put("/profile")
-def save_profile(body: MasterProfile, user_id: str = Depends(verify_user)) -> dict:
+def save_profile(
+    body: MasterProfile,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(verify_user),
+) -> dict:
     """Persist the reviewed/edited profile and mark onboarding complete.
 
     The body is validated as a full :class:`MasterProfile`; ``user_id`` is forced
     to the authenticated user so a client can't write someone else's profile.
+
+    The *first* time a user completes onboarding, this also kicks off one
+    discovery cycle (fetch + score) so the "Discovery and Matching are running
+    now" promise on the review screen is actually true — nothing else in the
+    app fires an initial run, and ``auto_discovery`` defaults to off. Later
+    profile edits (re-PUTting an already-complete profile) don't repeat this.
     """
+    existing = _user_ref(user_id).get().to_dict() or {}
+    first_completion = not existing.get("onboarding_complete")
+
     body.user_id = user_id
     _user_ref(user_id).set(
         {**body.model_dump(mode="json"), "onboarding_complete": True}, merge=True
@@ -129,4 +164,11 @@ def save_profile(body: MasterProfile, user_id: str = Depends(verify_user)) -> di
         roles=len(body.experience),
         skill_groups=len(body.skills),
     )
+    if first_completion:
+        from api.routes.discovery import dispatch_cycle
+
+        log.info("profile.onboarding_discovery_kickoff", user_id=user_id)
+        background_tasks.add_task(
+            dispatch_cycle, "discovery", user_id, trigger="onboarding"
+        )
     return {"ok": True}
