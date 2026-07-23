@@ -10,9 +10,17 @@ from models.job import Job
 from models.profile import MasterProfile
 from obs.logging import get_logger
 
+from .ashby import submit_ashby
 from .greenhouse import ProgressFn, submit_greenhouse
+from .lever import submit_lever
 
 log = get_logger("tools.submitters")
+
+SUBMITTERS = {
+    "greenhouse": submit_greenhouse,
+    "lever": submit_lever,
+    "ashby": submit_ashby,
+}
 
 
 async def submit_application(
@@ -26,12 +34,13 @@ async def submit_application(
 ) -> dict:
     """Submit ``job`` via the appropriate path based on ``job.source``.
 
-    Path A (deterministic Greenhouse) is implemented. Path B (Computer Use) for
-    other ATS is deferred — those sources report an unsupported failure rather
-    than auto-submitting through an unverified path.
+    Path A (deterministic Playwright) covers greenhouse, lever, and ashby.
+    Path B (Computer Use) for the rest is deferred — those sources report an
+    unsupported failure rather than auto-submitting through an unverified path.
     """
-    if job.source == "greenhouse":
-        return await submit_greenhouse(
+    submitter = SUBMITTERS.get(job.source)
+    if submitter is not None:
+        return await submitter(
             job,
             profile,
             resume_path,

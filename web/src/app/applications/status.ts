@@ -34,6 +34,13 @@ export function statusPill(status: ApplicationStatus): StatusPill {
         border: "var(--warn-border)",
         color: "var(--danger)",
       };
+    case "needs_input":
+      return {
+        label: "needs your input",
+        bg: "var(--warn-bg)",
+        border: "var(--warn-border)",
+        color: "var(--warn)",
+      };
     case "posting_removed":
       return {
         label: "posting removed",

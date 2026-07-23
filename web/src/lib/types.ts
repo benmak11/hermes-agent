@@ -181,6 +181,7 @@ export type ApplicationStatus =
   | "submitted"
   | "failed"
   | "responded"
+  | "needs_input"
   | "posting_removed";
 
 export type Confirmation = {
@@ -205,6 +206,8 @@ export type Application = {
   master_bullets: RoleBullets[];
   tailored_bullets: RoleBullets[];
   last_submitted_at?: string | null;
+  /** With status=needs_input: the required questions left for the user. */
+  unanswered_questions?: string[];
   screenshots?: Screenshot[];
   confirmation?: Confirmation | null;
   timeline: StatusEvent[];

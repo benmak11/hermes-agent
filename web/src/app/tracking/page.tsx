@@ -337,6 +337,25 @@ function pipelineView(app: Application): PipelineView {
         },
       };
     }
+    case "needs_input":
+      // Filled as far as automation goes — the user finishes on the ATS form.
+      return {
+        segments: [
+          { color: good },
+          { color: good },
+          { color: "var(--warn)", pulse: true },
+          { color: IDLE },
+        ],
+        label: "finish a few questions →",
+        labelColor: "var(--warn)",
+        labelHref: `/applications/${app.id}/review`,
+        pill: {
+          text: "needs your input",
+          bg: "var(--warn-bg)",
+          border: "var(--warn-border)",
+          color: "var(--warn)",
+        },
+      };
     case "failed":
     default: {
       // Failed after a submit attempt → the applied segment broke; otherwise
