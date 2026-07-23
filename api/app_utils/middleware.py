@@ -7,6 +7,12 @@ the route runs, so every log line emitted while handling the request (including
 ``log.exception`` in a route, ``deps.verify_user`` binding ``user_id``, and the
 tools it calls) is stitched together by ``request_id``. The same id is echoed
 back in the ``X-Request-Id`` response header for client-side correlation.
+
+The access-log lines below spell the method/path/status directly into the
+message (deliberately not just key/value fields, unlike the rest of the app's
+logging) — "GET /jobs/pending" is legible at a glance in a Cloud Logging list
+view without expanding the payload; ``method``/``path``/``status_code``/
+``duration_ms`` still land as separate fields for filtering.
 """
 
 from __future__ import annotations
@@ -53,14 +59,17 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         quiet = request.url.path in _QUIET_PATHS
         start = time.perf_counter()
         if not quiet:
-            self._log.info("request.start")
+            self._log.info(f"{request.method} {request.url.path}")
 
         try:
             response = await call_next(request)
         except Exception:
             duration_ms = round((time.perf_counter() - start) * 1000, 1)
             # The unhandled error itself — the failure point we want traceable.
-            self._log.exception("request.error", duration_ms=duration_ms)
+            self._log.exception(
+                f"{request.method} {request.url.path} raised an unhandled exception",
+                duration_ms=duration_ms,
+            )
             # Answer with the correlation id instead of re-raising into a bare
             # 500: the UI surfaces "request <id>", which is exactly the string
             # to paste into Cloud Logging (jsonPayload.request_id) to find the
@@ -75,7 +84,8 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         duration_ms = round((time.perf_counter() - start) * 1000, 1)
         if not quiet:
             self._log.info(
-                "request.end",
+                f"{request.method} {request.url.path} {response.status_code} "
+                f"({duration_ms}ms)",
                 status_code=response.status_code,
                 duration_ms=duration_ms,
             )

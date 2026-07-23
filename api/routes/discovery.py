@@ -27,7 +27,7 @@ from google.cloud import firestore
 
 from api.deps import verify_user
 from models.settings import DiscoverySettings
-from obs.logging import get_logger, run_context
+from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import queues
 from tools.ats.sweep import sweep_postings
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
@@ -91,7 +91,9 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
     """
     with run_context("auto_discovery", user_id=user_id, trigger=trigger) as run_id:
         started = time.monotonic()
-        log.info("auto_discovery.start")
+        agent_started = log_agent_start(
+            log, "discovery", trigger=trigger, user_id=user_id
+        )
         try:
             summary = await run_discovery(user_id)
             # Free title pre-filter: confidently out-of-family jobs never get
@@ -135,14 +137,24 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
             )
             # The one line to watch per auto search: how the run performed.
             log.info("auto_discovery.metrics", **metrics)
+            log_agent_end(
+                log,
+                "discovery",
+                agent_started,
+                outcome="completed",
+                new_jobs=new,
+                scored=counts["scored"],
+                batch_run=counts.get("batch_run"),
+            )
         except Exception:
             log.exception("auto_discovery.failed")
+            log_agent_end(log, "discovery", agent_started, outcome="failed")
 
 
 async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
     """Background: re-check served postings; dismiss ones the ATS took down."""
     with run_context("liveness_sweep", user_id=user_id, trigger=trigger) as run_id:
-        log.info("sweep.start")
+        started = log_agent_start(log, "sweep", trigger=trigger, user_id=user_id)
         try:
             counts = await sweep_postings(user_id)
             _user_ref(user_id).set(
@@ -154,8 +166,10 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
                 },
                 merge=True,
             )
+            log_agent_end(log, "sweep", started, outcome="completed", **counts)
         except Exception:
             log.exception("sweep.failed")
+            log_agent_end(log, "sweep", started, outcome="failed")
 
 
 async def dispatch_cycle(kind: str, user_id: str, *, trigger: str) -> bool:

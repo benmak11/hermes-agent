@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -229,3 +230,45 @@ def run_context(runner: str, **kwargs: Any) -> Iterator[str]:
 def clear_request_context() -> None:
     """Drop all context-bound values (call at the start of each request)."""
     structlog.contextvars.clear_contextvars()
+
+
+def log_agent_start(logger: Any, agent: str, **context: Any) -> float:
+    """Log the explicit kickoff of a background "agent" cycle (discovery, sweep,
+    tailoring, submission, profile extraction, ...).
+
+    Every one of these previously logged its own ad hoc ``"<domain>.start"``
+    event with whatever fields the author remembered — some had none at all,
+    making "what is this run actually doing" invisible without cross-referencing
+    the bound run_id against other lines. This standardizes the event name
+    (filter Cloud Logging on ``jsonPayload.message="agent.started"`` to see
+    every agent kickoff in the app) and requires the caller to state what's
+    being initiated via ``context`` (trigger, job_id, company, title, ...).
+
+    Returns a ``time.perf_counter()`` start mark — pass it to
+    :func:`log_agent_end` to report how long the run took.
+    """
+    logger.info("agent.started", agent=agent, **context)
+    return time.perf_counter()
+
+
+def log_agent_end(
+    logger: Any, agent: str, started: float, *, outcome: str, **result: Any
+) -> None:
+    """Log the explicit end of a background "agent" cycle (pairs with
+    :func:`log_agent_start`).
+
+    ``outcome`` is the field to filter/group on — e.g. ``"completed"``,
+    ``"failed"``, ``"discarded"``, ``"posting_removed"`` — so a scan of
+    ``jsonPayload.message="agent.finished"`` immediately shows what happened to
+    every run, not just that something with this run_id eventually stopped.
+    ``**result`` carries whatever summary is useful for that agent (counts,
+    resume_uri, error, ...).
+    """
+    duration_ms = round((time.perf_counter() - started) * 1000, 1)
+    logger.info(
+        "agent.finished",
+        agent=agent,
+        outcome=outcome,
+        duration_ms=duration_ms,
+        **result,
+    )
