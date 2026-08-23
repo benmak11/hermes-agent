@@ -27,6 +27,7 @@ from google.cloud import firestore
 
 from api.deps import verify_user
 from models.settings import DiscoverySettings
+from obs.llm_cost import run_cost_snapshot
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import queues
 from tools.ats.sweep import sweep_postings
@@ -34,6 +35,7 @@ from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
 from tools.matching import batch_runs
 from tools.matching.score import score_pending_jobs
+from tools.run_costs import persist_run_cost
 
 log = get_logger("api.discovery")
 
@@ -91,9 +93,11 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
     """
     with run_context("auto_discovery", user_id=user_id, trigger=trigger) as run_id:
         started = time.monotonic()
+        started_at = _now().isoformat()
         agent_started = log_agent_start(
             log, "discovery", trigger=trigger, user_id=user_id
         )
+        counts: dict = {}
         try:
             summary = await run_discovery(user_id)
             # Free title pre-filter: confidently out-of-family jobs never get
@@ -120,6 +124,10 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
                 "scored": counts["scored"],
                 "discarded": counts["discarded"],
                 "failed": counts["failed"],
+                # What this cycle spent on LLM calls so far. Zero on a batch
+                # run: those tokens aren't priced until the worker ingests
+                # them, and land on the run ledger doc then.
+                "cost_usd": run_cost_snapshot(run_id)["cost_usd"],
                 "duration_ms": int((time.monotonic() - started) * 1000),
             }
             if "batch_run" in counts:
@@ -149,11 +157,31 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
         except Exception:
             log.exception("auto_discovery.failed")
             log_agent_end(log, "discovery", agent_started, outcome="failed")
+        finally:
+            # In the finally, not the happy path: a cycle that died after
+            # scoring still spent the money, and that is exactly the run whose
+            # cost someone will come looking for.
+            await persist_run_cost(
+                _client,
+                user_id,
+                run_id,
+                runner="auto_discovery",
+                trigger=trigger,
+                started_at=started_at,
+                batch_run=counts.get("batch_run"),
+                jobs={
+                    "pending": counts.get("pending", 0),
+                    "scored": counts.get("scored", 0),
+                    "discarded": counts.get("discarded", 0),
+                    "failed": counts.get("failed", 0),
+                },
+            )
 
 
 async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
     """Background: re-check served postings; dismiss ones the ATS took down."""
     with run_context("liveness_sweep", user_id=user_id, trigger=trigger) as run_id:
+        started_at = _now().isoformat()
         started = log_agent_start(log, "sweep", trigger=trigger, user_id=user_id)
         try:
             counts = await sweep_postings(user_id)
@@ -170,6 +198,17 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
         except Exception:
             log.exception("sweep.failed")
             log_agent_end(log, "sweep", started, outcome="failed")
+        finally:
+            # The sweep is HTTP-only today, so this normally banks a $0 run —
+            # which is itself the answer to "did the sweep cost anything?".
+            await persist_run_cost(
+                _client,
+                user_id,
+                run_id,
+                runner="liveness_sweep",
+                trigger=trigger,
+                started_at=started_at,
+            )
 
 
 async def dispatch_cycle(kind: str, user_id: str, *, trigger: str) -> bool:

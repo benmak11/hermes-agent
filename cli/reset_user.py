@@ -3,8 +3,9 @@
 """
 Full data wipe for one user — for resetting a demo account to a clean slate.
 
-Deletes: the `users/{uid}` doc and its `jobs`/`applications`/`discarded_jobs`
-subcollections, that user's `batch_runs` docs (top-level collection, matched
+Deletes: the `users/{uid}` doc and its `jobs`/`applications`/`discarded_jobs`/
+`runs` (per-run cost ledger) subcollections, that user's `batch_runs` docs
+(top-level collection, matched
 by the `user_id` field), and their GCS resume/screenshot blobs under
 `users/{uid}/` in the resumes bucket. Does NOT touch the Firebase Auth
 account (they can log back in to an empty/onboarding state) or `jd_cache`
@@ -91,7 +92,7 @@ async def main() -> None:
     user_ref = db.collection("users").document(args.user_id)
 
     counts = {}
-    for name in ("jobs", "applications", "discarded_jobs"):
+    for name in ("jobs", "applications", "discarded_jobs", "runs"):
         counts[name] = await _delete_subcollection(
             db, user_ref.collection(name), execute=args.execute
         )
@@ -110,6 +111,7 @@ async def main() -> None:
     print(f"  jobs subcollection:           {counts['jobs']}")
     print(f"  applications subcollection:   {counts['applications']}")
     print(f"  discarded_jobs subcollection: {counts['discarded_jobs']}")
+    print(f"  runs subcollection (costs):   {counts['runs']}")
     print(
         f"  users/{{uid}} doc:              {'yes' if user_doc_existed else 'no (already absent)'}"
     )

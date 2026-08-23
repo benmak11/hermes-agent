@@ -131,6 +131,7 @@ export type DiscoveryState = {
     new_jobs: number;
     scored: number;
     failed: number;
+    cost_usd?: number | null;
     jobs_fetched?: number;
     jobs_by_platform?: Record<string, number>;
     boards_failed?: number;

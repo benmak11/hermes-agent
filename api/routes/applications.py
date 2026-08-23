@@ -26,6 +26,7 @@ from models.job import Job
 from models.profile import MasterProfile
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools.ats.validate import check_posting
+from tools.run_costs import persist_run_cost
 from tools.submitters.router import submit_application
 from tools.submitters.storage import download_resume, upload_screenshot
 from tools.tailoring.pipeline import application_id, tailor_application
@@ -107,7 +108,8 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
     db = _client()
     user_ref = db.collection("users").document(user_id)
     app_ref = user_ref.collection("applications").document(application_id(job_id))
-    with run_context("tailoring", user_id=user_id, job_id=job_id):
+    with run_context("tailoring", user_id=user_id, job_id=job_id) as run_id:
+        started_at = _now()
         started = log_agent_start(task_log, "tailoring")
         try:
             profile = MasterProfile.model_validate(user_ref.get().to_dict())
@@ -166,6 +168,18 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             )
             log_agent_end(
                 task_log, "tailoring", started, outcome="failed", error=str(e)[:300]
+            )
+        finally:
+            # Tailoring is the second-most expensive per-user action, and it
+            # binds a run_id — so without this flush its spend accumulates in
+            # the API process and is never banked or released.
+            await persist_run_cost(
+                _client,
+                user_id,
+                run_id,
+                runner="tailoring",
+                job_id=job_id,
+                started_at=started_at,
             )
 
 

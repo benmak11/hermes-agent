@@ -61,7 +61,13 @@ async def main() -> None:
             await (
                 user_ref.collection("discarded_jobs")
                 .document(job.id)
-                .set(discard_tombstone(job, match))
+                .set(
+                    # Carry over the run that paid to score this job, if the
+                    # doc has one. This purge spends nothing, so stamping its
+                    # own run_id would misattribute the tombstone — and
+                    # tombstones are where most of a cycle's spend lands.
+                    discard_tombstone(job, match, scored_run_id=d.get("scored_run_id"))
+                )
             )
             await snap.reference.delete()
         moved += 1
