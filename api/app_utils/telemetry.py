@@ -8,6 +8,40 @@ from obs.logging import get_logger
 log = get_logger("api.telemetry")
 
 
+def setup_cloud_otel() -> None:
+    """Export traces and logs to Cloud Trace / Cloud Logging.
+
+    ``get_fast_api_app(otel_to_cloud=True)`` installs these exporters as a side
+    effect of building the ADK app. When the ADK surface is disabled (the
+    default — see ``ADK_ENABLED`` in ``api/main.py``) nothing else would, so
+    call this explicitly. It goes through ADK's own helpers so both paths
+    configure OTel identically.
+
+    Never fatal: telemetry is not worth failing a boot over.
+    """
+    try:
+        import google.auth
+        from google.adk.telemetry.google_cloud import get_gcp_exporters
+        from google.adk.telemetry.setup import maybe_set_otel_providers
+
+        credentials, project_id = google.auth.default()
+        maybe_set_otel_providers(
+            [
+                get_gcp_exporters(
+                    enable_cloud_tracing=True,
+                    # Metrics stay off — ADK disables them too, pending a fix
+                    # for exporter errors during shutdown.
+                    enable_cloud_metrics=False,
+                    enable_cloud_logging=True,
+                    google_auth=(credentials, project_id),
+                )
+            ]
+        )
+        log.info("telemetry.cloud_otel", enabled=True)
+    except Exception as e:
+        log.warning("telemetry.cloud_otel_failed", error=str(e))
+
+
 def setup_telemetry() -> str | None:
     """Configure OpenTelemetry and GenAI telemetry with GCS upload."""
 

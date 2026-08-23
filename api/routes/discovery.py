@@ -272,14 +272,20 @@ def save_discovery_settings(
 async def run_discovery_now(
     background_tasks: BackgroundTasks, user_id: str = Depends(verify_user)
 ) -> dict:
-    """Explicit user action: run discovery + scoring immediately."""
+    """Explicit user action: run discovery + scoring immediately.
+
+    ``mode`` reports where the work actually went — "queued" (Cloud Tasks →
+    hermes-worker) or "in_process" (a background task on this instance, which
+    scale-down can kill). It is the cheapest way to confirm from outside that a
+    deployment's QUEUE_MODE is what you think it is.
+    """
     log.info("discovery.run_now", user_id=user_id)
     if queues.enabled():
         queued = await dispatch_cycle("discovery", user_id, trigger="manual")
-        return {"ok": True, "deduped": not queued}
+        return {"ok": True, "mode": "queued", "deduped": not queued}
     # No queue infra: run in-process, after the response goes out.
     background_tasks.add_task(run_discovery_cycle, user_id, trigger="manual")
-    return {"ok": True}
+    return {"ok": True, "mode": "in_process"}
 
 
 @router.post("/settings/discovery/sweep")
@@ -290,9 +296,9 @@ async def run_sweep_now(
     log.info("sweep.run_now", user_id=user_id)
     if queues.enabled():
         queued = await dispatch_cycle("sweep", user_id, trigger="manual")
-        return {"ok": True, "deduped": not queued}
+        return {"ok": True, "mode": "queued", "deduped": not queued}
     background_tasks.add_task(run_sweep_cycle, user_id, trigger="manual")
-    return {"ok": True}
+    return {"ok": True, "mode": "in_process"}
 
 
 @router.post("/internal/cron/tick")

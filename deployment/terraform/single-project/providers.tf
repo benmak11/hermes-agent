@@ -16,8 +16,19 @@ terraform {
 }
 
 provider "google" {
+  project               = var.project_id
+  region                = var.region
+  user_project_override = true
+}
+
+provider "google" {
   alias                 = "billing_override"
   billing_project       = var.project_id
-  region = var.region
+  region                = var.region
   user_project_override = true
+}
+
+# Project number, used to build the worker's Cloud Run URL (worker.tf).
+data "google_project" "project" {
+  project_id = var.project_id
 }

@@ -1,12 +1,10 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
 
-provider "google" {
-  project               = var.project_id
-  region                = var.region
-  user_project_override = true
-}
-
+# Backing store for the GenAI completions telemetry pipeline in telemetry.tf
+# (the external table and its BigQuery connection both read from it).
+# NOT YET APPLIED — this bucket does not exist and LOGS_BUCKET_NAME is unset on
+# the live services, so nothing writes completions today. See README.md.
 resource "google_storage_bucket" "logs_data_bucket" {
   name                        = "${var.project_id}-${var.project_name}-logs"
   location                    = var.region
