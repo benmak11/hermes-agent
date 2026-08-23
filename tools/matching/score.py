@@ -50,8 +50,10 @@ SCORE_LIMIT_CEILING = 300
 # that corpse on the next run. So: err long.
 #
 # The floor keeps a two-job run from being sized off a 12-second estimate; it
-# binds under ~600 jobs at concurrency 5, which includes the default 300-slot
-# cycle — that run gets 2x headroom over its estimate rather than exactly none.
+# binds under ~600 jobs at concurrency 5, which includes a default-sized cycle
+# — that run gets headroom over its estimate rather than exactly none. (A
+# measured 100-job run took 170s at concurrency 5, so the estimate itself runs
+# well ahead of reality; the floor is what makes that safe rather than tight.)
 # The ceiling is NOT derived from SCORING_BUDGET_PER_CYCLE and sits far enough
 # above it that raising that knob can't silently push runs past it (a cost
 # regression hidden behind a cost knob); it binds only for ``ignore_budget``
