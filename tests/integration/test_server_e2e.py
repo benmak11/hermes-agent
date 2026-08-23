@@ -46,6 +46,13 @@ def start_server() -> subprocess.Popen[str]:
     ]
     env = os.environ.copy()
     env["INTEGRATION_TEST"] = "TRUE"
+    # This suite exercises the ADK agent surface (/apps/*, /run_sse), which
+    # api.main does not mount unless asked — see the ADK_ENABLED comment there.
+    env["ADK_ENABLED"] = "1"
+    # /feedback now requires a verified caller. Use the local auth bypass rather
+    # than minting a real Firebase token for a loopback server.
+    env["AUTH_DEV_MODE"] = "1"
+    env.setdefault("AUTH_DEV_USER", "integration-test-user")
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -183,7 +190,9 @@ def test_collect_feedback(server_fixture: subprocess.Popen[str]) -> None:
     Test the feedback collection endpoint (/feedback) to ensure it properly
     logs the received feedback.
     """
-    # Create sample feedback data
+    # Create sample feedback data. The client-supplied "user_id" is accepted by
+    # the schema but discarded by the route — the logged uid comes from the auth
+    # dependency (here, AUTH_DEV_USER via the bypass set in start_server).
     feedback_data = {
         "score": 4,
         "user_id": "test-user-456",

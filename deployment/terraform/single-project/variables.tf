@@ -36,17 +36,7 @@ variable "llm_cost_logs_filter" {
   default     = "jsonPayload.message=\"llm.call\""
 }
 
-variable "app_sa_roles" {
-  description = "List of roles to assign to the application service account"
-  type        = list(string)
-  default = [
-
-    "roles/aiplatform.user",
-    "roles/logging.logWriter",
-    "roles/cloudtrace.agent",
-    "roles/storage.admin",
-    "roles/serviceusage.serviceUsageConsumer",
-    "roles/cloudsql.client",
-    "roles/secretmanager.secretAccessor",
-  ]
-}
+# NOTE: the runtime service account (hermes-runtime@) and the roles bound to it
+# are managed by hand, not here — see README.md. The old `app_sa_roles` variable
+# and the `hermes-app` service account it configured were removed: that account
+# was never created and nothing referenced it.
