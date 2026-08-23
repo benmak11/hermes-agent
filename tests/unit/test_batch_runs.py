@@ -14,12 +14,15 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+import structlog
 from google.api_core.exceptions import FailedPrecondition
 from google.genai import types
 
 import tools.matching.batch_runs as batch_runs
 from models.job import Job, ParsedJD
 from models.match import JobMatch, ScoreBreakdown
+from obs.llm_cost import reset_run_cost, run_cost_snapshot
+from obs.logging import current_run_id
 
 
 def _job(job_id="j1", jd_raw="Build things at Acme.", parsed=None) -> Job:
@@ -159,7 +162,16 @@ def harness(monkeypatch):
         results=[],  # (job_id, overall_score)
         cache_hits={},  # lookup_many return value
         online_calls=[],
+        cost_flushes=[],  # (user_id, run_id, meta) banked by persist_run_cost
+        banked=[],  # the accumulated totals each flush would have written
     )
+
+    async def fake_persist_run_cost(db, user_id, run_id, **meta):
+        rec.cost_flushes.append((user_id, run_id, meta))
+        # Capture what the real flush would have banked, then release the
+        # entry exactly as it does — otherwise spend bleeds between tests.
+        rec.banked.append(run_cost_snapshot(run_id))
+        reset_run_cost(run_id)
 
     async def fake_submit(*, model, lines, gcs_dir, display_name):
         rec.submitted.append((model, len(lines), gcs_dir, display_name))
@@ -185,6 +197,7 @@ def harness(monkeypatch):
     monkeypatch.setattr(batch_runs, "upload_text", fake_upload)
     monkeypatch.setattr(batch_runs, "persist_jd_parsed", fake_persist_jd_parsed)
     monkeypatch.setattr(batch_runs, "persist_result", fake_persist_result)
+    monkeypatch.setattr(batch_runs, "persist_run_cost", fake_persist_run_cost)
     monkeypatch.setattr(batch_runs.jd_cache, "lookup_many", fake_lookup_many)
     monkeypatch.setattr(batch_runs.jd_cache, "store_many", fake_store_many)
     monkeypatch.setattr(batch_runs, "batch_bucket_name", lambda: "test-bucket")
@@ -471,6 +484,128 @@ def test_resume_marks_run_without_job_name_as_orphaned(harness, monkeypatch):
     assert summary["failed"] == 1
     assert store["r1"]["state"] == "failed"
     assert "hermes-*-r1" in store["r1"]["error"]
+
+
+# ------------------------------------------- cost attribution across the seam
+
+
+def test_start_stamps_the_originating_run_id(harness, monkeypatch):
+    db = _FakeDB()
+    _patch_pending(monkeypatch, [(object(), _job("j1"))])
+
+    with structlog.contextvars.bound_contextvars(run_id="cycle-1"):
+        result = asyncio.run(batch_runs.start("u1", db=db))
+
+    assert db.store[result["run"]]["origin_run_id"] == "cycle-1"
+
+
+def test_resume_prices_the_batch_under_the_run_that_ordered_it(harness, monkeypatch):
+    """A batch's tokens are only priced at ingest, on a later worker tick —
+    so the ingest must run under the submitting cycle's run_id, not the
+    tick's, or one cycle's spend scatters across whichever passes ingested it.
+    """
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="score", origin_run_id="cycle-1")
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+
+    bound_during_ingest = []
+
+    async def fake_download(path):
+        return "CTX"
+
+    async def fake_fetch(gcs_dir):
+        bound_during_ingest.append(current_run_id())
+        return [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))]
+
+    monkeypatch.setattr(batch_runs, "download_text", fake_download)
+    monkeypatch.setattr(batch_runs, "fetch_batch_output", fake_fetch)
+
+    with structlog.contextvars.bound_contextvars(run_id="worker-tick"):
+        summary = _resume(db)
+        # The tick's own context is restored once the run is ingested.
+        assert current_run_id() == "worker-tick"
+
+    assert summary["completed"] == 1
+    assert bound_during_ingest == ["cycle-1"]
+    assert harness.cost_flushes == [("u1", "cycle-1", {"batch_run": "r1"})]
+
+
+def test_resume_ingests_runs_predating_origin_run_id(harness, monkeypatch):
+    """One live July batch_runs doc has no origin_run_id; it must still
+    ingest — just unattributed, exactly as it does today."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="score")  # no origin_run_id
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+
+    async def fake_download(path):
+        return "CTX"
+
+    async def fake_fetch(gcs_dir):
+        return [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))]
+
+    monkeypatch.setattr(batch_runs, "download_text", fake_download)
+    monkeypatch.setattr(batch_runs, "fetch_batch_output", fake_fetch)
+
+    summary = _resume(db)
+
+    assert summary["completed"] == 1
+    assert harness.results == [("j1", 85.0)]
+    assert harness.cost_flushes == []  # nothing to attribute it to
+
+
+def test_resume_banks_cost_when_the_ingest_dies_after_pricing(harness, monkeypatch):
+    """The failure has to land *after* join_score_responses has priced the
+    output, which is the case the finally exists for: that spend is real and
+    already charged, so losing it would under-report the run."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="score", origin_run_id="cycle-1")
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+
+    async def fake_download(path):
+        return "CTX"
+
+    async def fake_fetch(gcs_dir):
+        return [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))]
+
+    async def exploding_persist(ref, job, match):
+        raise RuntimeError("Firestore died after the batch was priced")
+
+    monkeypatch.setattr(batch_runs, "download_text", fake_download)
+    monkeypatch.setattr(batch_runs, "fetch_batch_output", fake_fetch)
+    monkeypatch.setattr(batch_runs, "persist_result", exploding_persist)
+
+    summary = _resume(db)
+
+    assert summary["completed"] == 0  # the ingest did not finish
+    assert store["r1"]["state"] == "running"  # left claimed for the retry
+    assert harness.cost_flushes == [("u1", "cycle-1", {"batch_run": "r1"})]
+    # The point of the test: real spend was banked, not an empty flush.
+    banked = harness.banked[0]
+    assert banked["calls"] == 1
+    assert banked["cost_usd"] > 0
+    assert banked["by_step"]["matching.score"]["calls"] == 1
+
+
+def test_resume_does_not_bank_cost_for_a_failed_vertex_job(harness, monkeypatch):
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(origin_run_id="cycle-1")
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_FAILED, error="quota")
+
+    summary = _resume(db)
+
+    assert summary["failed"] == 1
+    assert harness.cost_flushes == []
 
 
 # ------------------------------------------------- score_or_start_run()

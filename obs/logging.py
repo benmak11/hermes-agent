@@ -227,6 +227,16 @@ def run_context(runner: str, **kwargs: Any) -> Iterator[str]:
         yield run_id
 
 
+def current_run_id() -> str | None:
+    """The ``run_id`` bound by :func:`run_context`, or None outside a run.
+
+    Lets code that is *not* logging (cost accumulation, the ``scored_run_id``
+    stamp on a job doc) read the same correlation id every log line already
+    carries, without threading it through call signatures.
+    """
+    return structlog.contextvars.get_contextvars().get("run_id")
+
+
 def clear_request_context() -> None:
     """Drop all context-bound values (call at the start of each request)."""
     structlog.contextvars.clear_contextvars()

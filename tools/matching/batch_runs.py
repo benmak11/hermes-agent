@@ -41,12 +41,13 @@ import asyncio
 import uuid
 from datetime import UTC, datetime
 
+import structlog
 from google.api_core.exceptions import FailedPrecondition
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from models.job import Job
-from obs.logging import get_logger
+from obs.logging import current_run_id, get_logger
 from tools.matching import jd_cache
 from tools.matching.batch import (
     _DONE_STATES,
@@ -77,6 +78,7 @@ from tools.matching.score import (
     persist_result,
     score_pending_jobs,
 )
+from tools.run_costs import persist_run_cost
 
 log = get_logger("tools.matching")
 
@@ -169,6 +171,10 @@ async def start(
         "counts": counts,
         "created_at": _now().isoformat(),
         "updated_at": _now().isoformat(),
+        # The batch's tokens are only priced when a *later* process ingests
+        # the output, so without this the spend would be attributed to the
+        # worker tick that happened to pick the run up. resume() rebinds it.
+        "origin_run_id": current_run_id(),
         # Born claimed: resume must not touch the doc until the submit below
         # has recorded its job name.
         "claimed_at": _now().isoformat(),
@@ -447,6 +453,13 @@ async def resume(
             summary["running"] += 1
             continue
 
+        # Ingest under the *originating* cycle's run_id: this is where the
+        # batch's calls get priced, and pricing them under this tick's id would
+        # scatter one cycle's spend across whichever worker passes happened to
+        # ingest it. Runs written before origin_run_id existed (one live July
+        # doc) ingest unattributed, exactly as they do today.
+        origin = run.get("origin_run_id")
+        rebind = {"run_id": origin, "runner": "batch_resume"} if origin else {}
         try:
             if job.state not in _USABLE_STATES:
                 await run_ref.update(
@@ -463,12 +476,35 @@ async def resume(
                     state=str(job.state),
                     error=str(job.error)[:200],
                 )
-            elif run.get("stage") == "parse":
-                await _ingest_parse(db, run_ref, run)
-                summary["advanced"] += 1
             else:
-                await _ingest_score(db, run_ref, run)
-                summary["completed"] += 1
+                with structlog.contextvars.bound_contextvars(**rebind):
+                    try:
+                        if run.get("stage") == "parse":
+                            await _ingest_parse(db, run_ref, run)
+                            summary["advanced"] += 1
+                        else:
+                            await _ingest_score(db, run_ref, run)
+                            summary["completed"] += 1
+                    finally:
+                        # In a finally so an ingest that dies after pricing
+                        # its responses banks that spend rather than losing
+                        # it, and so the accumulator entry is always released
+                        # — the bounded-map invariant has to hold on the
+                        # failure path too.
+                        #
+                        # This is NOT idempotent: Increment isn't, and the
+                        # post-TTL retry re-reads the same GCS output and
+                        # re-prices the same calls, so a run that dies
+                        # mid-ingest is banked twice. That's the deliberate
+                        # trade — over-counting is the conservative direction
+                        # for the budget cap this feeds, and losing spend is
+                        # not. Banking it once (a per-leg cost_banked_at
+                        # marker on the run doc, checked before flushing) is
+                        # Phase 1B work.
+                        if origin:
+                            await persist_run_cost(
+                                db, run["user_id"], origin, batch_run=snap.id
+                            )
         except Exception:
             # Leave the run claimed; after the TTL the next pass retries the
             # (idempotent) ingest. Never let one bad run kill the whole pass.

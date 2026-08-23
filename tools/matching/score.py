@@ -19,7 +19,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from models.job import Job
 from models.match import JobMatch
 from models.profile import MasterProfile
-from obs.logging import get_logger
+from obs.logging import current_run_id, get_logger
 from tools.matching import jd_cache
 from tools.matching.pipeline import (
     FLASH_MODEL,
@@ -46,12 +46,18 @@ def should_discard(match: JobMatch) -> bool:
     return match.overall_score <= DISCARD_AT_OR_BELOW
 
 
-def discard_tombstone(job: Job, match: JobMatch) -> dict:
+def discard_tombstone(
+    job: Job, match: JobMatch, *, scored_run_id: str | None = None
+) -> dict:
     """Minimal `discarded_jobs` record.
 
     Exists so discovery's seen-check still recognizes the posting and never
     re-persists (and re-pays Flash/Pro to re-score) it while it stays live on
     the board.
+
+    ``scored_run_id`` is explicit rather than read from the ambient context so
+    a backfill (``cli.purge_discarded``) can carry over the run that actually
+    paid to score the job instead of stamping its own free run.
     """
     return {
         "job_id": job.id,
@@ -62,6 +68,11 @@ def discard_tombstone(job: Job, match: JobMatch) -> dict:
         "recommendation": match.recommendation,
         "reasoning": match.reasoning,
         "discarded_at": datetime.now(UTC).isoformat(),
+        # Most of a cycle's Pro spend ends up here rather than in `jobs`
+        # (71% of the 12K backlog tombstoned), so without this the tombstones
+        # are the one place the money went that can't be traced. Same field
+        # name as on the job docs — one query answers "what did this run buy?".
+        "scored_run_id": scored_run_id,
     }
 
 
@@ -123,7 +134,7 @@ async def persist_result(ref, job: Job, match: JobMatch) -> str:
         await (
             user_ref.collection("discarded_jobs")
             .document(job.id)
-            .set(discard_tombstone(job, match))
+            .set(discard_tombstone(job, match, scored_run_id=current_run_id()))
         )
         await ref.delete()
         log.info(
@@ -139,6 +150,11 @@ async def persist_result(ref, job: Job, match: JobMatch) -> str:
             "jd_parsed": (
                 job.jd_parsed.model_dump(mode="json") if job.jd_parsed else None
             ),
+            # Spend attribution: `discovered_at` says when the posting showed
+            # up, which is not when (or by which run) it was paid to be scored
+            # — a backlog scored months later is the normal case.
+            "scored_at": datetime.now(UTC).isoformat(),
+            "scored_run_id": current_run_id(),
         }
     )
     return "scored"

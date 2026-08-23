@@ -22,8 +22,10 @@ worker.
 
 import argparse
 import asyncio
+from datetime import UTC, datetime
 
 from dotenv import load_dotenv
+from google.cloud import firestore
 
 from models.job import Job
 from models.match import JobMatch
@@ -31,6 +33,7 @@ from obs.logging import bind_run_context
 from tools.matching import batch_runs
 from tools.matching.batch import batch_score_pending_jobs
 from tools.matching.score import score_pending_jobs
+from tools.run_costs import persist_run_cost
 
 load_dotenv()
 
@@ -45,37 +48,12 @@ def _print_result(job: Job, match: JobMatch | None, error: str | None) -> None:
         print(f"  ✗ {job.company} - {job.title[:50]}: {error}")
 
 
-async def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--user-id", required=True)
-    parser.add_argument(
-        "--limit", type=int, default=None, help="Max jobs to score this run"
-    )
-    parser.add_argument("--concurrency", type=int, default=5)
-    parser.add_argument(
-        "--batch",
-        action="store_true",
-        help="Use Vertex batch prediction: 50%% cheaper, async turnaround",
-    )
-    parser.add_argument(
-        "--poll-seconds",
-        type=int,
-        default=60,
-        help="Batch mode: how often to poll the batch job state",
-    )
-    parser.add_argument(
-        "--batch-async",
-        action="store_true",
-        help="Submit a resumable batch run and exit; worker ticks ingest it",
-    )
-    parser.add_argument(
-        "--batch-resume",
-        action="store_true",
-        help="One resume pass over in-flight batch runs, then exit",
-    )
-    args = parser.parse_args()
-    bind_run_context("matching", user_id=args.user_id)
+async def _score(args: argparse.Namespace) -> None:
+    """Do whatever the flags asked for.
 
+    Split out of ``main`` so the cost flush there can wrap every path in one
+    ``finally`` — including the early returns of the two batch modes.
+    """
     if args.batch_resume:
         summary = await batch_runs.resume(user_id=args.user_id)
         print(
@@ -130,6 +108,53 @@ async def main() -> None:
         f"✓ Scored {counts['scored']}, discarded {counts['discarded']},"
         f" failed {counts['failed']}"
     )
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--user-id", required=True)
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Max jobs to score this run"
+    )
+    parser.add_argument("--concurrency", type=int, default=5)
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Use Vertex batch prediction: 50%% cheaper, async turnaround",
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=int,
+        default=60,
+        help="Batch mode: how often to poll the batch job state",
+    )
+    parser.add_argument(
+        "--batch-async",
+        action="store_true",
+        help="Submit a resumable batch run and exit; worker ticks ingest it",
+    )
+    parser.add_argument(
+        "--batch-resume",
+        action="store_true",
+        help="One resume pass over in-flight batch runs, then exit",
+    )
+    args = parser.parse_args()
+    run_id = bind_run_context("matching", user_id=args.user_id)
+    started_at = datetime.now(UTC).isoformat()
+
+    try:
+        await _score(args)
+    finally:
+        # In a finally: a run killed mid-scoring has still paid for every
+        # call it got through, and that spend lives only in this process
+        # until it reaches the ledger.
+        await persist_run_cost(
+            firestore.AsyncClient,
+            args.user_id,
+            run_id,
+            runner="matching",
+            started_at=started_at,
+        )
 
 
 if __name__ == "__main__":
