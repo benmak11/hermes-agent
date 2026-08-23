@@ -226,7 +226,12 @@ def test_summary_of_an_unbudgeted_run_is_empty():
 def test_limits_default_to_the_documented_numbers(monkeypatch):
     monkeypatch.delenv("SCORING_BUDGET_PER_CYCLE", raising=False)
     monkeypatch.delenv("SCORING_BUDGET_PER_DAY", raising=False)
-    assert Limits.from_env() == Limits(per_cycle=300, per_day=1000)
+    # Calibrated against the $0.0098/job measured 2026-08-23: 200 slots is
+    # ~$1.96, which is what holds a first cycle under the $2 criterion.
+    assert Limits.from_env() == Limits(
+        per_cycle=budget.DEFAULT_PER_CYCLE, per_day=budget.DEFAULT_PER_DAY
+    )
+    assert (budget.DEFAULT_PER_CYCLE, budget.DEFAULT_PER_DAY) == (200, 400)
 
 
 def test_limits_read_the_env(monkeypatch):
@@ -238,7 +243,9 @@ def test_limits_read_the_env(monkeypatch):
 def test_unparseable_limits_fall_back_to_the_defaults(monkeypatch):
     monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "lots")
     monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "")
-    assert Limits.from_env() == Limits(per_cycle=300, per_day=1000)
+    assert Limits.from_env() == Limits(
+        per_cycle=budget.DEFAULT_PER_CYCLE, per_day=budget.DEFAULT_PER_DAY
+    )
 
 
 # ------------------------------------------------- reserve() / release() txn

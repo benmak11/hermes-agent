@@ -23,6 +23,7 @@ from models.job import Job, ParsedJD
 from models.match import JobMatch, ScoreBreakdown
 from obs.llm_cost import reset_run_cost, run_cost_snapshot
 from obs.logging import current_run_id
+from tools.matching import budget
 
 
 def _job(job_id="j1", jd_raw="Build things at Acme.", parsed=None) -> Job:
@@ -232,9 +233,9 @@ def test_start_below_min_pending_does_nothing(harness, monkeypatch):
         # The reservation was taken before the backlog was known, and the
         # unlimited_budget fixture grants a full cycle; start() gives it all
         # back when it submits nothing.
-        "budget_granted": 300,
+        "budget_granted": budget.DEFAULT_PER_CYCLE,
         "budget_remaining_cycle": 0,
-        "budget_remaining_day": 700,
+        "budget_remaining_day": budget.DEFAULT_PER_DAY - budget.DEFAULT_PER_CYCLE,
         "budget_capped": False,
     }
     assert db.store == {} and harness.submitted == []

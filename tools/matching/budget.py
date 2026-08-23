@@ -18,13 +18,11 @@ disjoint slice. Whatever a run doesn't *reach* is refunded when it ends — the
 slots granted beyond the backlog it actually had.
 
 A slot is charged per job **attempted**, not per LLM call, so a job rejected
-locally as out-of-family costs a slot despite costing no money. That makes the
-cap conservative by roughly the out-of-family rate — measured at 71%, so a
-300-slot cycle Pro-scores ~87 jobs and spends ~$0.35 rather than the ~$1.20 the
-defaults are sized against. Deliberate: the cheap alternative (charge only on a
-priced call) means an all-rejection backlog streams without limit, which is the
-memory failure this exists to prevent. The cost of it is that draining a large
-backlog takes proportionally longer than the dollar figures suggest.
+locally as out-of-family costs a slot despite costing no money. Deliberate: the
+cheap alternative (charge only on a priced call) means an all-rejection backlog
+streams without limit, which is the memory failure this exists to prevent. The
+cost of it is that draining a large backlog takes longer than a pure
+dollars-per-Pro-call model would suggest.
 
 Rollover is **lazy, at read time inside the transaction**: a stored ``day``
 that isn't today, or a ``cycle_id`` that isn't the run asking, means that
@@ -39,14 +37,25 @@ State lives in one map on the user doc, ``users/{uid}.scoring_budget``::
     updated_at: iso
 
 Env contract (same shape as ``tools.queues``):
-- ``SCORING_BUDGET_PER_CYCLE`` — slots one cycle may score (default 300).
-- ``SCORING_BUDGET_PER_DAY`` — slots one user may score per UTC day (1000).
+- ``SCORING_BUDGET_PER_CYCLE`` — slots one cycle may score (default 200).
+- ``SCORING_BUDGET_PER_DAY`` — slots one user may score per UTC day (400).
 
-At the ~$0.004/job end-to-end rate measured in July, 300 slots is ~$1.20 — the
-number the "a fresh signup's first cycle costs under $2" criterion is set
-against. Exceeding the budget is a normal outcome, not an error: the run scores
-what it was granted, logs ``matching.budget_capped`` at info, and the rest of
-the backlog waits for the next cycle.
+**The defaults are calibrated against a real measurement, not an estimate.** On
+2026-08-23 one capped 100-job run through the Phase 1A ledger (run
+``37338813872b4197a860e49d380c2813``) cost **$0.979287 — $0.0098/job**, split
+$0.00279 per Flash parse and $0.01649 per cached Pro score. That is ~2.2x the
+~$0.004/job figure measured in July, because both models now emit billed
+thinking tokens (~510 per parse). At $0.0098/job, 200 slots is **~$1.96** and
+400/day is **~$3.92**, which is what keeps a fresh signup's first cycle under
+the $2 the viability criterion asks for. The earlier 300/1000 defaults would
+have been ~$2.94 and ~$9.79.
+
+Re-measure before trusting these: the rate has moved once already, and it moved
+under us without any code change on our side.
+
+Exceeding the budget is a normal outcome, not an error: the run scores what it
+was granted, logs ``matching.budget_capped`` at info, and the rest of the
+backlog waits for the next cycle.
 """
 
 from __future__ import annotations
@@ -65,8 +74,8 @@ log = get_logger("tools.matching")
 # The map on users/{uid} holding the counters below.
 FIELD = "scoring_budget"
 
-DEFAULT_PER_CYCLE = 300
-DEFAULT_PER_DAY = 1000
+DEFAULT_PER_CYCLE = 200
+DEFAULT_PER_DAY = 400
 
 
 class _CycleDefault(Enum):
@@ -238,7 +247,7 @@ def summary(reservation: Reservation | None, *, drawn: int | None = None) -> dic
     ``drawn`` is how many slots the run actually filled. A run that filled
     every slot it was granted reports as capped whether or not the reservation
     itself was trimmed — that is the case this whole phase exists for, where a
-    13K backlog meets a 300-slot cycle and the ask (a full cycle) was granted
+    13K backlog meets a one-cycle grant and the ask (a full cycle) was granted
     in full.
     """
     if reservation is None:
