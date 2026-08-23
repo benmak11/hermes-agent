@@ -204,6 +204,66 @@ def build_match_job_block(job: Job) -> str:
     )
 
 
+def match_cache_display_name(user_id: str) -> str:
+    """A cache is a per-user singleton — one live one per user, at most.
+
+    That is what makes :func:`reap_match_caches` able to clean up after a run
+    that never got to delete its own.
+    """
+    return f"hermes-match-{user_id}"
+
+
+# Caches are listed project-wide (the Vertex list API takes no display-name
+# filter), so the scan is bounded: with TTLs clamped to an hour there should
+# only ever be a handful alive, and a surprise is not worth an unbounded walk.
+_CACHE_SCAN_LIMIT = 200
+
+
+async def reap_match_caches(client, display_name: str) -> int:
+    """Delete any live cache still carrying ``display_name``; returns how many.
+
+    Every run deletes its own cache in a ``finally``, but a killed process
+    (Cloud Run scale-down, SIGKILL) leaves one standing and *billed* until its
+    TTL runs out — with the old 24h TTL, for a day. Since the display name is
+    a per-user singleton, anything found here is a previous run's corpse, so
+    each run buries the last one's. Best-effort: never let cache hygiene stop
+    a scoring run.
+
+    Two runs for the same user overlapping would have the later one bury the
+    earlier one's *live* cache; that costs the first run its discount (
+    ``match_job`` falls back to the uncached prompt on a cache error) but not
+    its results, and the queue's named tasks already dedupe cycles per user.
+    """
+    deleted = 0
+    try:
+        scanned = 0
+        async for cache in await client.aio.caches.list():
+            scanned += 1
+            if cache.display_name == display_name and cache.name:
+                await client.aio.caches.delete(name=cache.name)
+                deleted += 1
+            if scanned >= _CACHE_SCAN_LIMIT:
+                # Truncated: the user's own leaked cache may be past here, so
+                # this reap silently becomes a no-op exactly when there are
+                # enough live caches for leaks to matter. Warn so that shows
+                # up in the logs instead of as a slow bill.
+                log.warning(
+                    "matching.cache.reap_truncated",
+                    display_name=display_name,
+                    scanned=scanned,
+                )
+                break
+        if deleted:
+            log.info(
+                "matching.cache.reaped", display_name=display_name, deleted=deleted
+            )
+    except Exception as e:
+        log.warning(
+            "matching.cache.reap_failed", display_name=display_name, error=str(e)[:200]
+        )
+    return deleted
+
+
 async def create_match_cache(
     profile: MasterProfile,
     rejection_patterns: str = "",
@@ -217,8 +277,14 @@ async def create_match_cache(
     cached_content=)``, or ``None`` when creation fails — e.g. the block is
     under the model's minimum cacheable size for a thin profile. Callers just
     run uncached in that case; scoring behavior is identical either way.
+
+    Any previous cache for this user is reaped first (see
+    :func:`reap_match_caches`) — the display name is a per-user singleton, so
+    the only thing that can be standing here is a leak.
     """
     client = genai.Client(vertexai=True)
+    display_name = match_cache_display_name(profile.user_id)
+    await reap_match_caches(client, display_name)
     try:
         cache = await client.aio.caches.create(
             model=PRO_MODEL,
@@ -227,7 +293,7 @@ async def create_match_cache(
                     build_match_context(profile, rejection_patterns, approval_patterns)
                 ],
                 ttl=f"{ttl_seconds}s",
-                display_name=f"hermes-match-{profile.user_id}",
+                display_name=display_name,
             ),
         )
     except Exception as e:

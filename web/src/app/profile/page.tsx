@@ -424,6 +424,14 @@ function AutoDiscoveryCard() {
   const s = data.settings;
   const patch = (next: Partial<DiscoverySettings>) => save.mutate({ ...s, ...next });
   const sweep = data.state.last_sweep;
+  const last = data.state.last_discovery;
+  // Only shown once a run has actually reported a budget — pre-cap runs and
+  // operator runs have none, and an invented "0 left" would read as broken.
+  const budget =
+    typeof last?.budget_remaining_day === "number" &&
+    typeof last?.budget_granted === "number"
+      ? last
+      : null;
 
   return (
     <Card>
@@ -455,6 +463,16 @@ function AutoDiscoveryCard() {
           ? `last ${relPast(data.state.last_discovery_at)} · next ${relNext(data.next_discovery_at)}`
           : "off — run from the CLI or the button below"}
       </div>
+      {budget && (
+        <div
+          className="mt-1 font-mono text-[11px] font-medium"
+          style={{ color: budget.budget_capped ? "var(--warn)" : "var(--subtle)" }}
+        >
+          {budget.budget_capped
+            ? `scored ${budget.budget_granted} — cycle limit reached · ${budget.budget_remaining_day} left today`
+            : `${budget.budget_remaining_day} of today's scoring budget left`}
+        </div>
+      )}
 
       <Divider my={13} />
 

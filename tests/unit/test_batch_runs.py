@@ -152,8 +152,12 @@ class _FakeDB:
 
 
 @pytest.fixture
-def harness(monkeypatch):
-    """Patch every external seam; return the recorders."""
+def harness(monkeypatch, unlimited_budget):
+    """Patch every external seam; return the recorders.
+
+    ``unlimited_budget`` gets ``start()`` past the per-user scoring cap — what
+    the cap does to it is pinned in ``test_scoring_budget.py``.
+    """
     rec = SimpleNamespace(
         submitted=[],  # (model, n_lines, gcs_dir, display_name)
         uploaded={},  # gcs_path -> text
@@ -222,7 +226,17 @@ def test_start_below_min_pending_does_nothing(harness, monkeypatch):
 
     result = asyncio.run(batch_runs.start("u1", min_pending=50, db=db))
 
-    assert result == {"started": False, "pending": 1}
+    assert result == {
+        "started": False,
+        "pending": 1,
+        # The reservation was taken before the backlog was known, and the
+        # unlimited_budget fixture grants a full cycle; start() gives it all
+        # back when it submits nothing.
+        "budget_granted": 300,
+        "budget_remaining_cycle": 0,
+        "budget_remaining_day": 700,
+        "budget_capped": False,
+    }
     assert db.store == {} and harness.submitted == []
 
 
@@ -427,6 +441,76 @@ def test_resume_ingests_parse_and_submits_score(harness, monkeypatch):
     assert doc["counts"]["parse_failed"] == 1  # the broken line
     assert doc["counts"]["discarded"] == 1
     assert doc["claimed_at"] is None  # released for the next tick
+
+
+def test_score_stage_submits_only_the_jobs_the_run_reserved(harness, monkeypatch):
+    """The ingest reload is a superset of the run — the join needs it — and
+    every parsed job in it would otherwise become a paid Pro request. A run
+    that reserved one slot must submit one request, not one per parsed job
+    left pending by every earlier run."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="parse", job_ids=["j1"])
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+
+    owned = _job("j1", jd_raw="ENG JD")
+    # Parsed, in-family, still pending — the shape a failed earlier run leaves
+    # behind, and a permanent floor if the score stage sweeps it in.
+    stranger_a = _job("j2", jd_raw="OTHER JD", parsed=_parsed())
+    stranger_b = _job("j3", jd_raw="THIRD JD", parsed=_parsed())
+    _patch_pending(
+        monkeypatch,
+        [(object(), owned), (object(), stranger_a), (object(), stranger_b)],
+    )
+
+    async def fake_fetch(gcs_dir):
+        return [_line("ENG JD", _parsed("engineering").model_dump_json())]
+
+    monkeypatch.setattr(batch_runs, "fetch_batch_output", fake_fetch)
+
+    summary = _resume(db)
+
+    assert summary["advanced"] == 1
+    model, n_lines, _gcs_dir, _ = harness.submitted[-1]
+    assert (model, n_lines) == (batch_runs.BATCH_PRO_MODEL, 1)
+    assert harness.jd_persisted == ["j1"]
+    assert harness.results == []  # nobody else's job was touched at all
+
+
+def test_score_stage_of_a_legacy_run_falls_back_to_what_it_parsed(harness, monkeypatch):
+    """batch_runs docs written before job_ids existed (there are live ones)
+    score only the jobs their own batch echoed — a subset of what the run
+    reserved, never a superset. The remainder is picked up by a later start(),
+    which is itself budgeted."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="parse")  # no job_ids
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+
+    mine = _job("j1", jd_raw="ENG JD")
+    stranger = _job("j2", jd_raw="OTHER JD", parsed=_parsed())
+    _patch_pending(monkeypatch, [(object(), mine), (object(), stranger)])
+
+    async def fake_fetch(gcs_dir):
+        return [_line("ENG JD", _parsed("engineering").model_dump_json())]
+
+    monkeypatch.setattr(batch_runs, "fetch_batch_output", fake_fetch)
+
+    _resume(db)
+
+    model, n_lines, _gcs_dir, _ = harness.submitted[-1]
+    assert (model, n_lines) == (batch_runs.BATCH_PRO_MODEL, 1)
+
+
+def test_start_records_the_jobs_it_reserved_on_the_run_doc(harness, monkeypatch):
+    db = _FakeDB()
+    _patch_pending(monkeypatch, [(object(), _job("j1")), (object(), _job("j2"))])
+
+    result = asyncio.run(batch_runs.start("u1", db=db))
+
+    assert db.store[result["run"]]["job_ids"] == ["j1", "j2"]
 
 
 def test_resume_ingests_score_and_completes(harness, monkeypatch):

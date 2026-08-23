@@ -139,6 +139,12 @@ export type DiscoveryState = {
     duration_ms?: number;
     run_id?: string;
     trigger?: string;
+    /** Scoring budget: what this cycle was granted, and what is left after it.
+     *  Absent on runs taken before the cap existed, or run with --ignore-budget. */
+    budget_granted?: number;
+    budget_remaining_cycle?: number;
+    budget_remaining_day?: number;
+    budget_capped?: boolean;
   } | null;
   last_sweep?: {
     checked: number;

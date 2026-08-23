@@ -141,7 +141,7 @@ def test_store_many_swallows_write_failures():
     asyncio.run(jd_cache.store_many(_FailingDB(), {"jd": _parsed()}, model="m"))
 
 
-def test_online_path_cache_hit_skips_flash(monkeypatch):
+def test_online_path_cache_hit_skips_flash(monkeypatch, unlimited_budget):
     job, ref = _job(), _FakeRef()
     profile = SimpleNamespace(
         preferences=SimpleNamespace(target_role_families=["engineering"])
@@ -178,7 +178,7 @@ def test_online_path_cache_hit_skips_flash(monkeypatch):
     assert ref.updates == [{"jd_parsed": _parsed().model_dump(mode="json")}]
 
 
-def test_online_path_cache_miss_parses_then_stores(monkeypatch):
+def test_online_path_cache_miss_parses_then_stores(monkeypatch, unlimited_budget):
     job, ref = _job(), _FakeRef()
     profile = SimpleNamespace(
         preferences=SimpleNamespace(target_role_families=["engineering"])
@@ -212,7 +212,7 @@ def test_online_path_cache_miss_parses_then_stores(monkeypatch):
     assert store_calls == [(job.jd_raw, score.FLASH_MODEL)]
 
 
-def test_batch_path_cache_hit_shrinks_the_flash_batch(monkeypatch):
+def test_batch_path_cache_hit_shrinks_the_flash_batch(monkeypatch, unlimited_budget):
     cached_job, fresh_job = _job("a", "Cached JD."), _job("b", "Fresh JD.")
     refs = {"a": _FakeRef(), "b": _FakeRef()}
     profile = SimpleNamespace(

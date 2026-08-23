@@ -8,6 +8,15 @@ Usage:
     python -m cli.run_matching --user-id me --batch [--poll-seconds S]
     python -m cli.run_matching --user-id me --batch-async
     python -m cli.run_matching --user-id me --batch-resume
+    python -m cli.run_matching --user-id me --ignore-budget --limit 5000
+
+Every scoring path is capped by the per-user scoring budget
+(``tools.matching.budget``, ``SCORING_BUDGET_PER_CYCLE`` / ``_PER_DAY``), so a
+plain run scores at most one cycle's worth. ``--ignore-budget`` is the operator
+escape hatch for hand-scoring a backlog — it exists only here, never on the
+HTTP surface. It does not mean "unbounded": without ``--limit`` the run is
+still capped at ``SCORE_LIMIT_CEILING`` (300) on every mode, so a real backlog
+run is ``--ignore-budget --limit N``.
 
 ``--batch`` runs the LLM legs as Vertex batch prediction jobs — half price on
 both models, but async: expect minutes to hours before results land. Right
@@ -64,7 +73,19 @@ async def _score(args: argparse.Namespace) -> None:
         return
 
     if args.batch_async:
-        result = await batch_runs.start(args.user_id, limit=args.limit)
+        result = await batch_runs.start(
+            args.user_id, limit=args.limit, ignore_budget=args.ignore_budget
+        )
+        if not result.get("started"):
+            # The only way here without --min-pending: the scoring budget for
+            # this cycle/day is spent.
+            print(
+                "✓ Nothing submitted — the scoring budget is exhausted "
+                f"(remaining this cycle: {result.get('budget_remaining_cycle')}, "
+                f"today: {result.get('budget_remaining_day')}). Raise "
+                "SCORING_BUDGET_PER_CYCLE / _PER_DAY, or pass --ignore-budget."
+            )
+            return
         counts = result["counts"]
         print(
             f"✓ Batch run {result['run']} submitted at stage "
@@ -85,6 +106,7 @@ async def _score(args: argparse.Namespace) -> None:
                 limit=args.limit,
                 poll_seconds=args.poll_seconds,
                 on_result=_print_result,
+                ignore_budget=args.ignore_budget,
             )
         else:
             print(
@@ -95,6 +117,7 @@ async def _score(args: argparse.Namespace) -> None:
                 limit=args.limit,
                 concurrency=args.concurrency,
                 on_result=_print_result,
+                ignore_budget=args.ignore_budget,
             )
     except ValueError as e:
         # Only the missing-profile ValueError gets the friendly exit;
@@ -137,6 +160,15 @@ async def main() -> None:
         "--batch-resume",
         action="store_true",
         help="One resume pass over in-flight batch runs, then exit",
+    )
+    parser.add_argument(
+        "--ignore-budget",
+        action="store_true",
+        help=(
+            "Skip the per-user scoring budget (operator backlog runs only — "
+            "this is real money). Still capped at 300 jobs unless --limit is "
+            "given, on every mode"
+        ),
     )
     args = parser.parse_args()
     run_id = bind_run_context("matching", user_id=args.user_id)

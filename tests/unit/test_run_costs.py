@@ -445,6 +445,40 @@ def test_discovery_cycle_flushes_cost_and_reports_it_in_metrics(monkeypatch):
     }
 
 
+def test_discovery_state_carries_the_budget_the_cycle_was_given(monkeypatch):
+    """The Profile card reads these off discovery_state.last_discovery."""
+    counts = {
+        "scored": 300,
+        "discarded": 0,
+        "failed": 0,
+        "pending": 300,
+        "budget_granted": 300,
+        "budget_remaining_cycle": 0,
+        "budget_remaining_day": 700,
+        "budget_capped": True,
+    }
+    _flushes, state = _flush_site_harness(monkeypatch, counts=counts)
+
+    asyncio.run(discovery.run_discovery_cycle("u1"))
+
+    metrics = state["discovery_state"]["last_discovery"]
+    assert metrics["budget_granted"] == 300
+    assert metrics["budget_remaining_day"] == 700
+    assert metrics["budget_capped"] is True
+
+
+def test_discovery_state_omits_budget_for_an_unbudgeted_run(monkeypatch):
+    # An --ignore-budget run reports no budget rather than a fabricated zero.
+    _flushes, state = _flush_site_harness(
+        monkeypatch, counts={"scored": 1, "discarded": 0, "failed": 0, "pending": 1}
+    )
+
+    asyncio.run(discovery.run_discovery_cycle("u1"))
+
+    metrics = state["discovery_state"]["last_discovery"]
+    assert not [k for k in metrics if k.startswith("budget_")]
+
+
 def test_discovery_cycle_flushes_even_when_the_cycle_fails(monkeypatch):
     flushes, _state = _flush_site_harness(monkeypatch, counts={})
 
