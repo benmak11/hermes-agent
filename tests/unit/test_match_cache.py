@@ -10,6 +10,7 @@ import pytest
 from google.genai import types
 
 import tools.matching.pipeline as pipeline
+import tools.matching.score as score
 from models.job import Job, ParsedJD
 from models.match import JobMatch, ScoreBreakdown
 from models.profile import JobPreferences, MasterProfile
@@ -174,3 +175,122 @@ def test_create_match_cache_returns_none_on_failure(monkeypatch):
     fake = SimpleNamespace(aio=SimpleNamespace(caches=_FailingCaches()))
     monkeypatch.setattr(pipeline.genai, "Client", lambda **kw: fake)
     assert asyncio.run(pipeline.create_match_cache(_profile())) is None
+
+
+# ------------------------------------------------------- leaked-cache cleanup
+
+
+class _FakeCaches:
+    """Records deletes; ``list`` yields whatever caches are alive."""
+
+    def __init__(self, alive):
+        self._alive = alive
+        self.deleted: list[str] = []
+        self.created: list[dict] = []
+
+    async def list(self, config=None):
+        async def _iter():
+            for cache in self._alive:
+                yield cache
+
+        return _iter()
+
+    async def delete(self, *, name):
+        self.deleted.append(name)
+
+    async def create(self, *, model, config):
+        self.created.append({"model": model, "config": config})
+        return SimpleNamespace(name="caches/new", usage_metadata=None)
+
+
+def _cache(name, display_name):
+    return SimpleNamespace(name=name, display_name=display_name)
+
+
+def test_creating_a_cache_buries_the_previous_run_s(monkeypatch):
+    """Every run deletes its own cache in a finally — but a killed process
+    leaves one standing and *billed* until its TTL runs out. The display name
+    is a per-user singleton, so anything alive here is a leak."""
+    caches = _FakeCaches(
+        [
+            _cache("caches/leaked", "hermes-match-u1"),
+            _cache("caches/other-user", "hermes-match-u2"),
+            _cache("caches/unrelated", None),
+        ]
+    )
+    monkeypatch.setattr(
+        pipeline.genai,
+        "Client",
+        lambda **kw: SimpleNamespace(aio=SimpleNamespace(caches=caches)),
+    )
+
+    assert asyncio.run(pipeline.create_match_cache(_profile())) == "caches/new"
+
+    assert caches.deleted == ["caches/leaked"]  # nobody else's, ever
+    assert caches.created[0]["config"].display_name == "hermes-match-u1"
+
+
+def test_a_failing_reap_never_blocks_the_run(monkeypatch):
+    class _UnlistableCaches(_FakeCaches):
+        async def list(self, config=None):
+            raise Exception("caches.list is not available here")
+
+    caches = _UnlistableCaches([])
+    monkeypatch.setattr(
+        pipeline.genai,
+        "Client",
+        lambda **kw: SimpleNamespace(aio=SimpleNamespace(caches=caches)),
+    )
+
+    assert asyncio.run(pipeline.create_match_cache(_profile())) == "caches/new"
+
+
+def test_reap_stops_at_the_scan_limit(monkeypatch):
+    """caches.list has no display-name filter, so the walk is project-wide;
+    it must stay bounded no matter what is in the project."""
+    alive = [_cache(f"caches/{i}", "hermes-match-u1") for i in range(500)]
+    caches = _FakeCaches(alive)
+    client = SimpleNamespace(aio=SimpleNamespace(caches=caches))
+
+    deleted = asyncio.run(pipeline.reap_match_caches(client, "hermes-match-u1"))
+
+    assert deleted == pipeline._CACHE_SCAN_LIMIT
+
+
+def test_cache_ttl_tracks_the_run_length_between_its_bounds():
+    """The TTL has to outlive the run: a cache that expires mid-run bills the
+    remaining jobs' input at 10x, so both bounds err long. The floor is what
+    binds for a default 300-slot cycle, giving it headroom over the estimate
+    rather than exactly none; the ceiling bounds a leak, and is deliberately
+    far enough out that raising SCORING_BUDGET_PER_CYCLE can't silently push
+    runs past it."""
+    assert score.cache_ttl_seconds(2, 5) == score._CACHE_TTL_FLOOR_SECONDS
+    # The default cycle budget: estimated at 1800s, floored to 2x that.
+    assert score.cache_ttl_seconds(300, 5) == score._CACHE_TTL_FLOOR_SECONDS
+    assert score.cache_ttl_seconds(1000, 5) == 6000  # tracks the run in between
+    # Only an --ignore-budget backlog run is long enough to hit the ceiling.
+    assert score.cache_ttl_seconds(13_000, 5) == 78_000
+    assert score.cache_ttl_seconds(20_000, 5) == score._CACHE_TTL_CEILING_SECONDS
+
+
+def test_the_scorer_sizes_its_cache_from_the_backlog(monkeypatch):
+    ttls = []
+
+    class _StopHere(Exception):
+        """Nothing past the cache creation matters to this test."""
+
+    async def fake_create(profile, *a, ttl_seconds=3600, **kw):
+        ttls.append(ttl_seconds)
+        raise _StopHere
+
+    async def fake_load(db, user_id, limit=None):
+        job = _job()
+        return _profile(), [(SimpleNamespace(), job)] * 1000
+
+    monkeypatch.setattr(score, "create_match_cache", fake_create)
+    monkeypatch.setattr(score, "load_profile_and_pending", fake_load)
+
+    with pytest.raises(_StopHere):
+        asyncio.run(score._score_pending(None, "u1", None, 5, None, {"attempted": 0}))
+
+    assert ttls == [score.cache_ttl_seconds(1000, 5)]

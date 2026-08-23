@@ -48,7 +48,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 from models.job import Job
 from obs.logging import current_run_id, get_logger
-from tools.matching import jd_cache
+from tools.matching import budget, jd_cache
 from tools.matching.batch import (
     _DONE_STATES,
     _PERSIST_CONCURRENCY,
@@ -77,6 +77,7 @@ from tools.matching.score import (
     persist_jd_parsed,
     persist_result,
     score_pending_jobs,
+    unbudgeted_limit,
 )
 from tools.run_costs import persist_run_cost
 
@@ -88,6 +89,11 @@ COLLECTION = "batch_runs"
 # architecture is available: half-price LLM calls, no long-lived process.
 # Below it, online scoring answers in seconds and the Phase 3.2 context cache
 # keeps it cheap — the scheduler's hourly increments live down here.
+#
+# Coupled to SCORING_BUDGET_PER_CYCLE in a way that doesn't look coupled: the
+# reservation is taken first, so what this threshold sees is min(backlog,
+# grant), not the backlog. Set the per-cycle budget below this and every run
+# routes online no matter how much backlog is waiting.
 BATCH_MIN_PENDING = 50
 
 # A claim this old is considered abandoned (its resume pass died) and the run
@@ -127,6 +133,8 @@ async def start(
     limit: int | None = None,
     min_pending: int | None = None,
     db: firestore.AsyncClient | None = None,
+    cycle_id: budget.CycleId = budget.CURRENT_RUN,
+    ignore_budget: bool = False,
 ) -> dict:
     """Submit a resumable batch run for the user's pending backlog.
 
@@ -134,12 +142,61 @@ async def start(
     the family filter and Pro submission); paid batches are submitted but
     never awaited. Returns ``{"started": False, "pending": n}`` when
     ``min_pending`` says the backlog is too small to bother.
+
+    Budgeted like the online scorer: the reservation is taken before anything
+    is loaded and caps how much backlog one run may submit, and ``cycle_id``
+    behaves exactly as it does there. See ``tools.matching.budget``.
     """
     db = db or firestore.AsyncClient()
-    profile, pending = await load_profile_and_pending(db, user_id, limit)
-    if min_pending is not None and len(pending) < min_pending:
-        return {"started": False, "pending": len(pending)}
+    reservation = None
+    if ignore_budget:
+        log.warning("matching.budget_ignored", user_id=user_id, mode="batch_start")
+        limit = unbudgeted_limit(limit)
+    else:
+        reservation = await budget.reserve(db, user_id, limit, cycle_id=cycle_id)
+        limit = reservation.granted
+        if not limit:
+            return {
+                "started": False,
+                "pending": 0,
+                **budget.summary(reservation, drawn=0),
+            }
 
+    attempted = 0
+    try:
+        profile, pending = await load_profile_and_pending(db, user_id, limit)
+        if min_pending is not None and len(pending) < min_pending:
+            # Nothing was submitted, so nothing is owed.
+            return {
+                "started": False,
+                "pending": len(pending),
+                **budget.summary(reservation, drawn=len(pending)),
+            }
+        # Committed here, before any submission: _start pays for a batch and
+        # only then records its job name, so a Firestore failure on that write
+        # must not hand back slots whose Flash/Pro requests are already in
+        # flight (resume() would later orphan that run, spend and all).
+        attempted = len(pending)
+        return await _start(db, user_id, profile, pending, reservation=reservation)
+    finally:
+        if reservation is not None:
+            await budget.release(
+                db,
+                user_id,
+                reservation.granted - attempted,
+                cycle_id=reservation.cycle_id,
+            )
+
+
+async def _start(
+    db: firestore.AsyncClient,
+    user_id: str,
+    profile,
+    pending: list[tuple],
+    *,
+    reservation: budget.Reservation | None,
+) -> dict:
+    """The submission itself, over an already-budgeted job set."""
     run_tag = _now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     gcs_root = f"gs://{batch_bucket_name()}/vertex-batch/{run_tag}"
     counts = {"scored": 0, "discarded": 0, "failed": 0, "parse_failed": 0}
@@ -175,6 +232,13 @@ async def start(
         # the output, so without this the spend would be attributed to the
         # worker tick that happened to pick the run up. resume() rebinds it.
         "origin_run_id": current_run_id(),
+        # The jobs this run reserved budget for — and therefore the only ones
+        # its score stage may submit to Pro. Ingest reloads *all* pending jobs
+        # (the content join needs them) and would otherwise sweep in every
+        # parsed job any earlier run left behind, against this run's grant.
+        # 16-hex-char ids, so even a --ignore-budget backlog run stays far
+        # inside Firestore's 1 MiB document limit.
+        "job_ids": [job.id for _, job in pending],
         # Born claimed: resume must not touch the doc until the submit below
         # has recorded its job name.
         "claimed_at": _now().isoformat(),
@@ -203,6 +267,7 @@ async def start(
             "stage": "parse",
             "pending": len(pending),
             "counts": counts,
+            **budget.summary(reservation, drawn=len(pending)),
         }
 
     # Everything already parsed (cache hits / prior runs): skip straight to
@@ -225,6 +290,7 @@ async def start(
         "stage": stage,
         "pending": len(pending),
         "counts": counts,
+        **budget.summary(reservation, drawn=len(pending)),
     }
 
 
@@ -237,6 +303,11 @@ async def _submit_score_stage(
     path as every other scorer (free, no LLM). Unparsed jobs are left alone —
     their parse failed, and a future run retries them. Returns the resulting
     run stage ("score", or "done" when nothing needs Pro).
+
+    ``pending`` must already be narrowed to the jobs this run reserved budget
+    for — see :func:`_owned_pending`. Every entry here that carries a parse
+    becomes a paid Pro request, so handing this function a full reload is how
+    a 300-slot run submits 900 jobs.
     """
     targets = {f.lower() for f in profile.preferences.target_role_families}
     tombstones: list[tuple] = []
@@ -333,15 +404,47 @@ async def _ingest_parse(db, run_ref, run: dict) -> None:
         await _persist_all(
             [(ref_by_id[j.id], j) for j in parsed_jobs], persist_jd_parsed
         )
+    owned = _owned_pending(run, pending, fallback=parsed_jobs)
     log.info(
         "batch_runs.parse_ingested",
         run=run_tag,
         parsed=len(parsed_jobs),
         parse_failed=len(failed),
+        # Reloaded vs. this run's own: the gap is other runs' pending jobs,
+        # which must not be scored against this run's budget.
+        reloaded=len(pending),
+        owned=len(owned),
     )
     await _submit_score_stage(
-        db, run_ref, run_tag, run["gcs_root"], profile, pending, counts
+        db, run_ref, run_tag, run["gcs_root"], profile, owned, counts
     )
+
+
+def _owned_pending(run: dict, pending: list[tuple], *, fallback: list[Job]) -> list:
+    """The reloaded pending pairs this run reserved budget for.
+
+    Ingest has to reload *everything* pending — the content join is what makes
+    resuming stateless, and truncating the reload would silently drop jobs
+    whose responses this run already paid for. But the reload is a superset:
+    it also carries jobs from other runs, and every parsed one of those would
+    become a paid Pro request in the score stage. So the reload is joined, and
+    then narrowed to the ids recorded at submit time.
+
+    ``fallback`` covers the batch_runs docs written before ``job_ids`` existed
+    (there are live ones): those score only the jobs this run's own batch
+    echoed, which is the safe direction — the remainder is picked up by a later
+    ``start()``, whose skip-straight-to-score path is itself budgeted.
+
+    The fallback is *almost* always a subset of what the run reserved. The one
+    leak: ``join_parse_responses`` fans one response out to every reloaded job
+    sharing that ``jd_raw``, so a posting mirrored on a second board and
+    discovered mid-batch joins the echoed set. Costs next to nothing — identical
+    blocks collapse into one Pro request, since ``build_match_job_block``
+    carries no job id — and it expires with the legacy docs.
+    """
+    recorded = run.get("job_ids")
+    owned = set(recorded) if recorded else {job.id for job in fallback}
+    return [(ref, job) for ref, job in pending if job.id in owned]
 
 
 async def _ingest_score(db, run_ref, run: dict) -> None:
@@ -525,6 +628,8 @@ async def score_or_start_run(user_id: str) -> dict:
     """
     run = await start(user_id, min_pending=BATCH_MIN_PENDING)
     if not run.get("started"):
+        # The unstarted run gave its reservation back, so the online scorer
+        # takes its own against the same cycle window.
         return await score_pending_jobs(user_id)
     counts = run["counts"]
     return {
@@ -533,4 +638,5 @@ async def score_or_start_run(user_id: str) -> dict:
         "failed": counts["failed"],
         "pending": run["pending"],
         "batch_run": run["run"],
+        **{k: v for k, v in run.items() if k.startswith("budget_")},
     }

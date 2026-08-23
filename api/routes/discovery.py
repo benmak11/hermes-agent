@@ -134,6 +134,11 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
                 # Scoring went async: the zeros above are "so far", and this
                 # tag finds the run in batch_runs / its logs.
                 metrics["batch_run"] = counts["batch_run"]
+            # What the scoring budget granted this cycle and what is left —
+            # the Profile card reads these off discovery_state. Copied only
+            # when present: a run with ignore_budget reports no budget at all
+            # rather than a fabricated zero.
+            metrics.update({k: v for k, v in counts.items() if k.startswith("budget_")})
             _user_ref(user_id).set(
                 {
                     "discovery_state": {

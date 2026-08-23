@@ -70,7 +70,9 @@ def test_persist_jd_parsed_swallows_write_failures():
     asyncio.run(score.persist_jd_parsed(_FakeRef(fail=True), job))
 
 
-def test_online_path_persists_parse_before_scoring_failure(monkeypatch):
+def test_online_path_persists_parse_before_scoring_failure(
+    monkeypatch, unlimited_budget
+):
     job, ref = _job(), _FakeRef()
     profile = SimpleNamespace(
         preferences=SimpleNamespace(target_role_families=["engineering"])
@@ -105,7 +107,9 @@ def test_online_path_persists_parse_before_scoring_failure(monkeypatch):
     assert ref.updates == [{"jd_parsed": _parsed().model_dump(mode="json")}]
 
 
-def test_batch_path_persists_parses_before_score_stage_failure(monkeypatch):
+def test_batch_path_persists_parses_before_score_stage_failure(
+    monkeypatch, unlimited_budget
+):
     job, ref = _job(), _FakeRef()
     profile = SimpleNamespace(
         preferences=SimpleNamespace(target_role_families=["engineering"])

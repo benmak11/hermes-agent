@@ -42,7 +42,7 @@ from models.job import Job, ParsedJD
 from models.match import JobMatch
 from obs.llm_cost import record_llm_call
 from obs.logging import get_logger
-from tools.matching import jd_cache
+from tools.matching import budget, jd_cache
 from tools.matching.pipeline import (
     _MATCH_MAX_OUTPUT_TOKENS,
     _MATCH_THINKING,
@@ -58,6 +58,7 @@ from tools.matching.score import (
     load_profile_and_pending,
     persist_jd_parsed,
     persist_result,
+    unbudgeted_limit,
 )
 
 log = get_logger("tools.matching")
@@ -402,15 +403,73 @@ async def batch_score_pending_jobs(
     poll_seconds: int = 60,
     timeout_hours: float = 25.0,
     on_result: OnResult | None = None,
+    ignore_budget: bool = False,
 ) -> dict:
     """Batch-mode twin of ``score_pending_jobs`` — same counts contract.
 
     Expect minutes-to-hours of turnaround (Vertex targets 24h, hence the
     default timeout); worth it only on runs big enough that half-price beats
     waiting, which is why the CLI keeps online mode as the default.
+
+    Reached only from ``cli.run_matching --batch``, which routes through
+    neither of the other two scorers — so the budget gate has to be here too,
+    or the CLI bypasses the cap entirely. ``ignore_budget`` skips it and, as
+    on every other entry point, leaves the run bounded by ``limit`` or
+    ``SCORE_LIMIT_CEILING``.
     """
     db = firestore.AsyncClient()
-    profile, pending = await load_profile_and_pending(db, user_id, limit)
+    reservation = None
+    if ignore_budget:
+        log.warning("matching.budget_ignored", user_id=user_id, mode="batch")
+        limit = unbudgeted_limit(limit)
+    else:
+        reservation = await budget.reserve(db, user_id, limit)
+        limit = reservation.granted
+        if not limit:
+            return {
+                "scored": 0,
+                "discarded": 0,
+                "failed": 0,
+                "pending": 0,
+                **budget.summary(reservation, drawn=0),
+            }
+
+    attempted = 0
+    try:
+        profile, pending = await load_profile_and_pending(db, user_id, limit)
+        # Every job handed to a batch draws its slot up front: the submission
+        # commits the spend, so unlike the online scorer's terminal counts
+        # there is nothing to give back once the requests go out.
+        attempted = len(pending)
+        counts = await _batch_score(
+            db,
+            profile,
+            pending,
+            poll_seconds=poll_seconds,
+            timeout_hours=timeout_hours,
+            on_result=on_result,
+        )
+        return {**counts, **budget.summary(reservation, drawn=attempted)}
+    finally:
+        if reservation is not None:
+            await budget.release(
+                db,
+                user_id,
+                reservation.granted - attempted,
+                cycle_id=reservation.cycle_id,
+            )
+
+
+async def _batch_score(
+    db: firestore.AsyncClient,
+    profile,
+    pending: list[tuple],
+    *,
+    poll_seconds: int,
+    timeout_hours: float,
+    on_result: OnResult | None,
+) -> dict:
+    """The two-stage batch run itself, over an already-budgeted job set."""
     counts = {"scored": 0, "discarded": 0, "failed": 0, "pending": len(pending)}
     started = time.monotonic()
     run_tag = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]

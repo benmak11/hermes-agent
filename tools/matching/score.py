@@ -20,7 +20,7 @@ from models.job import Job
 from models.match import JobMatch
 from models.profile import MasterProfile
 from obs.logging import current_run_id, get_logger
-from tools.matching import jd_cache
+from tools.matching import budget, jd_cache
 from tools.matching.pipeline import (
     FLASH_MODEL,
     create_match_cache,
@@ -33,6 +33,48 @@ log = get_logger("tools.matching")
 
 # (job, match, error) — match is None when scoring failed and error says why.
 OnResult = Callable[[Job, JobMatch | None, str | None], None]
+
+# Belt and braces. The budget reservation is the real cap, but a run that
+# takes no reservation (``ignore_budget``, or some future caller that reaches
+# this function without passing the gate) must still not stream an unbounded
+# backlog into memory — 13K job docs is what this exists to prevent.
+SCORE_LIMIT_CEILING = 300
+
+# Cache TTL bounds, in seconds. The estimate below (~30s per Pro call per
+# concurrency slot) is what actually sizes the TTL; these only bound it, and
+# both are deliberately generous, because the two failure modes are not
+# symmetric. A TTL shorter than the run means the tail bills the static
+# context block uncached at 10x — real money, on every run that overruns the
+# estimate. A TTL longer than the run costs nothing at all unless the run is
+# killed before its finally-block delete, and ``reap_match_caches`` buries
+# that corpse on the next run. So: err long.
+#
+# The floor keeps a two-job run from being sized off a 12-second estimate; it
+# binds under ~600 jobs at concurrency 5, which includes the default 300-slot
+# cycle — that run gets 2x headroom over its estimate rather than exactly none.
+# The ceiling is NOT derived from SCORING_BUDGET_PER_CYCLE and sits far enough
+# above it that raising that knob can't silently push runs past it (a cost
+# regression hidden behind a cost knob); it binds only for ``ignore_budget``
+# backlog runs, over ~14,400 jobs at concurrency 5.
+_CACHE_TTL_FLOOR_SECONDS = 3600
+_CACHE_TTL_CEILING_SECONDS = 24 * 3600
+
+
+def unbudgeted_limit(limit: int | None) -> int:
+    """The job cap for a run that took no budget reservation.
+
+    Shared by all three scoring entry points so ``--ignore-budget`` means the
+    same thing on every one of them: an explicit ``--limit`` if the operator
+    gave one, otherwise the ceiling.
+    """
+    return limit or SCORE_LIMIT_CEILING
+
+
+def cache_ttl_seconds(pending: int, concurrency: int) -> int:
+    """How long this run's context cache should live (see the bounds above)."""
+    estimate = pending * 30 // concurrency
+    return min(max(_CACHE_TTL_FLOOR_SECONDS, estimate), _CACHE_TTL_CEILING_SECONDS)
+
 
 # Jobs scoring at or below this never stay in the `jobs` collection: 0 is the
 # out-of-family sentinel and the matching prompt caps geographically
@@ -166,6 +208,8 @@ async def score_pending_jobs(
     limit: int | None = None,
     concurrency: int = 5,
     on_result: OnResult | None = None,
+    cycle_id: budget.CycleId = budget.CURRENT_RUN,
+    ignore_budget: bool = False,
 ) -> dict:
     """Score every pending, unscored job against the user's profile.
 
@@ -173,25 +217,89 @@ async def score_pending_jobs(
     scores at/below ``DISCARD_AT_OR_BELOW``, in which case the doc is replaced
     by a tombstone in ``discarded_jobs`` so it never reaches the queue but is
     still deduped on future discovery runs. Returns ``{"scored": n,
-    "discarded": n, "failed": n, "pending": n}``. Raises ``ValueError`` when
-    the user has no profile to match against.
+    "discarded": n, "failed": n, "pending": n}`` plus the ``budget_*`` fields
+    of :func:`tools.matching.budget.summary`. Raises ``ValueError`` when the
+    user has no profile to match against.
+
+    How many jobs this run may score is decided *before* anything is loaded,
+    by one budget reservation (``tools.matching.budget``); what it grants
+    becomes the query's limit. Slots the run doesn't end up drawing on are
+    refunded when it ends. ``cycle_id`` defaults to the ambient run, which
+    opens a new cycle window; pass ``None`` (as the worker's ad-hoc score task
+    does) to draw down the window already open instead — note that an
+    exhausted window then yields zero slots until a discovery cycle opens the
+    next one, since the cycle counter has no time-based rollover.
+
+    ``ignore_budget`` skips the gate entirely and is reachable only from
+    ``cli.run_matching --ignore-budget`` — the operator workflow for
+    hand-scoring a backlog, which is otherwise blocked by its own cap. Such a
+    run is still bounded by ``limit`` or :data:`SCORE_LIMIT_CEILING`.
     """
     db = firestore.AsyncClient()
+    reservation = None
+    if ignore_budget:
+        log.warning("matching.budget_ignored", user_id=user_id, limit=limit)
+        limit = unbudgeted_limit(limit)
+    else:
+        reservation = await budget.reserve(db, user_id, limit, cycle_id=cycle_id)
+        limit = reservation.granted
+        if not limit:
+            # Nothing left in this cycle/day. A normal outcome, not an error:
+            # the backlog waits for the next window.
+            return {
+                "scored": 0,
+                "discarded": 0,
+                "failed": 0,
+                "pending": 0,
+                **budget.summary(reservation, drawn=0),
+            }
+
+    # Counted as jobs finish rather than from the returned counts: the run can
+    # be cancelled out from under us (worker shutdown, the 1800s Cloud Run
+    # timeout) after paying for hundreds of Pro calls, and refunding those
+    # slots because no counts dict came back is the one direction that costs
+    # money. A hard SIGKILL skips the finally entirely, which fails safe.
+    progress = {"attempted": 0}
+    try:
+        counts = await _score_pending(
+            db, user_id, limit, concurrency, on_result, progress
+        )
+        return {**counts, **budget.summary(reservation, drawn=counts["pending"])}
+    finally:
+        if reservation is not None:
+            await budget.release(
+                db,
+                user_id,
+                reservation.granted - progress["attempted"],
+                cycle_id=reservation.cycle_id,
+            )
+
+
+async def _score_pending(
+    db: firestore.AsyncClient,
+    user_id: str,
+    limit: int | None,
+    concurrency: int,
+    on_result: OnResult | None,
+    progress: dict,
+) -> dict:
+    """The scoring run itself, inside whatever budget was granted for it."""
     profile, pending = await load_profile_and_pending(db, user_id, limit)
 
     started = time.monotonic()
 
     # One Vertex context cache for the static scoring block (profile + rules),
     # shared by every job in this run — the block dominates input tokens and
-    # cached input bills at a tenth of the standard rate. TTL is scaled to the
-    # backlog (~30s per Pro call per concurrency slot, capped at 24h);
-    # match_job falls back to the uncached prompt if the cache expires
-    # mid-run, and create_match_cache returning None (e.g. block under the
-    # model's minimum cacheable size) just means the run prices like before.
+    # cached input bills at a tenth of the standard rate. TTL is sized to the
+    # backlog by cache_ttl_seconds above. match_job falls back to the uncached
+    # prompt if the cache expires mid-run, and create_match_cache returning
+    # None (e.g. block under the model's minimum cacheable size) just means
+    # the run prices like before.
     cache_name: str | None = None
     if len(pending) >= 2:
-        ttl_seconds = min(max(3600, len(pending) * 30 // concurrency), 86_400)
-        cache_name = await create_match_cache(profile, ttl_seconds=ttl_seconds)
+        cache_name = await create_match_cache(
+            profile, ttl_seconds=cache_ttl_seconds(len(pending), concurrency)
+        )
 
     log.info(
         "matching.start",
@@ -226,6 +334,13 @@ async def score_pending_jobs(
                 log.exception("match.failed", job_id=job.id, company=job.company)
                 if on_result:
                     on_result(job, None, str(e))
+            finally:
+                # A job that got as far as holding the semaphore has drawn its
+                # slot, whatever happened next — including a cancellation
+                # partway through a (billed) Pro call. Jobs still queued
+                # behind the semaphore when a run is cancelled never run this,
+                # so their slots are correctly refunded.
+                progress["attempted"] += 1
 
     try:
         await asyncio.gather(*(_score(ref, job) for ref, job in pending))
