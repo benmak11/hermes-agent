@@ -595,6 +595,11 @@ def test_online_scorer_stops_when_the_budget_is_spent(budgeted, monkeypatch):
         "discarded": 0,
         "failed": 0,
         "pending": 0,
+        # Zeroed rather than omitted: every branch that can return counts
+        # returns the same key set, or reading them means guessing which one
+        # ran (tools/matching/score.py: EMPTY_GEO_COUNTS).
+        "geo_ineligible": 0,
+        "geo_abstain": 0,
         "budget_granted": 0,
         "budget_remaining_cycle": 0,
         "budget_remaining_day": 995,
