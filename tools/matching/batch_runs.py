@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import UTC, datetime
+from functools import partial
 
 import structlog
 from google.api_core.exceptions import FailedPrecondition
@@ -73,6 +74,7 @@ from tools.matching.pipeline import (
     build_match_job_block,
 )
 from tools.matching.score import (
+    EMPTY_GEO_COUNTS,
     load_profile_and_pending,
     persist_jd_parsed,
     persist_result,
@@ -321,6 +323,9 @@ async def _submit_score_stage(
             tombstones.append((ref, job, match))
         else:
             to_score.append((ref, job))
+    # No ``profile``, so no geo shadow record: these tombstones are the
+    # OUT_OF_FAMILY sentinel, rejected by the free family pre-filter without a
+    # Pro call, so there is no decision for the gate to be measured against.
     for outcome in await _persist_all(tombstones, persist_result):
         counts[outcome] = counts.get(outcome, 0) + 1
 
@@ -452,7 +457,12 @@ async def _ingest_score(db, run_ref, run: dict) -> None:
     run_tag = run_ref.id
     context = await download_text(f"{run['gcs_root']}/score/context.txt")
     out_lines = await fetch_batch_output(f"{run['gcs_root']}/score")
-    _, pending = await load_profile_and_pending(db, run["user_id"])
+    # The profile is kept (it used to be discarded here) only to feed the geo
+    # shadow recording below. Recomputing the verdict at ingest rather than
+    # carrying it across from submit is deliberate and matches this module's
+    # stateless-ingest design: nothing the submitting process knew has to
+    # survive for a later one to finish the run.
+    profile, pending = await load_profile_and_pending(db, run["user_id"])
 
     # Same restriction as parse ingest: only blocks the batch echoed count,
     # so join_score_responses's failed list means "line failed", not "job
@@ -480,7 +490,13 @@ async def _ingest_score(db, run_ref, run: dict) -> None:
         for job in jobs
         if job.id in matches
     ]
-    for outcome in await _persist_all(to_persist, persist_result):
+    # Bound here rather than inside ``_persist_all``: that helper splats whatever
+    # tuples it is given at whatever persister it is given, and it stays that
+    # dumb on purpose — ``_submit_score_stage`` hands it the same function with
+    # no profile bound at all.
+    for outcome in await _persist_all(
+        to_persist, partial(persist_result, profile=profile)
+    ):
         counts[outcome] = counts.get(outcome, 0) + 1
 
     await run_ref.update(
@@ -637,6 +653,11 @@ async def score_or_start_run(user_id: str) -> dict:
         "discarded": counts["discarded"],
         "failed": counts["failed"],
         "pending": run["pending"],
+        # Zero-so-far like the LLM outcomes above, and for the same reason: the
+        # geo verdicts are recorded onto documents by whichever worker tick
+        # ingests this run. Present rather than omitted so both branches of
+        # this function hand back the same key set.
+        **EMPTY_GEO_COUNTS,
         "batch_run": run["run"],
         **{k: v for k, v in run.items() if k.startswith("budget_")},
     }

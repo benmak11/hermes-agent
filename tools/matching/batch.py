@@ -54,10 +54,13 @@ from tools.matching.pipeline import (
     build_match_job_block,
 )
 from tools.matching.score import (
+    EMPTY_GEO_COUNTS,
     OnResult,
+    count_geo_gate,
     load_profile_and_pending,
     persist_jd_parsed,
     persist_result,
+    shadow_geo_gate,
     unbudgeted_limit,
 )
 
@@ -431,6 +434,7 @@ async def batch_score_pending_jobs(
                 "discarded": 0,
                 "failed": 0,
                 "pending": 0,
+                **EMPTY_GEO_COUNTS,
                 **budget.summary(reservation, drawn=0),
             }
 
@@ -470,7 +474,13 @@ async def _batch_score(
     on_result: OnResult | None,
 ) -> dict:
     """The two-stage batch run itself, over an already-budgeted job set."""
-    counts = {"scored": 0, "discarded": 0, "failed": 0, "pending": len(pending)}
+    counts = {
+        "scored": 0,
+        "discarded": 0,
+        "failed": 0,
+        "pending": len(pending),
+        **EMPTY_GEO_COUNTS,
+    }
     started = time.monotonic()
     run_tag = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     gcs_root = f"gs://{batch_bucket_name()}/vertex-batch/{run_tag}"
@@ -595,8 +605,15 @@ async def _batch_score(
     async def _persist(job: Job, match: JobMatch) -> None:
         async with sem:
             try:
-                outcome = await persist_result(ref_by_job_id[job.id], job, match)
+                # ``profile`` turns on geo shadow recording (see
+                # ``score.shadow_geo_gate``). The OUT_OF_FAMILY tombstones in
+                # this same list carry score 0 and are skipped there — they
+                # never reached Pro, so there is no decision to compare against.
+                outcome = await persist_result(
+                    ref_by_job_id[job.id], job, match, profile=profile
+                )
                 counts[outcome] += 1
+                count_geo_gate(counts, shadow_geo_gate(job, match, profile))
                 if on_result:
                     on_result(job, match, None)
             except Exception as e:

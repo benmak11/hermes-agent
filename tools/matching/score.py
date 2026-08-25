@@ -9,6 +9,7 @@ CLI share one implementation.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -20,7 +21,7 @@ from models.job import Job
 from models.match import JobMatch
 from models.profile import MasterProfile
 from obs.logging import current_run_id, get_logger
-from tools.matching import budget, jd_cache
+from tools.matching import budget, geo, jd_cache
 from tools.matching.pipeline import (
     FLASH_MODEL,
     create_match_cache,
@@ -90,8 +91,124 @@ def should_discard(match: JobMatch) -> bool:
     return match.overall_score <= DISCARD_AT_OR_BELOW
 
 
+# --------------------------------------------------------- geo gate, in shadow
+#
+# ``tools.matching.geo`` decides for free what Rule 6 of the scoring prompt
+# currently buys a Pro call to decide (69.4% of every Pro call ever made on the
+# main user came back capped at exactly 20 — geographically ineligible). The
+# replay against history proved the gate never *wrongly* rejects, but it cannot
+# prove what it would *save*: ``persist_result`` tombstones every capped score
+# out of the `jobs` collection and ``discard_tombstone`` carries no
+# ``jd_parsed``, so the gate has nothing to replay against exactly where its
+# upside lives. Live recording is the only way to measure it.
+#
+# So the gate runs on every scored job and its verdict is written down next to
+# what Pro said — and nothing else. It skips no call, changes no score, and
+# changes no discard decision. Acting on it is a later phase, and that phase
+# gets to make its case out of this data.
+
+# Language Pro reaches for when it rejects a job on geography, matched against
+# ``red_flags_hit`` + ``reasoning``.
+#
+# **This is a disambiguator, not a signal.** It is deliberately loose — it also
+# fires on ~1.5% of jobs Pro *kept* (17 of 1,127 in the historical corpus), so
+# on its own it says almost nothing. Its one job is the ambiguous band: a score
+# strictly between 0 and 20 is neither the out-of-family sentinel nor the geo
+# cap, and 37 historical records sit there. For those, "did Pro's own prose
+# mention geography?" is the only evidence available. Never read it as the
+# primary signal; ``pro_capped`` is that.
+#
+# It has to be computed *here* or not at all: ``discard_tombstone`` writes a
+# deliberately minimal record with no ``red_flags_hit``, and the discard path is
+# where most geo rejections go — so this is the last moment the full ``JobMatch``
+# still exists.
+_PRO_GEO_LANGUAGE = re.compile(
+    r"geograph|relocat|time ?zone|ineligib"
+    r"|\bvisa\b|work (?:authoriz|permit)"
+    r"|\bresiden|\bbased in\b|\blocated in\b"
+    r"|\bon-?site\b|\bhybrid\b|\bin-office\b",
+    re.IGNORECASE,
+)
+
+
+def pro_geo_flag(match: JobMatch) -> bool:
+    """Does Pro's own prose mention geography? See ``_PRO_GEO_LANGUAGE``."""
+    return bool(
+        _PRO_GEO_LANGUAGE.search(" ".join([*match.red_flags_hit, match.reasoning]))
+    )
+
+
+def shadow_geo_gate(
+    job: Job, match: JobMatch, profile: MasterProfile | None
+) -> dict | None:
+    """What the geo gate would have said about this job, ready to record.
+
+    ``None`` — record nothing — whenever there is no honest comparison to make:
+
+    - no ``profile``, so the caller opted out (or predates this phase);
+    - no ``jd_parsed``, so the gate has no inputs;
+    - ``overall_score == 0``, the ``pipeline.OUT_OF_FAMILY`` sentinel. That
+      job was rejected by the free family pre-filter and never reached Pro, so
+      there is no Pro decision to agree or disagree with. The same guard also
+      drops a genuine Pro zero, which under-counts true positives and can never
+      manufacture a false positive — the safe direction to be wrong in.
+
+    What lands in Firestore is **raw inputs, not a conclusion**: no ``agree``
+    boolean. The (0, 20) band is genuinely ambiguous, and storing the fields
+    rather than a verdict-on-a-verdict lets the metric be redefined over data
+    already collected instead of re-running anything.
+
+    Never raises. A measurement that can break the thing it measures is worse
+    than no measurement: this runs inside ``persist_result``, after a Pro call
+    has already been paid for, so an exception here would throw away work worth
+    real money to record a statistic.
+    """
+    if profile is None or job.jd_parsed is None or match.overall_score <= 0:
+        return None
+    try:
+        decision = geo.evaluate(job.jd_parsed, profile)
+    except Exception as e:
+        log.warning("matching.geo_shadow_failed", job_id=job.id, error=str(e)[:200])
+        return None
+    return {
+        "version": geo.GATE_VERSION,
+        "verdict": decision.verdict,
+        "rule": decision.rule,
+        "residence_country": decision.residence_country,
+        "job_country": decision.job_country,
+        "pro_score": match.overall_score,
+        # Exactly 20, not <=: a weighted score that merely lands under the
+        # discard threshold is a bad match, not a geo rejection.
+        "pro_capped": match.overall_score == DISCARD_AT_OR_BELOW,
+        "pro_geo_flag": pro_geo_flag(match),
+    }
+
+
+def count_geo_gate(counts: dict, record: dict | None) -> None:
+    """Tally one shadow verdict into a scorer's counts dict.
+
+    Only the two verdicts that would change anything are counted: ``ineligible``
+    is the Pro call a later phase could skip, ``abstain`` is the coverage this
+    gate leaves on the table. ``eligible`` is reached only by the ``us_remote_ok``
+    exception and would skip nothing, so it has no counter.
+    """
+    if record is not None and record["verdict"] in ("ineligible", "abstain"):
+        counts[f"geo_{record['verdict']}"] += 1
+
+
+#: Zeroed geo tallies, spread into every counts dict a scorer can return —
+#: including the ones it returns without scoring anything. A counts contract
+#: whose key set depends on which branch produced it is one KeyError waiting
+#: for whoever reads these numbers next.
+EMPTY_GEO_COUNTS = {"geo_ineligible": 0, "geo_abstain": 0}
+
+
 def discard_tombstone(
-    job: Job, match: JobMatch, *, scored_run_id: str | None = None
+    job: Job,
+    match: JobMatch,
+    *,
+    scored_run_id: str | None = None,
+    geo_gate: dict | None = None,
 ) -> dict:
     """Minimal `discarded_jobs` record.
 
@@ -101,9 +218,11 @@ def discard_tombstone(
 
     ``scored_run_id`` is explicit rather than read from the ambient context so
     a backfill (``cli.purge_discarded``) can carry over the run that actually
-    paid to score the job instead of stamping its own free run.
+    paid to score the job instead of stamping its own free run. ``geo_gate`` is
+    explicit for the same reason — the caller decides whether there was
+    anything worth recording; see :func:`shadow_geo_gate`.
     """
-    return {
+    stone = {
         "job_id": job.id,
         "company": job.company,
         "title": job.title,
@@ -118,6 +237,15 @@ def discard_tombstone(
         # name as on the job docs — one query answers "what did this run buy?".
         "scored_run_id": scored_run_id,
     }
+    if geo_gate is not None:
+        # The one field that earns a place in an otherwise minimal record: the
+        # geo rejections this whole gate exists to skip land *here*, not on job
+        # docs, so a tombstone without it is a measurement that can never be
+        # taken. Absent rather than null when there was nothing to record — the
+        # analysis counts documents that carry a verdict, and "we didn't look"
+        # must stay distinguishable from "we looked and found nothing".
+        stone["geo_gate"] = geo_gate
+    return stone
 
 
 async def load_profile_and_pending(
@@ -165,20 +293,37 @@ async def persist_jd_parsed(ref, job: Job) -> None:
         log.warning("matching.persist_jd_parsed_failed", job_id=job.id)
 
 
-async def persist_result(ref, job: Job, match: JobMatch) -> str:
+async def persist_result(
+    ref, job: Job, match: JobMatch, *, profile: MasterProfile | None = None
+) -> str:
     """Persist one scoring outcome; returns ``"discarded"`` or ``"scored"``.
 
     Discarding replaces the job doc with a ``discarded_jobs`` tombstone (see
     :func:`discard_tombstone`); anything else writes ``match`` + the parsed JD
     onto the job doc.
+
+    ``profile`` turns on shadow recording of the geo gate: a ``geo_gate`` map
+    goes onto whichever document this call writes. It changes nothing else —
+    same outcome, same score, same discard decision, with it or without it.
+    It is keyword-only and optional so that a caller with no profile to hand
+    (``cli.purge_discarded``, a future backfill) keeps working unchanged.
+
+    This is the seam the recording hangs off rather than ``match_job`` because
+    it is the *one* function all three scorers go through. Instrumenting the
+    scorers individually is how the cheap path ships silently uninstrumented.
     """
+    geo_gate = shadow_geo_gate(job, match, profile)
     if should_discard(match):
         # ref.parent is the jobs collection; its parent is the user doc.
         user_ref = ref.parent.parent
         await (
             user_ref.collection("discarded_jobs")
             .document(job.id)
-            .set(discard_tombstone(job, match, scored_run_id=current_run_id()))
+            .set(
+                discard_tombstone(
+                    job, match, scored_run_id=current_run_id(), geo_gate=geo_gate
+                )
+            )
         )
         await ref.delete()
         log.info(
@@ -188,19 +333,18 @@ async def persist_result(ref, job: Job, match: JobMatch) -> str:
             score=match.overall_score,
         )
         return "discarded"
-    await ref.update(
-        {
-            "match": match.model_dump(mode="json"),
-            "jd_parsed": (
-                job.jd_parsed.model_dump(mode="json") if job.jd_parsed else None
-            ),
-            # Spend attribution: `discovered_at` says when the posting showed
-            # up, which is not when (or by which run) it was paid to be scored
-            # — a backlog scored months later is the normal case.
-            "scored_at": datetime.now(UTC).isoformat(),
-            "scored_run_id": current_run_id(),
-        }
-    )
+    fields = {
+        "match": match.model_dump(mode="json"),
+        "jd_parsed": (job.jd_parsed.model_dump(mode="json") if job.jd_parsed else None),
+        # Spend attribution: `discovered_at` says when the posting showed
+        # up, which is not when (or by which run) it was paid to be scored
+        # — a backlog scored months later is the normal case.
+        "scored_at": datetime.now(UTC).isoformat(),
+        "scored_run_id": current_run_id(),
+    }
+    if geo_gate is not None:
+        fields["geo_gate"] = geo_gate
+    await ref.update(fields)
     return "scored"
 
 
@@ -219,9 +363,10 @@ async def score_pending_jobs(
     scores at/below ``DISCARD_AT_OR_BELOW``, in which case the doc is replaced
     by a tombstone in ``discarded_jobs`` so it never reaches the queue but is
     still deduped on future discovery runs. Returns ``{"scored": n,
-    "discarded": n, "failed": n, "pending": n}`` plus the ``budget_*`` fields
-    of :func:`tools.matching.budget.summary`. Raises ``ValueError`` when the
-    user has no profile to match against.
+    "discarded": n, "failed": n, "pending": n}`` plus the ``geo_*`` shadow
+    tallies (:func:`count_geo_gate`) and the ``budget_*`` fields of
+    :func:`tools.matching.budget.summary`. Raises ``ValueError`` when the user
+    has no profile to match against.
 
     How many jobs this run may score is decided *before* anything is loaded,
     by one budget reservation (``tools.matching.budget``); what it grants
@@ -253,6 +398,7 @@ async def score_pending_jobs(
                 "discarded": 0,
                 "failed": 0,
                 "pending": 0,
+                **EMPTY_GEO_COUNTS,
                 **budget.summary(reservation, drawn=0),
             }
 
@@ -310,7 +456,13 @@ async def _score_pending(
         context_cache=cache_name is not None,
     )
     sem = asyncio.Semaphore(concurrency)
-    counts = {"scored": 0, "discarded": 0, "failed": 0, "pending": len(pending)}
+    counts = {
+        "scored": 0,
+        "discarded": 0,
+        "failed": 0,
+        "pending": len(pending),
+        **EMPTY_GEO_COUNTS,
+    }
 
     async def _score(ref, job: Job) -> None:
         async with sem:
@@ -327,8 +479,14 @@ async def _score_pending(
                         )
                     await persist_jd_parsed(ref, job)
                 match = await match_job(job, profile, cached_content=cache_name)
-                outcome = await persist_result(ref, job, match)
+                outcome = await persist_result(ref, job, match, profile=profile)
                 counts[outcome] += 1
+                # Recomputed rather than handed back by persist_result: the
+                # gate is pure and costs microseconds, and one definition of
+                # "is there anything to record here?" beats two. Widening
+                # persist_result's return would also break its callers, who
+                # index a counts dict with it.
+                count_geo_gate(counts, shadow_geo_gate(job, match, profile))
                 if on_result:
                     on_result(job, match, None)
             except Exception as e:

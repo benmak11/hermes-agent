@@ -165,6 +165,9 @@ def harness(monkeypatch, unlimited_budget):
         cached=[],  # store_many payload keys
         jd_persisted=[],  # job ids whose parse was persisted
         results=[],  # (job_id, overall_score)
+        # (job_id, profile): geo shadow recording is on only where a profile
+        # was handed down, so this is what says which paths are instrumented.
+        persist_profiles=[],
         cache_hits={},  # lookup_many return value
         online_calls=[],
         cost_flushes=[],  # (user_id, run_id, meta) banked by persist_run_cost
@@ -194,8 +197,9 @@ def harness(monkeypatch, unlimited_budget):
     async def fake_persist_jd_parsed(ref, job):
         rec.jd_persisted.append(job.id)
 
-    async def fake_persist_result(ref, job, match):
+    async def fake_persist_result(ref, job, match, *, profile=None):
         rec.results.append((job.id, match.overall_score))
+        rec.persist_profiles.append((job.id, profile))
         return "discarded" if match.overall_score <= 20 else "scored"
 
     monkeypatch.setattr(batch_runs, "submit_batch", fake_submit)
@@ -571,6 +575,71 @@ def test_resume_marks_run_without_job_name_as_orphaned(harness, monkeypatch):
     assert "hermes-*-r1" in store["r1"]["error"]
 
 
+# ------------------------------------------------- geo gate shadow recording
+
+
+def test_score_ingest_hands_persist_the_profile(harness, monkeypatch):
+    """The resumable path is the cheap path, so it is the one most likely to
+    ship silently uninstrumented — ``_ingest_score`` used to throw the profile
+    away outright (``_, pending = ...``). Without it every geo verdict on this
+    path is simply never recorded, and the coverage measurement this whole
+    phase exists for is quietly taken over the online scorer alone."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="score")
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+
+    async def fake_download(path):
+        return "CTX"
+
+    async def fake_fetch(gcs_dir):
+        return [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))]
+
+    monkeypatch.setattr(batch_runs, "download_text", fake_download)
+    monkeypatch.setattr(batch_runs, "fetch_batch_output", fake_fetch)
+
+    assert _resume(db)["completed"] == 1
+    assert harness.persist_profiles == [("j1", PROFILE)]
+
+
+def test_out_of_family_tombstones_are_not_geo_recorded(harness, monkeypatch):
+    """The submit-time tombstones never reached Pro — the free family filter
+    rejected them — so there is no Pro decision for the gate to be scored
+    against, and handing them a profile would only pollute the corpus."""
+    db = _FakeDB()
+    _patch_pending(
+        monkeypatch, [(object(), _job("j1", parsed=_parsed(family="sales")))]
+    )
+
+    asyncio.run(batch_runs.start("u1", db=db))
+
+    assert harness.persist_profiles == [("j1", None)]
+
+
+def test_started_batch_run_reports_the_same_keys_as_the_online_scorer(monkeypatch):
+    """Both branches of score_or_start_run feed one caller (the discovery
+    cycle's metrics), so they have to agree on their key set."""
+
+    async def fake_start(user_id, *, min_pending):
+        return {
+            "started": True,
+            "run": "r9",
+            "stage": "parse",
+            "pending": 904,
+            "counts": {"scored": 0, "discarded": 7, "failed": 0, "parse_failed": 0},
+        }
+
+    monkeypatch.setattr(batch_runs, "start", fake_start)
+
+    counts = asyncio.run(batch_runs.score_or_start_run("u1"))
+
+    # Zero-so-far, exactly like scored/failed: the verdicts are recorded by
+    # whichever worker tick ingests the run.
+    assert counts["geo_ineligible"] == 0 and counts["geo_abstain"] == 0
+
+
 # ------------------------------------------- cost attribution across the seam
 
 
@@ -661,7 +730,7 @@ def test_resume_banks_cost_when_the_ingest_dies_after_pricing(harness, monkeypat
     async def fake_fetch(gcs_dir):
         return [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))]
 
-    async def exploding_persist(ref, job, match):
+    async def exploding_persist(ref, job, match, *, profile=None):
         raise RuntimeError("Firestore died after the batch was priced")
 
     monkeypatch.setattr(batch_runs, "download_text", fake_download)
