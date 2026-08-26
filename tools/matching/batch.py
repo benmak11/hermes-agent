@@ -47,11 +47,11 @@ from tools.matching.pipeline import (
     _MATCH_MAX_OUTPUT_TOKENS,
     _MATCH_THINKING,
     _PARSE_JD_THINKING,
-    OUT_OF_FAMILY,
     PARSE_JD_PROMPT,
     PRO_MODEL,
     build_match_context,
     build_match_job_block,
+    family_prefilter,
 )
 from tools.matching.score import (
     EMPTY_GEO_COUNTS,
@@ -566,15 +566,13 @@ async def _batch_score(
 
     # Stage 2 — free local family pre-filter; out-of-family goes straight to
     # tombstones through the same persistence path the online scorer uses.
-    targets = {f.lower() for f in profile.preferences.target_role_families}
     to_persist: list[tuple[Job, JobMatch]] = []
     to_score: list[Job] = []
     for _, job in pending:
         if job.jd_parsed is None:
             continue  # already counted failed in stage 1
-        if job.jd_parsed.role_family not in targets:
-            m = OUT_OF_FAMILY.model_copy()
-            m.job_id = job.id
+        m = family_prefilter(job, profile)
+        if m is not None:
             to_persist.append((job, m))
         else:
             to_score.append(job)
