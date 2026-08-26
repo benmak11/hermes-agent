@@ -71,10 +71,12 @@ from tools.matching.batch import (
 from tools.matching.pipeline import (
     build_match_context,
     build_match_job_block,
-    family_prefilter,
+    geo_enforce_enabled,
+    prefilter,
 )
 from tools.matching.score import (
     EMPTY_GEO_COUNTS,
+    enforced_geo_gate,
     load_profile_and_pending,
     persist_jd_parsed,
     persist_result,
@@ -296,15 +298,26 @@ async def _start(
     }
 
 
+async def _persist_prefiltered(ref, job: Job, match, geo_gate: dict | None) -> str:
+    """``persist_result`` with the geo record positional, for ``_persist_all``.
+
+    That helper splats whatever tuples it is given at whatever persister it is
+    given, and it stays that dumb on purpose, so a keyword-only argument needs a
+    shim rather than a smarter helper. Deliberately passes no ``profile``: see
+    the note at the call site.
+    """
+    return await persist_result(ref, job, match, geo_gate=geo_gate)
+
+
 async def _submit_score_stage(
     db, run_ref, run_tag: str, gcs_root: str, profile, pending, counts: dict
 ) -> str:
-    """Family-filter parsed pending jobs, then submit the Pro batch.
+    """Pre-filter parsed pending jobs, then submit the Pro batch.
 
-    Out-of-family jobs tombstone immediately through the same persistence
-    path as every other scorer (free, no LLM). Unparsed jobs are left alone —
-    their parse failed, and a future run retries them. Returns the resulting
-    run stage ("score", or "done" when nothing needs Pro).
+    Whatever the pre-filter rejects tombstones immediately through the same
+    persistence path as every other scorer (free, no LLM). Unparsed jobs are
+    left alone — their parse failed, and a future run retries them. Returns the
+    resulting run stage ("score", or "done" when nothing needs Pro).
 
     ``pending`` must already be narrowed to the jobs this run reserved budget
     for — see :func:`_owned_pending`. Every entry here that carries a parse
@@ -313,18 +326,24 @@ async def _submit_score_stage(
     """
     tombstones: list[tuple] = []
     to_score: list[tuple] = []
+    enforce_geo = geo_enforce_enabled()
     for ref, job in pending:
         if job.jd_parsed is None:
             continue
-        match = family_prefilter(job, profile)
+        match, decision = prefilter(job, profile, enforce=enforce_geo)
         if match is not None:
-            tombstones.append((ref, job, match))
+            enforced = enforced_geo_gate(decision)
+            if enforced is not None:
+                counts["geo_skipped"] = counts.get("geo_skipped", 0) + 1
+            tombstones.append((ref, job, match, enforced))
         else:
             to_score.append((ref, job))
-    # No ``profile``, so no geo shadow record: these tombstones are the
-    # OUT_OF_FAMILY sentinel, rejected by the free family pre-filter without a
-    # Pro call, so there is no decision for the gate to be measured against.
-    for outcome in await _persist_all(tombstones, persist_result):
+    # No ``profile``, so no geo *shadow* record: an OUT_OF_FAMILY tombstone was
+    # rejected by the free family test without a Pro call, so there is no
+    # decision for the gate to be measured against. An enforced geo tombstone
+    # carries its record explicitly instead — same reason, opposite direction:
+    # it is the gate's own verdict, not a comparison against one.
+    for outcome in await _persist_all(tombstones, _persist_prefiltered):
         counts[outcome] = counts.get(outcome, 0) + 1
 
     if not to_score:
@@ -656,6 +675,10 @@ async def score_or_start_run(user_id: str) -> dict:
         # ingests this run. Present rather than omitted so both branches of
         # this function hand back the same key set.
         **EMPTY_GEO_COUNTS,
+        # ...except the enforced skips, which cost nothing and are already final
+        # whenever ``start`` reached the score stage inline (everything was
+        # cached, so no Flash batch had to run first).
+        "geo_skipped": counts.get("geo_skipped", 0),
         "batch_run": run["run"],
         **{k: v for k, v in run.items() if k.startswith("budget_")},
     }

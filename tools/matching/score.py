@@ -26,8 +26,10 @@ from tools.matching.pipeline import (
     FLASH_MODEL,
     create_match_cache,
     delete_match_cache,
+    geo_enforce_enabled,
     match_job,
     parse_jd,
+    prefilter,
 )
 
 log = get_logger("tools.matching")
@@ -184,6 +186,34 @@ def shadow_geo_gate(
     }
 
 
+def enforced_geo_gate(decision: geo.GeoDecision | None) -> dict | None:
+    """The ``geo_gate`` record for a job the gate *skipped*, not merely watched.
+
+    ``None`` in, ``None`` out: ``pipeline.prefilter`` returns a decision beside
+    its sentinel only when the geo gate is what rejected the job, so a family
+    miss (decision ``None``) produces no record and every caller can pipe the
+    two straight through without branching.
+
+    The shape deliberately diverges from :func:`shadow_geo_gate`'s in two ways.
+    It carries **no ``pro_*`` keys at all** — not nulls, absent — because no Pro
+    call was made and a null ``pro_score`` sitting next to 7,000 real ones is an
+    invitation to average it in. And it carries ``enforced: True``, which is the
+    *only* thing that distinguishes these tombstones from ``OUT_OF_FAMILY``
+    ones: both score 0 (see :data:`pipeline.GEO_INELIGIBLE`), so score cannot do
+    it. ``cli.geo_resurrect`` selects on exactly this field.
+    """
+    if decision is None:
+        return None
+    return {
+        "version": geo.GATE_VERSION,
+        "verdict": decision.verdict,
+        "rule": decision.rule,
+        "residence_country": decision.residence_country,
+        "job_country": decision.job_country,
+        "enforced": True,
+    }
+
+
 def count_geo_gate(counts: dict, record: dict | None) -> None:
     """Tally one shadow verdict into a scorer's counts dict.
 
@@ -200,7 +230,36 @@ def count_geo_gate(counts: dict, record: dict | None) -> None:
 #: including the ones it returns without scoring anything. A counts contract
 #: whose key set depends on which branch produced it is one KeyError waiting
 #: for whoever reads these numbers next.
-EMPTY_GEO_COUNTS = {"geo_ineligible": 0, "geo_abstain": 0}
+EMPTY_GEO_COUNTS = {"geo_ineligible": 0, "geo_abstain": 0, "geo_skipped": 0}
+
+
+def restore_payload(job: Job) -> dict:
+    """Everything needed to rebuild this ``Job`` from its tombstone, later.
+
+    **Why a tombstone carries a copy of the job at all.** ``discarded_jobs`` is
+    not a log, it is discovery's dedupe mechanism: ``discovery.pipeline``
+    checks the tombstone *before* the job doc, so a tombstoned posting is never
+    re-persisted and never re-scored while it stays live on a board. Under
+    enforcement a wrong ``ineligible`` verdict is therefore not "one job lost" —
+    it is that posting permanently suppressed, on every future re-discovery,
+    with nothing anywhere recording that a machine decided it.
+
+    **Why carry the job rather than just delete the tombstone and let discovery
+    re-find the posting.** A ``geo.GATE_VERSION`` bump has to be resolvable
+    *offline and for free*: stream the enforced tombstones, re-run the current
+    gate over the parse stored here, resurrect exactly the ones whose verdict
+    changed (``cli.geo_resurrect``). That is deterministic and unit-testable,
+    depends on no posting still being live on a board months later, and re-pays
+    for no Flash parse. Deleting the tombstone instead would hand the correction
+    to a crawl we do not control and cannot replay.
+
+    The whole ``Job`` is dumped rather than a hand-picked field list, so
+    restoring is ``Job.model_validate(restore)`` with nothing to keep in sync —
+    and note ``jd_raw`` is *required* by ``models.job.Job``, which is why the
+    minimal tombstone can restore nothing at all. It is the tombstone's one
+    heavy field, and it is written only on enforced tombstones.
+    """
+    return job.model_dump(mode="json")
 
 
 def discard_tombstone(
@@ -209,6 +268,7 @@ def discard_tombstone(
     *,
     scored_run_id: str | None = None,
     geo_gate: dict | None = None,
+    restore: dict | None = None,
 ) -> dict:
     """Minimal `discarded_jobs` record.
 
@@ -221,6 +281,11 @@ def discard_tombstone(
     paid to score the job instead of stamping its own free run. ``geo_gate`` is
     explicit for the same reason — the caller decides whether there was
     anything worth recording; see :func:`shadow_geo_gate`.
+
+    ``restore`` is :func:`restore_payload`, and belongs only on tombstones the
+    geo gate issued under enforcement. Every other tombstone is a *Pro*
+    decision: reversing it would need the Pro call re-run, not a stored copy of
+    the job, so carrying the payload there would be pure weight.
     """
     stone = {
         "job_id": job.id,
@@ -245,6 +310,8 @@ def discard_tombstone(
         # analysis counts documents that carry a verdict, and "we didn't look"
         # must stay distinguishable from "we looked and found nothing".
         stone["geo_gate"] = geo_gate
+    if restore is not None:
+        stone["restore"] = restore
     return stone
 
 
@@ -294,7 +361,12 @@ async def persist_jd_parsed(ref, job: Job) -> None:
 
 
 async def persist_result(
-    ref, job: Job, match: JobMatch, *, profile: MasterProfile | None = None
+    ref,
+    job: Job,
+    match: JobMatch,
+    *,
+    profile: MasterProfile | None = None,
+    geo_gate: dict | None = None,
 ) -> str:
     """Persist one scoring outcome; returns ``"discarded"`` or ``"scored"``.
 
@@ -308,11 +380,24 @@ async def persist_result(
     It is keyword-only and optional so that a caller with no profile to hand
     (``cli.purge_discarded``, a future backfill) keeps working unchanged.
 
+    ``geo_gate`` supplies that map *verbatim* instead, and is how an enforced
+    skip travels (:func:`enforced_geo_gate`). It cannot go through the shadow
+    path: :func:`shadow_geo_gate` returns ``None`` for ``overall_score <= 0``,
+    correctly, because there is no Pro decision to compare against — and an
+    enforced skip is exactly a record with no Pro decision. Passing it here also
+    keeps the record and the ``restore`` payload written by the same statement,
+    so a tombstone can never come out carrying one and not the other.
+
     This is the seam the recording hangs off rather than ``match_job`` because
     it is the *one* function all three scorers go through. Instrumenting the
     scorers individually is how the cheap path ships silently uninstrumented.
     """
-    geo_gate = shadow_geo_gate(job, match, profile)
+    if geo_gate is None:
+        geo_gate = shadow_geo_gate(job, match, profile)
+    # Only enforced tombstones are reversible, and only they need to be: see
+    # :func:`restore_payload`. A Pro-issued discard is a judgement, not a
+    # machine-provable claim, and carries no copy of the job.
+    restore = restore_payload(job) if geo_gate and geo_gate.get("enforced") else None
     if should_discard(match):
         # ref.parent is the jobs collection; its parent is the user doc.
         user_ref = ref.parent.parent
@@ -321,7 +406,11 @@ async def persist_result(
             .document(job.id)
             .set(
                 discard_tombstone(
-                    job, match, scored_run_id=current_run_id(), geo_gate=geo_gate
+                    job,
+                    match,
+                    scored_run_id=current_run_id(),
+                    geo_gate=geo_gate,
+                    restore=restore,
                 )
             )
         )
@@ -449,11 +538,16 @@ async def _score_pending(
             profile, ttl_seconds=cache_ttl_seconds(len(pending), concurrency)
         )
 
+    # Read once per run, not per job: the env cannot change mid-run, and one
+    # value per run is what makes "was this run enforcing?" answerable from the
+    # log line below.
+    enforce_geo = geo_enforce_enabled()
     log.info(
         "matching.start",
         pending=len(pending),
         concurrency=concurrency,
         context_cache=cache_name is not None,
+        geo_enforce=enforce_geo,
     )
     sem = asyncio.Semaphore(concurrency)
     counts = {
@@ -478,6 +572,35 @@ async def _score_pending(
                             db, job.jd_raw, job.jd_parsed, model=FLASH_MODEL
                         )
                     await persist_jd_parsed(ref, job)
+                # Free rejections before the paid call, in the one place all
+                # three scorers share. A non-None decision beside the sentinel
+                # means the geo gate is what rejected it, not the family test.
+                skipped, decision = prefilter(job, profile, enforce=enforce_geo)
+                if skipped is not None:
+                    enforced = enforced_geo_gate(decision)
+                    if enforced is None:
+                        # The log the pre-filter used to emit from inside
+                        # match_job. It stays a call-site concern: the batch
+                        # paths have never emitted it (they tombstone in bulk
+                        # and report counts), and moving it into prefilter would
+                        # start two new log streams.
+                        log.info(
+                            "matching.skip_out_of_family",
+                            job_id=job.id,
+                            company=job.company,
+                            role_family=job.jd_parsed.role_family
+                            if job.jd_parsed
+                            else None,
+                        )
+                    else:
+                        counts["geo_skipped"] += 1
+                    outcome = await persist_result(
+                        ref, job, skipped, profile=profile, geo_gate=enforced
+                    )
+                    counts[outcome] += 1
+                    if on_result:
+                        on_result(job, skipped, None)
+                    return
                 match = await match_job(job, profile, cached_content=cache_name)
                 outcome = await persist_result(ref, job, match, profile=profile)
                 counts[outcome] += 1
