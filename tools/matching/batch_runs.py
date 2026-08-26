@@ -69,9 +69,9 @@ from tools.matching.batch import (
     upload_text,
 )
 from tools.matching.pipeline import (
-    OUT_OF_FAMILY,
     build_match_context,
     build_match_job_block,
+    family_prefilter,
 )
 from tools.matching.score import (
     EMPTY_GEO_COUNTS,
@@ -311,15 +311,13 @@ async def _submit_score_stage(
     becomes a paid Pro request, so handing this function a full reload is how
     a 300-slot run submits 900 jobs.
     """
-    targets = {f.lower() for f in profile.preferences.target_role_families}
     tombstones: list[tuple] = []
     to_score: list[tuple] = []
     for ref, job in pending:
         if job.jd_parsed is None:
             continue
-        if job.jd_parsed.role_family not in targets:
-            match = OUT_OF_FAMILY.model_copy()
-            match.job_id = job.id
+        match = family_prefilter(job, profile)
+        if match is not None:
             tombstones.append((ref, job, match))
         else:
             to_score.append((ref, job))

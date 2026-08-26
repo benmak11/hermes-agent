@@ -353,6 +353,42 @@ OUT_OF_FAMILY = JobMatch(
 )
 
 
+def family_prefilter(job: Job, profile: MasterProfile) -> JobMatch | None:
+    """The :data:`OUT_OF_FAMILY` sentinel when this job misses the profile's
+    target families, else ``None`` — the one pre-Pro seam every scorer shares.
+
+    This decision used to be written out three times (here in :func:`match_job`,
+    in ``batch._batch_score``, in ``batch_runs._submit_score_stage``) because the
+    batch paths never call :func:`match_job` — they build their own Pro requests
+    from a list of jobs. That is also why Phase 1C's geo shadow recording had to
+    be hung off ``score.persist_result`` rather than off the pre-filter itself:
+    there was no single place the pre-filter *was*. There is now.
+
+    The families are lowercased on the profile side only. ``role_family`` is a
+    ``Literal`` the parse prompt already constrains to lowercase, whereas
+    ``target_role_families`` is user-supplied and arrives however it was typed.
+
+    A job with no parse also gets ``None``, and the two ``None``\\ s deliberately
+    do not have to be told apart at a call site: every caller settles the
+    unparsed case *before* asking. :func:`match_job` parses first; both batch
+    paths skip such jobs, which were already counted as failures by their parse
+    stage. Do not "fix" this by parsing here — that would put a billed Flash
+    call inside the function whose job is to avoid billed calls.
+
+    Returns a ``model_copy``, never the module-level singleton: callers stamp
+    ``job_id`` onto what they get back.
+    """
+    parsed = job.jd_parsed
+    if parsed is None:
+        return None
+    targets = {f.lower() for f in profile.preferences.target_role_families}
+    if parsed.role_family in targets:
+        return None
+    match = OUT_OF_FAMILY.model_copy()
+    match.job_id = job.id
+    return match
+
+
 async def parse_jd(job: Job) -> ParsedJD:
     """Cheap structured extraction with Flash — runs on every discovered job."""
     client = genai.Client(vertexai=True)
@@ -396,14 +432,15 @@ async def match_job(
         job.jd_parsed = await parse_jd(job)
 
     # Cheap pre-filter: skip jobs outside target families before the Pro call.
-    targets = {f.lower() for f in profile.preferences.target_role_families}
-    if job.jd_parsed.role_family not in targets:
+    # The log stays at this call site rather than inside the pre-filter: the
+    # batch paths have never emitted it (they tombstone in bulk and report
+    # counts), and moving it in would start two new log streams.
+    skipped = family_prefilter(job, profile)
+    if skipped is not None:
         job_log.info(
             "matching.skip_out_of_family", role_family=job.jd_parsed.role_family
         )
-        m = OUT_OF_FAMILY.model_copy()
-        m.job_id = job.id
-        return m
+        return skipped
 
     job_block = build_match_job_block(job)
     config = types.GenerateContentConfig(
