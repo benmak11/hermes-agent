@@ -3,12 +3,15 @@
 """Matching pipeline: parse a JD (Flash) then score it against the profile (Pro).
 
 Deterministic engine (run via cli/run_matching.py), not an ADK agent. A cheap
-family pre-filter drops out-of-target roles before the expensive Pro scoring
-call. Models are kept in sync with agents/_shared.py.
+pre-filter (:func:`prefilter`) drops out-of-target roles — and, under
+``GEO_GATE_ENFORCE``, provably unreachable ones — before the expensive Pro
+scoring call. Models are kept in sync with agents/_shared.py.
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
 import time
 
 from google import genai
@@ -19,6 +22,7 @@ from models.match import JobMatch, ScoreBreakdown
 from models.profile import MasterProfile
 from obs.llm_cost import record_llm_call
 from obs.logging import get_logger
+from tools.matching import geo
 
 log = get_logger("tools.matching")
 
@@ -334,6 +338,14 @@ def _residence_str(profile: MasterProfile) -> str:
     return ", ".join(parts) if parts else profile.location
 
 
+# ------------------------------------------------------------- the pre-filter
+#
+# Everything a scorer can decide *without* buying a Pro call lives in
+# :func:`prefilter`, which all three scorers call immediately before deciding
+# to spend. Two rejections come out of it, and they must never be confused:
+# a role outside the target families, and — only under ``GEO_GATE_ENFORCE`` — a
+# job the deterministic geo gate proves the candidate cannot hold.
+
 # Sentinel score for jobs filtered out before full scoring.
 OUT_OF_FAMILY = JobMatch(
     job_id="",
@@ -352,41 +364,214 @@ OUT_OF_FAMILY = JobMatch(
     recommendation="skip",
 )
 
+#: Sentinel for a job the geo gate rejected *instead of* calling Pro.
+#:
+#: **The score is 0, and it must never be 20.** 20 is
+#: ``score.DISCARD_AT_OR_BELOW`` and, across this codebase, means exactly one
+#: thing: *Pro* looked at the job and applied Rule 6's geographic cap. Three
+#: separate pieces of machinery read it that way — ``cli.geo_replay``'s
+#: ``GEO_CAP_SCORE``, ``score.shadow_geo_gate``'s ``pro_capped``, and every
+#: historical tombstone count derived from either. A gate-issued 20 would forge
+#: Pro decisions that were never made and silently corrupt the one measurement
+#: this whole phase is justified by.
+#:
+#: 0 is already ``OUT_OF_FAMILY``'s "never reached Pro" sentinel, which is
+#: precisely what this is too. The two are told apart by ``geo_gate.enforced``
+#: on the tombstone — never by score, and never by ``reasoning``.
+GEO_INELIGIBLE = JobMatch(
+    job_id="",
+    overall_score=0,
+    breakdown=ScoreBreakdown(
+        role_fit=0,
+        qualifications_match=0,
+        seniority_match=0,
+        comp_alignment=0,
+        # 0 rather than OUT_OF_FAMILY's 100, mirroring what Rule 6 instructs Pro
+        # to write for a geographically ineligible role. The breakdown is
+        # fiction either way — nothing scored this job — but where a value can
+        # match what the paid path would have produced, it should.
+        deal_breaker_penalty=0,
+    ),
+    matched_strengths=[],
+    gaps=[],
+    red_flags_hit=[],
+    reasoning=(
+        "Geographically ineligible from the candidate's residence — skipped "
+        "before scoring by the deterministic geo gate (tools.matching.geo)."
+    ),
+    recommendation="skip",
+)
 
-def family_prefilter(job: Job, profile: MasterProfile) -> JobMatch | None:
-    """The :data:`OUT_OF_FAMILY` sentinel when this job misses the profile's
-    target families, else ``None`` — the one pre-Pro seam every scorer shares.
+#: Fraction of gate-rejected jobs scored by Pro anyway, for measurement.
+DEFAULT_GEO_HOLDOUT = 0.10
 
-    This decision used to be written out three times (here in :func:`match_job`,
-    in ``batch._batch_score``, in ``batch_runs._submit_score_stage``) because the
+
+def geo_enforce_enabled() -> bool:
+    """True when the geo gate may *skip* Pro calls, not merely record them.
+
+    Off unless explicitly switched on, same shape as ``QUEUE_MODE``
+    (``tools.queues.enabled``) and ``ADK_ENABLED`` (``api.main``). Off is the
+    shipped state: the gate's false-positive rate is measured (0 over 1,127
+    records) but a false positive under enforcement is not one lost job — the
+    tombstone is discovery's dedupe key, so it suppresses that posting on every
+    future re-discovery too. That is what :func:`score.restore_payload` and
+    ``cli.geo_resurrect`` exist to make reversible, and what this flag exists to
+    keep switched off until someone decides to turn it on.
+    """
+    return os.getenv("GEO_GATE_ENFORCE", "").strip().lower() in {"1", "true", "on"}
+
+
+def geo_holdout_fraction() -> float:
+    """``GEO_GATE_HOLDOUT`` as a fraction in [0, 1]; default 10%.
+
+    Anything unparseable or out of range falls back to the default rather than
+    disabling the hold-out, because a hold-out of zero is the one setting that
+    quietly destroys the measurement.
+    """
+    raw = os.getenv("GEO_GATE_HOLDOUT", "").strip()
+    if not raw:
+        return DEFAULT_GEO_HOLDOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("matching.geo_holdout_env_invalid", value=raw[:40])
+        return DEFAULT_GEO_HOLDOUT
+    if not 0.0 <= value <= 1.0:
+        log.warning("matching.geo_holdout_env_invalid", value=raw[:40])
+        return DEFAULT_GEO_HOLDOUT
+    return value
+
+
+def geo_holdout(job_id: str, fraction: float) -> bool:
+    """Is this job in the hold-out — scored by Pro despite an ineligible verdict?
+
+    **Deterministic on the job id, never ``random()``.** The resumable batch
+    pipeline decides at submit time and joins the responses back at ingest,
+    hours later and in a different process (``batch_runs.resume``, typically a
+    worker cron tick). A job that answered "skip" at submit and "score" at
+    ingest — or the reverse — would break the content join: the ingest would
+    either look for a Pro response that was never requested, or tombstone a job
+    whose paid response is sitting in the output it is holding. Hashing the id
+    makes the answer a property of the job rather than of the process asking.
+
+    SHA-256 rather than :func:`hash`, because Python salts ``hash(str)`` per
+    process by default — the exact failure this is written to avoid.
+
+    Sampling the id and not the *decision* also means the hold-out set is stable
+    across a ``GATE_VERSION`` bump, so the same jobs keep producing the Pro
+    comparison and the series stays readable.
+    """
+    if fraction <= 0.0:
+        return False
+    if fraction >= 1.0:
+        return True
+    digest = hashlib.sha256(job_id.encode()).digest()
+    return int.from_bytes(digest[:8], "big") / 2.0**64 < fraction
+
+
+def prefilter(
+    job: Job, profile: MasterProfile, *, enforce: bool
+) -> tuple[JobMatch | None, geo.GeoDecision | None]:
+    """What can be decided about this job for free — the one pre-Pro seam.
+
+    Returns ``(match, decision)``:
+
+    - ``(OUT_OF_FAMILY copy, None)`` — role family outside the profile's
+      targets. No gate was consulted, hence no decision.
+    - ``(GEO_INELIGIBLE copy, decision)`` — ``enforce`` is on and the gate
+      proved the job unreachable. **The non-``None`` decision is the
+      discriminator**: a caller tells an enforced geo skip from a family miss by
+      whether a decision came back with the sentinel, never by comparing scores
+      (both are 0, deliberately — see :data:`GEO_INELIGIBLE`).
+    - ``(None, ...)`` — go and score it.
+
+    This decision used to be written out three times (in :func:`match_job`, in
+    ``batch._batch_score``, in ``batch_runs._submit_score_stage``) because the
     batch paths never call :func:`match_job` — they build their own Pro requests
     from a list of jobs. That is also why Phase 1C's geo shadow recording had to
     be hung off ``score.persist_result`` rather than off the pre-filter itself:
-    there was no single place the pre-filter *was*. There is now.
+    there was no single place the pre-filter *was*.
 
     The families are lowercased on the profile side only. ``role_family`` is a
     ``Literal`` the parse prompt already constrains to lowercase, whereas
     ``target_role_families`` is user-supplied and arrives however it was typed.
 
-    A job with no parse also gets ``None``, and the two ``None``\\ s deliberately
-    do not have to be told apart at a call site: every caller settles the
-    unparsed case *before* asking. :func:`match_job` parses first; both batch
-    paths skip such jobs, which were already counted as failures by their parse
-    stage. Do not "fix" this by parsing here — that would put a billed Flash
-    call inside the function whose job is to avoid billed calls.
+    A job with no parse gets ``(None, None)``, and that ``None`` deliberately
+    does not have to be told apart from "go score it" at a call site: every
+    caller settles the unparsed case *before* asking. Do not "fix" this by
+    parsing here — that would put a billed Flash call inside the function whose
+    job is to avoid billed calls.
 
-    Returns a ``model_copy``, never the module-level singleton: callers stamp
+    **When ``enforce`` is false the gate is not consulted at all**, so this
+    reduces to the family test that shipped before Phase 1D, plus one boolean.
+    That is the merge-safety argument, and it is why the gate call sits behind
+    the flag rather than being evaluated and discarded: with the flag off there
+    is no new code path for anything — not even an exception — to come out of.
+    The shadow recording is unaffected; it has always had its own
+    ``geo.evaluate`` call inside ``score.persist_result``.
+
+    Returns a ``model_copy``, never a module-level singleton: callers stamp
     ``job_id`` onto what they get back.
     """
     parsed = job.jd_parsed
     if parsed is None:
-        return None
+        return None, None
     targets = {f.lower() for f in profile.preferences.target_role_families}
-    if parsed.role_family in targets:
-        return None
-    match = OUT_OF_FAMILY.model_copy()
+    if parsed.role_family not in targets:
+        match = OUT_OF_FAMILY.model_copy()
+        match.job_id = job.id
+        return match, None
+    if not enforce:
+        return None, None
+
+    try:
+        decision = geo.evaluate(parsed, profile)
+    except Exception as e:
+        # The gate is pure and has no business raising, but a profile it cannot
+        # read (an old doc, a stub) must cost a skipped optimization and never a
+        # skipped job. Abstaining here is exactly the status quo.
+        log.warning("matching.geo_gate_failed", job_id=job.id, error=str(e)[:200])
+        return None, None
+    if decision.verdict != "ineligible":
+        return None, decision
+
+    # **US residents only, and this check belongs here rather than in geo.py.**
+    # ``geo.evaluate`` reads exactly one profile field (``residence.country``),
+    # and both profiles the gate was measured against normalize to "US" — so the
+    # effective sample is one profile, not two. For a non-US resident the
+    # structure inverts rather than merely shifting: ``us_remote_ok``, the
+    # safety valve carrying 73.4% of the kept corpus, is hard-gated on US inside
+    # the gate and so never fires, while ``country_mismatch`` fires against
+    # nearly every US posting. That population is unmeasured *and* structurally
+    # different, and there are zero non-US users today, so declining to enforce
+    # for them costs nothing. geo.py stays a pure statement of what is provable;
+    # who we are willing to act on it for is a policy, and policy lives here.
+    if decision.residence_country != "US":
+        return None, decision
+
+    if geo_holdout(job.id, geo_holdout_fraction()):
+        # Scored by Pro anyway, and recorded through the normal shadow path.
+        # Permanent, not a rollout ramp: once enforcing, the enforced population
+        # stops producing Pro comparisons forever, which would leave the only
+        # metric that justifies the gate with a hole exactly where the gate acts.
+        log.info(
+            "matching.geo_holdout",
+            job_id=job.id,
+            rule=decision.rule,
+            job_country=decision.job_country,
+        )
+        return None, decision
+
+    log.info(
+        "matching.geo_skipped",
+        job_id=job.id,
+        rule=decision.rule,
+        job_country=decision.job_country,
+        residence_country=decision.residence_country,
+    )
+    match = GEO_INELIGIBLE.model_copy()
     match.job_id = job.id
-    return match
+    return match, decision
 
 
 async def parse_jd(job: Job) -> ParsedJD:
@@ -418,7 +603,14 @@ async def match_job(
     approval_patterns: str = "",
     cached_content: str | None = None,
 ) -> JobMatch:
-    """Parse (if needed), family pre-filter, then full Pro scoring.
+    """Parse (if needed), then full Pro scoring. **This call always spends.**
+
+    It does *not* pre-filter. :func:`prefilter` used to run here, which made the
+    online path the only one where the free rejections happened inside the paid
+    function — and left the caller unable to see *why* a job was rejected, which
+    the geo gate needs (it has to record a verdict onto the tombstone). So the
+    pre-filter moved out to the callers, where the two batch scorers had always
+    had it, and all three now call it immediately before deciding to spend.
 
     ``cached_content`` is a Vertex cache resource name from
     :func:`create_match_cache`; when set, only the per-job block is sent and
@@ -430,17 +622,6 @@ async def match_job(
     job_log = log.bind(job_id=job.id, company=job.company)
     if job.jd_parsed is None:
         job.jd_parsed = await parse_jd(job)
-
-    # Cheap pre-filter: skip jobs outside target families before the Pro call.
-    # The log stays at this call site rather than inside the pre-filter: the
-    # batch paths have never emitted it (they tombstone in bulk and report
-    # counts), and moving it in would start two new log streams.
-    skipped = family_prefilter(job, profile)
-    if skipped is not None:
-        job_log.info(
-            "matching.skip_out_of_family", role_family=job.jd_parsed.role_family
-        )
-        return skipped
 
     job_block = build_match_job_block(job)
     config = types.GenerateContentConfig(

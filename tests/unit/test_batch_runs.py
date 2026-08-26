@@ -168,6 +168,9 @@ def harness(monkeypatch, unlimited_budget):
         # (job_id, profile): geo shadow recording is on only where a profile
         # was handed down, so this is what says which paths are instrumented.
         persist_profiles=[],
+        # (job_id, geo_gate): non-None only for a gate-enforced skip, which
+        # carries its verdict explicitly instead of through the shadow path.
+        persist_gates=[],
         cache_hits={},  # lookup_many return value
         online_calls=[],
         cost_flushes=[],  # (user_id, run_id, meta) banked by persist_run_cost
@@ -197,9 +200,10 @@ def harness(monkeypatch, unlimited_budget):
     async def fake_persist_jd_parsed(ref, job):
         rec.jd_persisted.append(job.id)
 
-    async def fake_persist_result(ref, job, match, *, profile=None):
+    async def fake_persist_result(ref, job, match, *, profile=None, geo_gate=None):
         rec.results.append((job.id, match.overall_score))
         rec.persist_profiles.append((job.id, profile))
+        rec.persist_gates.append((job.id, geo_gate))
         return "discarded" if match.overall_score <= 20 else "scored"
 
     monkeypatch.setattr(batch_runs, "submit_batch", fake_submit)

@@ -51,12 +51,14 @@ from tools.matching.pipeline import (
     PRO_MODEL,
     build_match_context,
     build_match_job_block,
-    family_prefilter,
+    geo_enforce_enabled,
+    prefilter,
 )
 from tools.matching.score import (
     EMPTY_GEO_COUNTS,
     OnResult,
     count_geo_gate,
+    enforced_geo_gate,
     load_profile_and_pending,
     persist_jd_parsed,
     persist_result,
@@ -564,16 +566,22 @@ async def _batch_score(
         await asyncio.gather(*(_save_parse(job) for job in parsed_now))
         log.info("matching.batch.parses_persisted", count=len(parsed_now))
 
-    # Stage 2 — free local family pre-filter; out-of-family goes straight to
-    # tombstones through the same persistence path the online scorer uses.
-    to_persist: list[tuple[Job, JobMatch]] = []
+    # Stage 2 — the free local pre-filter; whatever it rejects goes straight to
+    # tombstones through the same persistence path the online scorer uses. The
+    # third tuple slot is the enforced geo record, ``None`` for everything the
+    # gate did not reject — including every Pro result appended below.
+    to_persist: list[tuple[Job, JobMatch, dict | None]] = []
     to_score: list[Job] = []
+    enforce_geo = geo_enforce_enabled()
     for _, job in pending:
         if job.jd_parsed is None:
             continue  # already counted failed in stage 1
-        m = family_prefilter(job, profile)
+        m, decision = prefilter(job, profile, enforce=enforce_geo)
         if m is not None:
-            to_persist.append((job, m))
+            enforced = enforced_geo_gate(decision)
+            if enforced is not None:
+                counts["geo_skipped"] += 1
+            to_persist.append((job, m, enforced))
         else:
             to_score.append(job)
 
@@ -595,20 +603,26 @@ async def _batch_score(
         for job in failed:
             _fail(job, "scoring failed in batch")
         to_persist.extend(
-            (job, matches[job.id]) for job in to_score if job.id in matches
+            (job, matches[job.id], None) for job in to_score if job.id in matches
         )
 
     sem = asyncio.Semaphore(_PERSIST_CONCURRENCY)
 
-    async def _persist(job: Job, match: JobMatch) -> None:
+    async def _persist(job: Job, match: JobMatch, enforced: dict | None) -> None:
         async with sem:
             try:
                 # ``profile`` turns on geo shadow recording (see
                 # ``score.shadow_geo_gate``). The OUT_OF_FAMILY tombstones in
                 # this same list carry score 0 and are skipped there — they
                 # never reached Pro, so there is no decision to compare against.
+                # ``enforced`` is the one case that bypasses the shadow path
+                # entirely, for the same reason: no Pro call was made.
                 outcome = await persist_result(
-                    ref_by_job_id[job.id], job, match, profile=profile
+                    ref_by_job_id[job.id],
+                    job,
+                    match,
+                    profile=profile,
+                    geo_gate=enforced,
                 )
                 counts[outcome] += 1
                 count_geo_gate(counts, shadow_geo_gate(job, match, profile))
@@ -617,7 +631,7 @@ async def _batch_score(
             except Exception as e:
                 _fail(job, str(e))
 
-    await asyncio.gather(*(_persist(job, match) for job, match in to_persist))
+    await asyncio.gather(*(_persist(*args) for args in to_persist))
 
     log.info(
         "matching.batch.done",

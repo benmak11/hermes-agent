@@ -28,10 +28,28 @@ denominator: ``score.discard_tombstone`` writes a deliberately minimal record
 with a ``score`` and no ``jd_parsed``, so there is nothing to run the gate
 against.
 
+``--corpus jd-cache`` answers the *other* question — the one the per-user
+``jobs`` corpus structurally cannot. That corpus is survivorship-filtered: every
+job the gate would have caught was tombstoned out of it, so it can falsify the
+gate (any ``ineligible`` verdict in it is a false positive) but can never show
+that the gate fires at all. The top-level ``jd_cache`` collection has neither
+problem. Parses are cached the moment Flash produces one, independently of
+whether the job was later kept, tombstoned or never scored, and the cache is
+cross-user — so it is the closest thing to an unfiltered sample of what the
+crawler actually finds. It costs nothing to read and nothing to evaluate: the
+parses are already paid for and the gate is pure.
+
+What it reports is a distribution, not a contingency table. A ``jd_cache`` doc
+carries no ``match``, so there is no Pro decision to compare against and no
+false-positive rate to compute; the FP number stays the ``jobs`` corpus's job.
+Read the two together — one says the gate is safe, the other says it is not
+silent.
+
 Usage:
     python -m cli.geo_replay --user-id me
     python -m cli.geo_replay --user-id me --user-id E3cika... --with-discarded
     python -m cli.geo_replay --all-users
+    python -m cli.geo_replay --corpus jd-cache --user-id E3cika...
 """
 
 from __future__ import annotations
@@ -48,7 +66,7 @@ from google.cloud import firestore
 from models.job import ParsedJD
 from models.profile import MasterProfile
 from obs.logging import bind_run_context, get_logger
-from tools.matching import geo
+from tools.matching import geo, jd_cache
 from tools.matching.score import DISCARD_AT_OR_BELOW
 
 load_dotenv()
@@ -206,6 +224,94 @@ async def replay_user(
     return result
 
 
+@dataclass
+class CacheReplay:
+    """The gate's verdict distribution over the cross-user parse cache.
+
+    Deliberately *not* a :class:`Replay`. There is no ``capped`` axis here — a
+    ``jd_cache`` doc is a parse and nothing else — and reusing the contingency
+    table would print a false-positive rate of zero over a corpus that cannot
+    measure one, which is the single most misreadable number this tool could
+    emit.
+    """
+
+    user_id: str
+    residence: str | None = None
+    n: int = 0
+    unparseable: int = 0
+    verdicts: Counter = field(default_factory=Counter)
+    rules: Counter = field(default_factory=Counter)
+
+    def record(self, decision: geo.GeoDecision) -> None:
+        self.n += 1
+        self.verdicts[decision.verdict] += 1
+        self.rules[decision.rule] += 1
+
+
+async def replay_jd_cache(
+    db: firestore.AsyncClient, user_id: str
+) -> CacheReplay | None:
+    """Run the gate over every cached parse. ``None`` = no usable profile.
+
+    A profile is still needed, and for one field: ``geo.evaluate`` reads
+    ``residence.country`` and nothing else (see ``tools/matching/geo.py``). So
+    ``--user-id`` here does not select the corpus — the corpus is everything —
+    it selects the *residence the corpus is evaluated against*. Two users whose
+    residence normalizes to the same country produce byte-identical output.
+    """
+    result = CacheReplay(user_id=user_id)
+    snap = await db.collection("users").document(user_id).get()
+    if not snap.exists:
+        print(f"  ! users/{user_id}: no such user — nothing to evaluate against")
+        return None
+    try:
+        profile = MasterProfile.model_validate(snap.to_dict())
+    except Exception as e:
+        print(f"  ! users/{user_id}: unreadable profile ({str(e)[:80]}) — skipped")
+        return None
+    result.residence = geo.normalize_country(
+        profile.residence.country if profile.residence else None
+    )
+
+    async for doc_snap in db.collection(jd_cache.COLLECTION).stream():
+        doc = doc_snap.to_dict() or {}
+        try:
+            parsed = ParsedJD.model_validate(doc.get("jd_parsed"))
+        except Exception:
+            # Schema drift, exactly as ``jd_cache.lookup_many`` treats it: a
+            # doc the current model can't read is a miss, not a verdict.
+            # Counted so a systematic gap can't hide behind a clean histogram.
+            result.unparseable += 1
+            continue
+        result.record(geo.evaluate(parsed, profile))
+    return result
+
+
+def report_jd_cache(r: CacheReplay) -> None:
+    print(f"\n── jd_cache vs users/{r.user_id} " + "─" * 30)
+    print(f"   residence={r.residence}   gate v{geo.GATE_VERSION}")
+    print(f"   {r.n} cached parse(s)", end="")
+    print(f" ({r.unparseable} unparseable, skipped)" if r.unparseable else "")
+    if not r.n:
+        return
+
+    print(f"\n   {'verdict':<12}{'count':>10}{'share':>10}")
+    for verdict in VERDICTS:
+        count = r.verdicts[verdict]
+        print(f"   {verdict:<12}{count:>10}{count / r.n:>10.1%}")
+
+    print("\n   rule fired:")
+    for rule, count in r.rules.most_common():
+        print(f"     {count:6d}  {rule}  ({count / r.n:.1%})")
+
+    print(
+        "\n   This corpus carries no Pro decisions, so nothing here is a\n"
+        "   false-positive rate — that number comes from the `jobs` corpus.\n"
+        "   What it does show is that the gate is not silent: the ineligible\n"
+        "   share above is the fraction of *all* parses it would act on."
+    )
+
+
 def report(r: Replay, *, title: str) -> None:
     print(f"\n── {title} " + "─" * max(0, 58 - len(title)))
     print(f"   residence={r.residence}   gate v{geo.GATE_VERSION}")
@@ -291,9 +397,41 @@ async def main() -> None:
         action="store_true",
         help="Also count discarded_jobs tombstones (slow; large collection)",
     )
+    parser.add_argument(
+        "--corpus",
+        choices=("jobs", "jd-cache"),
+        default="jobs",
+        help=(
+            "jobs: per-user scored history (measures false positives). "
+            "jd-cache: the cross-user parse cache (measures how often the gate "
+            "fires at all). Needs exactly one --user-id, for its residence."
+        ),
+    )
     args = parser.parse_args()
     if not args.user_ids and not args.all_users:
         parser.error("pass --user-id (repeatable) or --all-users")
+
+    if args.corpus == "jd-cache":
+        # One residence, one distribution. Allowing several would print the
+        # same corpus repeatedly under different profiles with no way to tell
+        # from the totals that the denominator never changed.
+        if args.all_users or len(args.user_ids) != 1:
+            parser.error("--corpus jd-cache takes exactly one --user-id")
+        bind_run_context("geo_replay", user_id=args.user_ids[0])
+        cached = await replay_jd_cache(firestore.AsyncClient(), args.user_ids[0])
+        if cached is None:
+            return
+        report_jd_cache(cached)
+        log.info(
+            "geo_replay.done",
+            corpus="jd-cache",
+            n=cached.n,
+            unparseable=cached.unparseable,
+            gate_version=geo.GATE_VERSION,
+            **{f"verdict_{k}": v for k, v in cached.verdicts.items()},
+        )
+        return
+
     bind_run_context("geo_replay", user_id=",".join(args.user_ids) or "all")
 
     db = firestore.AsyncClient()
@@ -318,6 +456,7 @@ async def main() -> None:
         report(combined, title=f"ALL {reports} users")
     log.info(
         "geo_replay.done",
+        corpus="jobs",
         users=reports,
         n=combined.n,
         false_positives=combined.fp,
