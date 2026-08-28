@@ -28,12 +28,19 @@ check their email before resubmitting, and the note tells them so.
 Dry-run by default, like ``cli.reset_user`` and ``cli.geo_resurrect``: without
 ``--execute`` it reports exactly what it would move and writes nothing.
 
+**A live lease is never released, at any age.** ``tools.applications.state``
+leases are written by the process actually running the work, so they are the
+one first-hand signal here; everything else on this page is inference. The age
+arithmetic below only decides documents that hold no lease — the in-process
+submission path writes none, and neither did anything before the lease existed.
+
 Age is measured from ``last_submitted_at`` (written atomically with the
 ``submitting`` status by ``POST /applications/{id}/submit``), falling back to the
 newest timeline entry for documents predating it. The default floor is the
-``submitting`` lease from ``tools.applications.state.IN_PROGRESS`` — the same
-20 minutes that bounds a real run against the 1800s Cloud Tasks dispatch
-deadline — so a submission still legitimately in flight is never touched.
+``submitting`` lease from ``tools.applications.state.IN_PROGRESS`` — which is
+deliberately *longer* than the 1800s Cloud Tasks dispatch deadline, since a lock
+that expires while its work can still be running is not a lock — so a submission
+still legitimately in flight is never touched.
 
 Usage:
     python -m cli.unwedge_submitting --user-id me                    # dry run
@@ -117,11 +124,26 @@ def age_minutes(doc: dict, *, now: datetime) -> float | None:
 def is_wedged(doc: dict, *, now: datetime, min_age_minutes: float) -> bool:
     """Is this document stuck in ``submitting`` past the lease? Pure.
 
-    A document whose age can't be determined is treated as wedged: it has no
-    ``last_submitted_at`` and no usable timeline, which only happens to
-    documents old enough that no submission of theirs is still running.
+    **A held lease wins over the age arithmetic, whatever the age says.** The
+    ages here are inferred: ``last_submitted_at`` records when the *request*
+    claimed the status, which is not when the run started — once submission goes
+    through the queue, a task can sit enqueued for minutes before a worker picks
+    it up, so an application can be older than the floor while its browser is
+    still on the first page of the form. Releasing that one writes ``failed``
+    and clears the lease under a working submitter, and the real outcome is then
+    refused when it reports back: the user is told "failed" about an application
+    that went out, with the confirmation screenshot dropped. The lease is the
+    only signal that comes from the process actually doing the work, so it is
+    the one that decides.
+
+    A document whose age can't be determined *and* holds no lease is treated as
+    wedged: it has no ``last_submitted_at`` and no usable timeline, which only
+    happens to documents old enough that no submission of theirs is still
+    running.
     """
     if doc.get("status") != WEDGED_STATUS:
+        return False
+    if state.lease_is_held(doc, now=now):
         return False
     age = age_minutes(doc, now=now)
     return age is None or age >= min_age_minutes

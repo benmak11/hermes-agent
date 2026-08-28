@@ -38,8 +38,37 @@ def _doc(status="submitting", *, minutes_ago=None, timeline_minutes_ago=None):
 
 
 def test_default_age_is_the_state_machines_own_lease():
-    """Not an independently chosen number — the two must not drift."""
-    assert DEFAULT_MIN_AGE_MINUTES == state.IN_PROGRESS["submitting"] // 60 == 20
+    """Not an independently chosen number — the two must not drift.
+
+    31 minutes, not 20: the lease is now the 1800s dispatch deadline plus a
+    minute of grace, because a lock that can expire while its work is still
+    running is not a lock. This tool inherits that floor.
+    """
+    assert DEFAULT_MIN_AGE_MINUTES == state.IN_PROGRESS["submitting"] // 60 == 31
+
+
+def test_a_live_lease_is_never_wedged_however_old_the_document_looks():
+    """The lease is first-hand evidence from the process doing the work; the age
+    is inference. Once submission goes through the queue, ``last_submitted_at``
+    is stamped when the *request* claimed the status, which can be long before a
+    worker picks the task up — so age alone would release a document whose
+    browser is still on the first page of the form, write ``failed`` under it,
+    and lose the confirmation when the real outcome is refused."""
+    doc = _doc(minutes_ago=999)
+    doc["lease"] = state.lease_for("submitting", owner="w1", now=NOW)
+    assert is_wedged(doc, now=NOW, min_age_minutes=DEFAULT_MIN_AGE_MINUTES) is False
+
+    # ...and it stops protecting the document the moment it lapses.
+    expired = NOW + timedelta(seconds=state.IN_PROGRESS["submitting"] + 1)
+    assert is_wedged(doc, now=expired, min_age_minutes=DEFAULT_MIN_AGE_MINUTES) is True
+
+
+def test_a_document_with_no_lease_still_falls_back_to_the_age():
+    """The in-process submission path writes no lease at all, and neither did
+    anything before leases existed — absence must not read as 'alive'."""
+    doc = _doc(minutes_ago=DEFAULT_MIN_AGE_MINUTES)
+    assert "lease" not in doc
+    assert is_wedged(doc, now=NOW, min_age_minutes=DEFAULT_MIN_AGE_MINUTES) is True
 
 
 def test_started_at_prefers_last_submitted_at():

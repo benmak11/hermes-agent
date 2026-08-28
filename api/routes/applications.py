@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Collection
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -43,6 +44,10 @@ log = get_logger("api.applications")
 # Derived from the state machine so the two can't drift — the enforcement is the
 # compare-and-swap in submit(), not this set.
 SUBMITTABLE = {s for s, nxt in state.TRANSITIONS.items() if "submitting" in nxt}
+#: Prefix on every timeline note a rehearsal writes. ``web/`` renders notes
+#: verbatim, so this is the only thing separating "we walked the form for free"
+#: from "we applied to this job" in the user's own record of what happened.
+DRY_RUN_NOTE = "[dry run] "
 # Where the SSE stream stops polling. Wider than state.TERMINAL_STATUSES on
 # purpose: submitted/failed end *this* submission even though the lifecycle can
 # still move on from them.
@@ -64,11 +69,23 @@ def _apps(user_id: str):
     return _client().collection("users").document(user_id).collection("applications")
 
 
+def application_ref(user_id: str, app_id: str):
+    """The Application document reference.
+
+    Public because ``api/routes/worker.py`` needs the *same* reference this
+    module writes through: its ``/tasks/apply`` handler claims the delivery on
+    the document that ``submit()`` already moved to ``submitting``.
+    """
+    return _apps(user_id).document(app_id)
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-async def _dismiss_if_posting_removed(user_ref, app_ref, job: Job, task_log) -> bool:
+async def _dismiss_if_posting_removed(
+    user_ref, app_ref, job: Job, task_log, *, allowed_from: Collection[str]
+) -> bool:
     """Verify the posting is still live before spending work on it.
 
     Only a definitive "gone" from the ATS dismisses (check_posting fails open on
@@ -76,6 +93,18 @@ async def _dismiss_if_posting_removed(user_ref, app_ref, job: Job, task_log) -> 
     ``user_decision: dismissed`` and the application flips to the terminal
     ``posting_removed`` status, which is the user-facing notification on the
     tracking page. Returns True when the caller should stop.
+
+    ``allowed_from`` is **required, and each caller passes the status it owns.**
+    ``check_posting`` is a network round trip, so every caller here holds a read
+    that is already stale by the time the write goes out, and
+    ``submitting → posting_removed`` is a legal edge. Without the precondition
+    *inside* the swap, a rehearsal (or a tailoring run) that started on a
+    ``ready_for_review`` document could return from that round trip, find the
+    user had meanwhile clicked Submit, and park the document terminally —
+    clearing the lease out from under a live browser and destroying the
+    confirmation evidence for an application that really was sent. Same failure
+    the liveness sweep documents in ``state.try_transition``; filtering before
+    the swap is not a compare-and-swap.
     """
     if await check_posting(job) != "removed":
         return False
@@ -84,15 +113,18 @@ async def _dismiss_if_posting_removed(user_ref, app_ref, job: Job, task_log) -> 
         {"user_decision": "dismissed", "posting_removed_at": _now()}
     )
     # The caller stops either way — the posting really is gone. A refused
-    # transition just means someone else already parked the application
-    # somewhere terminal.
-    state.try_transition(
+    # transition means the document moved out from under us: either someone
+    # already parked it somewhere terminal, or it is now owned by a run this
+    # caller must not interrupt.
+    if not state.try_transition(
         app_ref,
         app_ref.get(),
         "posting_removed",
         note=f"posting no longer available at {job.url} — application dismissed",
         lease=state.CLEAR_LEASE,
-    )
+        allowed_from=allowed_from,
+    ):
+        task_log.info("application.posting_removed_not_recorded")
     return True
 
 
@@ -121,7 +153,20 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             # Claim before any paid work. Two schedulings of this task (approve
             # then regenerate, or a retry) can't both spend an LLM run on the
             # same job, and a doc the undo path deleted is never resurrected.
-            if not state.try_transition(app_ref, app_ref.get(), "tailoring"):
+            #
+            # Status and lease in **one** write. The status is what stops the
+            # double spend; the lease is what stops a worker killed mid-run from
+            # stranding the document forever. Without it the tailor queue's
+            # retry arrives, correctly refuses the now-illegal queued → tailoring
+            # edge, and the work is silently dropped — the user's only way out
+            # being the Regenerate button, on a page that gives no sign anything
+            # is wrong. Every exit below hands the lease back.
+            if not state.try_transition(
+                app_ref,
+                app_ref.get(),
+                "tailoring",
+                lease=state.lease_for("tailoring", owner=state.new_owner()),
+            ):
                 task_log.info("tailoring.not_claimed")
                 log_agent_end(task_log, "tailoring", started, outcome="not_claimed")
                 return
@@ -135,7 +180,12 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
 
             # The posting may have died between discovery and approval — don't
             # spend an LLM run tailoring for a page that no longer exists.
-            if await _dismiss_if_posting_removed(user_ref, app_ref, job, task_log):
+            # allowed_from is the status this run owns: if the document has left
+            # ``tailoring`` while check_posting was on the wire, it is no longer
+            # ours to park.
+            if await _dismiss_if_posting_removed(
+                user_ref, app_ref, job, task_log, allowed_from={"tailoring"}
+            ):
                 log_agent_end(task_log, "tailoring", started, outcome="posting_removed")
                 return
 
@@ -147,6 +197,10 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 user_ref.collection("jobs").document(job_id).get().to_dict() or {}
             ).get("user_decision")
             if decision != "approved":
+                # The one exit that leaves the lease behind, deliberately: the
+                # undo path has usually deleted this document already, and
+                # writing to one that survived would only resurrect state the
+                # user asked us to drop. It expires on the IN_PROGRESS clock.
                 task_log.info("tailoring.discarded", decision=decision)
                 log_agent_end(
                     task_log,
@@ -167,7 +221,14 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             # update(), not set(merge=True): a doc the undo path deleted between
             # the decision check above and here must not come back.
             app_ref.update(content)
-            if not state.try_transition(app_ref, app_ref.get(), "ready_for_review"):
+            # CLEAR_LEASE: the run is over. A tailoring lease left on a
+            # ready_for_review document would still be live when the user clicks
+            # Submit, and the worker's own claim on ``submitting`` would find it
+            # held and refuse — a submission silently dropped by a lease nobody
+            # owns any more.
+            if not state.try_transition(
+                app_ref, app_ref.get(), "ready_for_review", lease=state.CLEAR_LEASE
+            ):
                 task_log.info("tailoring.result_not_published")
             task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
             log_agent_end(
@@ -322,12 +383,27 @@ def regenerate(
     return {"ok": True}
 
 
-async def run_submission(user_id: str, app_id: str) -> None:
+async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) -> None:
     """Background task: submit the application to the live ATS and record evidence.
 
     Downloads the tailored resume, runs the per-source submitter, uploads pre/post
     screenshots to GCS, and writes the terminal status (submitted/failed). Progress
     is appended to the timeline as it goes so the SSE stream can relay it live.
+
+    ``dry_run`` drives the whole path against the live posting but stops the
+    submitter before it clicks Submit, so the browser automation can be
+    exercised for $0. It is **keyword-only and worker-only** — nothing on the
+    public API surface can set it (see ``api/routes/worker.ApplyTask``).
+
+    A dry run writes **no status of its own**: ``submit_greenhouse`` reports one
+    as ``success=True, dry_run=True``, and treating that as a real success would
+    write ``submitted`` on a job nobody applied to. It writes timeline notes,
+    marked as a rehearsal so the tracking page cannot read them as a submission
+    in progress. The **one** status it can still reach is ``posting_removed``,
+    via the pre-flight check below: the posting being gone is a fact about the
+    world rather than about this run, and it is recorded under the same
+    ``allowed_from`` guard as everything else here — only while the document is
+    still where the rehearsal found it.
     """
     ref = _apps(user_id).document(app_id)
     snap = ref.get()
@@ -335,6 +411,12 @@ async def run_submission(user_id: str, app_id: str) -> None:
         return
     app = snap.to_dict()
     job_id = app["job_id"]
+    # The status this run may act on, read once and used as the precondition for
+    # every write below — a real submission owns ``submitting`` (the API claimed
+    # it before scheduling), a rehearsal owns nothing and may only touch a
+    # document still sitting where it found it.
+    owned: Collection[str] = SUBMITTABLE if dry_run else {"submitting"}
+    found_status = app.get("status")
     task_log = log.bind(
         user_id=user_id,
         app_id=app_id,
@@ -351,6 +433,15 @@ async def run_submission(user_id: str, app_id: str) -> None:
         # it emits "submitted" the moment it sees a confirmation page, and
         # honouring that as a transition would lock out the real terminal write
         # below, which is the one carrying the screenshots and confirmation.
+        if dry_run:
+            # A rehearsal's steps are the *same* steps, so unmarked they render
+            # on the tracking page as a submission in progress — "Opening…",
+            # "Attaching resume" — against a document nobody submitted. Keep the
+            # entry's status where the document actually is and label the note.
+            state.append_note(
+                ref, found_status or "ready_for_review", DRY_RUN_NOTE + message
+            )
+            return
         state.append_note(ref, status, message)
 
     # run_id context so the submitter's own log lines (tools.submitters, the
@@ -368,7 +459,9 @@ async def run_submission(user_id: str, app_id: str) -> None:
 
             # Last-line check: never drive a browser at a posting the ATS says
             # is gone. Fail-open — a flaky board proceeds and fails visibly.
-            if await _dismiss_if_posting_removed(user_ref, ref, job, task_log):
+            if await _dismiss_if_posting_removed(
+                user_ref, ref, job, task_log, allowed_from=owned
+            ):
                 log_agent_end(
                     task_log, "submission", started, outcome="posting_removed"
                 )
@@ -380,7 +473,7 @@ async def run_submission(user_id: str, app_id: str) -> None:
                 job,
                 profile,
                 resume_path,
-                dry_run=False,
+                dry_run=dry_run,
                 headless=True,
                 on_progress=progress,
             )
@@ -411,10 +504,36 @@ async def run_submission(user_id: str, app_id: str) -> None:
                 task_log,
                 "submission",
                 started,
-                outcome="submitted" if result.get("success") else "failed",
+                outcome=(
+                    ("dry_run" if dry_run else "submitted")
+                    if result.get("success")
+                    else "failed"
+                ),
                 error=result.get("error"),
             )
-            if result.get("success"):
+            if dry_run:
+                # The pre-submit screenshot is uploaded but not attached to the
+                # document (``screenshots`` is submission evidence, and no
+                # submission happened), so log where it landed — that upload is
+                # the only artifact a rehearsal leaves behind.
+                task_log.info(
+                    "submission.dry_run", screenshot_uris=[s["uri"] for s in shots]
+                )
+                # No transition, in either direction. The document is still
+                # wherever the worker found it (a submittable status — the
+                # handler checks), and there is no edge that would put it back
+                # if a dry run moved it, so it moves it nowhere.
+                state.append_note(
+                    ref,
+                    found_status or "ready_for_review",
+                    DRY_RUN_NOTE
+                    + (
+                        "completed — stopped before Submit; nothing was submitted"
+                        if result.get("success")
+                        else f"failed: {result.get('error') or 'unknown'}"[:300]
+                    ),
+                )
+            elif result.get("success"):
                 confirm_uri = next(
                     (s["uri"] for s in shots if s["name"] == "confirmation.png"), None
                 )
@@ -459,6 +578,24 @@ async def run_submission(user_id: str, app_id: str) -> None:
                 )
         except Exception as e:  # record failure for the UI
             task_log.exception("submission.failed")
+            if dry_run:
+                # Same rule as the success path: a dry run writes no status.
+                # ``failed`` is a legal edge from a submittable status, so
+                # without this guard a $0 rehearsal could mark a real
+                # application failed.
+                state.append_note(
+                    ref,
+                    found_status or "ready_for_review",
+                    DRY_RUN_NOTE + f"errored: {e!s}"[:300],
+                )
+                log_agent_end(
+                    task_log,
+                    "submission",
+                    started,
+                    outcome="failed",
+                    error=str(e)[:300],
+                )
+                return
             if not state.try_transition(
                 ref, ref.get(), "failed", note=str(e)[:300], lease=state.CLEAR_LEASE
             ):
@@ -502,6 +639,17 @@ def submit(
         user_id=user_id,
         status_was=status,
     )
+    # NOTE FOR THE PR THAT MOVES THIS TO THE QUEUE. The lease that fences
+    # ``/tasks/apply`` fences *nothing here*: this path takes the status claim
+    # and then submits in-process, without ever writing a lease. That is fine
+    # while it is the only path — but it stops being fine during the cutover.
+    # Cloud Run shifts traffic between revisions gradually, so for the length of
+    # the migration the old revision (in-process, no lease) and the new one
+    # (enqueue, leased) both serve, on the same documents, and neither can see
+    # the other's claim. The status CAS above is the only thing keeping the two
+    # apart, and it is enough *only* because both paths take it before doing any
+    # work: keep it that way, or move the claim into ``run_submission`` so both
+    # paths are fenced by the same lease before splitting traffic.
     background_tasks.add_task(run_submission, user_id, app_id)
     return {"ok": True}
 
