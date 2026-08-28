@@ -17,6 +17,7 @@ scheduler tick rather than hot-retrying paid LLM calls.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException
@@ -177,12 +178,11 @@ async def task_batch_resume() -> dict:
 
 
 # --------------------------------------------------------------------------
-# The application funnel (Phase 2). Both handlers below are **deliberately
-# unreachable in this deploy**: nothing in the repo enqueues to them yet, and
-# adding a caller here is a separate merge on purpose. CI deploys hermes-api
-# and hermes-worker from the same commit, so flipping the callers in the same
-# PR would leave a window where the API enqueues to a worker route that doesn't
-# exist yet. Two merges, two deploys, ordering guaranteed — no feature flag.
+# The application funnel (Phase 2). These handlers landed one merge ahead of
+# their callers — CI deploys hermes-api and hermes-worker from the same commit,
+# so shipping both together would have left a window where the API enqueued to
+# a worker route that didn't exist yet. This is the merge that turns the
+# callers on (``applications.dispatch_tailor`` / ``dispatch_apply``).
 # --------------------------------------------------------------------------
 
 
@@ -213,24 +213,27 @@ async def task_apply(body: ApplyTask) -> dict:
 
     **The claim is split in two, and neither half is taken twice.**
     ``POST /applications/{id}/submit`` compare-and-swaps
-    ``ready_for_review → submitting`` and only then schedules the work; that
+    ``ready_for_review → submitting`` and only then dispatches the work; that
     swap is the double-click guard and it has to stay on the request, because
     it is what turns the losing click into a 409. By the time the task gets
     here the status *is* that claim — and ``submitting → submitting`` is
-    illegal, exactly as it must be — so this handler takes the other claim, the
-    lease, which answers the question a status can't: *is a worker running this
-    right now?* A redelivered task finds a live lease and returns without
-    touching a browser. ``run_submission``'s terminal write hands the lease back
-    in the same update that records the outcome, and the explicit release below
-    covers the case where that write lost its race; a run that dies instead
-    leaves the lease to expire on the ``state.IN_PROGRESS`` clock, which is set
-    *longer* than the dispatch deadline precisely so a retry can never arrive
-    while the run it would duplicate is still legally holding the document.
+    illegal, exactly as it must be — so the other claim, the lease, answers the
+    question a status can't: *is a process running this right now?*
 
-    **What is load-bearing in production today is not this code.** The
+    **That lease is taken by ``run_submission``, not by this handler.** It used
+    to be taken here, which fenced worker against worker and nothing else:
+    ``dispatch_apply`` still runs the same function as a background task
+    wherever QUEUE_MODE is off, and a Cloud Run traffic migration puts two
+    hermes-api revisions on the same documents for the length of the rollout. A
+    claim only one of those paths takes is not a lock. Moving it into the callee
+    puts every path that can drive a submission behind the same primitive, and
+    is why this handler now reads as thinly as ``/tasks/tailor`` does — ``ran``
+    is simply whether the callee got the claim.
+
+    **What is load-bearing in production today is still not that.** The
     ``hermes-apply`` queue is provisioned with ``max_attempts = 1``, so an apply
-    task is never redelivered in the first place; the lease is what makes the
-    handler correct if that is ever raised, and what a reaper (and
+    task is never redelivered in the first place; the lease is what makes this
+    correct if that is ever raised, and what a reaper (and
     ``cli/unwedge_submitting``) can read to tell a live run from a dead one.
 
     ``dry_run`` takes no lease because it makes no claim: it writes no status of
@@ -250,13 +253,13 @@ async def task_apply(body: ApplyTask) -> dict:
     """
     _require_worker()
     task_log = log.bind(user_id=body.user_id, app_id=body.app_id)
-    ref = application_ref(body.user_id, body.app_id)
-    snap = ref.get()
-    if not snap.exists:
-        task_log.info("task.apply.missing")
-        return {"ok": True, "ran": False}
 
     if body.dry_run:
+        ref = application_ref(body.user_id, body.app_id)
+        snap = await asyncio.to_thread(ref.get)
+        if not snap.exists:
+            task_log.info("task.apply.missing")
+            return {"ok": True, "ran": False, "dry_run": True}
         current = (snap.to_dict() or {}).get(state.STATUS_FIELD)
         if current not in SUBMITTABLE:
             task_log.info("task.apply.dry_run_skipped", current=current)
@@ -264,36 +267,8 @@ async def task_apply(body: ApplyTask) -> dict:
         await run_submission(body.user_id, body.app_id, dry_run=True)
         return {"ok": True, "ran": True, "dry_run": True}
 
-    owner = state.new_owner()
-    if not state.try_claim_lease(ref, snap, "submitting", owner=owner):
-        # A duplicate delivery, or a document that moved on. 200, not 4xx or
-        # 5xx: this task has nothing left to do, and a retry would only ask the
-        # same question again.
-        task_log.info("task.apply.not_claimed")
-        return {"ok": True, "ran": False}
-
-    task_log = task_log.bind(lease_owner=owner)
-    try:
-        await run_submission(body.user_id, body.app_id)
-    finally:
-        # Hand the lease back — but only once the document has an outcome.
-        #
-        # Normally there is nothing to do: every terminal transition carries
-        # CLEAR_LEASE, so the outcome and the release are one write. The case
-        # this covers is that transition *losing* — it loses because the
-        # document moved on, which leaves our lease sitting on someone else's
-        # status for its full TTL.
-        #
-        # Still ``submitting`` is the opposite case and must NOT be released:
-        # the run ended without recording an outcome, so whether the form was
-        # actually submitted is unknown, and dropping the lease would invite a
-        # redelivery straight back into the same document. Let it expire, which
-        # is what cli/unwedge_submitting (and the reaper) exist to adjudicate.
-        after = ref.get()
-        doc = after.to_dict() or {}
-        if doc.get(state.STATUS_FIELD) == "submitting":
-            if state.lease_owner(doc) == owner:
-                task_log.warning("task.apply.finished_without_an_outcome")
-        elif state.release_lease(ref, after, owner):
-            task_log.warning("task.apply.lease_released_late")
-    return {"ok": True, "ran": True}
+    # False means the document is gone or the claim was lost — a duplicate
+    # delivery, or a document that moved on. 200, not 4xx or 5xx: this task has
+    # nothing left to do, and a retry would only ask the same question again.
+    ran = await run_submission(body.user_id, body.app_id)
+    return {"ok": True, "ran": ran}

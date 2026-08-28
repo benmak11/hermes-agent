@@ -32,6 +32,7 @@ from google.cloud import firestore
 from api.deps import verify_user
 from models.profile import MasterProfile
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
+from tools import queues
 from tools.profile.extract import extract_profile, read_resume_text
 from tools.run_costs import persist_run_cost
 
@@ -167,6 +168,21 @@ def save_profile(
     now" promise on the review screen is actually true — nothing else in the
     app fires an initial run, and ``auto_discovery`` defaults to off. Later
     profile edits (re-PUTting an already-complete profile) don't repeat this.
+
+    That kickoff enqueues **inside the request** where there is a queue to
+    enqueue to. It is one RPC, and it is the only thing that ever fires for a
+    brand-new user, so it must not be the one part of this route that depends on
+    the instance still having CPU after the response — the same failure mode
+    that made "discovery never runs" a bug in the first place.
+
+    **And if that RPC fails, ``onboarding_complete`` does not stick.** The flag
+    is the only thing that makes this kickoff fire again, so leaving it set on a
+    failed enqueue re-creates the very bug under a different cause: onboarded
+    user, error on screen, discovery never runs, nothing to retry. Rolling it
+    back costs the user one more click of a button whose contents are already
+    saved, and that click re-fires the kickoff. (Without a queue the kickoff is
+    a background task whose failure this request cannot see, exactly as before —
+    the flag is written and stays written.)
     """
     existing = _user_ref(user_id).get().to_dict() or {}
     first_completion = not existing.get("onboarding_complete")
@@ -182,10 +198,37 @@ def save_profile(
         skill_groups=len(body.skills),
     )
     if first_completion:
-        from api.routes.discovery import dispatch_cycle
+        from api.routes.discovery import dispatch_cycle, enqueue_cycle
 
         log.info("profile.onboarding_discovery_kickoff", user_id=user_id)
-        background_tasks.add_task(
-            dispatch_cycle, "discovery", user_id, trigger="onboarding"
-        )
+        if queues.enabled():
+            try:
+                queued = enqueue_cycle("discovery", user_id, trigger="onboarding")
+            except Exception as e:
+                # Everything that can throw here is environmental — Cloud Tasks
+                # 503, a missing IAM binding, an unset WORKER_URL/TASKS_SA_EMAIL
+                # (queues.enqueue reads those with os.environ[...]) — and none of
+                # it means the profile save failed. Give the flag back so the
+                # retry is a real retry, and tell the user something to retry.
+                _user_ref(user_id).set({"onboarding_complete": False}, merge=True)
+                log.exception("profile.onboarding_kickoff_failed", user_id=user_id)
+                raise HTTPException(
+                    status_code=503,
+                    detail="profile saved, but the first search could not be "
+                    "started — please save again",
+                ) from e
+            # Deduped means a kickoff for this user and hour is already queued,
+            # which is the outcome we wanted; it is not a failure.
+            log.info(
+                "profile.onboarding_kickoff_queued",
+                user_id=user_id,
+                deduped=not queued,
+            )
+        else:
+            # No queue: dispatch_cycle would run the whole discovery-and-scoring
+            # cycle right here, which is minutes of work and cannot happen
+            # inside the request. Deferred, as before.
+            background_tasks.add_task(
+                dispatch_cycle, "discovery", user_id, trigger="onboarding"
+            )
     return {"ok": True}

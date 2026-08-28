@@ -15,6 +15,7 @@ back.
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -715,6 +716,211 @@ def test_submit_404s_on_a_missing_application(submit_client):
     doc.delete()
     assert client.post("/applications/app-job1/submit").status_code == 404
     assert submissions == []
+
+
+# --------------------------------------------------------------------------
+# Claim first, dispatch second
+#
+# Once the submission goes to a queue, the claim and the dispatch are two
+# separate writes to two separate systems, and the order between them is a
+# correctness property rather than a style preference.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def queued_submit(monkeypatch):
+    """The real submit() route with QUEUE_MODE on and the enqueue recorded.
+
+    The fake enqueue **reads the document from inside the call**, so every
+    recorded task carries what a worker picking it up at that instant would
+    see. That snapshot is the ordering assertion.
+    """
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    doc = _ready()
+    monkeypatch.setattr(applications, "_apps", lambda user_id: _FakeCollection(doc))
+
+    enqueued: list[dict] = []
+    # ``hook`` runs where Cloud Tasks would be, so a test can decide what the
+    # rest of the world does while this request is inside the enqueue call.
+    outcome = SimpleNamespace(accepted=True, error=None, hook=None)
+
+    def fake_enqueue(queue, path, payload, *, task_id=None):
+        enqueued.append(
+            {
+                "queue": queue,
+                "path": path,
+                "payload": payload,
+                "task_id": task_id,
+                "doc_at_enqueue": doc.data,
+            }
+        )
+        if outcome.hook is not None:
+            outcome.hook()
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.accepted
+
+    monkeypatch.setattr(applications.queues, "enqueue", fake_enqueue)
+
+    app = FastAPI()
+    app.include_router(applications.router)
+    app.dependency_overrides[verify_user] = lambda: "u1"
+    return SimpleNamespace(
+        client=TestClient(app), doc=doc, enqueued=enqueued, outcome=outcome
+    )
+
+
+def test_submit_commits_the_claim_before_it_enqueues(queued_submit):
+    """The enqueue is the *last* thing the request does.
+
+    Cloud Tasks can hand the task to a worker before this request executes its
+    next line. Enqueue first and that worker reads a ``ready_for_review``
+    application, finds no claim to inherit, and returns having done nothing —
+    the submission lost in silence. In this order the worst case is a claim with
+    nothing behind it, which the reaper can undo and which never clicked
+    anything.
+    """
+    resp = queued_submit.client.post("/applications/app-job1/submit")
+
+    assert resp.status_code == 200
+    (task,) = queued_submit.enqueued
+    assert (task["queue"], task["path"]) == ("apply", "/tasks/apply")
+    assert task["payload"] == {"user_id": "u1", "app_id": "app-job1"}
+    assert task["doc_at_enqueue"]["status"] == "submitting"
+    assert task["doc_at_enqueue"]["submit_attempts"] == 1
+    assert task["task_id"] == "apply-u1-app-job1-1"
+
+
+def test_the_attempt_counter_rides_in_the_same_write_as_the_claim(queued_submit):
+    """It names the task, so a claim that loses must not advance it: two claims
+    sharing a number would share a task name, and the queue would dedupe the
+    second real submission away."""
+    doc = queued_submit.doc
+    in_flight = doc.snapshot()  # the second click's read, taken concurrently
+
+    assert queued_submit.client.post("/applications/app-job1/submit").status_code == 200
+
+    doc.pin(in_flight)
+    assert queued_submit.client.post("/applications/app-job1/submit").status_code == 409
+
+    claim, _option = doc.updates[0]
+    assert claim["status"] == "submitting" and claim["submit_attempts"] == 1
+    assert doc.data["submit_attempts"] == 1  # the loser advanced nothing
+    assert len(queued_submit.enqueued) == 1
+
+
+def test_a_retry_after_a_failure_gets_a_task_name_of_its_own(queued_submit):
+    """Which is what no time granularity can offer: an hour-grained name would
+    block a legitimate retry for an hour, and a minute-grained one would still
+    swallow a retry issued in the same minute as the submission that failed."""
+    doc = queued_submit.doc
+    queued_submit.client.post("/applications/app-job1/submit")
+    state.try_transition(doc, doc.get(), "failed", note="the ATS said no")
+
+    assert queued_submit.client.post("/applications/app-job1/submit").status_code == 200
+
+    assert [t["task_id"] for t in queued_submit.enqueued] == [
+        "apply-u1-app-job1-1",
+        "apply-u1-app-job1-2",
+    ]
+    assert doc.data["submit_attempts"] == 2
+
+
+def test_a_submission_that_cannot_be_dispatched_gives_the_claim_back(queued_submit):
+    """The enqueue is the one step that can fail *after* the claim has landed,
+    and a transient Cloud Tasks error is an ordinary event.
+
+    ``submitting`` is the one status a user cannot leave — Submit and Regenerate
+    both 409 out of it and the undo path refuses to delete a document in it — so
+    a claim with nothing behind it wedges a real application until an operator
+    runs ``cli/unwedge_submitting``. Nothing was clicked, so the claim is rolled
+    back to ``failed``, which is both true and actionable.
+    """
+    queued_submit.outcome.error = RuntimeError("Cloud Tasks is unreachable")
+
+    resp = queued_submit.client.post("/applications/app-job1/submit")
+
+    assert resp.status_code == 503
+    doc = queued_submit.doc
+    assert doc.data["status"] == "failed"
+    assert doc.data["timeline"][-1]["note"] == applications.DISPATCH_FAILED_NOTE
+    assert "lease" not in doc.data  # the rollback's own claim is handed back
+    assert "submitted" not in [e["status"] for e in doc.data["timeline"]]
+
+
+def test_the_user_can_submit_again_after_a_failed_dispatch(queued_submit):
+    """Which is the whole point of the rollback — and the retry also gets a
+    *new* task name, so the collision that is one way to fail a dispatch cannot
+    repeat itself on the retry."""
+    queued_submit.outcome.error = RuntimeError("Cloud Tasks is unreachable")
+    assert queued_submit.client.post("/applications/app-job1/submit").status_code == 503
+
+    queued_submit.outcome.error = None
+    assert queued_submit.client.post("/applications/app-job1/submit").status_code == 200
+
+    assert queued_submit.doc.data["status"] == "submitting"
+    assert [t["task_id"] for t in queued_submit.enqueued] == [
+        "apply-u1-app-job1-1",
+        "apply-u1-app-job1-2",
+    ]
+
+
+def test_a_deduped_apply_dispatch_gives_the_claim_back_too(queued_submit):
+    """A double-click cannot reach here — it lost the swap and got a 409 — so a
+    refused task name means one was *reused*. The reachable way: revert deletes
+    the application, re-approving recreates it at the same deterministic id with
+    the counter gone, and the next submit rebuilds a name whose Cloud Tasks
+    tombstone is still alive. Same wedge, same answer."""
+    queued_submit.outcome.accepted = False
+
+    resp = queued_submit.client.post("/applications/app-job1/submit")
+
+    assert resp.status_code == 503
+    assert queued_submit.doc.data["status"] == "failed"
+    assert "lease" not in queued_submit.doc.data
+
+
+def test_the_rollback_will_not_touch_a_document_someone_is_running(queued_submit):
+    """**The rollback is itself a claim, and that is not a formality.**
+
+    An enqueue can report failure and still have created the task (a deadline
+    that expires after the server committed), and ``AlreadyExists`` can name a
+    task that is still pending. Either way a worker may already be driving a
+    browser at this document — and writing ``failed`` with CLEAR_LEASE
+    underneath it would clear a live run's claim and throw away the confirmation
+    evidence for an application that really was sent.
+    """
+    doc = queued_submit.doc
+    live = state.new_owner()
+
+    def the_task_landed_anyway(*args, **kwargs):
+        # The worker got the task, claimed the document, and is mid-submit when
+        # our own enqueue call finally reports its deadline.
+        state.try_claim_lease(doc, doc.get(), "submitting", owner=live)
+        raise RuntimeError("DEADLINE_EXCEEDED")
+
+    queued_submit.outcome.hook = the_task_landed_anyway
+
+    resp = queued_submit.client.post("/applications/app-job1/submit")
+
+    assert resp.status_code == 503
+    # Left exactly as the live run has it: still claimed, still that run's lease.
+    assert doc.data["status"] == "submitting"
+    assert doc.data["lease"]["owner"] == live
+    assert "failed" not in [e["status"] for e in doc.data["timeline"]]
+
+
+def test_regenerate_commits_before_it_enqueues(queued_submit):
+    """Same ordering at the other end of the funnel: ``run_tailoring`` claims
+    the application out of ``queued``, so the task must not be able to arrive
+    while the document is still ``ready_for_review``."""
+    resp = queued_submit.client.post("/applications/app-job1/regenerate")
+
+    assert resp.status_code == 200
+    (task,) = queued_submit.enqueued
+    assert (task["queue"], task["path"]) == ("tailor", "/tasks/tailor")
+    assert task["payload"] == {"user_id": "u1", "job_id": "job1"}
+    assert task["doc_at_enqueue"]["status"] == state.INITIAL
 
 
 # --------------------------------------------------------------------------

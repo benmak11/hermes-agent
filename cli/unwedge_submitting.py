@@ -5,8 +5,9 @@ Move applications wedged in ``submitting`` to ``failed`` so the user can act.
 
 ``submitting`` is the one status with no automatic way out. ``run_submission``
 writes ``failed`` from its own ``except``, but that never fires if the process
-dies — and ``run_submission`` is a FastAPI ``BackgroundTask`` on ``hermes-api``,
-so an ordinary Cloud Run eviction mid-submit strands the document there.
+dies — and it runs as a Cloud Tasks delivery on ``hermes-worker`` (or, without a
+queue, as a FastAPI ``BackgroundTask`` on ``hermes-api``), so an ordinary Cloud
+Run eviction mid-submit strands the document there.
 Everything else then refuses to touch it, correctly: ``submit`` and
 ``regenerate`` return 409, the undo path declines to delete it, and the liveness
 sweep skips it (``tools.ats.sweep.ACTIVE_APP_STATUSES``). Before the state
@@ -31,8 +32,12 @@ Dry-run by default, like ``cli.reset_user`` and ``cli.geo_resurrect``: without
 **A live lease is never released, at any age.** ``tools.applications.state``
 leases are written by the process actually running the work, so they are the
 one first-hand signal here; everything else on this page is inference. The age
-arithmetic below only decides documents that hold no lease — the in-process
-submission path writes none, and neither did anything before the lease existed.
+arithmetic below only decides documents that hold no lease. Every path that
+drives a submission now takes one — the claim lives in ``run_submission``
+itself, so the in-process path is leased too — but there is still a window
+between the request writing ``submitting`` and the run claiming it, a permanent
+one where the dispatch in between failed outright, and documents predating the
+lease entirely. Those are what the age arithmetic is for.
 
 Age is measured from ``last_submitted_at`` (written atomically with the
 ``submitting`` status by ``POST /applications/{id}/submit``), falling back to the

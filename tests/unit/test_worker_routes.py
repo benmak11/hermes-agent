@@ -6,10 +6,11 @@ Pins the security contract (task routes 404 without WORKER_MODE, so the
 public API service never exposes them) and the dispatch behavior on both
 sides of QUEUE_MODE.
 
-The Phase 2 funnel routes (``/tasks/tailor``, ``/tasks/apply``) add two more
-properties to that contract: they ship with **no caller anywhere in the repo**
-(the deploy ordering seam — one merge for the handler, the next for the
-enqueue, so the API can never enqueue to a route the worker doesn't have yet),
+The Phase 2 funnel routes (``/tasks/tailor``, ``/tasks/apply``) shipped one
+merge ahead of their callers — the deploy-ordering seam, so the API could never
+enqueue to a route the worker didn't have yet. This is the merge that turns the
+callers on, so what is pinned here now is the other half: the dispatch helpers
+enqueue to routes the worker actually serves, they commit before they enqueue,
 and a redelivered task is a no-op that spends nothing rather than a second LLM
 run or a duplicate real job application.
 """
@@ -22,7 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from google.api_core.exceptions import FailedPrecondition, NotFound
 from google.cloud import firestore
@@ -31,7 +32,9 @@ from pydantic import BaseModel
 
 import api.routes.applications as applications
 import api.routes.discovery as discovery
+import api.routes.jobs as jobs
 import api.routes.worker as worker
+from api.deps import verify_user
 from obs.logging import current_run_id
 from tools.applications import state
 from tools.matching import budget
@@ -270,6 +273,189 @@ def test_dispatch_cycle_runs_inline_without_queue_mode(monkeypatch):
     assert calls == [("u1", "cron")]
 
 
+class _FakeUsers:
+    """A Firestore client whose ``users`` collection streams these documents."""
+
+    def __init__(self, docs: dict):
+        self._docs = docs
+        self.reads = 0
+
+    def _snap(self, uid, data):
+        def to_dict():
+            self.reads += 1
+            return dict(data)
+
+        return SimpleNamespace(id=uid, to_dict=to_dict)
+
+    def collection(self, name):
+        assert name == "users"
+        return SimpleNamespace(
+            stream=lambda: [self._snap(uid, d) for uid, d in self._docs.items()]
+        )
+
+
+@pytest.fixture
+def cron_world(monkeypatch):
+    """``cron_tick`` over two users, with the per-user tick recorded."""
+    monkeypatch.setenv("WORKER_MODE", "1")
+    ticked: list[tuple] = []
+
+    async def fake_tick(user_id, *, force_check=False, doc=None):
+        ticked.append((user_id, force_check, doc))
+
+    users = _FakeUsers({"u1": {"discovery_settings": {}}, "u2": {}})
+    monkeypatch.setattr(discovery, "tick_user", fake_tick)
+    monkeypatch.setattr(discovery, "maybe_enqueue_batch_resume", lambda: False)
+    monkeypatch.setattr(discovery, "_client", lambda: users)
+    return SimpleNamespace(ticked=ticked, tick=fake_tick, users=users)
+
+
+def test_cron_tick_fans_out_in_request_under_queue_mode(cron_world, monkeypatch):
+    """The hourly tick's real home is hermes-worker, which does **not** run
+    with ``cpu-throttling: false``. A per-user tick deferred past the response
+    there runs on an instance that may already be frozen — the unattended loops
+    would then fire for nobody, which is the same bug as "discovery never runs".
+    Under QUEUE_MODE a tick is a settings read plus an enqueue, so it belongs in
+    the request."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    background = BackgroundTasks()
+
+    result = asyncio.run(discovery.cron_tick(background))
+
+    assert result == {"ok": True, "users": 2, "failed": 0}
+    assert [(uid, forced) for uid, forced, _doc in cron_world.ticked] == [
+        ("u1", True),
+        ("u2", True),
+    ]
+    assert background.tasks == []  # nothing left for a frozen instance to run
+
+
+def test_cron_tick_hands_over_the_documents_it_already_read(cron_world, monkeypatch):
+    """The fan-out streams the whole ``users`` collection, so each tick is handed
+    the document rather than being left to re-fetch it."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+
+    asyncio.run(discovery.cron_tick(BackgroundTasks()))
+
+    assert [doc for _uid, _forced, doc in cron_world.ticked] == [
+        {"discovery_settings": {}},
+        {},
+    ]
+    assert cron_world.users.reads == 2  # one materialization per streamed doc
+
+
+def test_tick_user_uses_the_document_it_was_handed(monkeypatch):
+    """The other half, and the one that makes the hand-over worth anything: a
+    tick given a document must not go and fetch it again. Doubling the reads
+    also doubles the latency of the single request Cloud Scheduler is waiting
+    on, and that request now does the whole fan-out."""
+
+    def no_reads(user_id):
+        pytest.fail("tick_user re-read a document it was already given")
+
+    monkeypatch.setattr(discovery, "_user_ref", no_reads)
+    monkeypatch.setattr(discovery, "_last_tick_check", {})
+
+    asyncio.run(
+        discovery.tick_user(
+            "u1",
+            force_check=True,
+            doc={
+                "discovery_settings": {
+                    "auto_discovery": False,
+                    "liveness_sweep": False,
+                }
+            },
+        )
+    )
+
+
+def test_tick_user_still_reads_for_itself_when_given_nothing(monkeypatch):
+    """Positive control: the opportunistic callers pass no document, and the
+    fixture above would pass just as well against a tick that does nothing."""
+    reads: list[str] = []
+
+    def counted(user_id):
+        reads.append(user_id)
+        return SimpleNamespace(
+            get=lambda: SimpleNamespace(
+                to_dict=lambda: {"discovery_settings": {"auto_discovery": False}}
+            )
+        )
+
+    monkeypatch.setattr(discovery, "_user_ref", counted)
+    monkeypatch.setattr(discovery, "_last_tick_check", {})
+
+    asyncio.run(discovery.tick_user("u1", force_check=True))
+
+    assert reads == ["u1"]
+
+
+def test_cron_tick_still_defers_the_fan_out_without_a_queue(cron_world, monkeypatch):
+    """The other side of it: with no queue a due tick runs the whole
+    discovery-and-scoring cycle, which is minutes of work per user and cannot
+    happen inside an HTTP request."""
+    monkeypatch.delenv("QUEUE_MODE", raising=False)
+    background = BackgroundTasks()
+
+    assert asyncio.run(discovery.cron_tick(background)) == {
+        "ok": True,
+        "users": 2,
+        "failed": 0,
+    }
+
+    assert cron_world.ticked == []
+    assert [(t.func, t.args, t.kwargs) for t in background.tasks] == [
+        (
+            cron_world.tick,
+            ("u1",),
+            {"force_check": True, "doc": {"discovery_settings": {}}},
+        ),
+        (cron_world.tick, ("u2",), {"force_check": True, "doc": {}}),
+    ]
+
+
+def test_one_users_tick_failing_does_not_cost_the_rest_theirs(cron_world, monkeypatch):
+    """Running in-request means an exception is now the *request's* problem.
+    The fan-out has to survive one bad user, or a single broken profile silently
+    stops every other user's unattended loops — and it has to say so."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+
+    async def explode_for_u1(user_id, *, force_check=False, doc=None):
+        if user_id == "u1":
+            raise RuntimeError("that user's settings doc is unreadable")
+        cron_world.ticked.append((user_id, force_check, doc))
+
+    monkeypatch.setattr(discovery, "tick_user", explode_for_u1)
+
+    result = asyncio.run(discovery.cron_tick(BackgroundTasks()))
+
+    assert result == {"ok": True, "users": 2, "failed": 1}
+    assert [uid for uid, _forced, _doc in cron_world.ticked] == ["u2"]
+
+
+def test_a_fan_out_where_nothing_ticked_is_not_reported_as_success(
+    cron_world, monkeypatch
+):
+    """Swallowing every failure behind a 200 is worse than failing loudly: with
+    a missing queue credential *every* tick raises, Cloud Scheduler records an
+    hourly success, and the unattended loops are dead with nothing to alert on.
+    Answering 5xx makes the scheduler's own retry and alerting worth something.
+    """
+    monkeypatch.setenv("QUEUE_MODE", "1")
+
+    async def explode(user_id, *, force_check=False, doc=None):
+        raise RuntimeError("TASKS_SA_EMAIL is not set")
+
+    monkeypatch.setattr(discovery, "tick_user", explode)
+
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(discovery.cron_tick(BackgroundTasks()))
+
+    assert raised.value.status_code == 500
+    assert "2 users" in raised.value.detail
+
+
 # --------------------------------------------------------------------------
 # Phase 2: the funnel routes.
 #
@@ -315,6 +501,14 @@ class _FakeDoc:
 
     def get(self):
         return _FakeSnap(self.id, self._data, self._version)
+
+    def set(self, data, merge=False):
+        if merge and self._data is not None:
+            _resolve(self._data, data)
+        else:
+            self._data = {}
+            _resolve(self._data, data)
+        self._version += 1
 
     def update(self, fields, option=None):
         self.updates.append((fields, option))
@@ -367,6 +561,170 @@ def _app_doc(status: str, **extra) -> _FakeDoc:
             **extra,
         }
     )
+
+
+# --------------------------------------------------------------------------
+# Phase 2 PR C: the funnel's own dispatch seam.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def enqueued(monkeypatch):
+    """Record what ``applications`` pushes onto a queue, and refuse the real
+    client. Returns the list of (queue, path, payload, task_id)."""
+    calls: list[tuple] = []
+
+    def fake_enqueue(queue, path, payload, *, task_id=None):
+        calls.append((queue, path, payload, task_id))
+        return True
+
+    monkeypatch.setattr(applications.queues, "enqueue", fake_enqueue)
+    return calls
+
+
+def test_the_dispatch_helpers_are_synchronous():
+    """Unlike ``dispatch_cycle``, and deliberately.
+
+    Every caller is a synchronous route (``decide``, ``regenerate``,
+    ``submit``), which FastAPI already runs in a threadpool — where the
+    blocking Firestore reads and compare-and-swaps those routes are built out of
+    belong. An ``async`` helper would have to be reached with ``asyncio.run`` or
+    by making the routes coroutines, which is exactly the arrangement
+    ``tools.applications.state`` documents as the one to avoid. Neither helper
+    awaits anything, so there is nothing to trade for it.
+    """
+    assert not inspect.iscoroutinefunction(applications.dispatch_tailor)
+    assert not inspect.iscoroutinefunction(applications.dispatch_apply)
+
+
+def test_dispatch_tailor_enqueues_when_queue_mode_on(monkeypatch, enqueued):
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    background = BackgroundTasks()
+
+    assert (
+        applications.dispatch_tailor("u1", "job1", background_tasks=background) is True
+    )
+
+    queue, path, payload, task_id = enqueued[0]
+    assert (queue, path) == ("tailor", "/tasks/tailor")
+    assert payload == {"user_id": "u1", "job_id": "job1"}
+    # Minute grain, like dispatch_cycle's `manual`: a double-click on Approve or
+    # Regenerate dedupes, a deliberate regenerate a minute later doesn't.
+    assert task_id.startswith("tailor-u1-job1-")
+    assert len(task_id.split("-")[-1]) == 12  # YYYYMMDDHHMM
+    assert background.tasks == []
+
+
+def test_dispatch_tailor_falls_back_to_a_background_task(monkeypatch):
+    """No queue infra: the work runs in-process, exactly as before. This is what
+    keeps local dev, the tests above, and the pre-worker deployment working."""
+    monkeypatch.delenv("QUEUE_MODE", raising=False)
+    monkeypatch.setattr(
+        applications.queues,
+        "enqueue",
+        lambda *a, **k: pytest.fail("nothing may be enqueued without QUEUE_MODE"),
+    )
+    background = BackgroundTasks()
+
+    assert (
+        applications.dispatch_tailor("u1", "job1", background_tasks=background) is True
+    )
+
+    assert [(t.func, t.args) for t in background.tasks] == [
+        (applications.run_tailoring, ("u1", "job1"))
+    ]
+
+
+def test_dispatch_apply_names_the_task_after_the_claim(monkeypatch, enqueued):
+    """The apply task id carries the ``submit_attempts`` value the claim wrote,
+    not a timestamp: same claim, same name (so the queue refuses a duplicate
+    dispatch), new claim, new name however soon the retry comes."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    background = BackgroundTasks()
+
+    assert (
+        applications.dispatch_apply(
+            "u1", "app-job1", attempt=3, background_tasks=background
+        )
+        is True
+    )
+
+    queue, path, payload, task_id = enqueued[0]
+    assert (queue, path) == ("apply", "/tasks/apply")
+    assert payload == {"user_id": "u1", "app_id": "app-job1"}
+    assert task_id == "apply-u1-app-job1-3"
+    # No dry_run in the payload: the switch is worker-only and stays that way.
+    assert "dry_run" not in payload
+    assert background.tasks == []
+
+
+def test_dispatch_apply_falls_back_to_a_background_task(monkeypatch):
+    monkeypatch.delenv("QUEUE_MODE", raising=False)
+    monkeypatch.setattr(
+        applications.queues,
+        "enqueue",
+        lambda *a, **k: pytest.fail("nothing may be enqueued without QUEUE_MODE"),
+    )
+    background = BackgroundTasks()
+
+    assert (
+        applications.dispatch_apply(
+            "u1", "app-job1", attempt=1, background_tasks=background
+        )
+        is True
+    )
+
+    assert [(t.func, t.args) for t in background.tasks] == [
+        (applications.run_submission, ("u1", "app-job1"))
+    ]
+
+
+def test_a_deduped_dispatch_is_reported_to_the_caller(monkeypatch):
+    """Returning True on a task the queue refused would tell the caller work is
+    scheduled when none is."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    monkeypatch.setattr(applications.queues, "enqueue", lambda *a, **k: False)
+    background = BackgroundTasks()
+
+    assert (
+        applications.dispatch_tailor("u1", "job1", background_tasks=background) is False
+    )
+    assert (
+        applications.dispatch_apply(
+            "u1", "app-job1", attempt=1, background_tasks=background
+        )
+        is False
+    )
+
+
+def test_approving_a_job_dispatches_only_after_the_application_exists(
+    monkeypatch, enqueued
+):
+    """Commit, then enqueue — at the front of the funnel too.
+
+    A worker can be reading the document before ``decide`` executes its next
+    line. Enqueue first and ``run_tailoring`` finds nothing to claim and returns
+    without spending anything, so the approval quietly never tailors.
+    """
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    app_doc = _FakeDoc(None)  # no Application yet
+    job_doc = _FakeDoc({"id": "job1", "url": "https://x/y"}, "job1")
+    monkeypatch.setattr(
+        jobs, "_client", lambda: _FakeDb(_FakeUser(app_doc, job_doc, None))
+    )
+    api = FastAPI()
+    api.include_router(jobs.router)
+    api.dependency_overrides[verify_user] = lambda: "u1"
+
+    resp = TestClient(api).post("/jobs/job1/decide", json={"decision": "approved"})
+
+    assert resp.status_code == 200
+    queue, path, payload, task_id = enqueued[0]
+    assert (queue, path) == ("tailor", "/tasks/tailor")
+    assert payload == {"user_id": "u1", "job_id": "job1"}
+    assert task_id.startswith("tailor-u1-job1-")
+    # The document the task names is already there, already claimable.
+    assert app_doc.data[state.STATUS_FIELD] == state.INITIAL
 
 
 @pytest.fixture
@@ -529,186 +887,97 @@ def test_a_finished_tailoring_run_hands_its_lease_back(client, monkeypatch):
 
 @pytest.fixture
 def apply_world(monkeypatch):
-    """The real ``/tasks/apply`` claim over a fake document, with
-    ``run_submission`` replaced by a recorder — 'did we drive the browser
-    twice?' is then directly observable."""
+    """The ``/tasks/apply`` handler over a fake document, with
+    ``run_submission`` replaced by a recorder.
+
+    Since the delivery claim moved *into* ``run_submission`` (so that the API's
+    own background path is fenced by it too), what is left to pin at this level
+    is the pass-through: the handler reports what the run reported, and the
+    dry-run gate still refuses to open a browser on a document that isn't
+    submittable. The claim itself is exercised against the real function below.
+    """
     monkeypatch.setenv("WORKER_MODE", "1")
     submissions: list[tuple] = []
+    outcome = SimpleNamespace(ran=True)
 
     async def fake_run_submission(user_id, app_id, *, dry_run=False):
         submissions.append((user_id, app_id, dry_run))
+        return outcome.ran
 
     monkeypatch.setattr(worker, "run_submission", fake_run_submission)
 
     def install(app_doc: _FakeDoc):
         monkeypatch.setattr(worker, "application_ref", lambda u, a: app_doc)
+        monkeypatch.setattr(
+            applications, "_apps", lambda user_id: _FakeCollection(app_doc)
+        )
         return app_doc
 
-    return install, submissions
+    return SimpleNamespace(install=install, submissions=submissions, outcome=outcome)
 
 
-def test_task_apply_claims_the_lease_for_the_length_of_the_run(
-    client, apply_world, monkeypatch
-):
-    """The lease is held *while* the run runs — the claim exists to fence the
-    work, not to mark the document afterwards."""
-    install, submissions = apply_world
-    doc = install(_app_doc("submitting"))
-    held: list[dict] = []
-
-    async def observe(user_id, app_id, *, dry_run=False):
-        submissions.append((user_id, app_id, dry_run))
-        held.append(doc.data["lease"])  # what a concurrent worker would see
-
-    monkeypatch.setattr(worker, "run_submission", observe)
+def test_task_apply_reports_whether_the_run_claimed_the_work(client, apply_world):
+    """``ran`` is the callee's answer now, and the handler must not guess at it:
+    "a browser was driven" and "a redelivery found the work already claimed and
+    did nothing" are the two outcomes this route exists to tell apart."""
+    apply_world.install(_app_doc("submitting"))
 
     resp = client.post("/tasks/apply", json={"user_id": "u1", "app_id": "app-job1"})
-
     assert resp.status_code == 200 and resp.json() == {"ok": True, "ran": True}
-    assert submissions == [("u1", "app-job1", False)]
-    # The lease is the worker's claim; the status is the API's, taken already.
-    assert held[0]["status"] == "submitting" and held[0]["owner"]
-    assert doc.data["status"] == "submitting"
 
-
-def test_a_duplicate_apply_delivery_does_not_submit_twice(apply_world, monkeypatch):
-    """The one that matters: a redelivered task arriving **while the first is
-    still running** must not put a second real application into an employer's
-    ATS. The status can't refuse it — the document is already ``submitting``
-    because that is how the API claimed it — so the live lease is what says no.
-
-    Driven through the handler coroutines directly rather than the TestClient:
-    the whole point is that the two deliveries overlap, which sequential HTTP
-    calls cannot express.
-    """
-    install, submissions = apply_world
-    doc = install(_app_doc("submitting"))
-    monkeypatch.setenv("WORKER_MODE", "1")
-    second_arrived = asyncio.Event()
-    running = asyncio.Event()
-
-    async def slow_submission(user_id, app_id, *, dry_run=False):
-        submissions.append((user_id, app_id, dry_run))
-        running.set()
-        await second_arrived.wait()  # still driving the browser
-
-    monkeypatch.setattr(worker, "run_submission", slow_submission)
-    body = worker.ApplyTask(user_id="u1", app_id="app-job1")
-
-    async def scenario():
-        first = asyncio.create_task(worker.task_apply(body))
-        await running.wait()
-        second = await worker.task_apply(body)  # redelivered mid-run
-        second_arrived.set()
-        return await first, second
-
-    first_result, second_result = asyncio.run(scenario())
-
-    assert first_result == {"ok": True, "ran": True}
-    # 200 and no work, not an error: a retry would only ask the same question.
-    assert second_result == {"ok": True, "ran": False}
-    assert submissions == [("u1", "app-job1", False)]
-    assert len(doc.data["timeline"]) == 1  # the no-op wrote nothing at all
-
-
-def test_apply_is_a_no_op_once_the_submission_reported_back(
-    client, apply_world, monkeypatch
-):
-    """The terminal write releases the lease, so a task redelivered *after* the
-    run finished can't be let through by the lease being gone — the status has
-    left ``submitting`` and that is the second half of the claim."""
-    install, submissions = apply_world
-    doc = install(_app_doc("submitting"))
-
-    async def submit_and_record(user_id, app_id, *, dry_run=False):
-        submissions.append((user_id, app_id, dry_run))
-        state.try_transition(doc, doc.get(), "submitted", lease=state.CLEAR_LEASE)
-
-    monkeypatch.setattr(worker, "run_submission", submit_and_record)
-    assert client.post(
-        "/tasks/apply", json={"user_id": "u1", "app_id": "app-job1"}
-    ).json()["ran"]
-    assert doc.data is not None and "lease" not in doc.data
-
-    late = client.post("/tasks/apply", json={"user_id": "u1", "app_id": "app-job1"})
-
-    assert late.status_code == 200 and late.json()["ran"] is False
-    assert submissions == [("u1", "app-job1", False)]
-
-
-def test_a_lease_left_by_a_lost_terminal_write_is_handed_back(
-    client, apply_world, monkeypatch
-):
-    """Every terminal transition carries CLEAR_LEASE, so the outcome and the
-    release are one write — except when that write *loses*, which is exactly
-    when it leaves our lease behind on someone else's status."""
-    install, submissions = apply_world
-    doc = install(_app_doc("submitting"))
-
-    async def outcome_lost(user_id, app_id, *, dry_run=False):
-        submissions.append((user_id, app_id, dry_run))
-        # cli/unwedge_submitting got there first; the run's own terminal write
-        # is refused, and the lease it would have cleared survives it.
-        state.try_transition(doc, doc.get(), "failed", note="unwedged")
-        assert doc.data["lease"]  # still ours at this point
-
-    monkeypatch.setattr(worker, "run_submission", outcome_lost)
-    client.post("/tasks/apply", json={"user_id": "u1", "app_id": "app-job1"})
-
-    assert doc.data["status"] == "failed"
-    assert doc.data is not None and "lease" not in doc.data
-
-
-def test_a_run_that_records_no_outcome_keeps_its_lease(
-    client, apply_world, monkeypatch
-):
-    """The opposite case, and the dangerous one: the run ended with the document
-    still ``submitting``, so whether the form went in is unknown. Releasing here
-    would invite a redelivery straight back into it — the lease is left to
-    expire, which is what unwedge_submitting exists to adjudicate."""
-    install, submissions = apply_world
-    doc = install(_app_doc("submitting"))
-
-    async def no_outcome(user_id, app_id, *, dry_run=False):
-        submissions.append((user_id, app_id, dry_run))
-
-    monkeypatch.setattr(worker, "run_submission", no_outcome)
-    client.post("/tasks/apply", json={"user_id": "u1", "app_id": "app-job1"})
-
-    assert doc.data["status"] == "submitting"
-    assert doc.data["lease"]["status"] == "submitting"
-
-
-def test_apply_is_a_no_op_for_a_missing_application(client, apply_world):
-    install, submissions = apply_world
-    install(_FakeDoc(None))
+    apply_world.outcome.ran = False  # claim lost, or the document is gone
     resp = client.post("/tasks/apply", json={"user_id": "u1", "app_id": "app-job1"})
+    # 200 and no work, not an error: a retry would only ask the same question.
     assert resp.status_code == 200 and resp.json() == {"ok": True, "ran": False}
-    assert submissions == []
+    assert apply_world.submissions == [("u1", "app-job1", False)] * 2
+
+
+def test_apply_is_a_no_op_for_a_missing_application(client, monkeypatch):
+    """Driven through the real ``run_submission``: the missing-document check
+    moved in there with the claim, so faking the callee would test nothing."""
+    monkeypatch.setenv("WORKER_MODE", "1")
+    doc = _FakeDoc(None)
+    monkeypatch.setattr(applications, "_apps", lambda user_id: _FakeCollection(doc))
+
+    resp = client.post("/tasks/apply", json={"user_id": "u1", "app_id": "app-job1"})
+
+    assert resp.status_code == 200 and resp.json() == {"ok": True, "ran": False}
+    assert doc.updates == []  # nothing written to a document that isn't there
 
 
 def test_apply_dry_run_only_runs_from_a_submittable_status(client, apply_world):
     """A rehearsal has no business driving a browser at an application that is
     mid-submit or already submitted."""
-    install, submissions = apply_world
-    doc = install(_app_doc("ready_for_review"))
+    doc = apply_world.install(_app_doc("ready_for_review"))
     assert client.post(
         "/tasks/apply",
         json={"user_id": "u1", "app_id": "app-job1", "dry_run": True},
     ).json() == {"ok": True, "ran": True, "dry_run": True}
-    assert submissions == [("u1", "app-job1", True)]
+    assert apply_world.submissions == [("u1", "app-job1", True)]
     # No claim of any kind: a dry run writes no status, so there is nothing for
     # a repeat to corrupt and nothing to take a lease on.
     assert doc.updates == []
 
     for blocked in ("submitting", "submitted", "queued"):
-        install(_app_doc(blocked))
+        apply_world.install(_app_doc(blocked))
         resp = client.post(
             "/tasks/apply",
             json={"user_id": "u1", "app_id": "app-job1", "dry_run": True},
         )
         assert resp.json() == {"ok": True, "ran": False, "dry_run": True}, blocked
-    assert len(submissions) == 1
+    assert len(apply_world.submissions) == 1
+
+
+def test_apply_dry_run_is_a_no_op_for_a_missing_application(client, apply_world):
+    apply_world.install(_FakeDoc(None))
+    resp = client.post(
+        "/tasks/apply", json={"user_id": "u1", "app_id": "app-job1", "dry_run": True}
+    )
+    # ``dry_run`` is reported on every return out of the rehearsal branch, or a
+    # log search for rehearsals silently misses the ones that found nothing.
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "ran": False, "dry_run": True}
+    assert apply_world.submissions == []
 
 
 @pytest.fixture
@@ -736,7 +1005,12 @@ def submission_world(monkeypatch):
         applications, "download_resume", lambda uri: Path("/tmp/r.docx")
     )
 
-    hooks = SimpleNamespace(posting="ok", result={"success": True, "dry_run": True})
+    # ``during`` runs where the browser would be — after the claim, before any
+    # outcome is written — so a test can decide what the rest of the world does
+    # while this run holds the document.
+    hooks = SimpleNamespace(
+        posting="ok", result={"success": True, "dry_run": True}, during=None
+    )
     submits: list[dict] = []
 
     async def check_posting(job):
@@ -744,6 +1018,10 @@ def submission_world(monkeypatch):
 
     async def submit_application(job, prof, resume, **kw):
         submits.append(kw)
+        if hooks.during is not None:
+            interruption = hooks.during()
+            if inspect.isawaitable(interruption):
+                await interruption
         if kw.get("on_progress"):
             kw["on_progress"]("Attaching resume", "submitting")
         return hooks.result
@@ -863,6 +1141,200 @@ def test_a_failing_dry_run_does_not_mark_a_real_application_failed(monkeypatch):
     assert "errored" in doc.data["timeline"][-1]["note"]
 
 
+# --------------------------------------------------------------------------
+# The delivery claim, where it lives now.
+#
+# It used to be taken by ``/tasks/apply``. That fenced worker against worker
+# and nothing else: ``dispatch_apply`` still runs the same function as a
+# background task wherever QUEUE_MODE is off, and a Cloud Run traffic migration
+# puts two hermes-api revisions on the same documents for the length of a
+# rollout. These drive the claim through ``run_submission`` itself, which is
+# what every one of those paths now goes through.
+# --------------------------------------------------------------------------
+
+
+def _submitting(world) -> _FakeDoc:
+    """The document as ``POST /submit`` leaves it: claimed, unleased."""
+    world.doc._data[state.STATUS_FIELD] = "submitting"
+    return world.doc
+
+
+def test_the_lease_is_held_for_the_length_of_the_run(submission_world):
+    """The claim fences the work, so it has to be taken before the browser
+    opens and held until an outcome is written — not stamped on afterwards."""
+    doc = _submitting(submission_world)
+    submission_world.hooks.result = {"success": True}
+    held: list[dict] = []
+    submission_world.hooks.during = lambda: held.append(doc.data["lease"])
+
+    assert asyncio.run(applications.run_submission("u1", "app-job1")) is True
+
+    assert held[0]["status"] == "submitting" and held[0]["owner"]
+    assert doc.data["status"] == "submitted"
+    # Handed back in the same write that recorded the outcome.
+    assert doc.data is not None and "lease" not in doc.data
+
+
+def test_two_runners_cannot_submit_the_same_application(submission_world, monkeypatch):
+    """**The one that matters, and the reason the claim moved.**
+
+    Two runners for one ``submitting`` document — a redelivered task, or the
+    API's own in-process path racing a worker during a revision rollout — must
+    not both put a real application into an employer's ATS. The status cannot
+    refuse the second: the document is *already* ``submitting``, because that is
+    how the API claimed it. The live lease is what says no, and it only says no
+    to both if both paths take it.
+
+    The first run here is the background-task path (``run_submission`` called
+    directly, as ``dispatch_apply`` does without a queue); the second arrives
+    through the worker handler while the first still holds the browser open.
+    """
+    monkeypatch.setenv("WORKER_MODE", "1")
+    doc = _submitting(submission_world)
+    submission_world.hooks.result = {"success": True}
+    running, release = asyncio.Event(), asyncio.Event()
+
+    async def still_driving_the_browser():
+        running.set()
+        await release.wait()
+
+    submission_world.hooks.during = still_driving_the_browser
+
+    async def scenario():
+        first = asyncio.create_task(applications.run_submission("u1", "app-job1"))
+        await running.wait()
+        # wait_for, so an unfenced second runner *fails* here rather than
+        # hanging: it would walk into the same browser hook the first run is
+        # still parked in, and wait for a release only it can give.
+        redelivered = await asyncio.wait_for(
+            worker.task_apply(worker.ApplyTask(user_id="u1", app_id="app-job1")),
+            timeout=5,
+        )
+        release.set()
+        return await first, redelivered
+
+    ran, redelivered = asyncio.run(scenario())
+
+    assert ran is True
+    assert redelivered == {"ok": True, "ran": False}
+    assert len(submission_world.submits) == 1  # one browser, one application
+    assert doc.data["status"] == "submitted"
+
+
+def test_a_delivery_after_the_run_finished_is_refused_by_the_status(
+    submission_world, monkeypatch
+):
+    """The terminal write releases the lease, so a task arriving *after* the run
+    finished can't be let through by the lease being gone — the status has left
+    ``submitting``, and that is the other half of the claim."""
+    monkeypatch.setenv("WORKER_MODE", "1")
+    doc = _submitting(submission_world)
+    submission_world.hooks.result = {"success": True}
+
+    assert asyncio.run(applications.run_submission("u1", "app-job1")) is True
+    assert doc.data is not None and "lease" not in doc.data
+
+    late = asyncio.run(
+        worker.task_apply(worker.ApplyTask(user_id="u1", app_id="app-job1"))
+    )
+
+    assert late == {"ok": True, "ran": False}
+    assert len(submission_world.submits) == 1
+
+
+def test_a_lease_left_by_a_lost_terminal_write_is_handed_back(submission_world):
+    """Every terminal transition carries CLEAR_LEASE, so the outcome and the
+    release are one write — except when that write *loses*, which is exactly
+    when it leaves our lease behind on someone else's status."""
+    doc = _submitting(submission_world)
+    submission_world.hooks.result = {"success": False, "error": "the ATS said no"}
+
+    def unwedged_while_we_ran():
+        # cli/unwedge_submitting got there first; the run's own terminal write
+        # is then refused, and the lease it would have cleared survives it.
+        state.try_transition(doc, doc.get(), "failed", note="unwedged")
+        assert doc.data["lease"]  # still ours at this point
+
+    submission_world.hooks.during = unwedged_while_we_ran
+
+    asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    assert doc.data["status"] == "failed"
+    # Released, so the next claim isn't blocked by a run that has ended.
+    assert doc.data is not None and "lease" not in doc.data
+
+
+def test_a_failure_right_after_the_claim_still_hands_the_lease_back(submission_world):
+    """Everything between taking the claim and the ``finally`` that returns it is
+    a region where an exception strands the lease on the document for its full
+    TTL — with the user's application wedged in ``submitting`` behind it. So the
+    ``try`` opens on the statement after the claim, which means the post-claim
+    re-read is inside it, not in front of it."""
+    doc = _submitting(submission_world)
+    real_get, tripped = doc.get, []
+
+    def blink():
+        # The first read taken while a lease is held is the post-claim re-read.
+        if not tripped and state.lease_is_held(doc.data or {}):
+            tripped.append(True)
+            raise RuntimeError("Firestore blinked right after the claim landed")
+        return real_get()
+
+    doc.get = blink
+
+    asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    assert tripped, "the re-read never happened — this test pins nothing"
+    assert doc.data["status"] == "failed"
+    assert doc.data is not None and "lease" not in doc.data
+    assert "Firestore blinked" in doc.data["timeline"][-1]["note"]
+    assert submission_world.submits == []  # and no browser was opened
+
+
+def test_a_run_that_records_no_outcome_keeps_its_lease(submission_world):
+    """The opposite case, and the dangerous one: the run ended with the document
+    still ``submitting``, so whether the form went in is unknown. Releasing here
+    would invite a redelivery straight back into it — the lease is left to
+    expire, which is what unwedge_submitting exists to adjudicate."""
+    doc = _submitting(submission_world)
+
+    async def the_worker_is_evicted_mid_submit():
+        raise asyncio.CancelledError
+
+    submission_world.hooks.during = the_worker_is_evicted_mid_submit
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    assert doc.data["status"] == "submitting"
+    assert doc.data["lease"]["status"] == "submitting"
+    assert state.lease_is_held(doc.data)
+
+
+def test_a_rehearsal_takes_no_lease(submission_world):
+    """A dry run makes no claim — it writes no status of its own, so there is
+    nothing a repeat could corrupt — and it must not take one either: a lease on
+    a ``ready_for_review`` document is still live when the user clicks Submit,
+    and the real run would then find the document held by nobody."""
+    asyncio.run(applications.run_submission("u1", "app-job1", dry_run=True))
+
+    assert "lease" not in submission_world.doc.data
+    assert submission_world.doc.data["status"] == "ready_for_review"
+
+
+def test_a_submission_no_one_claimed_never_opens_a_browser(submission_world):
+    """The claim is a precondition on the *status*, not just on the lease: a
+    document that never reached ``submitting`` has no claim to inherit."""
+    submission_world.doc._data["lease"] = state.lease_for(
+        "submitting", owner="someone-else"
+    )
+    _submitting(submission_world)
+
+    assert asyncio.run(applications.run_submission("u1", "app-job1")) is False
+    assert submission_world.submits == []
+    assert submission_world.doc.data["lease"]["owner"] == "someone-else"
+
+
 def test_dry_run_is_worker_only():
     """Mirror of test_score_task_cannot_turn_off_the_budget: a switch that must
     never be reachable from the public HTTP surface, pinned by shape rather
@@ -903,82 +1375,58 @@ def test_dry_run_is_worker_only():
     assert param.default is False
 
 
-#: The one module allowed to build an enqueue argument at runtime:
-#: ``dispatch_cycle`` interpolates ``kind`` into the path while hard-coding the
-#: ``discovery`` queue. Anywhere else, a computed queue or path is something
-#: this test cannot vouch for and says so.
-_DYNAMIC_OK = {Path(discovery.__file__)}
-
-
-def _suspect_enqueue_lines(source: str, *, dynamic_ok: bool) -> list[int]:
-    """Line numbers of ``enqueue`` calls that reach — or might reach — the
-    tailor/apply queues. Reads the AST, so it is not fooled by f-strings."""
-    suspect = []
+def _literal_enqueue_calls(source: str) -> set[tuple[str, str]]:
+    """Every ``enqueue(queue, path, ...)`` whose queue and path are both string
+    literals. Reads the AST, so it is not fooled by f-strings."""
+    calls = set()
     for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call):
+        if not isinstance(node, ast.Call) or len(node.args) < 2:
             continue
         name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
-        if name != "enqueue" or len(node.args) < 2:
+        if name != "enqueue":
             continue
         queue, route = node.args[0], node.args[1]
-        for arg, hits in ((queue, {"tailor", "apply"}), (route, None)):
-            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                if hits is None:
-                    if "/tasks/tailor" in arg.value or "/tasks/apply" in arg.value:
-                        suspect.append(node.lineno)
-                elif arg.value in hits:
-                    suspect.append(node.lineno)
-            elif not dynamic_ok:
-                suspect.append(node.lineno)
-    return sorted(set(suspect))
+        if isinstance(queue, ast.Constant) and isinstance(route, ast.Constant):
+            calls.add((queue.value, route.value))
+    return calls
 
 
-def test_nothing_enqueues_to_the_funnel_routes_yet():
-    """The deploy-ordering seam, pinned.
+def test_the_funnel_routes_have_callers_and_they_agree():
+    """The replacement for PR B's deploy-ordering guard.
 
-    CI deploys hermes-api and hermes-worker from the same merge. Shipping the
-    handlers and their callers together would leave a window where the API
-    enqueues to a worker route that 404s, so the handlers land one merge ahead,
-    dead on arrival. **This test is expected to be deleted by the PR that adds
-    the callers** — it is a guard on this merge, not a permanent property.
+    That guard asserted **nothing in the repo enqueued** to ``/tasks/tailor`` or
+    ``/tasks/apply``: CI deploys hermes-api and hermes-worker from the same
+    merge, so the handlers had to land one merge ahead of their callers or the
+    API could enqueue to a route that 404s. This is the merge that adds the
+    callers, so the guard is replaced by its opposite — the two names each
+    dispatch helper hard-codes have to be a queue that is provisioned and a
+    route the worker actually serves. A typo in either is a task that vanishes.
+
+    Scanned across the whole repo rather than just ``applications.py``, and
+    keyed by file: the funnel has exactly two entry points and they live in one
+    module, so a third appearing anywhere else is something to look at, not
+    something to add to a list.
     """
-    paths = {route.path for route in worker.router.routes}
-    assert {"/tasks/tailor", "/tasks/apply"} <= paths
-    # The queues themselves are provisioned and already known — this PR
-    # verifies that rather than editing it.
-    assert {"tailor", "apply"} <= KNOWN_QUEUES
-
-    markers = (
-        '"/tasks/tailor"',
-        '"/tasks/apply"',
-        'enqueue("tailor"',
-        'enqueue("apply"',
-        'dispatch_cycle("tailor"',
-        'dispatch_cycle("apply"',
-    )
-    # The request models too — but not in the module that defines them.
-    elsewhere = (
-        "TailorTask(",
-        "ApplyTask(",
-        "import TailorTask",
-        "import ApplyTask",
-    )
-    handlers = Path(worker.__file__)
-    callers = []
+    served = {route.path for route in worker.router.routes}
+    funnel_queues, funnel_paths = {"tailor", "apply"}, {"/tasks/tailor", "/tasks/apply"}
+    callers: dict[str, set[tuple[str, str]]] = {}
     for path in REPO_ROOT.rglob("*.py"):
         if set(path.parts) & {".venv", "tests", "node_modules", "locust_env"}:
             continue
-        source = path.read_text()
-        names = () if path == handlers else elsewhere
-        if any(marker in source for marker in markers + names):
-            callers.append(str(path.relative_to(REPO_ROOT)))
-        # Literals alone would miss ``enqueue(_KIND, f"/tasks/{_KIND}", ...)``,
-        # which is exactly how the existing dispatch_cycle is written. So every
-        # enqueue call is read from the AST: a constant naming one of these
-        # queues or paths is a caller, and an argument that isn't a constant at
-        # all is one nobody can rule out by reading.
-        callers.extend(
-            f"{path.relative_to(REPO_ROOT)}:{line}"
-            for line in _suspect_enqueue_lines(source, dynamic_ok=path in _DYNAMIC_OK)
-        )
-    assert callers == [], f"PR B ships dead routes; these reach them: {callers}"
+        touches = {
+            (queue, route)
+            for queue, route in _literal_enqueue_calls(path.read_text())
+            if queue in funnel_queues or route in funnel_paths
+        }
+        if touches:
+            callers[str(path.relative_to(REPO_ROOT))] = touches
+
+    assert callers == {
+        "api/routes/applications.py": {
+            ("tailor", "/tasks/tailor"),
+            ("apply", "/tasks/apply"),
+        }
+    }
+    for queue, route in callers["api/routes/applications.py"]:
+        assert queue in KNOWN_QUEUES, queue
+        assert route in served, route
