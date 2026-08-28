@@ -10,6 +10,21 @@ ATS submission — a **duplicate real job application**. This module makes that
 impossible by making one function the only place a ``status`` is ever written,
 and making that function a compare-and-swap.
 
+There is a second compare-and-swap here, :func:`try_claim_lease`, for the
+question the status can't answer: **which process is running this right now.**
+The status claim is taken by the API request (a double-click loses it); the
+lease claim is taken by the worker that receives the task, so a redelivered
+Cloud Task finds a live lease and does nothing instead of starting a second
+live ATS submission.
+
+That last sentence is only true because :data:`IN_PROGRESS` outlives the
+dispatch deadline — see the note on it. It is also, today, *not* the thing
+keeping duplicate submissions out of production: the ``hermes-apply`` queue is
+provisioned with ``max_attempts = 1`` (deployment/terraform/single-project/
+worker.tf), so a failed apply task is never redelivered at all. The lease is
+what makes the code correct if that ever changes, and what a reaper can read;
+the queue setting is what is load-bearing right now.
+
 **The mechanism is the update-time precondition**, the same one
 ``tools.matching.batch_runs`` uses to stop racing resumers from double-
 submitting a paid Pro batch: read a snapshot, then write with
@@ -48,11 +63,16 @@ from __future__ import annotations
 from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from uuid import uuid4
 
 from google.api_core.exceptions import FailedPrecondition, NotFound
 from google.cloud import firestore
 
 from obs.logging import get_logger
+
+# The lease TTL is defined *against* the dispatch deadline (see IN_PROGRESS), so
+# it is imported rather than restated. tools.queues imports nothing from here.
+from tools.queues import _DISPATCH_DEADLINE_SECONDS
 
 log = get_logger("tools.applications")
 
@@ -104,19 +124,42 @@ TERMINAL_STATUSES: frozenset[str] = frozenset(
     status for status, outgoing in TRANSITIONS.items() if not outgoing
 )
 
+#: Seconds a claim stays valid, and **the inequality that makes it a lock**:
+#: a lease must outlive the longest run it guards, or it stops being one.
+#:
+#: Cloud Tasks caps dispatch at ``_DISPATCH_DEADLINE_SECONDS`` (1800) and the
+#: worker's ``timeoutSeconds`` matches, so 1800s is the longest a task can run
+#: before Cloud Run kills it and the queue may redeliver. An earlier version of
+#: this file had the inequality backwards — a 1200s lease against 1800s of work
+#: — which is worse than no lease at all: worker A is killed at T+1800 with the
+#: browser possibly *past* the Submit click, the retry lands at T+1860, reads
+#: an expired lease, claims it, and files the application a second time. The
+#: grace is added on top of the deadline rather than subtracted from it, and
+#: the value is derived so the two cannot drift apart.
+_LEASE_GRACE_SECONDS = 60
+_LEASE_SECONDS = _DISPATCH_DEADLINE_SECONDS + _LEASE_GRACE_SECONDS
+
 #: The statuses that mean "a process is supposed to be working on this right
-#: now", mapped to how long that claim stays valid. Cloud Tasks caps dispatch at
-#: 1800s (``tools.queues._DISPATCH_DEADLINE_SECONDS``) and the worker's
-#: ``timeoutSeconds`` matches, so 20 minutes bounds a real run with margin.
+#: now". Uniform: each one is claimed by a task subject to the same dispatch
+#: deadline, so each needs the same floor. ``queued`` carries one for the
+#: reaper's benefit — nothing claims that status today.
 #:
 #: **Nothing reaps these yet.** This defines the shape so the reaper can be
-#: added without re-deciding it; until then :func:`try_transition` writes a
-#: lease only when one is passed explicitly, so no new field appears on live
-#: documents.
+#: added without re-deciding it. Two paths write a lease: :func:`try_claim_lease`
+#: (the worker's delivery claim on ``submitting``) and ``run_tailoring``'s
+#: ``queued → tailoring`` claim, which takes status and lease in one write.
+#:
+#: **For the reaper author:** a document in ``submitting`` with *no* lease is
+#: ambiguous, not dead. ``POST /applications/{id}/submit`` writes the status and
+#: the worker writes the lease, so there is a real window — and, until the
+#: queue-based path is the only one, a whole in-process code path — where a live
+#: submission carries no lease. "submitting and no lease" must therefore fall
+#: back to the age arithmetic in ``cli/unwedge_submitting``; it must never be
+#: read as "the owner is gone".
 IN_PROGRESS: dict[str, int] = {
-    "queued": 900,
-    "tailoring": 1200,
-    "submitting": 1200,
+    "queued": _LEASE_SECONDS,
+    "tailoring": _LEASE_SECONDS,
+    "submitting": _LEASE_SECONDS,
 }
 
 
@@ -157,21 +200,210 @@ def timeline_event(status: str, note: str | None = None) -> dict:
     return event
 
 
-def lease_for(status: str, *, now: datetime | None = None) -> dict | None:
+def new_owner() -> str:
+    """A fresh lease owner token. One per run, not one per process."""
+    return uuid4().hex
+
+
+def lease_for(
+    status: str, *, owner: str | None = None, now: datetime | None = None
+) -> dict | None:
     """The lease an in-progress ``status`` should carry, or ``None``.
 
     ``expires_at`` is what a reaper compares against: past it, the claiming
     process is presumed dead and the application may be failed or re-queued.
+
+    ``owner`` names *which* run holds it, and exists so a release can be
+    checked rather than assumed. Without it, an expiry lets two runs believe
+    they hold the same document: B claims after A's lease lapses, then A —
+    alive, merely slow — finishes and clears the lease, freeing the document
+    for a third claim while B is still working. :func:`release_lease` refuses
+    that. Optional in the *stored* shape on purpose: documents written before
+    this field existed must still read back as valid leases.
     """
     seconds = IN_PROGRESS.get(status)
     if seconds is None:
         return None
     now = now or _now()
-    return {
+    lease = {
         "status": status,
         "acquired_at": now.isoformat(),
         "expires_at": (now + timedelta(seconds=seconds)).isoformat(),
     }
+    if owner is not None:
+        lease["owner"] = owner
+    return lease
+
+
+def _lease_expiry(lease) -> datetime | None:
+    """``lease['expires_at']`` as an aware datetime, or ``None`` if unusable."""
+    if not isinstance(lease, dict):
+        return None
+    value = lease.get("expires_at")
+    if isinstance(value, datetime):  # Firestore hands timestamps back as these
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def lease_is_held(doc: dict, *, now: datetime | None = None) -> bool:
+    """Is someone currently claiming this document? Pure.
+
+    A lease whose ``expires_at`` can't be read counts as **held**. The bias is
+    deliberate and asymmetric: refusing to claim leaves the document wedged
+    (which ``cli/unwedge_submitting`` and, later, the reaper can undo), while
+    claiming anyway risks a duplicate real job application, which nothing can
+    undo.
+    """
+    lease = doc.get(LEASE_FIELD)
+    if not isinstance(lease, dict):
+        return False
+    expiry = _lease_expiry(lease)
+    if expiry is None:
+        return True
+    return expiry > (now or _now())
+
+
+def lease_owner(doc: dict) -> str | None:
+    """Who holds this document's lease, or ``None`` if it says (or has) nothing."""
+    lease = doc.get(LEASE_FIELD)
+    return lease.get("owner") if isinstance(lease, dict) else None
+
+
+def try_claim_lease(
+    ref, snap, status: str, *, owner: str, now: datetime | None = None
+) -> bool:
+    """Compare-and-swap the **lease** of a document already in ``status``.
+
+    The second compare-and-swap in this module, and the one that makes an
+    at-least-once task delivery safe. A status transition can't do this job:
+    ``POST /applications/{id}/submit`` already claims the work by CAS-ing
+    ``→ submitting`` (that is what a double-click loses on), so by the time the
+    worker picks the task up the status *is* the claim and there is no second
+    edge left to take — ``submitting → submitting`` is illegal, exactly as it
+    must be. Claiming the lease instead splits the two questions cleanly:
+    **who owns this application** (the status, claimed by the API) versus
+    **who is running it right now** (the lease, claimed by the worker).
+
+    Returns ``True`` when this caller took the lease. ``False`` means: the
+    document is gone, its status moved on, someone else's lease is still live,
+    or the write lost its precondition twice — in every case the caller's
+    correct response is to do nothing, which is what makes a redelivered task a
+    no-op rather than a second live ATS submission.
+
+    Every terminal write on the claiming path passes :data:`CLEAR_LEASE`, so a
+    run that finishes releases the lease in the same write that records its
+    outcome; :func:`release_lease` covers the case where that terminal write
+    lost its race and the lease would otherwise be left behind. A run that
+    *dies* leaves the lease to expire on the :data:`IN_PROGRESS` clock — a
+    wedged document, which is the safe failure.
+
+    ``owner`` is stamped on the lease so the release can be checked rather than
+    assumed; :func:`new_owner` mints one per run.
+
+    Retries once on a lost precondition for the same reason
+    :func:`try_transition` does (``_backfill_job_url`` writes on read), and
+    re-reads the status and the lease on that retry rather than trusting the
+    first read.
+    """
+    if status not in IN_PROGRESS:
+        raise ValueError(f"{status!r} carries no lease; see state.IN_PROGRESS")
+    for attempt in (0, 1):
+        if not snap.exists:
+            return False
+        doc = snap.to_dict() or {}
+        current = doc.get(STATUS_FIELD)
+        if current != status:
+            log.info(
+                "application.lease_wrong_status",
+                app_id=getattr(ref, "id", None),
+                status=current,
+                wanted=status,
+                attempt=attempt,
+            )
+            return False
+        if lease_is_held(doc, now=now):
+            log.info(
+                "application.lease_held",
+                app_id=getattr(ref, "id", None),
+                status=current,
+                lease=doc.get(LEASE_FIELD),
+                attempt=attempt,
+            )
+            return False
+        try:
+            ref.update(
+                {LEASE_FIELD: lease_for(status, owner=owner, now=now)},
+                option=_precondition(last_update_time=snap.update_time),
+            )
+            return True
+        except NotFound:
+            log.info(
+                "application.lease_missing",
+                app_id=getattr(ref, "id", None),
+                wanted=status,
+            )
+            return False
+        except FailedPrecondition:
+            if attempt:
+                log.warning(
+                    "application.lease_contended",
+                    app_id=getattr(ref, "id", None),
+                    status=current,
+                )
+                return False
+            snap = ref.get()
+    return False  # pragma: no cover - the loop always returns
+
+
+def release_lease(ref, snap, owner: str) -> bool:
+    """Drop a lease **this** caller holds, leaving everything else alone.
+
+    The counterpart to :func:`try_claim_lease`, for the path where the run
+    finished but its terminal ``try_transition`` lost — the status write carries
+    :data:`CLEAR_LEASE`, so when it loses, the lease it would have cleared stays
+    behind and blocks the next claim for its full TTL.
+
+    Refuses when the lease belongs to someone else, or when it carries no
+    ``owner`` at all: a lease we cannot prove is ours is one we might be about
+    to steal from a live run, and letting it expire costs only time. Returns
+    ``False`` for "nothing released" in every such case, including the ordinary
+    one where the terminal write already cleared it.
+    """
+    for attempt in (0, 1):
+        if not snap.exists:
+            return False
+        doc = snap.to_dict() or {}
+        if lease_owner(doc) != owner:
+            log.info(
+                "application.lease_not_ours",
+                app_id=getattr(ref, "id", None),
+                owner=lease_owner(doc),
+                attempt=attempt,
+            )
+            return False
+        try:
+            ref.update(
+                {LEASE_FIELD: firestore.DELETE_FIELD},
+                option=_precondition(last_update_time=snap.update_time),
+            )
+            return True
+        except NotFound:
+            return False
+        except FailedPrecondition:
+            if attempt:
+                log.warning(
+                    "application.lease_release_contended",
+                    app_id=getattr(ref, "id", None),
+                )
+                return False
+            snap = ref.get()
+    return False  # pragma: no cover - the loop always returns
 
 
 def creation_fields(*, note: str | None = None) -> dict:

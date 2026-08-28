@@ -13,6 +13,7 @@ rather than replaced, and no route writes a status field behind the helper's
 back.
 """
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -223,23 +224,40 @@ def test_creation_fields_start_queued():
 # --------------------------------------------------------------------------
 
 
-def test_in_progress_leases_are_bounded_by_the_dispatch_deadline():
+def test_every_lease_outlives_the_work_it_guards():
+    """**The inequality that makes a lease a lock.** This assertion used to read
+    ``<= _DISPATCH_DEADLINE_SECONDS`` and pinned the bug: a 1200s lease against
+    1800s of allowed work. Worker A is killed at T+1800 with the browser
+    possibly already past the Submit click; the retry arrives at T+1860, finds
+    the lease expired, claims it, and files the application a second time. A
+    lock whose TTL is shorter than the work is worse than none, because it
+    reads as permission."""
     assert set(state.IN_PROGRESS) == {"queued", "tailoring", "submitting"}
     for status, seconds in state.IN_PROGRESS.items():
         assert status in ALL_STATUSES
-        assert 0 < seconds <= _DISPATCH_DEADLINE_SECONDS
+        assert seconds > _DISPATCH_DEADLINE_SECONDS, status
 
 
 def test_lease_for_only_covers_in_progress_statuses():
-    from datetime import UTC, datetime
-
     now = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
     lease = state.lease_for("submitting", now=now)
     assert lease["status"] == "submitting"
     assert lease["acquired_at"] == "2026-08-26T12:00:00+00:00"
-    assert lease["expires_at"] == "2026-08-26T12:20:00+00:00"
+    assert lease["expires_at"] == "2026-08-26T12:31:00+00:00"
     for status in ALL_STATUSES - set(state.IN_PROGRESS):
         assert state.lease_for(status, now=now) is None
+
+
+def test_a_lease_names_its_owner_but_reads_back_without_one():
+    """Owner-less leases exist on documents written before the field did, and
+    must still read as valid claims rather than as free documents."""
+    assert "owner" not in (state.lease_for("submitting") or {})
+    assert state.lease_for("submitting", owner="abc")["owner"] == "abc"
+    assert state.lease_owner(
+        {"lease": {"expires_at": "2030-01-01T00:00:00+00:00"}}
+    ) is (None)
+    assert state.lease_is_held({"lease": {"expires_at": "2030-01-01T00:00:00+00:00"}})
+    assert state.new_owner() != state.new_owner()
 
 
 def test_a_lease_is_written_and_cleared_atomically_with_the_status():
@@ -261,6 +279,144 @@ def test_no_lease_field_appears_when_none_is_passed():
     doc = _ready()
     assert state.try_transition(doc, doc.get(), "submitting") is True
     assert doc.data is not None and "lease" not in doc.data
+
+
+# --------------------------------------------------------------------------
+# try_claim_lease: the worker's delivery claim
+# --------------------------------------------------------------------------
+
+
+def _submitting(**extra) -> _FakeDoc:
+    doc = _ready()
+    state.try_transition(doc, doc.get(), "submitting")
+    if extra:
+        doc.update(extra)
+    return doc
+
+
+def test_the_lease_claim_is_a_second_compare_and_swap():
+    """The status can't be the worker's claim — the API already took it, and
+    submitting → submitting is illegal. The lease answers the other question:
+    is a process running this *right now*."""
+    doc = _submitting()
+    assert state.try_claim_lease(doc, doc.get(), "submitting", owner="A") is True
+    assert doc.data["lease"]["status"] == "submitting"
+    assert doc.data["status"] == "submitting"  # the claim changed no status
+
+    # A redelivered Cloud Task, arriving while the first one runs.
+    assert state.try_claim_lease(doc, doc.get(), "submitting", owner="B") is False
+
+
+def test_a_lease_claim_requires_the_expected_status():
+    doc = _ready()
+    assert state.try_claim_lease(doc, doc.get(), "submitting", owner="A") is False
+    assert doc.updates == []
+    assert doc.data is not None and "lease" not in doc.data
+
+
+def test_a_released_lease_is_not_a_second_chance_to_submit():
+    """The terminal write clears the lease. Nothing may read that as free."""
+    doc = _submitting()
+    assert state.try_claim_lease(doc, doc.get(), "submitting", owner="A") is True
+    state.try_transition(doc, doc.get(), "submitted", lease=state.CLEAR_LEASE)
+    assert doc.data is not None and "lease" not in doc.data
+    assert state.try_claim_lease(doc, doc.get(), "submitting", owner="B") is False
+
+
+def test_an_expired_lease_may_be_reclaimed():
+    """A worker that died holds nothing forever — the IN_PROGRESS clock is what
+    bounds it, and what the reaper will read."""
+    now = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    doc = _submitting(lease=state.lease_for("submitting", now=now))
+    later = now + timedelta(seconds=state.IN_PROGRESS["submitting"] + 1)
+
+    assert (
+        state.try_claim_lease(doc, doc.get(), "submitting", owner="B", now=now) is False
+    )
+    assert (
+        state.try_claim_lease(doc, doc.get(), "submitting", owner="B", now=later)
+        is True
+    )
+    assert doc.data["lease"]["acquired_at"] == later.isoformat()
+
+
+@pytest.mark.parametrize(
+    "lease", [{"status": "submitting"}, {"expires_at": "whenever"}, {}]
+)
+def test_a_lease_that_cannot_be_read_counts_as_held(lease):
+    """Asymmetric on purpose: refusing wedges a document, which is undoable.
+    Claiming anyway risks a duplicate real application, which is not."""
+    doc = _submitting(lease=lease)
+    assert state.try_claim_lease(doc, doc.get(), "submitting", owner="A") is False
+
+
+def test_a_lease_claim_re_reads_before_it_retries():
+    """The genuine race: two deliveries, the second holding a read taken before
+    the first claimed. The precondition fails, and the retry sees the winner's
+    lease rather than overwriting it."""
+    doc = _submitting()
+    in_flight = doc.snapshot()
+    assert state.try_claim_lease(doc, doc.get(), "submitting", owner="A") is True
+    won = doc.data["lease"]
+
+    assert state.try_claim_lease(doc, in_flight, "submitting", owner="B") is False
+    assert doc.data["lease"] == won  # the winner keeps it, owner and all
+
+
+def test_a_spurious_precondition_failure_still_claims():
+    """_backfill_job_url writes on read, same as for try_transition."""
+    doc = _submitting()
+    stale = doc.snapshot()
+    doc.update({"job_url": "https://boards.greenhouse.io/acme/jobs/1"})
+    assert state.try_claim_lease(doc, stale, "submitting", owner="A") is True
+
+
+def test_a_lease_claim_does_not_resurrect_a_deleted_document():
+    doc = _submitting()
+    snap = doc.snapshot()
+    doc.delete()
+    assert state.try_claim_lease(doc, snap, "submitting", owner="A") is False
+    assert doc.data is None and doc.sets == []
+
+
+def test_a_lease_is_released_only_by_the_run_that_holds_it():
+    """Without an owner check, an expiry lets two runs believe they hold the
+    same document: B claims after A's lease lapses, then A — alive, merely slow
+    — finishes and frees the document for a *third* claim while B is working."""
+    doc = _submitting()
+    assert state.try_claim_lease(doc, doc.get(), "submitting", owner="A") is True
+    held = doc.data["lease"]
+
+    assert state.release_lease(doc, doc.get(), "B") is False  # A's lease, not B's
+    assert doc.data["lease"] == held
+
+    assert state.release_lease(doc, doc.get(), "A") is True
+    assert doc.data is not None and "lease" not in doc.data
+    # Nothing to release twice.
+    assert state.release_lease(doc, doc.get(), "A") is False
+
+
+def test_a_lease_with_no_owner_is_never_released_by_ownership():
+    """Backward compatibility, biased safe: a lease we cannot prove is ours may
+    belong to a live run, and waiting out its TTL costs only time."""
+    doc = _submitting(lease=state.lease_for("submitting"))
+    assert state.release_lease(doc, doc.get(), "A") is False
+    assert doc.data["lease"] is not None
+
+
+def test_release_does_not_resurrect_a_deleted_document():
+    doc = _submitting()
+    state.try_claim_lease(doc, doc.get(), "submitting", owner="A")
+    snap = doc.snapshot()
+    doc.delete()
+    assert state.release_lease(doc, snap, "A") is False
+    assert doc.data is None and doc.sets == []
+
+
+def test_claiming_a_status_that_carries_no_lease_is_a_programming_error():
+    doc = _ready()
+    with pytest.raises(ValueError, match="ready_for_review"):
+        state.try_claim_lease(doc, doc.get(), "ready_for_review", owner="A")
 
 
 # --------------------------------------------------------------------------
@@ -460,10 +616,10 @@ def submit_client(monkeypatch):
     doc = _ready()
     monkeypatch.setattr(applications, "_apps", lambda user_id: _FakeCollection(doc))
 
-    submissions: list[tuple[str, str]] = []
+    submissions: list[tuple] = []
 
-    async def fake_run_submission(user_id, app_id):
-        submissions.append((user_id, app_id))
+    async def fake_run_submission(user_id, app_id, *, dry_run=False):
+        submissions.append((user_id, app_id, dry_run))
 
     monkeypatch.setattr(applications, "run_submission", fake_run_submission)
 
@@ -491,7 +647,7 @@ def test_double_click_submits_once(submit_client):
     assert "ready_for_review" in second.json()["detail"]
 
     assert doc.data["status"] == "submitting"
-    assert submissions == [("u1", "app-job1")]
+    assert submissions == [("u1", "app-job1", False)]
     assert [e["status"] for e in doc.data["timeline"]] == ["tailoring", "submitting"]
 
 
@@ -509,7 +665,7 @@ def test_submit_from_failed_is_a_retry(submit_client):
     assert client.post("/applications/app-job1/submit").status_code == 200
     assert doc.data["status"] == "submitting"
     assert doc.data["last_submitted_at"]
-    assert submissions == [("u1", "app-job1")]
+    assert submissions == [("u1", "app-job1", False)]
 
 
 def test_regenerate_requeues_and_rejects_terminal_statuses(monkeypatch):
@@ -540,6 +696,18 @@ def test_regenerate_requeues_and_rejects_terminal_statuses(monkeypatch):
     assert resp.status_code == 409
     assert "submitted" in resp.json()["detail"]
     assert scheduled == [("u1", "job1"), ("u1", "job1")]
+
+
+def test_the_public_submit_route_cannot_ask_for_a_dry_run(submit_client):
+    """``dry_run`` is a worker-only switch (``worker.ApplyTask``): it drives the
+    real submission path but stops short of the Submit button, so a user able
+    to set it could tell the product they applied when nobody did. The route
+    takes no body at all, and run_submission's parameter is keyword-only, so a
+    body that asks for one is simply not read."""
+    client, _doc, submissions = submit_client
+    resp = client.post("/applications/app-job1/submit", json={"dry_run": True})
+    assert resp.status_code == 200
+    assert submissions == [("u1", "app-job1", False)]
 
 
 def test_submit_404s_on_a_missing_application(submit_client):
