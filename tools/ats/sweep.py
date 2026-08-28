@@ -25,6 +25,7 @@ from google.cloud import firestore
 
 from models.job import Job
 from obs.logging import get_logger
+from tools.applications import state
 from tools.ats._http import fetch_board_json
 from tools.ats.ashby import BASE as ASHBY_BASE
 from tools.ats.greenhouse import BASE as GREENHOUSE_BASE
@@ -36,8 +37,13 @@ log = get_logger("tools.ats")
 
 # Decisions whose jobs are still served somewhere (queue, shelves, pipeline).
 SWEEPABLE_DECISIONS = {"pending", "approved", "starred", "rejected"}
-# Application statuses that are still pre-submission — safe to invalidate.
-ACTIVE_APP_STATUSES = {"queued", "tailoring", "ready_for_review", "failed"}
+# Application statuses that are still pre-submission — safe for a background
+# sweep to invalidate. Narrower than the transitions the state machine allows
+# into ``posting_removed``: ``submitting`` is deliberately excluded so a sweep
+# never yanks a document out from under a browser that is mid-submit.
+ACTIVE_APP_STATUSES = {
+    s for s, nxt in state.TRANSITIONS.items() if "posting_removed" in nxt
+} - {"submitting"}
 
 BOARD_URLS = {
     "greenhouse": lambda slug: f"{GREENHOUSE_BASE}/{slug}/jobs",
@@ -117,26 +123,21 @@ async def sweep_postings(user_id: str) -> dict:
             {"user_decision": "dismissed", "posting_removed_at": now}
         )
         app_ref = user_ref.collection("applications").document(application_id(job.id))
-        app_snap = app_ref.get()
-        if app_snap.exists and app_snap.to_dict().get("status") in ACTIVE_APP_STATUSES:
-            app_ref.set(
-                {
-                    "status": "posting_removed",
-                    "timeline": firestore.ArrayUnion(
-                        [
-                            {
-                                "at": now,
-                                "status": "posting_removed",
-                                "note": (
-                                    f"posting no longer available at {job.url}"
-                                    " — application dismissed (liveness sweep)"
-                                ),
-                            }
-                        ]
-                    ),
-                },
-                merge=True,
-            )
+        # ACTIVE_APP_STATUSES goes *into* the swap, not around it. Checking it
+        # here and swapping after would let a sweep that lost the precondition
+        # to a user clicking Submit retry, re-read ``submitting``, and mark the
+        # posting removed mid-submission — see try_transition's docstring.
+        state.try_transition(
+            app_ref,
+            app_ref.get(),
+            "posting_removed",
+            allowed_from=ACTIVE_APP_STATUSES,
+            note=(
+                f"posting no longer available at {job.url}"
+                " — application dismissed (liveness sweep)"
+            ),
+            lease=state.CLEAR_LEASE,
+        )
         counts["removed"] += 1
         log.info(
             "sweep.posting_removed",
