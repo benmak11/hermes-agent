@@ -3,13 +3,36 @@
 """Application endpoints: tailoring lifecycle + the diff/review surface.
 
 The approval hook in ``jobs.decide`` creates an Application in ``queued`` state
-and schedules ``run_tailoring`` as a background task, which claims the work by
-moving it to ``tailoring``; these endpoints let the web app poll, edit the
-objective, regenerate, and hand off to submission.
+and dispatches ``run_tailoring``, which claims the work by moving it to
+``tailoring``; these endpoints let the web app poll, edit the objective,
+regenerate, and hand off to submission.
+
+**Where that work runs is decided by :func:`dispatch_tailor` and
+:func:`dispatch_apply`.** With ``QUEUE_MODE`` on they enqueue a named Cloud
+Tasks task to hermes-worker; without it they fall back to a FastAPI background
+task on this instance, which is what keeps local dev and the pre-worker
+deployment working. Both are called **after** the document that describes the
+work has been committed, never before: a task can be picked up by a worker
+before the caller's next line executes, and one that arrives ahead of its own
+write reads the old document and does nothing at all.
 
 Every ``status`` write in here goes through ``tools.applications.state`` — the
 compare-and-swap that stops a double-click on Submit from starting two live ATS
 submissions. Nothing in this module writes a status field directly.
+
+Firestore round trips made from the ``async def``s in here go through
+``asyncio.to_thread``. **The deployment that needs it is hermes-api, not the
+worker:** hermes-worker runs at ``containerConcurrency = 1``, so a task has that
+event loop to itself, but with QUEUE_MODE off ``run_tailoring`` and
+``run_submission`` are background tasks on the loop that is serving every other
+request — including the SSE stream polling this very document.
+
+Two things are deliberately left blocking, and the docstring says so rather than
+implying the coroutines are clean. ``progress()`` below is invoked by the
+submitter through a *synchronous* callback, so it has no await to hand the work
+back on; and the GCS transfers (``download_resume``, ``upload_screenshot``) are
+blocking too. Both are known, neither is a Firestore round trip, and converting
+them is a separate change.
 """
 
 from __future__ import annotations
@@ -31,6 +54,7 @@ from api.deps import verify_user, verify_user_query
 from models.job import Job
 from models.profile import MasterProfile
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
+from tools import queues
 from tools.applications import state
 from tools.ats.validate import check_posting
 from tools.run_costs import persist_run_cost
@@ -83,6 +107,18 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+async def _transition(ref, to: str, **kwargs) -> bool:
+    """``state.try_transition`` on a fresh read, off the event loop.
+
+    The read and the swap it is conditioned on go into the *same* thread hop on
+    purpose: they are one compare-and-swap, and an await between them would only
+    widen the window the update-time precondition exists to close.
+    """
+    return await asyncio.to_thread(
+        lambda: state.try_transition(ref, ref.get(), to, **kwargs)
+    )
+
+
 async def _dismiss_if_posting_removed(
     user_ref, app_ref, job: Job, task_log, *, allowed_from: Collection[str]
 ) -> bool:
@@ -109,16 +145,16 @@ async def _dismiss_if_posting_removed(
     if await check_posting(job) != "removed":
         return False
     task_log.warning("application.posting_removed", url=job.url)
-    user_ref.collection("jobs").document(job.id).update(
-        {"user_decision": "dismissed", "posting_removed_at": _now()}
+    await asyncio.to_thread(
+        user_ref.collection("jobs").document(job.id).update,
+        {"user_decision": "dismissed", "posting_removed_at": _now()},
     )
     # The caller stops either way — the posting really is gone. A refused
     # transition means the document moved out from under us: either someone
     # already parked it somewhere terminal, or it is now owned by a run this
     # caller must not interrupt.
-    if not state.try_transition(
+    if not await _transition(
         app_ref,
-        app_ref.get(),
         "posting_removed",
         note=f"posting no longer available at {job.url} — application dismissed",
         lease=state.CLEAR_LEASE,
@@ -161,9 +197,8 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             # edge, and the work is silently dropped — the user's only way out
             # being the Regenerate button, on a page that gives no sign anything
             # is wrong. Every exit below hands the lease back.
-            if not state.try_transition(
+            if not await _transition(
                 app_ref,
-                app_ref.get(),
                 "tailoring",
                 lease=state.lease_for("tailoring", owner=state.new_owner()),
             ):
@@ -171,8 +206,11 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 log_agent_end(task_log, "tailoring", started, outcome="not_claimed")
                 return
 
-            profile = MasterProfile.model_validate(user_ref.get().to_dict())
-            job_doc = user_ref.collection("jobs").document(job_id).get()
+            profile = MasterProfile.model_validate(
+                (await asyncio.to_thread(user_ref.get)).to_dict()
+            )
+            job_ref = user_ref.collection("jobs").document(job_id)
+            job_doc = await asyncio.to_thread(job_ref.get)
             if not job_doc.exists:
                 raise ValueError(f"Job {job_id} not found")
             job = Job.model_validate(job_doc.to_dict())
@@ -193,9 +231,9 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
 
             # The user may have reverted the approval (undo) while tailoring
             # ran — don't resurrect an application decide() already discarded.
-            decision = (
-                user_ref.collection("jobs").document(job_id).get().to_dict() or {}
-            ).get("user_decision")
+            decision = ((await asyncio.to_thread(job_ref.get)).to_dict() or {}).get(
+                "user_decision"
+            )
             if decision != "approved":
                 # The one exit that leaves the lease behind, deliberately: the
                 # undo path has usually deleted this document already, and
@@ -220,14 +258,20 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 content.pop(field, None)
             # update(), not set(merge=True): a doc the undo path deleted between
             # the decision check above and here must not come back.
-            app_ref.update(content)
+            #
+            # It also only writes the fields the model carries, which is what
+            # keeps ``submit_attempts`` alive across a regenerate. That counter
+            # names the apply task (see dispatch_apply): resetting it here would
+            # let a later submission reuse a task name the queue still holds a
+            # tombstone for, and the submission would be deduped into silence.
+            await asyncio.to_thread(app_ref.update, content)
             # CLEAR_LEASE: the run is over. A tailoring lease left on a
             # ready_for_review document would still be live when the user clicks
             # Submit, and the worker's own claim on ``submitting`` would find it
             # held and refuse — a submission silently dropped by a lease nobody
             # owns any more.
-            if not state.try_transition(
-                app_ref, app_ref.get(), "ready_for_review", lease=state.CLEAR_LEASE
+            if not await _transition(
+                app_ref, "ready_for_review", lease=state.CLEAR_LEASE
             ):
                 task_log.info("tailoring.result_not_published")
             task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
@@ -240,15 +284,11 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             )
         except Exception as e:  # persist failure for the UI, surface in timeline
             task_log.exception("tailoring.failed")
-            if not app_ref.get().exists:
+            if not (await asyncio.to_thread(app_ref.get)).exists:
                 log_agent_end(task_log, "tailoring", started, outcome="discarded")
                 return  # discarded by a revert while we ran — don't resurrect
-            state.try_transition(
-                app_ref,
-                app_ref.get(),
-                "failed",
-                note=str(e)[:300],
-                lease=state.CLEAR_LEASE,
+            await _transition(
+                app_ref, "failed", note=str(e)[:300], lease=state.CLEAR_LEASE
             )
             log_agent_end(
                 task_log, "tailoring", started, outcome="failed", error=str(e)[:300]
@@ -265,6 +305,54 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 job_id=job_id,
                 started_at=started_at,
             )
+
+
+# --------------------------------------------------------------------------
+# Where the work runs. dispatch_tailor and dispatch_apply (further down, next
+# to run_submission) mirror ``discovery.dispatch_cycle``: a named Cloud Tasks
+# task to hermes-worker under QUEUE_MODE, a background task on this instance
+# without one, so local dev and the pre-worker deployment keep working.
+#
+# **Synchronous, unlike dispatch_cycle**, and deliberately so: every caller is
+# a synchronous route. Enqueueing is one blocking RPC, which FastAPI already
+# runs in a threadpool for those routes; making these ``async`` would drag
+# ``decide``/``regenerate``/``submit`` — and the blocking Firestore reads and
+# compare-and-swaps they are built out of — onto the event loop instead, which
+# is the arrangement ``tools.applications.state`` documents as the thing to
+# avoid. Neither helper awaits anything, so there is nothing to gain from it.
+# --------------------------------------------------------------------------
+
+
+def dispatch_tailor(
+    user_id: str, job_id: str, *, background_tasks: BackgroundTasks
+) -> bool:
+    """Tailor an approved job — on the worker via queue when enabled.
+
+    The task id is minute-granular, matching ``dispatch_cycle``'s ``manual``
+    convention: a double-click on Approve or Regenerate dedupes at the queue,
+    while a deliberate regenerate a minute later isn't blocked for the full
+    hour a Cloud Tasks tombstone lives. Returns False when the queue deduped.
+
+    The residual case that costs something is a regenerate issued in the *same*
+    minute as the enqueue it collides with: the application has already been put
+    back in ``queued`` by then, so it sits there with nothing running. That is
+    precisely what ``regenerate``'s "already queued, so re-schedule rather than
+    refuse" branch exists for — the next click builds a new id and picks the
+    work back up — which is why this stays minute-granular rather than becoming
+    a per-document counter like ``dispatch_apply``'s: a counter would advance
+    only on the compare-and-swap, and re-scheduling from ``queued`` doesn't take
+    one, so the escape hatch would dedupe for a solid hour instead of a minute.
+    """
+    if queues.enabled():
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M")
+        return queues.enqueue(
+            "tailor",
+            "/tasks/tailor",
+            {"user_id": user_id, "job_id": job_id},
+            task_id=f"tailor-{user_id}-{job_id}-{stamp}",
+        )
+    background_tasks.add_task(run_tailoring, user_id, job_id)
+    return True
 
 
 def _backfill_job_url(user_id: str, app: dict) -> dict:
@@ -357,12 +445,14 @@ def regenerate(
 
     Puts the application back in ``queued``; ``run_tailoring`` claims it from
     there. Rejected with 409 where a regenerate makes no sense (mid-submission,
-    submitted, posting removed) — the background task must not be scheduled when
-    the state change didn't happen.
+    submitted, posting removed) — the work must not be dispatched when the state
+    change didn't happen, which is also why the dispatch is the *last* thing
+    here: the worker can be reading this document before the next line of this
+    function runs, so it has to find it already back in ``queued``.
 
     An application that is *already* queued is re-scheduled rather than
-    refused: a background task that never fired leaves the doc stuck there, and
-    this is the user's only manual way out of it. Safe because ``run_tailoring``
+    refused: a dispatch that never arrived leaves the doc stuck there, and this
+    is the user's only manual way out of it. Safe because ``run_tailoring``
     claims — a duplicate scheduling can't spend a second LLM run.
     """
     ref = _apps(user_id).document(app_id)
@@ -379,16 +469,33 @@ def regenerate(
             detail=f"cannot regenerate from status '{doc.get('status')}'",
         )
     log.info("application.regenerate", app_id=app_id, job_id=job_id, user_id=user_id)
-    background_tasks.add_task(run_tailoring, user_id, job_id)
+    if not dispatch_tailor(user_id, job_id, background_tasks=background_tasks):
+        # Deduped: an enqueue with this id happened inside the last minute. The
+        # doc is in ``queued``, so clicking Regenerate again is the way out.
+        log.info("application.regenerate_deduped", app_id=app_id, job_id=job_id)
     return {"ok": True}
 
 
-async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) -> None:
-    """Background task: submit the application to the live ATS and record evidence.
+async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) -> bool:
+    """Submit the application to the live ATS and record evidence.
 
     Downloads the tailored resume, runs the per-source submitter, uploads pre/post
     screenshots to GCS, and writes the terminal status (submitted/failed). Progress
     is appended to the timeline as it goes so the SSE stream can relay it live.
+
+    **This function takes the delivery claim itself.** The lease used to be
+    claimed by the ``/tasks/apply`` handler, which fenced worker against worker
+    but nothing else: ``dispatch_apply`` still runs this as a background task
+    wherever QUEUE_MODE is off, and during a rollout two hermes-api revisions
+    serve the same URL and the same documents at once. A claim taken by only one
+    of the paths that can drive a submission is not a lock on submissions. It
+    lives here so **every** such path takes the same one, before any browser
+    opens, and hands it back the same way.
+
+    Returns True when a run actually happened. False means the document is gone
+    or the claim was lost — a redelivered task, or a document that moved on —
+    and the caller has nothing left to do; it is the answer ``/tasks/apply``
+    reports as ``ran``.
 
     ``dry_run`` drives the whole path against the live posting but stops the
     submitter before it clicks Submit, so the browser automation can be
@@ -404,11 +511,16 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
     world rather than about this run, and it is recorded under the same
     ``allowed_from`` guard as everything else here — only while the document is
     still where the rehearsal found it.
+
+    A rehearsal takes **no lease**, because it makes no claim: it writes no
+    status of its own, so there is nothing a repeat could corrupt, and repeating
+    it costs nothing.
     """
     ref = _apps(user_id).document(app_id)
-    snap = ref.get()
+    snap = await asyncio.to_thread(ref.get)
     if not snap.exists:
-        return
+        log.info("submission.missing", user_id=user_id, app_id=app_id)
+        return False
     app = snap.to_dict()
     job_id = app["job_id"]
     # The status this run may act on, read once and used as the precondition for
@@ -448,14 +560,49 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
     # Playwright steps) stitch to this submission in Cloud Logging.
     with run_context("submission", user_id=user_id, app_id=app_id, job_id=job_id):
         started = log_agent_start(task_log, "submission", source=app.get("job_source"))
+
+        # The delivery claim, before any browser opens. The status can't take
+        # it: ``POST /applications/{id}/submit`` already claimed the work by
+        # swapping ``→ submitting`` (that is what a double-click loses on), so
+        # by the time we get here the status *is* the claim and
+        # ``submitting → submitting`` is illegal, exactly as it must be. The
+        # lease answers the other question — **is a process running this right
+        # now** — so a redelivered task, or a second runner during a revision
+        # rollout, finds it live and does nothing.
+        #
+        # Taken here rather than a few lines earlier so that the ``try`` below
+        # opens on the very next statement: everything between a claim and the
+        # ``finally`` that hands it back is a region where an exception strands
+        # the lease on the document for its full TTL.
+        owner: str | None = None
+        if not dry_run:
+            owner = state.new_owner()
+            if not await asyncio.to_thread(
+                state.try_claim_lease, ref, snap, "submitting", owner=owner
+            ):
+                # A duplicate delivery, or a document that moved on. Nothing to
+                # do, and nothing to record: asking again gets the same answer.
+                task_log.info("submission.not_claimed", found_status=found_status)
+                log_agent_end(task_log, "submission", started, outcome="not_claimed")
+                return False
+            task_log = task_log.bind(lease_owner=owner)
         try:
+            if owner is not None:
+                # Re-read now the claim has landed. ``try_claim_lease`` retries
+                # against a *fresh* snapshot, so it can succeed on a document one
+                # write newer than the one read at the top of this function —
+                # and everything below acts on the content of that read.
+                app = (await asyncio.to_thread(ref.get)).to_dict() or app
             resume_uri = app.get("resume_variant_uri")
             if not resume_uri:
                 raise ValueError("No tailored resume to submit — run tailoring first.")
-            profile = MasterProfile.model_validate(user_ref.get().to_dict())
-            job = Job.model_validate(
-                user_ref.collection("jobs").document(job_id).get().to_dict()
+            profile = MasterProfile.model_validate(
+                (await asyncio.to_thread(user_ref.get)).to_dict()
             )
+            job_snap = await asyncio.to_thread(
+                user_ref.collection("jobs").document(job_id).get
+            )
+            job = Job.model_validate(job_snap.to_dict())
 
             # Last-line check: never drive a browser at a posting the ATS says
             # is gone. Fail-open — a flaky board proceeds and fails visibly.
@@ -465,7 +612,7 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                 log_agent_end(
                     task_log, "submission", started, outcome="posting_removed"
                 )
-                return
+                return True
 
             resume_path = download_resume(resume_uri)
 
@@ -520,10 +667,11 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                     "submission.dry_run", screenshot_uris=[s["uri"] for s in shots]
                 )
                 # No transition, in either direction. The document is still
-                # wherever the worker found it (a submittable status — the
+                # wherever the rehearsal found it (a submittable status — the
                 # handler checks), and there is no edge that would put it back
                 # if a dry run moved it, so it moves it nowhere.
-                state.append_note(
+                await asyncio.to_thread(
+                    state.append_note,
                     ref,
                     found_status or "ready_for_review",
                     DRY_RUN_NOTE
@@ -538,9 +686,8 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                     (s["uri"] for s in shots if s["name"] == "confirmation.png"), None
                 )
                 submitted_at = _now()
-                recorded = state.try_transition(
+                recorded = await _transition(
                     ref,
-                    ref.get(),
                     "submitted",
                     lease=state.CLEAR_LEASE,
                     extra={
@@ -557,16 +704,16 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                     # extra= was dropped. This is the loudest thing in the file
                     # on purpose: the URIs below are the only remaining record
                     # that this submission happened.
+                    now_snap = await asyncio.to_thread(ref.get)
                     task_log.error(
                         "submission.result_not_recorded",
                         submitted_at=submitted_at,
                         confirmation_uri=confirm_uri,
                         screenshot_uris=[s["uri"] for s in shots],
-                        status_now=(ref.get().to_dict() or {}).get("status"),
+                        status_now=(now_snap.to_dict() or {}).get(state.STATUS_FIELD),
                     )
-            elif not state.try_transition(
+            elif not await _transition(
                 ref,
-                ref.get(),
                 "failed",
                 note=(result.get("error") or "submission failed")[:300],
                 lease=state.CLEAR_LEASE,
@@ -583,7 +730,8 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                 # ``failed`` is a legal edge from a submittable status, so
                 # without this guard a $0 rehearsal could mark a real
                 # application failed.
-                state.append_note(
+                await asyncio.to_thread(
+                    state.append_note,
                     ref,
                     found_status or "ready_for_review",
                     DRY_RUN_NOTE + f"errored: {e!s}"[:300],
@@ -595,9 +743,9 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                     outcome="failed",
                     error=str(e)[:300],
                 )
-                return
-            if not state.try_transition(
-                ref, ref.get(), "failed", note=str(e)[:300], lease=state.CLEAR_LEASE
+                return True
+            if not await _transition(
+                ref, "failed", note=str(e)[:300], lease=state.CLEAR_LEASE
             ):
                 # Leaves the document wedged in ``submitting``; cli/unwedge_submitting
                 # is the manual way out until the reaper lands.
@@ -605,6 +753,113 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
             log_agent_end(
                 task_log, "submission", started, outcome="failed", error=str(e)[:300]
             )
+        finally:
+            # Hand the lease back — but only once the document has an outcome.
+            #
+            # Normally there is nothing to do: every terminal transition carries
+            # CLEAR_LEASE, so the outcome and the release are one write. The case
+            # this covers is that transition *losing* — it loses because the
+            # document moved on, which leaves our lease sitting on someone else's
+            # status for its full TTL.
+            #
+            # Still ``submitting`` is the opposite case and must NOT be released:
+            # the run ended without recording an outcome, so whether the form was
+            # actually submitted is unknown, and dropping the lease would invite a
+            # redelivery straight back into the same document. Let it expire, which
+            # is what cli/unwedge_submitting (and the reaper) exist to adjudicate.
+            #
+            # The two event names are the ones ``/tasks/apply`` emitted before the
+            # claim moved in here, kept verbatim: the code moved, the operational
+            # trail it leaves should not have to.
+            if owner is not None:
+                after = await asyncio.to_thread(ref.get)
+                doc = after.to_dict() or {}
+                if doc.get(state.STATUS_FIELD) == "submitting":
+                    if state.lease_owner(doc) == owner:
+                        task_log.warning("task.apply.finished_without_an_outcome")
+                elif await asyncio.to_thread(state.release_lease, ref, after, owner):
+                    task_log.warning("task.apply.lease_released_late")
+    return True
+
+
+def dispatch_apply(
+    user_id: str, app_id: str, *, attempt: int, background_tasks: BackgroundTasks
+) -> bool:
+    """Submit an application the caller has **already** claimed.
+
+    The task id carries ``attempt`` — the ``submit_attempts`` value written in
+    the same compare-and-swap that took the ``submitting`` claim — rather than a
+    timestamp. Same claim, same name, so the queue refuses a duplicate dispatch;
+    a legitimate retry after a failure wins a *new* claim, advances the counter
+    and gets a name of its own however soon it comes, which no time granularity
+    can offer both of.
+
+    ``attempt`` is passed in rather than re-read here on purpose: the name has to
+    belong to *this* claim, and a fresh read can only ever return whatever the
+    document says now.
+
+    Returns False when the queue deduped, which after the above can only mean a
+    name was reused — the caller must not report that as a scheduled submission.
+    """
+    if queues.enabled():
+        return queues.enqueue(
+            "apply",
+            "/tasks/apply",
+            {"user_id": user_id, "app_id": app_id},
+            task_id=f"apply-{user_id}-{app_id}-{attempt}",
+        )
+    background_tasks.add_task(run_submission, user_id, app_id)
+    return True
+
+
+#: What the timeline says when a claim is rolled back because the work behind it
+#: was never dispatched. User-facing: ``web/`` renders notes verbatim.
+DISPATCH_FAILED_NOTE = "could not be scheduled — nothing was submitted. Try again."
+
+
+def _abandon_unstarted_claim(ref, app_id: str) -> None:
+    """Undo a ``submitting`` claim whose work was never dispatched.
+
+    ``submitting`` is the one status a *user* cannot leave: Submit and
+    Regenerate both 409 out of it and the undo path in ``jobs.decide`` refuses to
+    delete a document in it, so a claim with nothing behind it wedges the
+    application until an operator runs ``cli/unwedge_submitting`` — the reaper
+    that would collect it is a later PR. Nothing was clicked (the lease is taken
+    by the run, and no run started), so ``failed`` is both true and the one
+    status the user can act on. Clicking Submit again then computes a *new*
+    attempt number, which also breaks the task-name collision that is one of the
+    two ways to get here.
+
+    **The lease is claimed first, and that is the safety property rather than a
+    formality.** An enqueue can report failure and still have created the task —
+    a deadline that expires after the server committed — and ``AlreadyExists``
+    means a task by that name exists, possibly one still pending. Either way a
+    worker may be about to run, or already running, *this* document, and writing
+    ``failed`` with CLEAR_LEASE underneath it would clear a live run's claim and
+    throw away the confirmation evidence for an application that really was sent.
+    :func:`state.try_claim_lease` answers exactly that question inside its own
+    compare-and-swap — status *and* lease, re-checked on its retry — so losing it
+    means "someone is running this", and the right response is to leave the
+    document alone and let that run record its own outcome.
+    """
+    owner = state.new_owner()
+    if not state.try_claim_lease(ref, ref.get(), "submitting", owner=owner):
+        log.warning("application.submit_claim_left_alone", app_id=app_id)
+        return
+    if state.try_transition(
+        ref,
+        ref.get(),
+        "failed",
+        note=DISPATCH_FAILED_NOTE,
+        lease=state.CLEAR_LEASE,
+        allowed_from={"submitting"},
+    ):
+        log.info("application.submit_claim_rolled_back", app_id=app_id)
+        return
+    # The document moved on under us between the two writes. Hand back the lease
+    # we just took, or it sits on someone else's status for its full TTL.
+    state.release_lease(ref, ref.get(), owner)
+    log.warning("application.submit_claim_not_rolled_back", app_id=app_id)
 
 
 @router.post("/applications/{app_id}/submit")
@@ -621,14 +876,40 @@ def submit(
     ``ready_for_review``, but only one write survives the update-time
     precondition; the loser re-reads, finds ``submitting``, and gets a 409. That
     is what keeps a duplicate real job application from going out.
+
+    **Claim first, dispatch second, always in that order.** The claim is the
+    thing that stops a second submission; the dispatch only says where the work
+    runs. Enqueue first and the worker can be reading the document before this
+    request writes it — it would find a ``ready_for_review`` application with no
+    claim on it and refuse to run, which is the whole submission silently lost.
+    In the other order the worst case is a claim with nothing behind it, and
+    **nothing was ever clicked** — so that claim is rolled back to ``failed``
+    here rather than left for a reaper that doesn't exist yet. See
+    :func:`_abandon_unstarted_claim`: ``submitting`` is a status the user has no
+    way out of, and the two ways a dispatch fails (a transient Cloud Tasks
+    error, and a task name reused after the undo path deleted and re-created the
+    document) are both reachable in an ordinary session.
     """
     ref = _apps(user_id).document(app_id)
     snap = ref.get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="application not found")
-    status = snap.to_dict().get("status")
+    doc = snap.to_dict() or {}
+    status = doc.get(state.STATUS_FIELD)
+    # Bumped *inside* the swap below, never outside it. The counter names the
+    # apply task, so two claims sharing a number would share a task name and the
+    # second would be deduped into silence; only a claim that wins advances it,
+    # and every winning claim advances it exactly once. Computed from the same
+    # snapshot the swap is conditioned on, so the write that carries it is the
+    # write that proves nothing moved in between. (try_transition's one retry
+    # re-reads and re-checks legality: anything that could have bumped this
+    # counter also left the status somewhere the retry refuses.)
+    attempt = int(doc.get("submit_attempts") or 0) + 1
     if not state.try_transition(
-        ref, snap, "submitting", extra={"last_submitted_at": _now()}
+        ref,
+        snap,
+        "submitting",
+        extra={"last_submitted_at": _now(), "submit_attempts": attempt},
     ):
         raise HTTPException(
             status_code=409, detail=f"cannot submit from status '{status}'"
@@ -638,19 +919,31 @@ def submit(
         app_id=app_id,
         user_id=user_id,
         status_was=status,
+        attempt=attempt,
     )
-    # NOTE FOR THE PR THAT MOVES THIS TO THE QUEUE. The lease that fences
-    # ``/tasks/apply`` fences *nothing here*: this path takes the status claim
-    # and then submits in-process, without ever writing a lease. That is fine
-    # while it is the only path — but it stops being fine during the cutover.
-    # Cloud Run shifts traffic between revisions gradually, so for the length of
-    # the migration the old revision (in-process, no lease) and the new one
-    # (enqueue, leased) both serve, on the same documents, and neither can see
-    # the other's claim. The status CAS above is the only thing keeping the two
-    # apart, and it is enough *only* because both paths take it before doing any
-    # work: keep it that way, or move the claim into ``run_submission`` so both
-    # paths are fenced by the same lease before splitting traffic.
-    background_tasks.add_task(run_submission, user_id, app_id)
+    try:
+        dispatched = dispatch_apply(
+            user_id, app_id, attempt=attempt, background_tasks=background_tasks
+        )
+    except Exception as e:
+        # A transient Cloud Tasks error (503, DEADLINE_EXCEEDED, quota) is an
+        # ordinary event, and this PR is what put that RPC on the submit path.
+        log.exception(
+            "application.submit_not_dispatched", app_id=app_id, attempt=attempt
+        )
+        _abandon_unstarted_claim(ref, app_id)
+        raise HTTPException(
+            status_code=503, detail="could not schedule the submission"
+        ) from e
+    if not dispatched:
+        # A reused task name — see dispatch_apply. Not a double-click: that one
+        # lost the swap above and never got here. The reachable way in is the
+        # undo path: revert deletes the application, re-approving recreates it at
+        # the same deterministic id with the counter gone, and the next submit
+        # rebuilds a name whose Cloud Tasks tombstone is still alive.
+        log.error("application.submit_dispatch_deduped", app_id=app_id, attempt=attempt)
+        _abandon_unstarted_claim(ref, app_id)
+        raise HTTPException(status_code=503, detail="could not schedule the submission")
     return {"ok": True}
 
 

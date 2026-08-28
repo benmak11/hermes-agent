@@ -18,6 +18,7 @@ triggers never double-run a loop.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from datetime import UTC, datetime, timedelta
@@ -139,7 +140,8 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
             # when present: a run with ignore_budget reports no budget at all
             # rather than a fabricated zero.
             metrics.update({k: v for k, v in counts.items() if k.startswith("budget_")})
-            _user_ref(user_id).set(
+            await asyncio.to_thread(
+                _user_ref(user_id).set,
                 {
                     "discovery_state": {
                         "last_discovery_at": _now().isoformat(),
@@ -190,7 +192,8 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
         started = log_agent_start(log, "sweep", trigger=trigger, user_id=user_id)
         try:
             counts = await sweep_postings(user_id)
-            _user_ref(user_id).set(
+            await asyncio.to_thread(
+                _user_ref(user_id).set,
                 {
                     "discovery_state": {
                         "last_sweep_at": _now().isoformat(),
@@ -216,35 +219,60 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
             )
 
 
+def enqueue_cycle(kind: str, user_id: str, *, trigger: str) -> bool:
+    """Push one cycle onto the discovery queue. Returns False when deduped.
+
+    The queue half of :func:`dispatch_cycle`, split out because it is the half
+    that is one RPC and needs no event loop: a synchronous caller (the
+    onboarding kickoff in ``api.routes.profile``) can enqueue *inside* its
+    request instead of deferring the RPC to a background task on an instance
+    that may be frozen by then.
+
+    Hour-granular ids for scheduled work — one per user per hour no matter how
+    many triggers race — and minute-granular ids for manual runs, so a
+    double-click dedupes but a deliberate re-run a minute later doesn't.
+    """
+    grain = "%Y%m%d%H%M" if trigger == "manual" else "%Y%m%d%H"
+    return queues.enqueue(
+        "discovery",
+        f"/tasks/{kind}",
+        {"user_id": user_id, "trigger": trigger},
+        task_id=f"{trigger}-{kind}-{user_id}-{_now().strftime(grain)}",
+    )
+
+
 async def dispatch_cycle(kind: str, user_id: str, *, trigger: str) -> bool:
     """Run a discovery/sweep cycle — on the worker via queue when enabled.
 
     With QUEUE_MODE on, the cycle becomes a named Cloud Tasks task pushed to
-    the worker service: hour-granular ids for scheduled work (one per user
-    per hour no matter how many triggers race) and minute-granular ids for
-    manual runs (double-click dedupe). Returns False when the queue deduped.
-    Without QUEUE_MODE the cycle runs in-process, exactly as before.
+    the worker service. Without QUEUE_MODE the cycle runs in-process, exactly
+    as before — which is why callers that must not block for the length of a
+    whole cycle branch on ``queues.enabled()`` themselves rather than treating
+    this as "the cheap one".
     """
     if queues.enabled():
-        now = _now()
-        grain = "%Y%m%d%H%M" if trigger == "manual" else "%Y%m%d%H"
-        return queues.enqueue(
-            "discovery",
-            f"/tasks/{kind}",
-            {"user_id": user_id, "trigger": trigger},
-            task_id=f"{trigger}-{kind}-{user_id}-{now.strftime(grain)}",
-        )
+        # Off the event loop: the enqueue is a blocking gRPC call, and this
+        # coroutine runs on a worker serving other tasks concurrently.
+        return await asyncio.to_thread(enqueue_cycle, kind, user_id, trigger=trigger)
     cycle = run_discovery_cycle if kind == "discovery" else run_sweep_cycle
     await cycle(user_id, trigger=trigger)
     return True
 
 
-async def tick_user(user_id: str, *, force_check: bool = False) -> None:
+async def tick_user(
+    user_id: str, *, force_check: bool = False, doc: dict | None = None
+) -> None:
     """Run whichever opted-in loops are due for this user.
 
     Claims each slot (``last_*_at`` = now) before running so a concurrent tick
     from another trigger sees it as not-due. A failed run therefore waits out
     a full interval instead of retrying hot.
+
+    ``doc`` lets a caller that has already read this user's document hand it
+    over instead of paying for a second read — the cron fan-out streams the
+    whole ``users`` collection and would otherwise re-fetch every document it
+    just had. Safe to pass a moments-old read: nothing here is a compare-and-
+    swap, and the dispatch it leads to is deduped by a name the queue owns.
     """
     now = _now()
     last_check = _last_tick_check.get(user_id)
@@ -252,7 +280,8 @@ async def tick_user(user_id: str, *, force_check: bool = False) -> None:
         return
     _last_tick_check[user_id] = now
 
-    doc = _user_ref(user_id).get().to_dict() or {}
+    if doc is None:
+        doc = (await asyncio.to_thread(_user_ref(user_id).get)).to_dict() or {}
     settings = DiscoverySettings.model_validate(doc.get("discovery_settings") or {})
     state = doc.get("discovery_state") or {}
 
@@ -262,8 +291,10 @@ async def tick_user(user_id: str, *, force_check: bool = False) -> None:
         state.get("last_discovery_at"), settings.discovery_interval_hours, now
     ):
         log.info("tick.discovery_due", user_id=user_id, trigger=trigger)
-        _user_ref(user_id).set(
-            {"discovery_state": {"last_discovery_at": now.isoformat()}}, merge=True
+        await asyncio.to_thread(
+            _user_ref(user_id).set,
+            {"discovery_state": {"last_discovery_at": now.isoformat()}},
+            merge=True,
         )
         await dispatch_cycle("discovery", user_id, trigger=trigger)
 
@@ -271,8 +302,10 @@ async def tick_user(user_id: str, *, force_check: bool = False) -> None:
         state.get("last_sweep_at"), settings.sweep_interval_hours, now
     ):
         log.info("tick.sweep_due", user_id=user_id, trigger=trigger)
-        _user_ref(user_id).set(
-            {"discovery_state": {"last_sweep_at": now.isoformat()}}, merge=True
+        await asyncio.to_thread(
+            _user_ref(user_id).set,
+            {"discovery_state": {"last_sweep_at": now.isoformat()}},
+            merge=True,
         )
         await dispatch_cycle("sweep", user_id, trigger=trigger)
 
@@ -346,7 +379,7 @@ async def run_sweep_now(
 
 
 @router.post("/internal/cron/tick")
-def cron_tick(
+async def cron_tick(
     background_tasks: BackgroundTasks,
     x_cron_secret: str | None = Header(default=None),
 ) -> dict:
@@ -357,6 +390,26 @@ def cron_tick(
     private, so Cloud Run has already verified the scheduler's OIDC token.
     Elsewhere (public hermes-api) the ``CRON_SECRET`` header guards it —
     unset disables the endpoint.
+
+    **Under QUEUE_MODE the fan-out is in-request.** This endpoint's real home is
+    hermes-worker, which does *not* run with ``cpu-throttling: false``, so
+    anything deferred past the response runs on an instance that may already be
+    frozen — the hourly tick would then fire for nobody, which is the same shape
+    of bug as "discovery never runs". With a queue a tick is a settings read
+    plus an enqueue, so it costs the request nothing to do it properly.
+
+    Without a queue it stays a background task: there, a due tick runs the whole
+    discovery-and-scoring cycle, which is minutes of work per user and cannot
+    happen inside an HTTP request.
+
+    One user's failure never costs the rest theirs — the loop logs and carries
+    on rather than abandoning the fan-out mid-way, which is what an exception
+    escaping a background task did before. But **swallowing every failure and
+    answering 200 would be worse than the bug above**: with, say,
+    ``TASKS_SA_EMAIL`` unset, every tick raises, the scheduler sees success, and
+    the hourly loops are dead with nothing to alert on. The count comes back in
+    the response, and a fan-out where *nothing* got through answers 5xx so the
+    scheduler's own retry and alerting are worth something.
     """
     if not queues.worker_mode():
         secret = os.getenv("CRON_SECRET")
@@ -364,12 +417,35 @@ def cron_tick(
             raise HTTPException(status_code=503, detail="cron not configured")
         if x_cron_secret != secret:
             raise HTTPException(status_code=403, detail="forbidden")
-    users = [snap.id for snap in _client().collection("users").stream()]
-    for uid in users:
-        background_tasks.add_task(tick_user, uid, force_check=True)
-    maybe_enqueue_batch_resume()
-    log.info("cron.tick", users=len(users))
-    return {"ok": True, "users": len(users)}
+    # The documents, not just the ids: tick_user needs each user's settings and
+    # this stream has already paid for them.
+    users = await asyncio.to_thread(
+        lambda: [
+            (snap.id, snap.to_dict() or {})
+            for snap in _client().collection("users").stream()
+        ]
+    )
+    inline = queues.enabled()
+    failed = 0
+    for uid, doc in users:
+        if not inline:
+            background_tasks.add_task(tick_user, uid, force_check=True, doc=doc)
+            continue
+        try:
+            await tick_user(uid, force_check=True, doc=doc)
+        except Exception:
+            failed += 1
+            log.exception("cron.tick_failed", user_id=uid)
+    await asyncio.to_thread(maybe_enqueue_batch_resume)
+    log.info("cron.tick", users=len(users), failed=failed, inline=inline)
+    if users and failed == len(users):
+        # Nothing ticked. Almost always environmental (credentials, queue
+        # config), so let the scheduler retry it and let it be visible as a
+        # failing job rather than an hourly 200 that does nothing.
+        raise HTTPException(
+            status_code=500, detail=f"every tick failed ({failed} users)"
+        )
+    return {"ok": True, "users": len(users), "failed": failed}
 
 
 def maybe_enqueue_batch_resume() -> bool:

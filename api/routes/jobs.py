@@ -14,7 +14,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from pydantic import BaseModel
 
 from api.deps import verify_user
-from api.routes.applications import application_id, run_tailoring
+from api.routes.applications import application_id, dispatch_tailor
 from api.routes.discovery import tick_user
 from models.job import Job
 from obs.logging import get_logger
@@ -145,11 +145,12 @@ def decide(
     """Record the user's decision on a job.
 
     Approving a job kicks off tailoring: create the Application in ``queued``
-    state and schedule the (LLM + render + upload) pipeline as a background
-    task, which claims it by moving it to ``tailoring``. Approval is the *entry
-    event* into the application state machine — the job's own
-    ``pending``/``approved`` decision is a separate fact on a separate document,
-    which is why it isn't in the transition table.
+    state and dispatch the (LLM + render + upload) pipeline — to the worker
+    queue, or to a background task where there is no queue — which claims it by
+    moving it to ``tailoring``. Approval is the *entry event* into the
+    application state machine — the job's own ``pending``/``approved`` decision
+    is a separate fact on a separate document, which is why it isn't in the
+    transition table.
     Idempotent — an existing Application is left untouched.
 
     Reverting (``pending``) puts the job back in the review queue; an
@@ -194,7 +195,10 @@ def decide(
                     **app_state.creation_fields(),
                 }
             )
-            background_tasks.add_task(run_tailoring, user_id, job_id)
-            log.info("job.tailoring_scheduled", job_id=job_id)
+            # Dispatch after the Application document exists, never before: a
+            # worker can pick the task up before this request's next line runs,
+            # and run_tailoring's claim needs something to claim.
+            queued = dispatch_tailor(user_id, job_id, background_tasks=background_tasks)
+            log.info("job.tailoring_scheduled", job_id=job_id, deduped=not queued)
 
     return {"ok": True}

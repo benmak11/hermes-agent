@@ -146,16 +146,18 @@ _LEASE_SECONDS = _DISPATCH_DEADLINE_SECONDS + _LEASE_GRACE_SECONDS
 #:
 #: **Nothing reaps these yet.** This defines the shape so the reaper can be
 #: added without re-deciding it. Two paths write a lease: :func:`try_claim_lease`
-#: (the worker's delivery claim on ``submitting``) and ``run_tailoring``'s
+#: (``run_submission``'s delivery claim on ``submitting``) and ``run_tailoring``'s
 #: ``queued → tailoring`` claim, which takes status and lease in one write.
 #:
 #: **For the reaper author:** a document in ``submitting`` with *no* lease is
 #: ambiguous, not dead. ``POST /applications/{id}/submit`` writes the status and
-#: the worker writes the lease, so there is a real window — and, until the
-#: queue-based path is the only one, a whole in-process code path — where a live
-#: submission carries no lease. "submitting and no lease" must therefore fall
-#: back to the age arithmetic in ``cli/unwedge_submitting``; it must never be
-#: read as "the owner is gone".
+#: the run writes the lease, so there is a real window between the two — and,
+#: when the dispatch between them fails outright, a document that stays there.
+#: Every path that can drive a submission does take this lease (the claim lives
+#: in ``run_submission`` itself, not in the ``/tasks/apply`` handler, precisely
+#: so that is true of the in-process path too), but "submitting and no lease"
+#: must still fall back to the age arithmetic in ``cli/unwedge_submitting``; it
+#: must never be read as "the owner is gone".
 IN_PROGRESS: dict[str, int] = {
     "queued": _LEASE_SECONDS,
     "tailoring": _LEASE_SECONDS,
@@ -284,11 +286,14 @@ def try_claim_lease(
     at-least-once task delivery safe. A status transition can't do this job:
     ``POST /applications/{id}/submit`` already claims the work by CAS-ing
     ``→ submitting`` (that is what a double-click loses on), so by the time the
-    worker picks the task up the status *is* the claim and there is no second
-    edge left to take — ``submitting → submitting`` is illegal, exactly as it
-    must be. Claiming the lease instead splits the two questions cleanly:
-    **who owns this application** (the status, claimed by the API) versus
-    **who is running it right now** (the lease, claimed by the worker).
+    run starts the status *is* the claim and there is no second edge left to
+    take — ``submitting → submitting`` is illegal, exactly as it must be.
+    Claiming the lease instead splits the two questions cleanly: **who owns this
+    application** (the status, claimed by the API request) versus **who is
+    running it right now** (the lease, claimed by the run — meaning
+    ``run_submission`` itself, so that a queued task and an in-process
+    background task are fenced by the same primitive rather than only one of
+    them holding a claim).
 
     Returns ``True`` when this caller took the lease. ``False`` means: the
     document is gone, its status moved on, someone else's lease is still live,
