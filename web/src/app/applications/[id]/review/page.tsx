@@ -56,9 +56,13 @@ export default function ReviewPage() {
     queryKey,
     queryFn: () => apiFetch<Application>(`/applications/${id}`),
     enabled: !!user,
-    // Poll while tailoring or submitting is in flight, then stop. (The SSE
-    // stream below pushes faster updates; this polling is the safety net.)
+    // Poll while work is queued or in flight, then stop. (The SSE stream below
+    // pushes faster updates; this polling is the safety net.) "queued" has to
+    // be here: an application waits there until the background task claims it,
+    // and without it the page would stop polling forever on the exact state
+    // this status was introduced to make visible.
     refetchInterval: (q) =>
+      q.state.data?.status === "queued" ||
       q.state.data?.status === "tailoring" ||
       q.state.data?.status === "submitting"
         ? 3000
@@ -188,13 +192,16 @@ export default function ReviewPage() {
           </span>
         </div>
 
-        {app.status === "tailoring" && (
+        {(app.status === "queued" || app.status === "tailoring") && (
           <Banner>
             Tailoring in progress — generating your objective and resume variant.
             This page updates automatically.
           </Banner>
         )}
-        {app.status !== "tailoring" && (
+        {/* "queued" belongs on the banner side, not here: there is no objective
+            or resume variant yet, so this branch would render a blank editor
+            whose contents the tailoring result overwrites when it lands. */}
+        {app.status !== "queued" && app.status !== "tailoring" && (
           <>
             <ObjectiveEditor
               key={app.objective_text ?? ""}

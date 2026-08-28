@@ -18,6 +18,7 @@ from api.routes.applications import application_id, run_tailoring
 from api.routes.discovery import tick_user
 from models.job import Job
 from obs.logging import get_logger
+from tools.applications import state as app_state
 from tools.ats.validate import check_posting
 
 router = APIRouter(tags=["jobs"])
@@ -143,8 +144,12 @@ def decide(
 ) -> dict:
     """Record the user's decision on a job.
 
-    Approving a job kicks off tailoring: create the Application in ``tailoring``
-    state and schedule the (LLM + render + upload) pipeline as a background task.
+    Approving a job kicks off tailoring: create the Application in ``queued``
+    state and schedule the (LLM + render + upload) pipeline as a background
+    task, which claims it by moving it to ``tailoring``. Approval is the *entry
+    event* into the application state machine — the job's own
+    ``pending``/``approved`` decision is a separate fact on a separate document,
+    which is why it isn't in the transition table.
     Idempotent — an existing Application is left untouched.
 
     Reverting (``pending``) puts the job back in the review queue; an
@@ -181,14 +186,12 @@ def decide(
     if body.decision == "approved":
         app_ref = user_ref.collection("applications").document(application_id(job_id))
         if not app_ref.get().exists:
-            now = datetime.now(UTC).isoformat()
             app_ref.set(
                 {
                     "id": application_id(job_id),
                     "user_id": user_id,
                     "job_id": job_id,
-                    "status": "tailoring",
-                    "timeline": [{"at": now, "status": "tailoring"}],
+                    **app_state.creation_fields(),
                 }
             )
             background_tasks.add_task(run_tailoring, user_id, job_id)

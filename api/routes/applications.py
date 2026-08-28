@@ -2,9 +2,14 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Application endpoints: tailoring lifecycle + the diff/review surface.
 
-The approval hook in ``jobs.decide`` creates an Application in ``tailoring`` state
-and schedules ``run_tailoring`` as a background task; these endpoints let the web
-app poll, edit the objective, regenerate, and hand off to submission.
+The approval hook in ``jobs.decide`` creates an Application in ``queued`` state
+and schedules ``run_tailoring`` as a background task, which claims the work by
+moving it to ``tailoring``; these endpoints let the web app poll, edit the
+objective, regenerate, and hand off to submission.
+
+Every ``status`` write in here goes through ``tools.applications.state`` — the
+compare-and-swap that stops a double-click on Submit from starting two live ATS
+submissions. Nothing in this module writes a status field directly.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from api.deps import verify_user, verify_user_query
 from models.job import Job
 from models.profile import MasterProfile
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
+from tools.applications import state
 from tools.ats.validate import check_posting
 from tools.run_costs import persist_run_cost
 from tools.submitters.router import submit_application
@@ -34,7 +40,12 @@ from tools.tailoring.pipeline import application_id, tailor_application
 log = get_logger("api.applications")
 
 # Statuses from which a fresh submission is allowed (failed permits a retry).
-SUBMITTABLE = {"ready_for_review", "failed"}
+# Derived from the state machine so the two can't drift — the enforcement is the
+# compare-and-swap in submit(), not this set.
+SUBMITTABLE = {s for s, nxt in state.TRANSITIONS.items() if "submitting" in nxt}
+# Where the SSE stream stops polling. Wider than state.TERMINAL_STATUSES on
+# purpose: submitted/failed end *this* submission even though the lifecycle can
+# still move on from them.
 TERMINAL = {"submitted", "responded", "posting_removed"}
 
 router = APIRouter(tags=["applications"])
@@ -72,23 +83,15 @@ async def _dismiss_if_posting_removed(user_ref, app_ref, job: Job, task_log) -> 
     user_ref.collection("jobs").document(job.id).update(
         {"user_decision": "dismissed", "posting_removed_at": _now()}
     )
-    app_ref.set(
-        {
-            "status": "posting_removed",
-            "timeline": firestore.ArrayUnion(
-                [
-                    {
-                        "at": _now(),
-                        "status": "posting_removed",
-                        "note": (
-                            f"posting no longer available at {job.url}"
-                            " — application dismissed"
-                        ),
-                    }
-                ]
-            ),
-        },
-        merge=True,
+    # The caller stops either way — the posting really is gone. A refused
+    # transition just means someone else already parked the application
+    # somewhere terminal.
+    state.try_transition(
+        app_ref,
+        app_ref.get(),
+        "posting_removed",
+        note=f"posting no longer available at {job.url} — application dismissed",
+        lease=state.CLEAR_LEASE,
     )
     return True
 
@@ -96,9 +99,12 @@ async def _dismiss_if_posting_removed(user_ref, app_ref, job: Job, task_log) -> 
 async def run_tailoring(user_id: str, job_id: str) -> None:
     """Background task: tailor an approved job and persist the Application.
 
-    Reads the profile + job, runs the tailoring pipeline, and writes the result
-    onto the existing (``tailoring``-state) Application doc. On failure the doc is
-    flipped to ``failed`` with a timeline note so the UI can surface it.
+    Claims the ``queued`` Application by moving it to ``tailoring`` — a claim
+    that loses (a second task, or a status that has since moved on) returns
+    without spending an LLM run. Then reads the profile + job, runs the
+    tailoring pipeline, merges the result onto the doc and transitions it to
+    ``ready_for_review``. On failure the doc is flipped to ``failed`` with a
+    timeline note so the UI can surface it.
     """
     # Background tasks run after the response, outside the request context, so
     # bind the ids onto this logger explicitly to keep the trail intact. The
@@ -112,6 +118,14 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
         started_at = _now()
         started = log_agent_start(task_log, "tailoring")
         try:
+            # Claim before any paid work. Two schedulings of this task (approve
+            # then regenerate, or a retry) can't both spend an LLM run on the
+            # same job, and a doc the undo path deleted is never resurrected.
+            if not state.try_transition(app_ref, app_ref.get(), "tailoring"):
+                task_log.info("tailoring.not_claimed")
+                log_agent_end(task_log, "tailoring", started, outcome="not_claimed")
+                return
+
             profile = MasterProfile.model_validate(user_ref.get().to_dict())
             job_doc = user_ref.collection("jobs").document(job_id).get()
             if not job_doc.exists:
@@ -143,7 +157,18 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 )
                 return
 
-            app_ref.set(app.model_dump(mode="json"))
+            # Content only, merged. The old blanket set() of the whole model
+            # replaced the document and took the timeline with it; status and
+            # timeline belong to the state machine, so they're stripped here and
+            # written by the transition below.
+            content = app.model_dump(mode="json")
+            for field in state.OWNED_FIELDS:
+                content.pop(field, None)
+            # update(), not set(merge=True): a doc the undo path deleted between
+            # the decision check above and here must not come back.
+            app_ref.update(content)
+            if not state.try_transition(app_ref, app_ref.get(), "ready_for_review"):
+                task_log.info("tailoring.result_not_published")
             task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
             log_agent_end(
                 task_log,
@@ -157,14 +182,12 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             if not app_ref.get().exists:
                 log_agent_end(task_log, "tailoring", started, outcome="discarded")
                 return  # discarded by a revert while we ran — don't resurrect
-            app_ref.set(
-                {
-                    "status": "failed",
-                    "timeline": firestore.ArrayUnion(
-                        [{"at": _now(), "status": "failed", "note": str(e)[:300]}]
-                    ),
-                },
-                merge=True,
+            state.try_transition(
+                app_ref,
+                app_ref.get(),
+                "failed",
+                note=str(e)[:300],
+                lease=state.CLEAR_LEASE,
             )
             log_agent_end(
                 task_log, "tailoring", started, outcome="failed", error=str(e)[:300]
@@ -269,21 +292,31 @@ def regenerate(
     background_tasks: BackgroundTasks,
     user_id: str = Depends(verify_user),
 ) -> dict:
-    """Re-run tailoring for this application's job (explicit user action)."""
+    """Re-run tailoring for this application's job (explicit user action).
+
+    Puts the application back in ``queued``; ``run_tailoring`` claims it from
+    there. Rejected with 409 where a regenerate makes no sense (mid-submission,
+    submitted, posting removed) — the background task must not be scheduled when
+    the state change didn't happen.
+
+    An application that is *already* queued is re-scheduled rather than
+    refused: a background task that never fired leaves the doc stuck there, and
+    this is the user's only manual way out of it. Safe because ``run_tailoring``
+    claims — a duplicate scheduling can't spend a second LLM run.
+    """
     ref = _apps(user_id).document(app_id)
     snap = ref.get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="application not found")
-    job_id = snap.to_dict()["job_id"]
-    ref.set(
-        {
-            "status": "tailoring",
-            "timeline": firestore.ArrayUnion(
-                [{"at": _now(), "status": "tailoring", "note": "regenerate"}]
-            ),
-        },
-        merge=True,
-    )
+    doc = snap.to_dict()
+    job_id = doc["job_id"]
+    if doc.get("status") != state.INITIAL and not state.try_transition(
+        ref, snap, state.INITIAL, note="regenerate"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"cannot regenerate from status '{doc.get('status')}'",
+        )
     log.info("application.regenerate", app_id=app_id, job_id=job_id, user_id=user_id)
     background_tasks.add_task(run_tailoring, user_id, job_id)
     return {"ok": True}
@@ -313,14 +346,12 @@ async def run_submission(user_id: str, app_id: str) -> None:
     user_ref = _client().collection("users").document(user_id)
 
     def progress(message: str, status: str) -> None:
-        ref.set(
-            {
-                "timeline": firestore.ArrayUnion(
-                    [{"at": _now(), "status": status, "note": message}]
-                )
-            },
-            merge=True,
-        )
+        # Timeline only. The submitter's second argument is a display label for
+        # the step ("Opening ...", "Attaching resume"), not a lifecycle edge —
+        # it emits "submitted" the moment it sees a confirmation page, and
+        # honouring that as a transition would lock out the real terminal write
+        # below, which is the one carrying the screenshots and confirmation.
+        state.append_note(ref, status, message)
 
     # run_id context so the submitter's own log lines (tools.submitters, the
     # Playwright steps) stitch to this submission in Cloud Logging.
@@ -387,50 +418,53 @@ async def run_submission(user_id: str, app_id: str) -> None:
                 confirm_uri = next(
                     (s["uri"] for s in shots if s["name"] == "confirmation.png"), None
                 )
-                ref.set(
-                    {
-                        "status": "submitted",
+                submitted_at = _now()
+                recorded = state.try_transition(
+                    ref,
+                    ref.get(),
+                    "submitted",
+                    lease=state.CLEAR_LEASE,
+                    extra={
                         "screenshots": shots,
                         "confirmation": {
-                            "submitted_at": _now(),
+                            "submitted_at": submitted_at,
                             "screenshot_uri": confirm_uri,
                         },
-                        "timeline": firestore.ArrayUnion(
-                            [{"at": _now(), "status": "submitted"}]
-                        ),
                     },
-                    merge=True,
                 )
-            else:
-                ref.set(
-                    {
-                        "status": "failed",
-                        "screenshots": shots,
-                        "timeline": firestore.ArrayUnion(
-                            [
-                                {
-                                    "at": _now(),
-                                    "status": "failed",
-                                    "note": (
-                                        result.get("error") or "submission failed"
-                                    )[:300],
-                                }
-                            ]
-                        ),
-                    },
-                    merge=True,
+                if not recorded:
+                    # The application really went out but the document had
+                    # already moved somewhere terminal, so the evidence in
+                    # extra= was dropped. This is the loudest thing in the file
+                    # on purpose: the URIs below are the only remaining record
+                    # that this submission happened.
+                    task_log.error(
+                        "submission.result_not_recorded",
+                        submitted_at=submitted_at,
+                        confirmation_uri=confirm_uri,
+                        screenshot_uris=[s["uri"] for s in shots],
+                        status_now=(ref.get().to_dict() or {}).get("status"),
+                    )
+            elif not state.try_transition(
+                ref,
+                ref.get(),
+                "failed",
+                note=(result.get("error") or "submission failed")[:300],
+                lease=state.CLEAR_LEASE,
+                extra={"screenshots": shots},
+            ):
+                task_log.warning(
+                    "submission.failure_not_recorded",
+                    screenshot_uris=[s["uri"] for s in shots],
                 )
         except Exception as e:  # record failure for the UI
             task_log.exception("submission.failed")
-            ref.set(
-                {
-                    "status": "failed",
-                    "timeline": firestore.ArrayUnion(
-                        [{"at": _now(), "status": "failed", "note": str(e)[:300]}]
-                    ),
-                },
-                merge=True,
-            )
+            if not state.try_transition(
+                ref, ref.get(), "failed", note=str(e)[:300], lease=state.CLEAR_LEASE
+            ):
+                # Leaves the document wedged in ``submitting``; cli/unwedge_submitting
+                # is the manual way out until the reaper lands.
+                task_log.warning("submission.failure_not_recorded", error=str(e)[:300])
             log_agent_end(
                 task_log, "submission", started, outcome="failed", error=str(e)[:300]
             )
@@ -444,27 +478,24 @@ def submit(
 ) -> dict:
     """Submit the tailored application to the live ATS (explicit user action).
 
-    Idempotency-locked: only a ``ready_for_review`` (or previously ``failed``)
-    application may be submitted; ``submitting``/``submitted`` are rejected so a
-    job is never auto-resubmitted.
+    Idempotency-locked by compare-and-swap: only a ``ready_for_review`` (or
+    previously ``failed``) application may be submitted, and the check and the
+    claim are the *same write*. Two clicks racing on two instances both read
+    ``ready_for_review``, but only one write survives the update-time
+    precondition; the loser re-reads, finds ``submitting``, and gets a 409. That
+    is what keeps a duplicate real job application from going out.
     """
     ref = _apps(user_id).document(app_id)
     snap = ref.get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="application not found")
     status = snap.to_dict().get("status")
-    if status not in SUBMITTABLE:
+    if not state.try_transition(
+        ref, snap, "submitting", extra={"last_submitted_at": _now()}
+    ):
         raise HTTPException(
             status_code=409, detail=f"cannot submit from status '{status}'"
         )
-    ref.set(
-        {
-            "status": "submitting",
-            "last_submitted_at": _now(),
-            "timeline": firestore.ArrayUnion([{"at": _now(), "status": "submitting"}]),
-        },
-        merge=True,
-    )
     log.info(
         "application.submit_requested",
         app_id=app_id,
