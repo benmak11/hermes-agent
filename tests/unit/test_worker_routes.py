@@ -17,6 +17,7 @@ run or a duplicate real job application.
 
 import ast
 import asyncio
+import copy
 import importlib
 import inspect
 from datetime import UTC, datetime, timedelta
@@ -37,6 +38,7 @@ import api.routes.jobs as jobs
 import api.routes.worker as worker
 from api.deps import verify_user
 from obs.logging import current_run_id
+from tools import queues
 from tools.applications import reaper, state
 from tools.matching import budget
 from tools.queues import KNOWN_QUEUES
@@ -1820,3 +1822,765 @@ def test_a_successful_publish_clears_the_reapers_recovery_budget(client, monkeyp
     # regenerate had already moved on.
     publish = next(f for f, _o in doc.updates if f.get("status") == "ready_for_review")
     assert publish[reaper.ATTEMPTS_FIELD] is firestore.DELETE_FIELD
+
+
+# --------------------------------------------------------------------------
+# Phase 2 PR E: the schedule-slot lease.
+#
+# ``tick_user`` used to write ``last_*_at`` = now and *then* dispatch, so a run
+# that died looked exactly like one that succeeded and the user waited out a
+# whole ``discovery_interval_hours`` before anything retried. The slot claim
+# moved to the cycle's own success write; a lease covers the gap in between.
+# --------------------------------------------------------------------------
+
+
+def _merge_into(target: dict, data: dict) -> None:
+    """``set(merge=True)`` semantics: nested maps merge, DELETE_FIELD removes."""
+    for key, value in data.items():
+        if value is firestore.DELETE_FIELD:
+            target.pop(key, None)
+        elif isinstance(value, dict):
+            nested = target.get(key)
+            if not isinstance(nested, dict):
+                nested = target[key] = {}
+            _merge_into(nested, value)
+        else:
+            target[key] = value
+
+
+class _SlotSnap:
+    """A snapshot that is a real copy, so a read taken before a concurrent write
+    stays stale — the fake would otherwise hand the reader a live view of the
+    nested map and the precondition would never be the thing that refuses."""
+
+    def __init__(self, doc_id, data, update_time):
+        self.id = doc_id
+        self.update_time = update_time
+        self.exists = data is not None
+        self._data = None if data is None else copy.deepcopy(data)
+
+    def to_dict(self):
+        return None if self._data is None else copy.deepcopy(self._data)
+
+
+class _SlotDoc:
+    """A ``users/{uid}`` document honouring the three Firestore behaviours the
+    slot lease is built on: ``update`` takes a ``last_update_time``
+    precondition; ``update`` addresses nested fields by dotted path rather than
+    replacing the whole map (replacing it is what would silently wipe
+    ``last_discovery`` and the *other* loop's slot); and ``set(merge=True)``
+    resolves ``DELETE_FIELD`` inside a nested map."""
+
+    def __init__(self, data: dict | None = None):
+        self.id = "u1"
+        self._data = None if data is None else copy.deepcopy(data)
+        self._version = 1
+        self.updates: list[tuple[dict, object]] = []
+
+    @property
+    def data(self) -> dict | None:
+        return None if self._data is None else copy.deepcopy(self._data)
+
+    @property
+    def state(self) -> dict:
+        return (self.data or {}).get("discovery_state") or {}
+
+    def get(self):
+        return _SlotSnap(self.id, self._data, self._version)
+
+    def set(self, data, merge=False):
+        if not merge or self._data is None:
+            self._data = {}
+        _merge_into(self._data, copy.deepcopy(data))
+        self._version += 1
+
+    def update(self, fields, option=None):
+        self.updates.append((fields, option))
+        if self._data is None:
+            raise NotFound("no such document")
+        if option is not None and option._last_update_time != self._version:
+            raise FailedPrecondition("stale last_update_time")
+        for path, value in fields.items():
+            parts = path.split(".")
+            target = self._data
+            for part in parts[:-1]:
+                nested = target.get(part)
+                if not isinstance(nested, dict):
+                    nested = target[part] = {}
+                target = nested
+            if value is firestore.DELETE_FIELD:
+                target.pop(parts[-1], None)
+            else:
+                target[parts[-1]] = copy.deepcopy(value)
+        self._version += 1
+
+
+T0 = datetime(2026, 8, 26, 9, 0, tzinfo=UTC)
+LEASE = timedelta(seconds=discovery._LEASE_SECONDS)
+
+
+@pytest.fixture
+def slot_world(monkeypatch):
+    """One opted-in user plus a recorded ``dispatch_cycle``, so "did this tick
+    put a cycle on the queue?" is observable and no cycle actually runs."""
+    doc = _SlotDoc({"discovery_settings": {"auto_discovery": True}})
+    dispatched: list[tuple] = []
+
+    async def fake_dispatch(kind, user_id, *, trigger):
+        dispatched.append((kind, user_id, trigger))
+        return True
+
+    monkeypatch.setattr(discovery, "_user_ref", lambda uid: doc)
+    monkeypatch.setattr(discovery, "dispatch_cycle", fake_dispatch)
+    monkeypatch.setattr(discovery, "_last_tick_check", {})
+
+    def freeze(at: datetime):
+        monkeypatch.setattr(discovery, "_now", lambda: at)
+
+    def tick(at: datetime, *, doc=None):
+        freeze(at)
+        asyncio.run(discovery.tick_user("u1", force_check=True, doc=doc))
+
+    def seed(**state):
+        doc.set({"discovery_state": state}, merge=True)
+
+    return SimpleNamespace(
+        doc=doc, dispatched=dispatched, tick=tick, freeze=freeze, seed=seed
+    )
+
+
+@pytest.fixture
+def cycle_world(monkeypatch, slot_world):
+    """``run_discovery_cycle`` for real over ``slot_world``'s document, with the
+    pipeline and the ledger stubbed out. ``hooks.during`` decides how the run
+    ends — returning normally, raising, or being killed."""
+    hooks = SimpleNamespace(during=None)
+
+    async def fake_run_discovery(user_id):
+        if hooks.during is not None:
+            hooks.during()
+        return {"jobs": [], "jobs_by_platform": {}, "failures": [], "empty_boards": []}
+
+    async def fake_load_prefs(user_id):
+        return None
+
+    async def fake_persist_new_jobs(jobs):
+        return 0
+
+    async def fake_score(user_id):
+        return {"scored": 0, "discarded": 0, "failed": 0, "pending": 0}
+
+    async def fake_persist_run_cost(db, user_id, run_id, **kw):
+        pass
+
+    monkeypatch.setattr(discovery, "run_discovery", fake_run_discovery)
+    monkeypatch.setattr(discovery, "load_job_preferences", fake_load_prefs)
+    monkeypatch.setattr(discovery, "prefilter_jobs", lambda jobs, prefs: (jobs, {}))
+    monkeypatch.setattr(discovery, "persist_new_jobs", fake_persist_new_jobs)
+    monkeypatch.setattr(discovery, "score_pending_jobs", fake_score)
+    monkeypatch.setattr(discovery, "persist_run_cost", fake_persist_run_cost)
+    monkeypatch.delenv("QUEUE_MODE", raising=False)
+
+    def run(at: datetime, *, trigger="cron"):
+        slot_world.freeze(at)
+        asyncio.run(discovery.run_discovery_cycle("u1", trigger=trigger))
+
+    return SimpleNamespace(hooks=hooks, doc=slot_world.doc, run=run)
+
+
+def _explode(message="the boards all died"):
+    def boom():
+        raise RuntimeError(message)
+
+    return boom
+
+
+def test_the_slot_lease_outlives_the_run_it_guards():
+    """**The inequality is the lock**, and this project has already shipped it
+    backwards once (PR B: a 1200s lease over 1800s of work).
+
+    A lease shorter than the work it covers is not a weaker lock, it is *no*
+    lock — it is guaranteed to have lapsed before the run could possibly have
+    finished, so every tick in between reads it as permission. Derived from the
+    dispatch deadline rather than restated, so the two cannot drift apart.
+    """
+    assert discovery._LEASE_GRACE_SECONDS > 0
+    assert (
+        discovery._LEASE_SECONDS
+        == queues._DISPATCH_DEADLINE_SECONDS + discovery._LEASE_GRACE_SECONDS
+    )
+    # The behavioural form of the same statement: a cycle that burns its entire
+    # dispatch deadline and is then killed by Cloud Run is still holding the
+    # slot at the moment it dies. A subtracted grace fails right here.
+    killed_at = T0 + timedelta(seconds=queues._DISPATCH_DEADLINE_SECONDS)
+    assert discovery._lease_held(discovery._lease(T0), killed_at)
+
+
+def test_a_tick_leases_the_slot_instead_of_claiming_it(slot_world):
+    """The bug, stated as the fix: the tick writes a lease and dispatches, and
+    ``last_discovery_at`` — the field ``_due`` actually compares against — stays
+    exactly where the last *successful* run left it."""
+    slot_world.seed(last_discovery_at="2026-08-01T00:00:00+00:00")
+
+    slot_world.tick(T0)
+
+    assert slot_world.dispatched == [("discovery", "u1", "cron")]
+    state = slot_world.doc.state
+    assert state["last_discovery_at"] == "2026-08-01T00:00:00+00:00"
+    assert state["discovery_lease"]["acquired_at"] == T0.isoformat()
+    assert discovery._lease_held(state["discovery_lease"], T0)
+
+
+def test_a_second_tick_will_not_dispatch_on_top_of_a_live_run(slot_world):
+    """The other half of what the pre-claim used to buy, and the reason a lease
+    has to exist at all: two triggers must not both dispatch a paid cycle."""
+    slot_world.tick(T0)
+    slot_world.tick(T0 + timedelta(minutes=20))
+
+    assert slot_world.dispatched == [("discovery", "u1", "cron")]
+
+
+def test_a_run_that_dies_silently_costs_a_lease_not_an_interval(slot_world):
+    """**The bug this PR closes.**
+
+    Nothing writes ``last_discovery_at`` for a cycle whose worker was evicted,
+    so before this change the tick's own pre-claim was the only record and the
+    user waited a full ``discovery_interval_hours`` — a day, by default — for a
+    retry. Now the lease lapses and the next hourly tick picks it straight up.
+    """
+    slot_world.tick(T0)
+    assert slot_world.dispatched == [("discovery", "u1", "cron")]
+
+    # The cycle never returns: no success write, no failure write, nothing.
+    slot_world.tick(T0 + LEASE + timedelta(seconds=1))
+
+    assert slot_world.dispatched == [("discovery", "u1", "cron")] * 2
+    # ...and well inside the interval that used to be the retry latency.
+    assert LEASE < timedelta(hours=6)  # the shortest cadence the UI offers
+
+
+def test_a_successful_cycle_claims_the_slot_and_hands_the_lease_back(cycle_world):
+    """The success write *is* the slot claim. The lease rides out with it,
+    because the timestamp landing beside it holds the slot for a whole
+    interval — there is nothing left for a lease to protect."""
+    cycle_world.doc.set(
+        {"discovery_state": {"discovery_lease": discovery._lease(T0)}}, merge=True
+    )
+
+    cycle_world.run(T0 + timedelta(minutes=4))
+
+    state = cycle_world.doc.state
+    assert state["last_discovery_at"] == (T0 + timedelta(minutes=4)).isoformat()
+    assert "discovery_lease" not in state
+    assert state["last_discovery"]["trigger"] == "cron"
+
+
+def test_a_cycle_that_fails_loudly_hands_its_slot_straight_back(
+    cycle_world, slot_world
+):
+    """A run that raised is *over*, and it wrote no ``last_discovery_at`` — so
+    its lease is the only thing keeping the next tick off the slot, and holding
+    it buys nothing but silence on top of the failure. Dropping it turns a
+    lease-TTL wait into a next-tick retry."""
+    slot_world.tick(T0)
+    assert slot_world.doc.state["discovery_lease"]
+
+    cycle_world.hooks.during = _explode()
+    cycle_world.run(T0 + timedelta(minutes=1))
+
+    state = cycle_world.doc.state
+    assert "discovery_lease" not in state, "a loud failure left its lease behind"
+    assert "last_discovery_at" not in state  # the slot was never claimed
+
+    # And the point of all of it: the next tick retries rather than waiting.
+    slot_world.dispatched.clear()
+    slot_world.tick(T0 + timedelta(minutes=2))
+    assert slot_world.dispatched == [("discovery", "u1", "cron")]
+
+
+def test_a_sweep_that_fails_loudly_hands_its_slot_back_too(slot_world, monkeypatch):
+    """Same contract on the other loop, which has its own slot and its own
+    lease field — a fix applied to one of a matched pair is half a fix."""
+    slot_world.doc.set(
+        {"discovery_settings": {"auto_discovery": False, "liveness_sweep": True}},
+        merge=True,
+    )
+
+    async def dead_sweep(user_id):
+        raise RuntimeError("every ATS timed out")
+
+    async def fake_persist_run_cost(db, user_id, run_id, **kw):
+        pass
+
+    monkeypatch.setattr(discovery, "sweep_postings", dead_sweep)
+    monkeypatch.setattr(discovery, "persist_run_cost", fake_persist_run_cost)
+
+    slot_world.tick(T0)
+    assert slot_world.dispatched == [("sweep", "u1", "cron")]
+    assert slot_world.doc.state["sweep_lease"]
+
+    slot_world.freeze(T0 + timedelta(minutes=1))
+    asyncio.run(discovery.run_sweep_cycle("u1", trigger="cron"))
+
+    assert "sweep_lease" not in slot_world.doc.state
+    assert "last_sweep_at" not in slot_world.doc.state
+
+
+def test_a_cycle_killed_mid_run_leaves_its_lease_to_expire(cycle_world, slot_world):
+    """The opposite case, and why the release is in the ``except`` and not the
+    ``finally``.
+
+    ``CancelledError`` is what a Cloud Run eviction looks like from inside the
+    coroutine; it is not an ``Exception``, so it never reaches the handler. That
+    run may still be going, and freeing its slot on the way out would invite a
+    second cycle straight into it — so the lease is left to expire on the clock.
+    A release moved into the ``finally`` fails right here.
+    """
+    slot_world.tick(T0)
+
+    def evicted():
+        raise asyncio.CancelledError
+
+    cycle_world.hooks.during = evicted
+    with pytest.raises(asyncio.CancelledError):
+        cycle_world.run(T0 + timedelta(minutes=1))
+
+    assert discovery._lease_held(cycle_world.doc.state["discovery_lease"], T0)
+    slot_world.dispatched.clear()
+    slot_world.tick(T0 + timedelta(minutes=2))
+    assert slot_world.dispatched == []
+
+
+def test_a_tick_cannot_take_a_slot_another_tick_claimed_between_read_and_write(
+    slot_world,
+):
+    """**The phase's signature bug, in this file's shape.**
+
+    ``tick_user`` reads ``discovery_state`` and writes it two statements later,
+    and the two triggers that reach it — the hourly cron and the opportunistic
+    tick from ``jobs.list_pending_jobs`` — really can interleave there. A read
+    outside the write is not a compare-and-swap: both ticks see a free slot and
+    both dispatch a paid cycle. The claim is conditioned on ``update_time``, so
+    the loser re-reads, finds a live lease, and dispatches nothing.
+
+    ``dispatch_cycle``'s named task ids do not cover this. They dedupe one
+    ``(trigger, kind, user, hour)`` tuple, and these two ticks carry *different*
+    triggers — as do two ticks either side of an hour boundary — and with
+    ``QUEUE_MODE`` off there is no queue to hold a name at all.
+    """
+    doc, raced, intruder = slot_world.doc, [], []
+    real_get = doc.get
+
+    def racing_get():
+        snap = real_get()  # our read lands first...
+        if not raced:
+            raced.append(None)
+            # ...then the other tick's whole claim does, bumping update_time.
+            intruder.append(discovery._claim_slot("u1", "discovery", 24, T0))
+        return snap
+
+    doc.get = racing_get
+
+    assert discovery._claim_slot("u1", "discovery", 24, T0) is False
+    assert intruder == [True], "the intruder never claimed — this pins nothing"
+    assert doc.state["discovery_lease"]["acquired_at"] == T0.isoformat()
+
+
+def test_a_tick_holding_a_stale_document_cannot_re_run_a_finished_cycle(slot_world):
+    """The interval is re-checked inside the swap too, not just the lease.
+
+    The cron fan-out hands ``tick_user`` a document it streamed moments ago. If
+    the cycle that document was due for has since succeeded — writing a fresh
+    ``last_discovery_at`` and releasing its lease — a claim that re-checked only
+    the lease would sail through and buy a second cycle.
+    """
+    slot_world.seed(last_discovery_at=T0.isoformat())
+    stale = {"discovery_settings": {"auto_discovery": True}, "discovery_state": {}}
+
+    slot_world.tick(T0 + timedelta(minutes=1), doc=stale)
+
+    assert slot_world.dispatched == []
+    assert "discovery_lease" not in slot_world.doc.state
+
+
+def test_a_failing_manual_run_never_frees_a_scheduled_runs_slot(
+    cycle_world, slot_world
+):
+    """``POST /settings/discovery/run`` and the onboarding kickoff dispatch
+    straight past ``tick_user`` and hold no lease, so they have nothing to hand
+    back — and the lease they *would* find belongs to a scheduled cycle that
+    may still be running."""
+    slot_world.tick(T0)
+    held = slot_world.doc.state["discovery_lease"]
+
+    cycle_world.hooks.during = _explode()
+    cycle_world.run(T0 + timedelta(minutes=1), trigger="manual")
+
+    assert cycle_world.doc.state["discovery_lease"] == held
+
+
+def test_every_trigger_tick_user_dispatches_under_can_release_a_slot(slot_world):
+    """The other half of the test above: that gate is a set of trigger strings,
+    so it is only correct while every trigger ``tick_user`` actually dispatches
+    under is in it.
+
+    Driven through ``tick_user`` rather than read off its source. Both entry
+    points are exercised — the cron fan-out's ``force_check=True`` and the
+    opportunistic tick from ``jobs.list_pending_jobs`` — and what is asserted is
+    the trigger that reached ``dispatch_cycle``, which is the same string the
+    cycle later hands to ``_release_slot``.
+    """
+    for force_check in (True, False):
+        slot_world.seed(discovery_lease=firestore.DELETE_FIELD)
+        discovery._last_tick_check.clear()
+        slot_world.freeze(T0)
+        asyncio.run(discovery.tick_user("u1", force_check=force_check))
+
+    assert {trigger for _kind, _uid, trigger in slot_world.dispatched} == set(
+        discovery.SLOT_TRIGGERS
+    )
+    # The triggers that reach a cycle without ever passing through tick_user.
+    assert not discovery.SLOT_TRIGGERS & {"manual", "onboarding", "scheduled", "queued"}
+
+
+def test_a_release_refuses_a_lease_taken_after_this_run_began(slot_world):
+    """A run whose lease lapsed while it was still going finds a *successor's*
+    lease on the document. Clearing that would put a second cycle on the same
+    user with nothing left to stop a third; there is no owner token to carry
+    across the queue boundary, so the acquisition time is what tells them
+    apart."""
+    successor = T0 + LEASE + timedelta(minutes=5)
+    slot_world.seed(discovery_lease=discovery._lease(successor))
+
+    assert discovery._release_slot("u1", "discovery", "cron", T0) is False
+    assert (
+        slot_world.doc.state["discovery_lease"]["acquired_at"] == successor.isoformat()
+    )
+
+    # Positive control: our own lease, acquired before we began, does go back.
+    slot_world.seed(discovery_lease=discovery._lease(T0))
+    assert discovery._release_slot("u1", "discovery", "cron", T0) is True
+    assert "discovery_lease" not in slot_world.doc.state
+
+
+def test_an_unreadable_lease_never_wedges_a_loop_for_good(slot_world):
+    """The bias here is the opposite of ``state.lease_is_held``'s, on purpose.
+
+    Nothing reaps a schedule slot: a lease read as held is never dispatched
+    against, so nothing ever runs to clear it and this user's loops stop
+    forever — "discovery never runs", the bug this module exists to prevent.
+    There, refusing a claim only wedges one document while claiming anyway risks
+    a duplicate real job application, so it errs the other way.
+    """
+    for junk in ({"expires_at": "not a date"}, {}, "a string", None):
+        assert discovery._lease_held(junk, T0) is False
+
+    slot_world.seed(discovery_lease={"expires_at": "whenever"})
+    slot_world.tick(T0)
+
+    assert slot_world.dispatched == [("discovery", "u1", "cron")]
+    # ...and the corrupt value is overwritten on the way past.
+    assert discovery._lease_held(slot_world.doc.state["discovery_lease"], T0)
+
+
+def test_a_claim_only_ever_touches_its_own_slot(slot_world):
+    """``update`` replaces a map value wholesale unless the field is addressed
+    by dotted path, and ``discovery_state`` also carries the last run's metrics
+    and the *other* loop's slot. A claim that took the map would wipe both."""
+    slot_world.seed(
+        last_sweep_at="2026-08-25T00:00:00+00:00", last_discovery={"scored": 7}
+    )
+
+    slot_world.tick(T0)
+
+    state = slot_world.doc.state
+    assert state["last_sweep_at"] == "2026-08-25T00:00:00+00:00"
+    assert state["last_discovery"] == {"scored": 7}
+    assert state["discovery_lease"]["acquired_at"] == T0.isoformat()
+
+
+def test_the_next_run_display_does_not_go_backwards_during_a_run(slot_world):
+    """``last_discovery_at`` moves only on success now, so a run in flight would
+    otherwise leave the Profile card advertising a next run in the *past* —
+    further into the past every hour it stayed in flight. Counting from the
+    moment the slot was leased restores exactly what the old pre-claim showed.
+    """
+    slot_world.seed(last_discovery_at=(T0 - timedelta(days=3)).isoformat())
+    slot_world.tick(T0)  # a cycle is now in flight
+    assert slot_world.dispatched == [("discovery", "u1", "cron")]
+
+    payload = discovery.get_discovery_settings(BackgroundTasks(), user_id="u1")
+
+    assert datetime.fromisoformat(payload["next_discovery_at"]) == T0 + timedelta(
+        hours=24
+    )
+    # Positive control: with no run in flight the card still counts from the
+    # last success, so this is the lease being folded in and nothing else.
+    assert (
+        discovery._next_iso(
+            (T0 - timedelta(days=3)).isoformat(), 24, lease=None, now=T0
+        )
+        == (T0 + timedelta(hours=-72 + 24)).isoformat()
+    )
+
+
+def test_the_next_run_display_says_due_again_once_a_failed_run_lets_go():
+    """...and it has to degrade honestly at the other end: a failure releases
+    the lease, and the card goes back to reporting a next run in the past —
+    which is the truth, because the loop *is* due."""
+    last = (T0 - timedelta(days=3)).isoformat()
+
+    while_running = discovery._next_iso(last, 24, lease=discovery._lease(T0), now=T0)
+    after_release = discovery._next_iso(last, 24, lease=None, now=T0)
+
+    assert datetime.fromisoformat(while_running) > T0
+    assert datetime.fromisoformat(after_release) < T0
+
+
+# --------------------------------------------------------------------------
+# PR E, review pass: the guards the first round left undefended.
+# --------------------------------------------------------------------------
+
+
+def test_a_release_cannot_free_a_lease_claimed_between_read_and_write(slot_world):
+    """**The release side of the compare-and-swap**, and the one the first round
+    of tests left open — the claim had this and the release did not.
+
+    Run A claims at ``T`` and overruns its lease (in-process, where no dispatch
+    deadline applies). It fails loudly at ``T+1900`` and reads the document: the
+    lease is expired but still carries A's own ``acquired_at``, so the ownership
+    check passes. In the microseconds that follow, a tick sees that expired
+    lease, claims a fresh one, and dispatches run B. Without the precondition on
+    A's write, A then deletes **B's live lease** and the next tick dispatches a
+    third cycle — two concurrent paid discovery-and-scoring runs on one user.
+    """
+    slot_world.seed(discovery_lease=discovery._lease(T0))
+    doc, raced, intruder = slot_world.doc, [], []
+    real_get = doc.get
+    late = T0 + LEASE + timedelta(seconds=40)
+
+    def racing_get():
+        snap = real_get()  # A reads: expired, and still stamped as A's
+        if not raced:
+            raced.append(None)
+            # A tick collects the expired lease and dispatches run B.
+            intruder.append(discovery._claim_slot("u1", "discovery", 24, late))
+        return snap
+
+    doc.get = racing_get
+
+    assert discovery._release_slot("u1", "discovery", "cron", T0) is False
+    assert intruder == [True], "the intruder never claimed — this pins nothing"
+    # B's lease survived A's release, and is the one still standing.
+    assert doc.state["discovery_lease"]["acquired_at"] == late.isoformat()
+    assert discovery._lease_held(doc.state["discovery_lease"], late)
+
+
+def test_a_release_that_cannot_reach_firestore_never_escapes(monkeypatch):
+    """The "never raises" line in the docstring, made load-bearing.
+
+    ``_release_slot`` is called from ``run_discovery_cycle``'s ``except``. A
+    transient ``ServiceUnavailable`` on its read would propagate out of the
+    cycle, out of ``task_discovery``, and answer HTTP 500 — at which point the
+    ``hermes-discovery`` queue redelivers and buys a **second full paid cycle
+    for a run that had already failed**. The bookkeeping must not be able to do
+    that.
+    """
+
+    def unreachable(user_id):
+        raise RuntimeError("503 Firestore is unavailable")
+
+    monkeypatch.setattr(discovery, "_user_ref", unreachable)
+
+    assert discovery._release_slot("u1", "discovery", "cron", T0) is False
+
+
+def test_a_cycle_survives_a_release_that_cannot_reach_firestore(
+    cycle_world, slot_world
+):
+    """The consequence chain of the test above, end to end: the cycle still
+    reports its own failure the way it always did, and nothing reaches the task
+    handler that the queue would read as "retry this"."""
+    slot_world.tick(T0)
+    cycle_world.hooks.during = _explode()
+
+    def unreachable():
+        raise RuntimeError("503 Firestore is unavailable")
+
+    cycle_world.doc.get = unreachable
+
+    cycle_world.run(T0 + timedelta(minutes=1))  # returns, rather than raising
+
+
+def test_a_successful_sweep_claims_its_slot_and_hands_the_lease_back(
+    slot_world, monkeypatch
+):
+    """The matched pair, made whole: the discovery cycle's success write was
+    pinned and the sweep's was not, so ``sweep_lease``'s release could be
+    deleted with the whole suite green — which is what got PR D sent back."""
+
+    async def fake_sweep(user_id):
+        return {"checked": 4, "dismissed": 1}
+
+    async def fake_persist_run_cost(db, user_id, run_id, **kw):
+        pass
+
+    monkeypatch.setattr(discovery, "sweep_postings", fake_sweep)
+    monkeypatch.setattr(discovery, "persist_run_cost", fake_persist_run_cost)
+    slot_world.seed(sweep_lease=discovery._lease(T0))
+
+    slot_world.freeze(T0 + timedelta(minutes=2))
+    asyncio.run(discovery.run_sweep_cycle("u1", trigger="cron"))
+
+    state = slot_world.doc.state
+    assert state["last_sweep_at"] == (T0 + timedelta(minutes=2)).isoformat()
+    assert "sweep_lease" not in state
+    assert state["last_sweep"]["dismissed"] == 1
+
+
+def test_a_claim_wins_on_its_retry_when_an_unrelated_write_landed_underneath(
+    slot_world,
+):
+    """The retry's re-read, and the *winning* path — the first round covered
+    only the losing one, so the re-read could be deleted and the retry become
+    dead code with the suite green.
+
+    ``tools.matching.budget.reserve`` reserves out of this very document in a
+    transaction, so a scoring run in flight moves ``update_time`` without going
+    anywhere near the slot. Without the re-read the second attempt reuses the
+    stale ``update_time`` and is *guaranteed* to lose, so every tick that raced
+    a scoring run would silently skip its cycle.
+    """
+    doc, bumped = slot_world.doc, []
+    real_get = doc.get
+
+    def budget_writes_underneath():
+        snap = real_get()
+        if not bumped:
+            bumped.append(None)
+            doc.set({"scoring_budget": {"day": {"used": 12}}}, merge=True)
+        return snap
+
+    doc.get = budget_writes_underneath
+
+    assert discovery._claim_slot("u1", "discovery", 24, T0) is True
+    assert bumped, "nothing wrote underneath the claim — this pins nothing"
+    assert doc.state["discovery_lease"]["acquired_at"] == T0.isoformat()
+    # The unrelated write is still there: the retry re-read it rather than
+    # writing the whole map back over it.
+    assert doc.data["scoring_budget"] == {"day": {"used": 12}}
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param(T0, id="aware-datetime"),
+        pytest.param(T0.replace(tzinfo=None), id="naive-datetime"),
+        pytest.param(T0.isoformat(), id="aware-string"),
+        pytest.param(T0.replace(tzinfo=None).isoformat(), id="naive-string"),
+    ],
+)
+def test_every_shape_a_stored_timestamp_comes_back_in_is_comparable(stored):
+    """``_parse_ts`` normalises four shapes, and all four are reachable.
+
+    Firestore hands timestamps back as ``datetime`` objects, not strings, so a
+    lease written by anything but this module's ``isoformat`` — or a
+    hand-repaired document — reads back as one. If any of these escaped naive,
+    the comparison in ``_lease_held`` would raise ``TypeError: can't compare
+    offset-naive and offset-aware datetimes`` straight up through ``_due`` and
+    out of ``tick_user``, killing that user's loops entirely.
+    """
+    parsed = discovery._parse_ts(stored)
+
+    assert parsed == T0
+    assert parsed is not None and parsed.tzinfo is not None
+    # The behavioural form: neither of the two consumers may raise on it.
+    assert discovery._lease_held({"expires_at": stored}, T0 - timedelta(minutes=1))
+    assert discovery._due(stored, 24, T0 + timedelta(hours=25)) is True
+
+
+def test_a_cycle_re_stamps_its_lease_against_the_run_not_the_queue_wait(
+    cycle_world, slot_world
+):
+    """**The claim and the run do not start together.**
+
+    ``tick_user`` leases the slot before ``enqueue_cycle``, but the TTL is
+    derived from the dispatch deadline, which bounds run *duration*. A claim
+    stamped at dispatch time therefore spends its TTL sitting in a queue: the
+    ``discovery`` queue allows three concurrent dispatches and the worker runs
+    at ``containerConcurrency = 1`` across five queues, so a fan-out that finds
+    several users due can leave the last of them waiting tens of minutes. Its
+    lease would lapse mid-run, and the next hourly cron is a *different* task
+    name, so nothing would dedupe the duplicate — a regression against the old
+    pre-claim, which held for a full interval however long the queue was.
+    """
+    slot_world.tick(T0)
+    dispatched_with = slot_world.doc.state["discovery_lease"]
+    started = T0 + timedelta(minutes=20)  # 20 minutes behind the queue
+    still_running = started + timedelta(minutes=15)
+
+    # The lease the *tick* took is already dead by the time this run ends.
+    assert not discovery._lease_held(dispatched_with, still_running)
+
+    held: list[dict] = []
+    cycle_world.hooks.during = lambda: held.append(
+        cycle_world.doc.state["discovery_lease"]
+    )
+    cycle_world.run(started)
+
+    assert held, "the run never reached its work — this pins nothing"
+    assert held[0]["acquired_at"] == started.isoformat()
+    assert discovery._lease_held(held[0], still_running)
+
+
+def test_a_sweep_re_stamps_its_lease_too(slot_world, monkeypatch):
+    """The matched pair again — the sweep queues behind the same worker."""
+    held: list[dict] = []
+
+    async def fake_sweep(user_id):
+        held.append(slot_world.doc.state["sweep_lease"])
+        return {"checked": 0, "dismissed": 0}
+
+    async def fake_persist_run_cost(db, user_id, run_id, **kw):
+        pass
+
+    monkeypatch.setattr(discovery, "sweep_postings", fake_sweep)
+    monkeypatch.setattr(discovery, "persist_run_cost", fake_persist_run_cost)
+    slot_world.seed(sweep_lease=discovery._lease(T0))
+
+    started = T0 + timedelta(minutes=20)
+    slot_world.freeze(started)
+    asyncio.run(discovery.run_sweep_cycle("u1", trigger="cron"))
+
+    assert held[0]["acquired_at"] == started.isoformat()
+
+
+def test_a_manual_run_never_stamps_a_slot_lease(cycle_world, slot_world):
+    """A manual or onboarding run holds no slot — it went straight to
+    ``dispatch_cycle``, past ``tick_user`` — so stamping one would lock the
+    scheduled ticks out of a cadence this run never joined, for a full TTL."""
+    held: list = []
+    cycle_world.hooks.during = lambda: held.append(
+        cycle_world.doc.state.get("discovery_lease")
+    )
+
+    cycle_world.run(T0, trigger="manual")
+
+    assert held == [None]
+
+
+def test_a_re_stamp_leaves_the_rest_of_the_slot_state_alone(cycle_world, slot_world):
+    """It is a dotted-path write like the claim, for the same reason: a nested
+    map would take ``discovery_state`` wholesale and wipe the last run's metrics
+    and the other loop's slot on the way past."""
+    slot_world.seed(
+        last_sweep_at="2026-08-25T00:00:00+00:00", last_discovery={"scored": 7}
+    )
+    slot_world.tick(T0)
+    cycle_world.hooks.during = _explode()
+
+    cycle_world.run(T0 + timedelta(minutes=20))
+
+    state = cycle_world.doc.state
+    assert state["last_sweep_at"] == "2026-08-25T00:00:00+00:00"
+    assert state["last_discovery"] == {"scored": 7}

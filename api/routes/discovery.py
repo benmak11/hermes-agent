@@ -12,8 +12,15 @@ their ATS (the liveness sweep). Two triggers drive the loops:
   Scheduler / a GitHub Actions cron, for truly unattended runs while the
   Cloud Run instance is otherwise scaled to zero.
 
-Ticks claim the slot (write ``last_*_at``) before running, so overlapping
-triggers never double-run a loop.
+**A tick leases the slot; the cycle's own success write releases it.** The
+slot is claimed by ``last_*_at``, and that field is written by
+:func:`run_discovery_cycle` / :func:`run_sweep_cycle` when the work has
+actually happened. A tick used to write it *before* dispatching, which made a
+run that died indistinguishable from one that succeeded — the user then waited
+out a full ``discovery_interval_hours`` before anything retried. The lease
+covers only the gap in between: it stops a second tick dispatching on top of a
+live run, expires on its own if the run is killed silently, and is dropped
+immediately if the run fails loudly, so the next hourly tick retries.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
+from google.api_core.exceptions import FailedPrecondition, NotFound
 from google.cloud import firestore
 
 from api.deps import verify_user
@@ -48,6 +56,62 @@ router = APIRouter(tags=["discovery"])
 _TICK_CHECK_EVERY = timedelta(minutes=5)
 _last_tick_check: dict[str, datetime] = {}
 
+# ``write_option`` is a *staticmethod* factory: it builds a precondition and
+# never touches a client or the network. Bound once, the way
+# ``tools.applications.state`` binds it, so the compare-and-swaps below need no
+# client instance to construct one.
+_precondition = firestore.Client.write_option
+
+#: Seconds a slot lease stays valid, and **the inequality that makes it a
+#: lock**: a lease must outlive the longest run it guards.
+#:
+#: Derived from the dispatch deadline rather than restated, for the reason
+#: ``tools.applications.state._LEASE_SECONDS`` spells out. Cloud Tasks abandons
+#: a dispatch at ``_DISPATCH_DEADLINE_SECONDS`` (1800), so 1800s is the longest
+#: a queued cycle can still be running *as far as the queue is concerned* — and
+#: that is the load-bearing anchor here, because it is the one that lives in
+#: this repo. hermes-worker's ``timeoutSeconds`` is also 1800, but it is a Cloud
+#: Run value set by hand and represented in no terraform CI would check; if it
+#: were raised, the queue would abandon and possibly redeliver at 1800s anyway,
+#: which is a duplicate-dispatch exposure this module already had and does not
+#: add to.
+#:
+#: A lease *shorter* than the run is not a weaker lock, it is **no lock**: it is
+#: guaranteed to have expired before the run could possibly have finished, so
+#: every tick in the meantime reads it as permission. This project has already
+#: shipped that bug once (a 1200s lease over 1800s of work, PR B). The grace is
+#: added on top of the deadline, never subtracted from it.
+#:
+#: **This bounds run duration and nothing else**, which is why the lease is
+#: re-stamped when the run starts — see :func:`_extend_slot`. Sizing it to also
+#: cover an unbounded queue wait would mean a silently dead run held its slot
+#: for that whole span.
+#:
+#: **Deliberately not a heartbeat.** Recovery latency here is bounded by the
+#: hourly Cloud Scheduler tick, not by this TTL: a lease that lapses at T+1860
+#: and one a dead heartbeat frees at T+1830 are collected by the same next tick,
+#: so a heartbeat would be observably identical while having to be threaded
+#: through the whole body of ``run_discovery_cycle``.
+_LEASE_GRACE_SECONDS = 60
+_LEASE_SECONDS = queues._DISPATCH_DEADLINE_SECONDS + _LEASE_GRACE_SECONDS
+
+#: Per loop: the ``discovery_state`` field whose timestamp *is* the slot claim,
+#: and the field holding the lease that covers the gap before it is written.
+_SLOTS: dict[str, tuple[str, str]] = {
+    "discovery": ("last_discovery_at", "discovery_lease"),
+    "sweep": ("last_sweep_at", "sweep_lease"),
+}
+
+_CRON_TRIGGER = "cron"
+_OPPORTUNISTIC_TRIGGER = "opportunistic"
+
+#: The triggers :func:`tick_user` dispatches under, and therefore the only ones
+#: that arrive holding a lease. ``manual`` (``POST /settings/discovery/run``)
+#: and ``onboarding`` (the kickoff in ``api.routes.profile``) go straight to
+#: :func:`dispatch_cycle` and take no slot at all, so a failing one of those
+#: must not release a *scheduled* run's lease out from under it.
+SLOT_TRIGGERS = frozenset({_CRON_TRIGGER, _OPPORTUNISTIC_TRIGGER})
+
 _db: firestore.Client | None = None
 
 
@@ -66,25 +130,261 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _due(last_iso: str | None, interval_hours: int, now: datetime) -> bool:
-    if not last_iso:
-        return True
+def _parse_ts(value) -> datetime | None:
+    """A stored timestamp as an aware datetime, or ``None`` if unusable."""
+    if isinstance(value, datetime):  # Firestore hands timestamps back as these
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if not isinstance(value, str):
+        return None
     try:
-        last = datetime.fromisoformat(last_iso)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _lease(now: datetime) -> dict:
+    """A fresh slot lease for a run starting at ``now``."""
+    return {
+        "acquired_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=_LEASE_SECONDS)).isoformat(),
+    }
+
+
+def _lease_at(lease, key: str) -> datetime | None:
+    """One of a lease's timestamps, or ``None`` if there is no usable one."""
+    return _parse_ts(lease.get(key)) if isinstance(lease, dict) else None
+
+
+def _lease_held(lease, now: datetime) -> bool:
+    """Is a run holding this loop's slot right now? Pure.
+
+    **The bias is the opposite of ``tools.applications.state.lease_is_held``'s,
+    deliberately.** There an unreadable lease counts as *held*, because refusing
+    to claim only wedges one document while claiming anyway risks a duplicate
+    real job application. Here nothing reaps a slot: a lease read as held is
+    never dispatched against, so nothing ever runs to clear it, and this user's
+    loops stop **permanently** — which is precisely the "discovery never runs"
+    failure this module exists to prevent. Reading a corrupt lease as free costs
+    at most one extra cycle and overwrites the corrupt value on the way past.
+    """
+    expiry = _lease_at(lease, "expires_at")
+    return expiry is not None and expiry > now
+
+
+def _due(
+    last_iso: str | None, interval_hours: int, now: datetime, *, lease=None
+) -> bool:
+    """Is this loop's interval up *and* its slot free?
+
+    A live lease is not-due however old ``last_iso`` is: it means a cycle is in
+    flight that has not yet written its ``last_*_at``. Both halves are only
+    advisory at the call sites — the authoritative copy of this check runs
+    inside :func:`_claim_slot`, against the snapshot the claim is conditioned
+    on.
+    """
+    if _lease_held(lease, now):
+        return False
+    last = _parse_ts(last_iso)
+    if last is None:
         return True
     return now - last >= timedelta(hours=interval_hours)
 
 
-def _next_iso(last_iso: str | None, interval_hours: int) -> str | None:
-    if not last_iso:
+def _next_iso(
+    last_iso: str | None,
+    interval_hours: int,
+    *,
+    lease=None,
+    now: datetime | None = None,
+) -> str | None:
+    """The Profile card's "next run at", counted from the last *successful* run.
+
+    A held lease has to be folded in or the card reads as broken. ``last_*_at``
+    is now written only when a cycle succeeds, so while a run is in flight the
+    last success is by definition more than an interval old and the naive answer
+    is a "next run" in the past. Counting from the moment the slot was claimed
+    restores exactly what the old pre-claim displayed, and degrades honestly at
+    both ends: a run that succeeds moves the answer by its own duration, and a
+    run that fails drops its lease and the card goes back to saying the loop is
+    due now — which it is.
+    """
+    now = now or _now()
+    since = _parse_ts(last_iso)
+    if _lease_held(lease, now):
+        acquired = _lease_at(lease, "acquired_at") or now
+        if since is None or acquired > since:
+            since = acquired
+    if since is None:
         return None
+    return (since + timedelta(hours=interval_hours)).isoformat()
+
+
+def _claim_slot(user_id: str, kind: str, interval_hours: int, now: datetime) -> bool:
+    """Compare-and-swap this loop's lease. ``True`` iff this caller took it.
+
+    Synchronous, reached through ``asyncio.to_thread`` — the hop ``tick_user``
+    already makes for its Firestore writes — and modelled on
+    ``tools.applications.state.try_claim_lease``: read a snapshot, decide
+    against *that* snapshot, then write with ``last_update_time=`` so the write
+    fails if anything touched the document in between.
+
+    **Both preconditions are re-checked here, against this read.** The screen in
+    :func:`tick_user` runs on a document a caller may have handed over seconds
+    ago, and reads a lease another tick may have taken since — filtering outside
+    the swap is not a compare-and-swap, which is the bug every PR of this phase
+    has contained. Re-checking the *interval* matters as much as re-checking the
+    lease: a tick holding a stale document would otherwise dispatch a second
+    cycle in the window after the first one succeeded, wrote a fresh
+    ``last_*_at``, and released.
+
+    ``dispatch_cycle``'s hour-granular task ids do not make this redundant. They
+    dedupe one ``(trigger, kind, user, hour)`` — so two cron ticks in the same
+    hour collapse — but a cron tick and the opportunistic tick from
+    ``jobs.list_pending_jobs`` carry *different* triggers and both get through,
+    as do two ticks straddling an hour boundary; and with ``QUEUE_MODE`` off
+    there is no queue and therefore no name to dedupe on at all.
+    """
+    field, lease_field = _SLOTS[kind]
+    ref = _user_ref(user_id)
+    snap = ref.get()
+    for attempt in (0, 1):
+        if not snap.exists:
+            return False
+        state = (snap.to_dict() or {}).get("discovery_state") or {}
+        if not _due(
+            state.get(field), interval_hours, now, lease=state.get(lease_field)
+        ):
+            log.info("tick.slot_taken", user_id=user_id, kind=kind, attempt=attempt)
+            return False
+        try:
+            # A dotted path, not a nested map: ``update`` replaces a map value
+            # wholesale, and ``discovery_state`` also holds the last run's
+            # metrics and the *other* loop's slot.
+            ref.update(
+                {f"discovery_state.{lease_field}": _lease(now)},
+                option=_precondition(last_update_time=snap.update_time),
+            )
+            return True
+        except NotFound:
+            return False
+        except FailedPrecondition:
+            if attempt:
+                log.warning("tick.slot_contended", user_id=user_id, kind=kind)
+                return False
+            # One retry, for the reason ``state.try_claim_lease`` takes one:
+            # ``tools.matching.budget`` reserves out of this very document in a
+            # transaction, so a scoring run in flight bumps its update_time
+            # without going anywhere near the slot.
+            snap = ref.get()
+    return False  # pragma: no cover - the loop always returns
+
+
+def _extend_slot(user_id: str, kind: str, trigger: str, began: datetime) -> bool:
+    """Re-stamp this loop's lease against the moment the run actually started.
+
+    **The claim and the run do not start at the same time.** ``tick_user`` takes
+    the lease *before* ``enqueue_cycle``, but :data:`_LEASE_SECONDS` is derived
+    from the dispatch deadline, which bounds how long a run may take — not how
+    long it may sit in a queue first. So a claim stamped at dispatch time is
+    spending its TTL on queue wait, and the shortfall is real rather than
+    theoretical: the ``discovery`` queue allows 3 concurrent dispatches and the
+    worker runs at ``containerConcurrency = 1`` across five queues, so a
+    fan-out where several users come due at one tick can leave the last of them
+    waiting tens of minutes. Its lease would then lapse *mid-run*, and because
+    the next hourly cron is a different task name nothing would dedupe the
+    second dispatch — a duplicate paid cycle, and a regression against the old
+    pre-claim, which held for a full interval however long the queue was.
+
+    Re-stamping here is what ``tools.applications.state.try_claim_lease`` gets
+    for free by being taken on the worker: the TTL starts when the work does.
+    The tick-side claim is still needed and still does its own job — it is what
+    stops two ticks *dispatching* — so this extends that claim rather than
+    replacing it.
+
+    Unconditional, and deliberately not a compare-and-swap. A re-stamp that lost
+    a race would leave the lease too short, which is the bug being fixed; and
+    there is nothing to protect, because a dotted-path write touches this slot
+    and nothing else. Gated on :data:`SLOT_TRIGGERS` for the same reason
+    :func:`_release_slot` is: a manual or onboarding run holds no slot, and
+    stamping one would lock scheduled ticks out of a cadence it never joined.
+
+    Never raises — a cycle must not die because its bookkeeping did.
+    """
+    if trigger not in SLOT_TRIGGERS:
+        return False
+    _, lease_field = _SLOTS[kind]
     try:
-        return (
-            datetime.fromisoformat(last_iso) + timedelta(hours=interval_hours)
-        ).isoformat()
-    except ValueError:
-        return None
+        _user_ref(user_id).update({f"discovery_state.{lease_field}": _lease(began)})
+        return True
+    except Exception:
+        # Including NotFound: no document means no slot to hold, and the cycle
+        # is about to discover that for itself.
+        log.exception("tick.lease_extend_failed", user_id=user_id, kind=kind)
+        return False
+
+
+def _release_slot(user_id: str, kind: str, trigger: str, began: datetime) -> bool:
+    """Hand back a lease **this** run holds, leaving the schedule alone.
+
+    The loud-failure counterpart to :func:`_claim_slot`. A cycle that raised has
+    written no ``last_*_at``, so its lease is the only thing keeping the next
+    tick off the slot — and the run is over. Leaving it there makes a failure
+    cost a lease TTL of silence on top of the failure itself.
+
+    **Conditional, where the success path is not, and that asymmetry is the
+    point.** A successful cycle clears its lease inside the same unconditional
+    ``set`` that writes ``last_*_at``: even if that clear frees a *successor's*
+    lease, the fresh timestamp landing beside it holds the slot shut for a whole
+    interval (the shortest offered is 6h, against a 31-minute lease), so nothing
+    is actually unlocked and the write must never be allowed to lose. A failure
+    writes no timestamp, so the lease is all there is, and freeing one that
+    isn't ours would put two cycles on one user.
+
+    Two things say whose it is, without a token to pass across the queue
+    boundary. ``trigger`` says a tick dispatched this run at all — see
+    :data:`SLOT_TRIGGERS`. ``acquired_at <= began`` says the lease on the
+    document is still the one that dispatch came from: this run's own claim was
+    taken before it started, and a successor's can only have been taken after.
+
+    Never raises: it is called from an ``except`` block, and must not replace
+    the failure the cycle already logged or skip the cost flush behind it.
+    """
+    if trigger not in SLOT_TRIGGERS:
+        return False
+    _, lease_field = _SLOTS[kind]
+    try:
+        ref = _user_ref(user_id)
+        snap = ref.get()
+        for attempt in (0, 1):
+            if not snap.exists:
+                return False
+            state = (snap.to_dict() or {}).get("discovery_state") or {}
+            acquired = _lease_at(state.get(lease_field), "acquired_at")
+            if acquired is None or acquired > began:
+                # Gone already, unreadable, or a successor's. Letting it expire
+                # costs one hourly tick; stealing it costs a duplicate cycle.
+                log.info("tick.lease_not_ours", user_id=user_id, kind=kind)
+                return False
+            try:
+                ref.update(
+                    {f"discovery_state.{lease_field}": firestore.DELETE_FIELD},
+                    option=_precondition(last_update_time=snap.update_time),
+                )
+                log.info("tick.lease_released", user_id=user_id, kind=kind)
+                return True
+            except NotFound:
+                return False
+            except FailedPrecondition:
+                if attempt:
+                    log.warning(
+                        "tick.lease_release_contended", user_id=user_id, kind=kind
+                    )
+                    return False
+                snap = ref.get()
+    except Exception:
+        log.exception("tick.lease_release_failed", user_id=user_id, kind=kind)
+    return False
 
 
 async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
@@ -96,11 +396,15 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
     """
     with run_context("auto_discovery", user_id=user_id, trigger=trigger) as run_id:
         started = time.monotonic()
-        started_at = _now().isoformat()
+        began = _now()
+        started_at = began.isoformat()
         agent_started = log_agent_start(
             log, "discovery", trigger=trigger, user_id=user_id
         )
         counts: dict = {}
+        # Before any work: the tick's claim has been paying for queue wait, and
+        # from here the TTL has to cover the run.
+        await asyncio.to_thread(_extend_slot, user_id, "discovery", trigger, began)
         try:
             summary = await run_discovery(user_id)
             # Free title pre-filter: confidently out-of-family jobs never get
@@ -148,6 +452,14 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
                     "discovery_state": {
                         "last_discovery_at": _now().isoformat(),
                         "last_discovery": metrics,
+                        # **This write is the slot claim**, and it lands only
+                        # now that the work is done — a tick used to write the
+                        # timestamp before dispatching, which made a run that
+                        # died look exactly like one that succeeded. The lease
+                        # is released in the same write because the timestamp
+                        # beside it holds the slot for a whole interval, so
+                        # there is nothing left for the lease to protect.
+                        "discovery_lease": firestore.DELETE_FIELD,
                     }
                 },
                 merge=True,
@@ -166,6 +478,29 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
         except Exception:
             log.exception("auto_discovery.failed")
             log_agent_end(log, "discovery", agent_started, outcome="failed")
+            # A run that fails *loudly* is over, and it wrote no
+            # ``last_discovery_at`` — so its lease is all that stands between
+            # this user and the next tick, and holding it buys nothing but
+            # silence. In the ``except`` and **not** the ``finally``, which is
+            # the whole distinction: a worker killed mid-cycle raises
+            # ``CancelledError``, which is not an ``Exception`` and never
+            # reaches here, so a run that dies *silently* — and may still be
+            # running — leaves its lease to expire on the clock instead.
+            #
+            # **No backoff, decided rather than overlooked.** Waiting out a full
+            # interval after a failure was an accidental circuit breaker in the
+            # old pre-claim, and dropping it does raise the re-run rate of a
+            # deterministically failing cycle. Under QUEUE_MODE — every
+            # deployment that has a worker — the hour-granular task names cap
+            # that at two dispatches an hour, which is the retry this PR is
+            # for. The 5-minute storm is reachable only with QUEUE_MODE off,
+            # where the cycle runs in-process: local and dev. What actually
+            # bounds the spend either way is ``tools.matching.budget``'s daily
+            # cap, which is the guard built for that job. A backoff lease would
+            # also have to be told apart from a run lease in ``_next_iso``, or
+            # the Profile card would advertise a next run a day out when it is
+            # minutes away — a lease taxonomy for a dev-only exposure.
+            await asyncio.to_thread(_release_slot, user_id, "discovery", trigger, began)
         finally:
             # In the finally, not the happy path: a cycle that died after
             # scoring still spent the money, and that is exactly the run whose
@@ -190,8 +525,10 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
 async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
     """Background: re-check served postings; dismiss ones the ATS took down."""
     with run_context("liveness_sweep", user_id=user_id, trigger=trigger) as run_id:
-        started_at = _now().isoformat()
+        began = _now()
+        started_at = began.isoformat()
         started = log_agent_start(log, "sweep", trigger=trigger, user_id=user_id)
+        await asyncio.to_thread(_extend_slot, user_id, "sweep", trigger, began)
         try:
             counts = await sweep_postings(user_id)
             await asyncio.to_thread(
@@ -200,6 +537,9 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
                     "discovery_state": {
                         "last_sweep_at": _now().isoformat(),
                         "last_sweep": {**counts, "run_id": run_id, "trigger": trigger},
+                        # The slot claim, written now that the sweep has run —
+                        # see run_discovery_cycle for why the lease goes with it.
+                        "sweep_lease": firestore.DELETE_FIELD,
                     }
                 },
                 merge=True,
@@ -208,6 +548,7 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
         except Exception:
             log.exception("sweep.failed")
             log_agent_end(log, "sweep", started, outcome="failed")
+            await asyncio.to_thread(_release_slot, user_id, "sweep", trigger, began)
         finally:
             # The sweep is HTTP-only today, so this normally banks a $0 run —
             # which is itself the answer to "did the sweep cost anything?".
@@ -266,15 +607,21 @@ async def tick_user(
 ) -> None:
     """Run whichever opted-in loops are due for this user.
 
-    Claims each slot (``last_*_at`` = now) before running so a concurrent tick
-    from another trigger sees it as not-due. A failed run therefore waits out
-    a full interval instead of retrying hot.
+    **Leases each slot rather than claiming it.** The slot itself is claimed by
+    ``last_*_at``, which the cycle writes when the work has actually happened;
+    this used to be written here, before dispatching, so a run that died was
+    indistinguishable from one that succeeded and the user waited out a full
+    interval before anything retried. The lease covers only the gap in between.
 
     ``doc`` lets a caller that has already read this user's document hand it
     over instead of paying for a second read — the cron fan-out streams the
     whole ``users`` collection and would otherwise re-fetch every document it
-    just had. Safe to pass a moments-old read: nothing here is a compare-and-
-    swap, and the dispatch it leads to is deduped by a name the queue owns.
+    just had. It stays safe to pass a moments-old read, but for a different
+    reason than before: it is now only a **screen**. Nothing is dispatched off
+    it; a loop it says is due goes on to :func:`_claim_slot`, which re-reads and
+    re-checks both the interval and the lease inside a compare-and-swap. So the
+    hand-over still saves the read on the overwhelmingly common not-due path,
+    and the rare due path pays one read to get a precondition worth having.
     """
     now = _now()
     last_check = _last_tick_check.get(user_id)
@@ -287,28 +634,38 @@ async def tick_user(
     settings = DiscoverySettings.model_validate(doc.get("discovery_settings") or {})
     state = doc.get("discovery_state") or {}
 
-    trigger = "cron" if force_check else "opportunistic"
+    trigger = _CRON_TRIGGER if force_check else _OPPORTUNISTIC_TRIGGER
 
-    if settings.auto_discovery and _due(
-        state.get("last_discovery_at"), settings.discovery_interval_hours, now
-    ):
-        log.info("tick.discovery_due", user_id=user_id, trigger=trigger)
-        await asyncio.to_thread(
-            _user_ref(user_id).set,
-            {"discovery_state": {"last_discovery_at": now.isoformat()}},
-            merge=True,
+    if (
+        settings.auto_discovery
+        and _due(
+            state.get("last_discovery_at"),
+            settings.discovery_interval_hours,
+            now,
+            lease=state.get("discovery_lease"),
         )
+        and await asyncio.to_thread(
+            _claim_slot, user_id, "discovery", settings.discovery_interval_hours, now
+        )
+    ):
+        # Logged after the claim, not before it: this line means a cycle was
+        # dispatched, and a tick that loses the swap dispatches nothing.
+        log.info("tick.discovery_due", user_id=user_id, trigger=trigger)
         await dispatch_cycle("discovery", user_id, trigger=trigger)
 
-    if settings.liveness_sweep and _due(
-        state.get("last_sweep_at"), settings.sweep_interval_hours, now
+    if (
+        settings.liveness_sweep
+        and _due(
+            state.get("last_sweep_at"),
+            settings.sweep_interval_hours,
+            now,
+            lease=state.get("sweep_lease"),
+        )
+        and await asyncio.to_thread(
+            _claim_slot, user_id, "sweep", settings.sweep_interval_hours, now
+        )
     ):
         log.info("tick.sweep_due", user_id=user_id, trigger=trigger)
-        await asyncio.to_thread(
-            _user_ref(user_id).set,
-            {"discovery_state": {"last_sweep_at": now.isoformat()}},
-            merge=True,
-        )
         await dispatch_cycle("sweep", user_id, trigger=trigger)
 
 
@@ -325,13 +682,24 @@ def get_discovery_settings(
     return {
         "settings": settings.model_dump(),
         "state": state,
+        # The lease goes in: ``last_*_at`` now moves only on success, so a run
+        # in flight would otherwise leave the card advertising a next run in
+        # the past.
         "next_discovery_at": (
-            _next_iso(state.get("last_discovery_at"), settings.discovery_interval_hours)
+            _next_iso(
+                state.get("last_discovery_at"),
+                settings.discovery_interval_hours,
+                lease=state.get("discovery_lease"),
+            )
             if settings.auto_discovery
             else None
         ),
         "next_sweep_at": (
-            _next_iso(state.get("last_sweep_at"), settings.sweep_interval_hours)
+            _next_iso(
+                state.get("last_sweep_at"),
+                settings.sweep_interval_hours,
+                lease=state.get("sweep_lease"),
+            )
             if settings.liveness_sweep
             else None
         ),
