@@ -27,10 +27,12 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from google.cloud import firestore
 
 from api.deps import verify_user
+from api.routes.applications import dispatch_tailor
 from models.settings import DiscoverySettings
 from obs.llm_cost import run_cost_snapshot
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import queues
+from tools.applications import reaper
 from tools.ats.sweep import sweep_postings
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
@@ -378,6 +380,32 @@ async def run_sweep_now(
     return {"ok": True, "mode": "in_process"}
 
 
+async def reap_user(user_id: str, *, background_tasks: BackgroundTasks) -> dict:
+    """One reaper pass for this user: collect applications whose worker died.
+
+    Unlike discovery and the sweep this is not on a per-user cadence and takes
+    no slot claim. It costs one indexless Firestore query and no LLM call, and
+    the thing it recovers from — an instance killed mid-run — is not something a
+    user opts into. A document it does move gets a lease that keeps the next
+    tick off it, so "every hour, for everyone" cannot become a retry storm.
+
+    ``asyncio.to_thread`` because ``tools.applications.state`` is synchronous by
+    design; the same hop ``tick_user`` makes for its own Firestore writes.
+
+    The dispatcher is bound to *this* request's ``background_tasks`` so the
+    in-process path still works with ``QUEUE_MODE`` off. Under QUEUE_MODE —
+    every deployment that has a worker — ``dispatch_tailor`` enqueues and the
+    object is never touched.
+    """
+    return await asyncio.to_thread(
+        reaper.reap_applications,
+        user_id,
+        dispatch=lambda uid, job_id: dispatch_tailor(
+            uid, job_id, background_tasks=background_tasks
+        ),
+    )
+
+
 @router.post("/internal/cron/tick")
 async def cron_tick(
     background_tasks: BackgroundTasks,
@@ -427,17 +455,47 @@ async def cron_tick(
     )
     inline = queues.enabled()
     failed = 0
+    reaped = 0
+    reap_failed = 0
+    reap_truncated = 0
     for uid, doc in users:
         if not inline:
             background_tasks.add_task(tick_user, uid, force_check=True, doc=doc)
+            # Appending to the collection that is already being iterated when
+            # this runs, which is how dispatch_tailor's in-process fallback
+            # reaches the loop at all. A background task added mid-iteration is
+            # still picked up.
+            background_tasks.add_task(reap_user, uid, background_tasks=background_tasks)
             continue
         try:
             await tick_user(uid, force_check=True, doc=doc)
         except Exception:
             failed += 1
             log.exception("cron.tick_failed", user_id=uid)
+        # Its own try/except, *inside* the per-user one: a reaper that throws
+        # for every user must not turn a fan-out whose discovery ticks all
+        # worked into the 5xx below. It is reported on its own counter instead,
+        # which is the thing to alert on.
+        try:
+            tally = await reap_user(uid, background_tasks=background_tasks)
+            reaped += tally["recovered"]
+            # A pass that ran out of its per-tick budget looks exactly like a
+            # pass with nothing to do. Carried up so it can be alerted on: it is
+            # the signal that a backlog is draining slower than it accumulates.
+            reap_truncated += tally.get("truncated", 0)
+        except Exception:
+            reap_failed += 1
+            log.exception("cron.reap_failed", user_id=uid)
     await asyncio.to_thread(maybe_enqueue_batch_resume)
-    log.info("cron.tick", users=len(users), failed=failed, inline=inline)
+    log.info(
+        "cron.tick",
+        users=len(users),
+        failed=failed,
+        reaped=reaped,
+        reap_failed=reap_failed,
+        reap_truncated=reap_truncated,
+        inline=inline,
+    )
     if users and failed == len(users):
         # Nothing ticked. Almost always environmental (credentials, queue
         # config), so let the scheduler retry it and let it be visible as a
@@ -445,7 +503,17 @@ async def cron_tick(
         raise HTTPException(
             status_code=500, detail=f"every tick failed ({failed} users)"
         )
-    return {"ok": True, "users": len(users), "failed": failed}
+    return {
+        "ok": True,
+        "users": len(users),
+        "failed": failed,
+        # Additive to the contract PR C established. The reaper is the one loop
+        # here whose *inaction* is invisible — a stuck application looks like an
+        # idle one — so the count comes back rather than living only in logs.
+        "reaped": reaped,
+        "reap_failed": reap_failed,
+        "reap_truncated": reap_truncated,
+    }
 
 
 def maybe_enqueue_batch_resume() -> bool:

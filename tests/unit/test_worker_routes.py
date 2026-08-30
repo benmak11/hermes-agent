@@ -19,6 +19,7 @@ import ast
 import asyncio
 import importlib
 import inspect
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,9 +37,10 @@ import api.routes.jobs as jobs
 import api.routes.worker as worker
 from api.deps import verify_user
 from obs.logging import current_run_id
-from tools.applications import state
+from tools.applications import reaper, state
 from tools.matching import budget
 from tools.queues import KNOWN_QUEUES
+from tools.submitters import SUBMIT_CLICKED
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -296,18 +298,26 @@ class _FakeUsers:
 
 @pytest.fixture
 def cron_world(monkeypatch):
-    """``cron_tick`` over two users, with the per-user tick recorded."""
+    """``cron_tick`` over two users, with the per-user tick and reap recorded."""
     monkeypatch.setenv("WORKER_MODE", "1")
     ticked: list[tuple] = []
+    reaped: list[str] = []
 
     async def fake_tick(user_id, *, force_check=False, doc=None):
         ticked.append((user_id, force_check, doc))
 
+    async def fake_reap(user_id, *, background_tasks):
+        reaped.append(user_id)
+        return {"recovered": 0, "truncated": 0}
+
     users = _FakeUsers({"u1": {"discovery_settings": {}}, "u2": {}})
     monkeypatch.setattr(discovery, "tick_user", fake_tick)
+    monkeypatch.setattr(discovery, "reap_user", fake_reap)
     monkeypatch.setattr(discovery, "maybe_enqueue_batch_resume", lambda: False)
     monkeypatch.setattr(discovery, "_client", lambda: users)
-    return SimpleNamespace(ticked=ticked, tick=fake_tick, users=users)
+    return SimpleNamespace(
+        ticked=ticked, reaped=reaped, tick=fake_tick, reap=fake_reap, users=users
+    )
 
 
 def test_cron_tick_fans_out_in_request_under_queue_mode(cron_world, monkeypatch):
@@ -322,11 +332,20 @@ def test_cron_tick_fans_out_in_request_under_queue_mode(cron_world, monkeypatch)
 
     result = asyncio.run(discovery.cron_tick(background))
 
-    assert result == {"ok": True, "users": 2, "failed": 0}
+    assert result == {
+        "ok": True,
+        "users": 2,
+        "failed": 0,
+        "reaped": 0,
+        "reap_failed": 0,
+        "reap_truncated": 0,
+    }
     assert [(uid, forced) for uid, forced, _doc in cron_world.ticked] == [
         ("u1", True),
         ("u2", True),
     ]
+    # The reaper rides the same in-request fan-out, for the same reason.
+    assert cron_world.reaped == ["u1", "u2"]
     assert background.tasks == []  # nothing left for a frozen instance to run
 
 
@@ -402,6 +421,10 @@ def test_cron_tick_still_defers_the_fan_out_without_a_queue(cron_world, monkeypa
         "ok": True,
         "users": 2,
         "failed": 0,
+        # Deferred with the ticks, so nothing was reaped inside the request.
+        "reaped": 0,
+        "reap_failed": 0,
+        "reap_truncated": 0,
     }
 
     assert cron_world.ticked == []
@@ -411,7 +434,9 @@ def test_cron_tick_still_defers_the_fan_out_without_a_queue(cron_world, monkeypa
             ("u1",),
             {"force_check": True, "doc": {"discovery_settings": {}}},
         ),
+        (cron_world.reap, ("u1",), {"background_tasks": background}),
         (cron_world.tick, ("u2",), {"force_check": True, "doc": {}}),
+        (cron_world.reap, ("u2",), {"background_tasks": background}),
     ]
 
 
@@ -430,8 +455,17 @@ def test_one_users_tick_failing_does_not_cost_the_rest_theirs(cron_world, monkey
 
     result = asyncio.run(discovery.cron_tick(BackgroundTasks()))
 
-    assert result == {"ok": True, "users": 2, "failed": 1}
+    assert result == {
+        "ok": True,
+        "users": 2,
+        "failed": 1,
+        "reaped": 0,
+        "reap_failed": 0,
+        "reap_truncated": 0,
+    }
     assert [uid for uid, _forced, _doc in cron_world.ticked] == ["u2"]
+    # u1's tick blew up, but its stuck applications are still worth collecting.
+    assert cron_world.reaped == ["u1", "u2"]
 
 
 def test_a_fan_out_where_nothing_ticked_is_not_reported_as_success(
@@ -454,6 +488,52 @@ def test_a_fan_out_where_nothing_ticked_is_not_reported_as_success(
 
     assert raised.value.status_code == 500
     assert "2 users" in raised.value.detail
+
+
+def test_a_broken_reaper_never_costs_the_tick_its_fan_out(cron_world, monkeypatch):
+    """The reaper is wired *inside* the per-user handling but behind its own
+    try/except, so it cannot promote itself into the 500 above.
+
+    Discovery is the loop the scheduler exists for; the reaper is a repair pass
+    bolted alongside it. A reaper that throws for every user — a bad index, a
+    Firestore permission — must not take the hourly discovery fan-out down with
+    it. It gets its own counter instead, which is the thing to alert on."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+
+    async def explode(user_id, *, background_tasks):
+        raise RuntimeError("the applications query is broken")
+
+    monkeypatch.setattr(discovery, "reap_user", explode)
+
+    result = asyncio.run(discovery.cron_tick(BackgroundTasks()))
+
+    assert result == {
+        "ok": True,
+        "users": 2,
+        "failed": 0,
+        "reaped": 0,
+        "reap_failed": 2,
+        "reap_truncated": 0,
+    }
+    # Every tick still ran.
+    assert [uid for uid, _forced, _doc in cron_world.ticked] == ["u1", "u2"]
+
+
+def test_the_tick_reports_what_the_reaper_recovered(cron_world, monkeypatch):
+    """A stuck application looks exactly like an idle one, so the reaper's
+    *inaction* is invisible. The count comes back in the response rather than
+    living only in logs."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+
+    async def recovered(user_id, *, background_tasks):
+        return {"recovered": 3 if user_id == "u1" else 1, "truncated": 0}
+
+    monkeypatch.setattr(discovery, "reap_user", recovered)
+
+    result = asyncio.run(discovery.cron_tick(BackgroundTasks()))
+
+    assert result["reaped"] == 4
+    assert result["reap_failed"] == 0
 
 
 # --------------------------------------------------------------------------
@@ -1127,6 +1207,160 @@ def test_an_uncontested_rehearsal_does_record_a_dead_posting(submission_world):
     assert submission_world.job.data["user_decision"] == "dismissed"
 
 
+# --------------------------------------------------------------------------
+# Phase 2 PR D: the point-of-no-return marker.
+#
+# Every _emit in the Greenhouse submitter used the same "submitting" token, so
+# the Submit click — the one step that cannot be undone — was indistinguishable
+# from "Attaching resume". SUBMIT_CLICKED separates it, and the caller turns it
+# into the single fact the reaper reads before deciding whether a dead
+# submission may be retried.
+# --------------------------------------------------------------------------
+
+
+def _clicks(submission_world, message="Submitting application"):
+    """Make the fake submitter report the click, the way Greenhouse now does."""
+
+    async def submit_application(job, prof, resume, **kw):
+        submission_world.submits.append(kw)
+        if kw.get("on_progress"):
+            kw["on_progress"](message, SUBMIT_CLICKED)
+        if submission_world.hooks.during is not None:
+            submission_world.hooks.during()
+        return submission_world.hooks.result
+
+    return submit_application
+
+
+def test_the_click_marker_lands_in_the_same_write_as_its_timeline_entry(
+    submission_world, monkeypatch
+):
+    """The marker is what stands between a dead submission and a duplicate real
+    application, so it must not be possible for the timeline to say the form was
+    submitted while the marker is missing. One write, both fields.
+
+    And the entry itself is recorded as ``submitting``, never as the token:
+    ``web/`` renders a closed union of statuses and ``review/page.tsx`` filters
+    the submission timeline on ``["submitting", "submitted", "failed"]``, so a
+    new token reaching Firestore would simply stop rendering."""
+    doc = submission_world.doc
+    doc._data["status"] = "submitting"
+    submission_world.hooks.result = {"success": True}
+    monkeypatch.setattr(applications, "submit_application", _clicks(submission_world))
+    before = len(doc.updates)
+
+    asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    marker_writes = [
+        fields
+        for fields, _option in doc.updates[before:]
+        if "submit_attempted_at" in fields
+    ]
+    assert len(marker_writes) == 1, "the marker must be written exactly once"
+    assert state.TIMELINE_FIELD in marker_writes[0]  # ...in that same write
+    assert doc.data["submit_attempted_at"]
+
+    clicked = [
+        e for e in doc.data["timeline"] if e.get("note") == "Submitting application"
+    ]
+    assert [e["status"] for e in clicked] == ["submitting"]
+    assert SUBMIT_CLICKED not in [e["status"] for e in doc.data["timeline"]]
+
+
+def test_a_rehearsal_never_writes_the_click_marker(submission_world, monkeypatch):
+    """A dry run stops before the button, so ``submit_greenhouse`` cannot reach
+    the emit at all — but the guard is on the *caller* too, so no future
+    submitter can talk a $0 rehearsal into claiming a browser clicked Submit.
+    A rehearsal that left the marker behind would make the reaper permanently
+    refuse to retry an application nobody ever sent."""
+    doc = submission_world.doc
+    monkeypatch.setattr(applications, "submit_application", _clicks(submission_world))
+
+    asyncio.run(applications.run_submission("u1", "app-job1", dry_run=True))
+
+    assert "submit_attempted_at" not in doc.data
+    assert doc.data["status"] == "ready_for_review"
+    # Still labelled and still parked where the document actually is.
+    assert doc.data["timeline"][-1]["note"].startswith(applications.DRY_RUN_NOTE)
+
+
+def test_a_worker_killed_after_the_click_is_reaped_as_uncertain(
+    submission_world, monkeypatch
+):
+    """**The two halves of this PR, joined.**
+
+    ``CancelledError`` is what a Cloud Run eviction looks like from inside the
+    coroutine: it is not an ``Exception``, so ``run_submission``'s ``except``
+    never runs and the document is left in ``submitting`` exactly as a killed
+    worker leaves it — with the marker already on it, because the emit happens
+    before the click.
+
+    The reaper then finds an expired lease and a marker, and the only correct
+    answer is: fail it, flag it, tell the user to check their email, and never
+    re-enqueue it.
+    """
+    doc = submission_world.doc
+    doc._data["status"] = "submitting"
+
+    def killed():
+        raise asyncio.CancelledError()
+
+    submission_world.hooks.during = killed
+    monkeypatch.setattr(applications, "submit_application", _clicks(submission_world))
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    # A killed worker leaves exactly this: still submitting, still leased, and
+    # the marker recording that a browser got as far as the button.
+    assert doc.data["status"] == "submitting"
+    assert doc.data["submit_attempted_at"]
+    assert doc.data["lease"]["status"] == "submitting"
+
+    dispatched: list[tuple] = []
+    later = datetime.now(UTC) + timedelta(seconds=state.IN_PROGRESS["submitting"] + 1)
+    outcome = reaper.reap_one(
+        doc,
+        doc.get(),
+        doc.data,
+        reaper.classify(doc.data, now=later),
+        user_id="u1",
+        dispatch=lambda u, j: dispatched.append((u, j)) or True,
+        now=later,
+    )
+
+    assert outcome == "release_uncertain"
+    assert dispatched == []  # never, at any attempt count
+    assert doc.data["status"] == "failed"
+    assert doc.data[reaper.UNCERTAIN_FIELD] is True
+    assert "UNKNOWN" in doc.data["timeline"][-1]["note"]
+
+
+def test_only_the_click_emits_its_own_token(submission_world):
+    """The token has to name *one* step. Every other label the submitter emits
+    is display chatter, and if a second one carried SUBMIT_CLICKED the marker
+    would start meaning "we got somewhere near the form"."""
+    source = (REPO_ROOT / "tools" / "submitters" / "greenhouse.py").read_text()
+    emits = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_emit"
+    ]
+    # ast.unparse because the last emit's token is a conditional expression
+    # ("submitted" if confirmed else "submitting"), not a literal.
+    tokens = [ast.unparse(node.args[2]) for node in emits]
+    assert tokens.count("SUBMIT_CLICKED") == 1
+    assert "SUBMIT_CLICKED" not in " ".join(t for t in tokens if t != "SUBMIT_CLICKED")
+    assert len(emits) == 6, "a new step was added — does it click anything?"
+    # ...and the first thing awaited after that emit is the click itself. The
+    # marker means "a browser clicked Submit", so anything awaited in between
+    # would be a way to write it and then never click.
+    after = source.split("SUBMIT_CLICKED)", 1)[1]
+    assert after.split("await ")[1].startswith("submit_btn.click()")
+
+
 def test_a_failing_dry_run_does_not_mark_a_real_application_failed(monkeypatch):
     """``ready_for_review → failed`` is a legal edge, so the guard has to be
     explicit: a rehearsal that blows up must not consume the user's document."""
@@ -1430,3 +1664,159 @@ def test_the_funnel_routes_have_callers_and_they_agree():
     for queue, route in callers["api/routes/applications.py"]:
         assert queue in KNOWN_QUEUES, queue
         assert route in served, route
+
+
+# --------------------------------------------------------------------------
+# reap_user: the seam between the cron tick and the reaper.
+#
+# ``cron_world`` monkeypatches this function wholesale, so nothing above
+# executes its body. What it binds — which dispatcher, and whether the pass is
+# allowed to act — is the load-bearing fact behind the apply fork.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def reap_seam(monkeypatch):
+    """``reap_user`` with ``reap_applications`` replaced by a recorder, so the
+    call it actually makes is directly observable."""
+    calls: list[dict] = []
+
+    def record(user_id, **kwargs):
+        calls.append({"user_id": user_id, **kwargs})
+        return {"recovered": 0, "truncated": 0}
+
+    monkeypatch.setattr(discovery.reaper, "reap_applications", record)
+    return calls
+
+
+def test_reap_user_lets_the_pass_act(reap_seam):
+    """``execute`` defaults to True and nothing here may quietly flip it.
+
+    A pass pinned to ``execute=False`` still returns a tally and still reports
+    ``recovered: 0`` — indistinguishable from "nothing to do" — so the reaper
+    would silently never recover anything, for anyone, forever.
+    """
+    asyncio.run(discovery.reap_user("u1", background_tasks=BackgroundTasks()))
+
+    assert len(reap_seam) == 1
+    assert reap_seam[0]["user_id"] == "u1"
+    # Not passed at all, or passed as True — either is fine; False is not.
+    assert reap_seam[0].get("execute", True) is True
+
+
+def test_the_pass_acts_by_default():
+    """The other half of the test above, which leans on the callee's default and
+    cannot check it there — that fixture has replaced the callee."""
+    assert (
+        inspect.signature(reaper.reap_applications).parameters["execute"].default
+        is True
+    )
+
+
+def test_reap_user_binds_the_tailor_dispatcher_and_only_that_one(
+    reap_seam, monkeypatch
+):
+    """**Which dispatcher is bound is the whole apply fork.**
+
+    The reaper re-dispatches *tailoring* — cheap, claimed before it spends, safe
+    to repeat. It must never be able to reach ``dispatch_apply``: that drives a
+    live browser at a real employer, and re-running one is the duplicate
+    application this PR exists to prevent.
+    """
+    tailored: list[tuple] = []
+    monkeypatch.setattr(
+        discovery,
+        "dispatch_tailor",
+        lambda uid, job_id, *, background_tasks: (
+            tailored.append((uid, job_id, background_tasks)) or True
+        ),
+    )
+
+    def never(*args, **kwargs):
+        pytest.fail("the reaper reached dispatch_apply")
+
+    monkeypatch.setattr(applications, "dispatch_apply", never)
+
+    background = BackgroundTasks()
+    asyncio.run(discovery.reap_user("u1", background_tasks=background))
+
+    dispatch = reap_seam[0]["dispatch"]
+    assert dispatch("u1", "job1") is True
+
+    # The request's own BackgroundTasks is forwarded, which is what keeps the
+    # in-process path working with QUEUE_MODE off.
+    assert tailored == [("u1", "job1", background)]
+
+
+def test_reap_user_reports_the_tally_the_tick_reads(reap_seam, monkeypatch):
+    """The tick sums ``recovered`` and ``truncated`` off this return value."""
+    monkeypatch.setattr(
+        discovery.reaper,
+        "reap_applications",
+        lambda user_id, **kw: {"recovered": 2, "truncated": 1},
+    )
+
+    result = asyncio.run(discovery.reap_user("u1", background_tasks=BackgroundTasks()))
+
+    assert result["recovered"] == 2 and result["truncated"] == 1
+
+
+def test_a_successful_publish_clears_the_reapers_recovery_budget(client, monkeypatch):
+    """Driven through the real ``run_tailoring``, because the epoch is only
+    worth anything if the *publish* carries it.
+
+    ``reaper.MAX_ATTEMPTS`` bounds consecutive failed recoveries. Without a
+    reset the count is a lifetime total, so an application recovered three times
+    during a queue outage and then tailored perfectly stays permanently one
+    stale tick from ``give_up`` — a give_up that dispatches nothing while its
+    note tells the user to press Regenerate.
+    """
+    monkeypatch.setenv("WORKER_MODE", "1")
+    doc = _app_doc("queued", **{reaper.ATTEMPTS_FIELD: reaper.MAX_ATTEMPTS})
+    job = _FakeDoc(
+        {
+            "id": "job1",
+            "url": "https://x/y",
+            "company": "Acme",
+            "title": "Staff Engineer",
+            "user_decision": "approved",
+        }
+    )
+    monkeypatch.setattr(
+        applications, "_client", lambda: _FakeDb(_FakeUser(doc, job, {}))
+    )
+    monkeypatch.setattr(
+        applications, "MasterProfile", SimpleNamespace(model_validate=lambda d: d)
+    )
+    monkeypatch.setattr(
+        applications,
+        "Job",
+        SimpleNamespace(model_validate=lambda d: SimpleNamespace(**d)),
+    )
+
+    async def fake_check_posting(job):
+        return "ok"
+
+    async def fake_tailor_application(job, profile, upload=True):
+        return SimpleNamespace(
+            model_dump=lambda **kw: {"objective_text": "hi"},
+            resume_variant_uri="gs://b/r.docx",
+        )
+
+    async def fake_persist_run_cost(db, user_id, run_id, **meta):
+        pass
+
+    monkeypatch.setattr(applications, "check_posting", fake_check_posting)
+    monkeypatch.setattr(applications, "tailor_application", fake_tailor_application)
+    monkeypatch.setattr(applications, "persist_run_cost", fake_persist_run_cost)
+
+    client.post("/tasks/tailor", json={"user_id": "u1", "job_id": "job1"})
+
+    assert doc.data["status"] == "ready_for_review"
+    assert doc.data is not None and reaper.ATTEMPTS_FIELD not in doc.data
+    assert reaper.attempts(doc.data) == 0
+    # In the same write as the status, not beside it: the content write next to
+    # it carries no precondition, so a reset there could land on a document a
+    # regenerate had already moved on.
+    publish = next(f for f, _o in doc.updates if f.get("status") == "ready_for_review")
+    assert publish[reaper.ATTEMPTS_FIELD] is firestore.DELETE_FIELD

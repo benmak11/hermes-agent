@@ -55,9 +55,10 @@ from models.job import Job
 from models.profile import MasterProfile
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import queues
-from tools.applications import state
+from tools.applications import reaper, state
 from tools.ats.validate import check_posting
 from tools.run_costs import persist_run_cost
+from tools.submitters import SUBMIT_CLICKED
 from tools.submitters.router import submit_application
 from tools.submitters.storage import download_resume, upload_screenshot
 from tools.tailoring.pipeline import application_id, tailor_application
@@ -270,8 +271,23 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             # Submit, and the worker's own claim on ``submitting`` would find it
             # held and refuse — a submission silently dropped by a lease nobody
             # owns any more.
+            #
+            # ``reap_attempts`` is cleared **here**, in the same write, because
+            # this is the event that proves the pipeline works for this
+            # document. The reaper's cap counts *consecutive* failed recoveries;
+            # without an epoch it counts them for the lifetime of the
+            # application, and a doc recovered three times during a queue outage
+            # and then tailored perfectly stays permanently one stale tick away
+            # from ``give_up`` — a give_up that dispatches nothing while telling
+            # the user to press Regenerate, the one thing that cannot help.
+            # Riding the swap rather than the content write above matters: the
+            # content write has no precondition, so a reset there could land on
+            # a document a regenerate had already moved on.
             if not await _transition(
-                app_ref, "ready_for_review", lease=state.CLEAR_LEASE
+                app_ref,
+                "ready_for_review",
+                lease=state.CLEAR_LEASE,
+                extra={reaper.ATTEMPTS_FIELD: firestore.DELETE_FIELD},
             ):
                 task_log.info("tailoring.result_not_published")
             task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
@@ -324,9 +340,17 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
 
 
 def dispatch_tailor(
-    user_id: str, job_id: str, *, background_tasks: BackgroundTasks
+    user_id: str, job_id: str, *, background_tasks: BackgroundTasks | None = None
 ) -> bool:
     """Tailor an approved job — on the worker via queue when enabled.
+
+    ``background_tasks`` may be ``None`` for a caller that has no request to
+    defer work onto — ``cli.reap_applications``. That makes the helper
+    queue-only, and it returns ``False`` rather than pretending: with no queue
+    and nowhere to run the work in-process, **nothing was scheduled**, and the
+    reaper counts that as a re-dispatch that did not happen. The alternative
+    (handing it a throwaway ``BackgroundTasks`` that is never awaited) would
+    drop the work silently, which is the failure this whole PR exists to end.
 
     The task id is minute-granular, matching ``dispatch_cycle``'s ``manual``
     convention: a double-click on Approve or Regenerate dedupes at the queue,
@@ -351,6 +375,9 @@ def dispatch_tailor(
             {"user_id": user_id, "job_id": job_id},
             task_id=f"tailor-{user_id}-{job_id}-{stamp}",
         )
+    if background_tasks is None:
+        log.warning("tailor.not_dispatched", user_id=user_id, job_id=job_id)
+        return False
     background_tasks.add_task(run_tailoring, user_id, job_id)
     return True
 
@@ -461,8 +488,23 @@ def regenerate(
         raise HTTPException(status_code=404, detail="application not found")
     doc = snap.to_dict()
     job_id = doc["job_id"]
+    # The second epoch for the reaper's cap: a user asking for this again is a
+    # fresh start, so the automatic-recovery budget starts fresh too. Otherwise
+    # a document that exhausted the cap gets exactly one manual retry before the
+    # reaper starts failing it on sight — while the note it wrote says to press
+    # this button. Inside the swap, so a regenerate that loses resets nothing.
+    #
+    # **The already-``queued`` branch below takes no swap**, so it gets no reset;
+    # there is no precondition to attach one to and a bare write is how this
+    # phase's bugs start. That document is already where the reaper would put it
+    # and the click has already dispatched, so the residual is a cap that stays
+    # spent until the next successful tailoring clears it.
     if doc.get("status") != state.INITIAL and not state.try_transition(
-        ref, snap, state.INITIAL, note="regenerate"
+        ref,
+        snap,
+        state.INITIAL,
+        note="regenerate",
+        extra={reaper.ATTEMPTS_FIELD: firestore.DELETE_FIELD},
     ):
         raise HTTPException(
             status_code=409,
@@ -540,18 +582,41 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
     user_ref = _client().collection("users").document(user_id)
 
     def progress(message: str, status: str) -> None:
-        # Timeline only. The submitter's second argument is a display label for
-        # the step ("Opening ...", "Attaching resume"), not a lifecycle edge —
-        # it emits "submitted" the moment it sees a confirmation page, and
-        # honouring that as a transition would lock out the real terminal write
-        # below, which is the one carrying the screenshots and confirmation.
+        # Timeline only, with exactly one exception. The submitter's second
+        # argument is a display label for the step ("Opening ...", "Attaching
+        # resume"), not a lifecycle edge — it emits "submitted" the moment it
+        # sees a confirmation page, and honouring that as a transition would
+        # lock out the real terminal write below, which is the one carrying the
+        # screenshots and confirmation.
         if dry_run:
             # A rehearsal's steps are the *same* steps, so unmarked they render
             # on the tracking page as a submission in progress — "Opening…",
             # "Attaching resume" — against a document nobody submitted. Keep the
             # entry's status where the document actually is and label the note.
+            #
+            # A rehearsal cannot reach SUBMIT_CLICKED — the submitter returns
+            # before that line — but this branch comes first regardless, so no
+            # future submitter can talk a $0 rehearsal into writing the marker
+            # that says a browser clicked Submit.
             state.append_note(
                 ref, found_status or "ready_for_review", DRY_RUN_NOTE + message
+            )
+            return
+        if status == SUBMIT_CLICKED:
+            # **The point of no return.** The submitter emits this immediately
+            # before ``submit_btn.click()``, so from here on the application may
+            # already be in the employer's ATS, and no automatic path may
+            # resubmit it — ``tools.applications.reaper`` reads exactly this
+            # field to decide that. The marker and the timeline entry go in one
+            # write so the timeline can never claim the form was submitted while
+            # the marker that prevents a retry is missing.
+            #
+            # The entry itself is recorded as "submitting", not as the token:
+            # web/ renders a closed union of statuses and filters the submission
+            # timeline on ["submitting", "submitted", "failed"], so the token
+            # stays on the wire between submitter and caller.
+            state.append_note(
+                ref, "submitting", message, extra={"submit_attempted_at": _now()}
             )
             return
         state.append_note(ref, status, message)
