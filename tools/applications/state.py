@@ -144,20 +144,30 @@ _LEASE_SECONDS = _DISPATCH_DEADLINE_SECONDS + _LEASE_GRACE_SECONDS
 #: deadline, so each needs the same floor. ``queued`` carries one for the
 #: reaper's benefit — nothing claims that status today.
 #:
-#: **Nothing reaps these yet.** This defines the shape so the reaper can be
-#: added without re-deciding it. Two paths write a lease: :func:`try_claim_lease`
-#: (``run_submission``'s delivery claim on ``submitting``) and ``run_tailoring``'s
-#: ``queued → tailoring`` claim, which takes status and lease in one write.
+#: ``tools.applications.reaper`` is what expires these. Three paths write a
+#: lease: :func:`try_claim_lease` (``run_submission``'s delivery claim on
+#: ``submitting``, and the reaper's own claim on all three), ``run_tailoring``'s
+#: ``queued → tailoring`` claim, which takes status and lease in one write, and
+#: the reaper's ``→ queued`` recovery, which lands a fresh ``queued`` lease so
+#: the next pass backs off instead of re-dispatching hourly.
 #:
-#: **For the reaper author:** a document in ``submitting`` with *no* lease is
-#: ambiguous, not dead. ``POST /applications/{id}/submit`` writes the status and
+#: **The asymmetry the reaper is built on.** For ``tailoring`` the status and
+#: the lease are written together, so an absent lease there means a document
+#: predating leases entirely. For ``submitting`` they are written by two
+#: different processes: ``POST /applications/{id}/submit`` writes the status and
 #: the run writes the lease, so there is a real window between the two — and,
 #: when the dispatch between them fails outright, a document that stays there.
 #: Every path that can drive a submission does take this lease (the claim lives
 #: in ``run_submission`` itself, not in the ``/tasks/apply`` handler, precisely
-#: so that is true of the in-process path too), but "submitting and no lease"
-#: must still fall back to the age arithmetic in ``cli/unwedge_submitting``; it
-#: must never be read as "the owner is gone".
+#: so that is true of the in-process path too), but "submitting and no lease" is
+#: **ambiguous, not dead**: it must fall back to the age arithmetic in
+#: ``cli/unwedge_submitting`` and must never be read as "the owner is gone". The
+#: reaper honours that by refusing to touch an unleased ``submitting`` document
+#: at all — see its module docstring.
+#:
+#: ``queued`` is the exception to "the lease decides": nothing claims that
+#: status in the ordinary flow, so the reaper decides its staleness by age and
+#: then takes this lease itself, as its own re-dispatch bookkeeping.
 IN_PROGRESS: dict[str, int] = {
     "queued": _LEASE_SECONDS,
     "tailoring": _LEASE_SECONDS,
@@ -278,7 +288,13 @@ def lease_owner(doc: dict) -> str | None:
 
 
 def try_claim_lease(
-    ref, snap, status: str, *, owner: str, now: datetime | None = None
+    ref,
+    snap,
+    status: str,
+    *,
+    owner: str,
+    now: datetime | None = None,
+    extra: dict | None = None,
 ) -> bool:
     """Compare-and-swap the **lease** of a document already in ``status``.
 
@@ -311,6 +327,17 @@ def try_claim_lease(
     ``owner`` is stamped on the lease so the release can be checked rather than
     assumed; :func:`new_owner` mints one per run.
 
+    ``extra`` carries fields that must land **in the same write as the claim**,
+    the same contract :func:`try_transition` offers, and it may not contain
+    :data:`OWNED_FIELDS`. It exists for the reaper's retry counter: the counter
+    is what bounds an automatic re-dispatch loop, so a claim that loses must not
+    advance it and a claim that wins must advance it exactly once — which is
+    only true if the claim and the bump are one write. This is the same reason
+    ``submit_attempts`` rides inside the ``→ submitting`` swap rather than
+    beside it. On the ``queued`` claim it is the *only* payload of consequence:
+    nothing else claims that status, so the reaper's own bookkeeping is all
+    there is to protect.
+
     Retries once on a lost precondition for the same reason
     :func:`try_transition` does (``_backfill_job_url`` writes on read), and
     re-reads the status and the lease on that retry rather than trusting the
@@ -318,6 +345,9 @@ def try_claim_lease(
     """
     if status not in IN_PROGRESS:
         raise ValueError(f"{status!r} carries no lease; see state.IN_PROGRESS")
+    # Validated before the loop: a clash is a programming error, not a race, and
+    # it should raise whether or not the first attempt reaches the network.
+    _reject_owned(extra)
     for attempt in (0, 1):
         if not snap.exists:
             return False
@@ -342,8 +372,10 @@ def try_claim_lease(
             )
             return False
         try:
+            payload = _reject_owned(extra)
+            payload[LEASE_FIELD] = lease_for(status, owner=owner, now=now)
             ref.update(
-                {LEASE_FIELD: lease_for(status, owner=owner, now=now)},
+                payload,
                 option=_precondition(last_update_time=snap.update_time),
             )
             return True
@@ -424,29 +456,46 @@ def creation_fields(*, note: str | None = None) -> dict:
     }
 
 
-def append_note(ref, status: str, message: str) -> bool:
+def _reject_owned(extra: dict | None) -> dict:
+    """``extra`` as a fresh payload dict, refusing any field this module owns."""
+    if extra:
+        clashes = sorted(set(extra) & set(OWNED_FIELDS))
+        if clashes:
+            raise ValueError(f"{', '.join(clashes)} may only be written by state.py")
+    return dict(extra or {})
+
+
+def append_note(ref, status: str, message: str, *, extra: dict | None = None) -> bool:
     """Append a timeline entry **without** touching the document's status.
 
     For progress chatter: the submitter emits a label per step ("Filling
     standard fields", "submitting"), which is a display string, not a lifecycle
     edge. ``update`` rather than ``set(merge=True)`` so a late note can't
     resurrect a document the undo path deleted.
+
+    ``extra`` lands in the *same* write, under the same :data:`OWNED_FIELDS`
+    guard as :func:`try_transition`'s. One progress note needs that:
+    ``submit_attempted_at``, the point-of-no-return marker
+    (``api.routes.applications.run_submission``'s ``progress``), which is the
+    single fact the reaper's apply fork reads to decide whether a dead run may
+    be retried. Written beside the note rather than with it, a crash between the
+    two writes could leave the timeline saying the form was being submitted
+    while the marker — the thing that stops an automatic re-submission — is
+    missing. This is deliberately *not* a compare-and-swap: the marker must land
+    whatever else has happened to the document, and it is only ever set, never
+    cleared, so there is no lost update to protect against.
     """
+    payload = _reject_owned(extra)
+    payload[TIMELINE_FIELD] = firestore.ArrayUnion([timeline_event(status, message)])
     try:
-        ref.update(
-            {TIMELINE_FIELD: firestore.ArrayUnion([timeline_event(status, message)])}
-        )
+        ref.update(payload)
         return True
     except NotFound:
         return False
 
 
 def _payload(to: str, note: str | None, lease: Lease, extra: dict | None) -> dict:
-    if extra:
-        clashes = sorted(set(extra) & set(OWNED_FIELDS))
-        if clashes:
-            raise ValueError(f"{', '.join(clashes)} may only be written by state.py")
-    payload = dict(extra or {})
+    payload = _reject_owned(extra)
     payload[STATUS_FIELD] = to
     payload[TIMELINE_FIELD] = firestore.ArrayUnion([timeline_event(to, note)])
     if lease is CLEAR_LEASE:

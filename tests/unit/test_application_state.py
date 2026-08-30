@@ -30,7 +30,7 @@ import api.routes.worker as worker
 import tools.ats.sweep as sweep
 from api.deps import verify_user
 from models.application import ApplicationStatus
-from tools.applications import state
+from tools.applications import reaper, state
 from tools.queues import _DISPATCH_DEADLINE_SECONDS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -952,3 +952,51 @@ def test_the_state_module_is_the_one_that_writes_status():
     source = (REPO_ROOT / "tools" / "applications" / "state.py").read_text()
     assert 'STATUS_FIELD = "status"' in source
     assert "payload[STATUS_FIELD] = to" in source
+
+
+def test_regenerate_clears_the_reapers_recovery_budget(monkeypatch):
+    """A user asking again is the second epoch for ``reaper.reap_attempts``.
+
+    Without it, an application that exhausted the automatic-recovery cap gets
+    exactly one manual retry before the reaper starts failing it on sight — while
+    the note the reaper wrote says to press this very button. Inside the swap, so
+    a regenerate that loses its race resets nothing.
+    """
+    doc = _ready(**{reaper.ATTEMPTS_FIELD: reaper.MAX_ATTEMPTS})
+    monkeypatch.setattr(applications, "_apps", lambda user_id: _FakeCollection(doc))
+
+    async def fake_run_tailoring(user_id, job_id):
+        pass
+
+    monkeypatch.setattr(applications, "run_tailoring", fake_run_tailoring)
+    app = FastAPI()
+    app.include_router(applications.router)
+    app.dependency_overrides[verify_user] = lambda: "u1"
+
+    assert TestClient(app).post("/applications/app-job1/regenerate").status_code == 200
+
+    assert doc.data is not None and doc.data["status"] == "queued"
+    assert reaper.ATTEMPTS_FIELD not in doc.data
+    # One write, carrying both — the swap is what proves the reset was earned.
+    requeue = next(f for f, _o in doc.updates if f.get("status") == "queued")
+    assert requeue[reaper.ATTEMPTS_FIELD] is firestore.DELETE_FIELD
+
+
+def test_a_regenerate_that_loses_its_race_resets_nothing(monkeypatch):
+    """Positive control for the swap: two clicks, the second holding a stale
+    read. Only the winner's reset lands, and the loser cannot hand a document
+    someone else now owns a fresh recovery budget."""
+    doc = _ready(**{reaper.ATTEMPTS_FIELD: 2})
+    monkeypatch.setattr(applications, "_apps", lambda user_id: _FakeCollection(doc))
+    in_flight = doc.snapshot()
+
+    state.try_transition(doc, doc.get(), "submitting")  # the user clicked Submit
+
+    doc.pin(in_flight)
+    app = FastAPI()
+    app.include_router(applications.router)
+    app.dependency_overrides[verify_user] = lambda: "u1"
+
+    assert TestClient(app).post("/applications/app-job1/regenerate").status_code == 409
+    assert doc.data["status"] == "submitting"
+    assert doc.data[reaper.ATTEMPTS_FIELD] == 2

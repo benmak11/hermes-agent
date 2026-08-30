@@ -36,6 +36,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 from models.job import Job
 from models.profile import MasterProfile
 from obs.logging import get_logger
+from tools.submitters import SUBMIT_CLICKED
 
 log = get_logger("tools.submitters.greenhouse")
 
@@ -288,7 +289,19 @@ async def submit_greenhouse(
                     "pre_submit_screenshot": pre_path,
                 }
 
-            await _emit(on_progress, "Submitting application", "submitting")
+            # SUBMIT_CLICKED, not "submitting": the next statement is the point
+            # of no return, and the six other _emit calls in this function all
+            # use "submitting", so until this token existed the click was
+            # indistinguishable from "Attaching resume". The caller turns this
+            # into ``submit_attempted_at`` — the fact that stops a reaper from
+            # ever auto-retrying this application — and still records the
+            # timeline entry as "submitting", so nothing in web/ changes.
+            #
+            # Emitted *before* the click and awaited, so the marker is on the
+            # document by the time the browser can possibly have submitted. The
+            # dry-run path above returns before reaching this line: a rehearsal
+            # never clicks, so it must never leave the marker behind.
+            await _emit(on_progress, "Submitting application", SUBMIT_CLICKED)
             submit_btn = page.locator(
                 'button[type="submit"]:has-text("Submit"), '
                 'button:has-text("Submit Application")'
