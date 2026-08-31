@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.app_utils.middleware import RequestContextMiddleware
 from api.app_utils.telemetry import setup_cloud_otel, setup_telemetry
 from api.app_utils.typing import Feedback
-from api.deps import verify_user
+from api.deps import dev_mode, verify_user
 from api.routes import applications as applications_routes
 from api.routes import companies as companies_routes
 from api.routes import discovery as discovery_routes
@@ -108,7 +108,25 @@ if ADK_ENABLED:
         otel_to_cloud=True,
     )
 else:
-    app = FastAPI()
+    # ``/docs`` and ``/openapi.json`` are a development tool, exactly like the
+    # ADK surface above, and they were answering 200 unauthenticated on
+    # production. Nothing behind them is data or a billable model — they publish
+    # the *shape* of the API — so this is reconnaissance aid rather than a
+    # vulnerability, and the fix is correspondingly plain: don't publish it.
+    #
+    # Gated on ``deps.dev_mode()`` rather than a flag of its own, because that
+    # is already the codebase's answer to "is this a developer's machine?" —
+    # Terraform never sets AUTH_DEV_MODE, so a deployed revision cannot turn
+    # these back on by accident. (The ADK branch above keeps its own docs, and
+    # needs no gate: ADK_ENABLED is itself unset in production, which is the
+    # whole reason that branch exists.)
+    app = FastAPI(
+        docs_url="/docs" if dev_mode() else None,
+        openapi_url="/openapi.json" if dev_mode() else None,
+        # ``/redoc`` renders the same document from the same URL, so it is the
+        # same surface and moves with them.
+        redoc_url="/redoc" if dev_mode() else None,
+    )
     # Both of these are side effects of get_fast_api_app, so reproduce them —
     # dropping the ADK surface should change the agent routes and nothing else.
     setup_cloud_otel()
@@ -170,6 +188,9 @@ def collect_feedback(
 logger.info(
     "api.boot",
     adk_enabled=ADK_ENABLED,
+    # Reads back the app that was actually built, not the flag that was meant
+    # to build it — this line exists to answer "which mode is this revision in?"
+    docs_published=app.docs_url is not None,
     execution_mode="queued" if queues.enabled() else "in_process",
     worker_mode=queues.worker_mode(),
     worker_url=os.getenv("WORKER_URL") or None,

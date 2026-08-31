@@ -1,5 +1,22 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
+"""The gateway end to end: a real uvicorn process with the ADK surface mounted.
+
+**One test in here costs money.** ``test_chat_stream`` posts to ``/run_sse``,
+which drives the real ``root_agent`` against the live GCP project; the other two
+never reach a model (a 422 and a log-only ``/feedback`` write). So that one
+carries the ``billed`` marker, ``pyproject.toml`` deselects the marker by
+default, and::
+
+    uv run pytest tests/integration
+
+runs the free ones only. Opt into the paid one explicitly::
+
+    uv run pytest tests/integration -m billed
+
+A ``429 RESOURCE_EXHAUSTED`` from that run is production quota, not a bug in the
+test.
+"""
 
 import json
 import logging
@@ -108,8 +125,9 @@ def server_fixture(request: Any) -> Iterator[subprocess.Popen[str]]:
     yield server_process
 
 
+@pytest.mark.billed
 def test_chat_stream(server_fixture: subprocess.Popen[str]) -> None:
-    """Test the chat stream functionality."""
+    """Test the chat stream functionality. Billed: this one really calls Gemini."""
     logger.info("Starting chat stream test")
     # Create session first
     user_id = "test_user_123"

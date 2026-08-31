@@ -215,6 +215,38 @@ def test_summary_reports_a_full_draw_as_capped():
     assert budget.summary(res)["budget_capped"] is False
 
 
+def test_summary_reports_what_is_left_after_the_refund_not_before_it():
+    """The 1B reporting gap. ``Reservation`` is built at reserve time, with the
+    whole grant already debited; the caller's ``finally`` hands back
+    ``granted - drawn``. Reporting the reservation's own numbers skips that
+    refund, and ``budget_remaining_day`` is what the Profile card prints
+    verbatim as "N of today's scoring budget left".
+
+    12 pending jobs against a 200-slot grant on a 1000/day limit: 188 come
+    straight back, and the user has 988 left, not 800.
+    """
+    res = Reservation(
+        granted=200,
+        capped=False,
+        remaining_cycle=0,
+        remaining_day=800,
+        cycle_id="cycle-1",
+    )
+    scored_twelve = budget.summary(res, drawn=12)
+    assert scored_twelve["budget_remaining_day"] == 988
+    assert scored_twelve["budget_remaining_cycle"] == 188
+    assert scored_twelve["budget_granted"] == 200  # the grant is still the grant
+
+    # A run that drew everything refunds nothing, and reports the debit in full.
+    drew_it_all = budget.summary(res, drawn=200)
+    assert drew_it_all["budget_remaining_day"] == 800
+    assert drew_it_all["budget_remaining_cycle"] == 0
+
+    # No ``drawn`` at all means "the run has not happened yet" — the reserve-time
+    # log line is the caller — so nothing is refunded there either.
+    assert budget.summary(res)["budget_remaining_day"] == 800
+
+
 def test_summary_of_an_unbudgeted_run_is_empty():
     # --ignore-budget reports no budget at all rather than a fabricated zero.
     assert budget.summary(None, drawn=9000) == {}

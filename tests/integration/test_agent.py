@@ -1,6 +1,22 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
+"""The agent, end to end, against the real model. **This test costs money.**
 
+Nothing here is mocked: it builds a real ``Runner`` around the real
+``root_agent`` and streams a real Gemini response on the live GCP project.
+
+So it carries the ``billed`` marker and ``pyproject.toml`` deselects that marker
+by default — ``pytest tests/integration`` runs everything *except* this. To run
+it deliberately::
+
+    uv run pytest tests/integration -m billed
+
+Budget roughly $0.01-0.02 for the pair of billed tests in this directory, and
+expect ``429 RESOURCE_EXHAUSTED`` to mean production quota rather than a broken
+test.
+"""
+
+import pytest
 from coordinator.agent import root_agent
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.runners import Runner
@@ -8,6 +24,7 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 
+@pytest.mark.billed
 def test_agent_stream() -> None:
     """
     Integration test for the agent stream functionality.

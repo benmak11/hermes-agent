@@ -34,7 +34,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from google.api_core.exceptions import FailedPrecondition, NotFound
 from google.cloud import firestore
 
-from api.deps import verify_user
+from api.deps import dev_mode, verify_user
 from api.routes.applications import dispatch_tailor
 from models.settings import DiscoverySettings
 from obs.llm_cost import run_cost_snapshot
@@ -111,6 +111,44 @@ _OPPORTUNISTIC_TRIGGER = "opportunistic"
 #: :func:`dispatch_cycle` and take no slot at all, so a failing one of those
 #: must not release a *scheduled* run's lease out from under it.
 SLOT_TRIGGERS = frozenset({_CRON_TRIGGER, _OPPORTUNISTIC_TRIGGER})
+
+#: The one way to run the real pipeline from a developer's machine anyway.
+#: Deliberately a second, explicit variable rather than "unset AUTH_DEV_MODE":
+#: unsetting the bypass also takes away the way you were calling the API, so the
+#: cheapest route around the guard would have been to delete it.
+LIVE_RUN_OVERRIDE = "ALLOW_LIVE_RUNS"
+
+LIVE_RUN_REFUSED = (
+    "refusing to start a live discovery run from a local process: "
+    f"AUTH_DEV_MODE is on. Set {LIVE_RUN_OVERRIDE}=1 to override."
+)
+
+
+def live_runs_refused() -> bool:
+    """Would starting a real crawl here be a local process driving production?
+
+    **This has happened.** On 2026-08-23 a local harness posted to
+    ``POST /settings/discovery/run`` through FastAPI's ``TestClient``, which runs
+    ``background_tasks`` *synchronously* — so the call did not schedule a crawl
+    for later, it ran one: ~110s against production on ADC credentials, 8,469
+    junk jobs written to a real user, ~$0.50-1.00 spent. Phase 1's budget cap
+    bounded the damage; nothing prevented the trigger.
+
+    The signal is ``api.deps.dev_mode()`` — ``AUTH_DEV_MODE=1`` — because that is
+    what actually tells the two cases apart. There is one GCP project and it is
+    production, so "am I pointed at production?" is always yes and cannot
+    discriminate; what a deployed revision never has is this variable, which
+    Terraform does not set. So: dev bypass on ⇒ local process ⇒ the pipeline it
+    would drive is the real one, and it needs to be asked for by name.
+
+    Not applied to the queued path *versus* the in-process one, but to both: an
+    enqueue from a laptop with ``QUEUE_MODE=1`` hands the same crawl to the real
+    worker, which is the same spend one process further away.
+    """
+    if os.getenv(LIVE_RUN_OVERRIDE, "").strip().lower() in {"1", "true", "on"}:
+        return False
+    return dev_mode()
+
 
 _db: firestore.Client | None = None
 
@@ -393,7 +431,18 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
     Runs under a ``run_id`` log context, so every line the cycle emits — the
     discovery fetches, the per-job ``matching.scored`` events, the summary —
     can be pulled up with ``jsonPayload.run_id="..."`` in Cloud Logging.
+
+    **The chokepoint for :func:`live_runs_refused`.** The manual route refuses
+    early so the caller gets a 403 instead of silence, but every other way into
+    a live crawl lands here — the opportunistic tick that ``GET
+    /settings/discovery`` schedules, ``cron_tick``'s fan-out, the onboarding
+    kickoff, the worker's ``/tasks/*`` handlers — and under ``TestClient`` a
+    background task is not "later", it is now. Refusing before the first
+    ``_extend_slot`` write means a refused run touches no Firestore either.
     """
+    if live_runs_refused():
+        log.warning("discovery.cycle_refused", user_id=user_id, trigger=trigger)
+        return
     with run_context("auto_discovery", user_id=user_id, trigger=trigger) as run_id:
         started = time.monotonic()
         began = _now()
@@ -523,7 +572,19 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
 
 
 async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
-    """Background: re-check served postings; dismiss ones the ATS took down."""
+    """Background: re-check served postings; dismiss ones the ATS took down.
+
+    Refuses from a local process for the same reason discovery does — see
+    :func:`live_runs_refused`. The sweep buys no LLM calls, so this is not
+    about spend: it writes ``user_decision: dismissed`` onto real jobs and
+    moves real applications to ``posting_removed``, and a laptop pointed at
+    production should not be able to retire a user's queue by accident.
+    Refusing before the ``_extend_slot`` write means a refused sweep also
+    leaves no lease behind.
+    """
+    if live_runs_refused():
+        log.warning("sweep.cycle_refused", user_id=user_id, trigger=trigger)
+        return
     with run_context("liveness_sweep", user_id=user_id, trigger=trigger) as run_id:
         began = _now()
         started_at = began.isoformat()
@@ -725,7 +786,15 @@ async def run_discovery_now(
     hermes-worker) or "in_process" (a background task on this instance, which
     scale-down can kill). It is the cheapest way to confirm from outside that a
     deployment's QUEUE_MODE is what you think it is.
+
+    Refuses outright from a local process — see :func:`live_runs_refused`. The
+    check is the *first* thing here, ahead of the QUEUE_MODE branch, because
+    both arms of it spend the same money: one on this instance, one on the
+    worker.
     """
+    if live_runs_refused():
+        log.warning("discovery.run_now_refused", user_id=user_id)
+        raise HTTPException(status_code=403, detail=LIVE_RUN_REFUSED)
     log.info("discovery.run_now", user_id=user_id)
     if queues.enabled():
         queued = await dispatch_cycle("discovery", user_id, trigger="manual")
@@ -739,7 +808,15 @@ async def run_discovery_now(
 async def run_sweep_now(
     background_tasks: BackgroundTasks, user_id: str = Depends(verify_user)
 ) -> dict:
-    """Explicit user action: run the liveness sweep immediately."""
+    """Explicit user action: run the liveness sweep immediately.
+
+    Refused from a local process, and — as on the discovery route — refused
+    *before* the ``queues.enabled()`` branch: enqueueing from a laptop hands
+    the same production writes to the real worker one process further away.
+    """
+    if live_runs_refused():
+        log.warning("sweep.run_now_refused", user_id=user_id)
+        raise HTTPException(status_code=403, detail=LIVE_RUN_REFUSED)
     log.info("sweep.run_now", user_id=user_id)
     if queues.enabled():
         queued = await dispatch_cycle("sweep", user_id, trigger="manual")

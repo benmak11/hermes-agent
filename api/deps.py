@@ -15,6 +15,30 @@ log = get_logger("api.auth")
 _firebase_ready = False
 
 
+def dev_mode() -> bool:
+    """Is this process a developer's machine rather than a deployed service?
+
+    ``AUTH_DEV_MODE=1`` is the codebase's existing answer to that question, and
+    it is a reliable one in *one* direction: Cloud Run's environment comes from
+    Terraform, which does not set this variable, so **a deployed service never
+    has it on**. A local process, on the other hand, has it on precisely because
+    that is how a developer talks to the API without minting a Firebase token.
+
+    Read by two things besides the auth bypass below, both of which want that
+    exact question answered and neither of which should invent its own signal:
+
+    - ``api.main`` — whether to publish ``/docs`` and ``/openapi.json``.
+    - ``api.routes.discovery`` — whether to refuse to drive the real, billed
+      discovery pipeline (see the guard there; a local harness once ran a
+      198-board crawl against production this way).
+
+    Deliberately not "is this the production project?". There is one project,
+    and it is production, so a local process is *always* pointed at it — the
+    dangerous half of the combination is the only half worth testing for.
+    """
+    return os.getenv("AUTH_DEV_MODE") == "1"
+
+
 def _ensure_firebase() -> None:
     """Lazily initialize the Firebase Admin SDK (uses ADC)."""
     global _firebase_ready
@@ -33,7 +57,7 @@ def _verify_token(token: str | None) -> str:
     Binds the resolved ``user_id`` into the log context so every subsequent line
     for this request (route, background task, tools) carries it.
     """
-    if os.getenv("AUTH_DEV_MODE") == "1" and os.getenv("AUTH_DEV_USER"):
+    if dev_mode() and os.getenv("AUTH_DEV_USER"):
         uid = os.environ["AUTH_DEV_USER"]
         bind_request_context(user_id=uid, auth="dev")
         return uid

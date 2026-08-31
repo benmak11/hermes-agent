@@ -7,6 +7,27 @@ import pytest
 from tools.matching import budget
 
 
+@pytest.fixture(autouse=True)
+def no_dev_bypass(monkeypatch):
+    """Keep the developer's ``.env`` out of the unit suite.
+
+    Several ``cli/`` modules call ``load_dotenv()`` **at import time**, and this
+    suite imports three of them (``unwedge_submitting``, ``geo_resurrect``,
+    ``reap_applications``). So merely collecting these tests loads the real
+    ``.env`` — including ``AUTH_DEV_MODE=1`` — into the pytest process, and
+    every test after that point runs believing it is a developer at a keyboard
+    with the production project configured.
+
+    Nothing depended on that, and one thing now refuses to work under it:
+    ``api.routes.discovery.live_runs_refused``. Rather than teach that guard to
+    recognise pytest — a guard with an "unless you are testing" clause is not a
+    guard — the leak is closed here. Unit tests are hermetic: no dev bypass, no
+    ambient permission to drive a live run.
+    """
+    monkeypatch.delenv("AUTH_DEV_MODE", raising=False)
+    monkeypatch.delenv("ALLOW_LIVE_RUNS", raising=False)
+
+
 @pytest.fixture
 def unlimited_budget(monkeypatch):
     """Grant every scorer whatever it asks for, without touching Firestore.

@@ -46,11 +46,15 @@ reports :data:`tools.submitters.SUBMIT_CLICKED`, immediately before the click:
   reaper must not become the thing that undoes it.
 
 ``failed`` for both, deliberately. ``submitting → ready_for_review`` is *not* an
-edge in ``state.TRANSITIONS`` and must not become one: ``run_tailoring``
-publishes its result with a bare ``→ ready_for_review`` and no ``allowed_from``,
-so opening that edge would let a slow duplicate tailoring run move a *live*
-submission back to reviewable and clear the submitter's lease — inviting exactly
-the duplicate application this fork exists to prevent. ``failed`` is also what
+edge in ``state.TRANSITIONS``, and this fork does not need it to become one.
+(It once could not have been added at all: ``run_tailoring`` published its
+result with a bare ``→ ready_for_review`` and no ``allowed_from``, so opening
+the edge would have let a slow duplicate tailoring run move a *live* submission
+back to reviewable and clear the submitter's lease. That hole is closed — both
+of ``run_tailoring``'s terminal writes now carry ``allowed_from={"tailoring"}``
+— so what is left is the plain reason: ``ready_for_review`` means "ready to
+send", which is the wrong thing to say about a document that may already be
+sitting in an employer's ATS.) ``failed`` is also what
 ``_abandon_unstarted_claim`` already writes for the same "claimed but nothing
 clicked" fact. The two branches are told apart by the note and by
 ``submission_uncertain``, which is a plain boolean rather than a new
@@ -149,8 +153,18 @@ ATTEMPTS_FIELD = "reap_attempts"
 #: to be safe, because the note beside it says the same thing in words.
 UNCERTAIN_FIELD = "submission_uncertain"
 
-#: Written by ``run_submission``'s progress callback at the point of no return.
-#: Read here and nowhere else.
+#: Written by ``run_submission``'s progress callback at the point of no return,
+#: and read here and nowhere else.
+#:
+#: **Scoped to one attempt, not to the document.** ``POST /submit`` clears it
+#: inside the swap that claims ``→ submitting``, so the fork below asks "did
+#: *this* run click?" rather than "has this application ever been clicked?".
+#: The distinction matters most on the documents this module has already
+#: touched: after a ``release_uncertain`` the user retries, and a marker left
+#: standing would have that retry reported uncertain too — however early it
+#: died. Clearing it is safe precisely because that swap runs in the API
+#: request, before the apply task exists and therefore before any browser does.
+#: :data:`UNCERTAIN_FIELD` is what carries forward instead.
 CLICKED_FIELD = "submit_attempted_at"
 
 #: Notes are rendered verbatim by ``web/``, so these are user-facing copy. There

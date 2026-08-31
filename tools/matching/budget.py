@@ -244,18 +244,43 @@ def summary(reservation: Reservation | None, *, drawn: int | None = None) -> dic
     Empty for an unbudgeted run (``ignore_budget``), so the UI shows nothing
     rather than a fabricated zero.
 
-    ``drawn`` is how many slots the run actually filled. A run that filled
-    every slot it was granted reports as capped whether or not the reservation
-    itself was trimmed — that is the case this whole phase exists for, where a
-    13K backlog meets a one-cycle grant and the ask (a full cycle) was granted
-    in full.
+    ``drawn`` is how many slots the run actually filled, and it does two jobs.
+
+    First, capping: a run that filled every slot it was granted reports as
+    capped whether or not the reservation itself was trimmed — that is the case
+    this whole phase exists for, where a 13K backlog meets a one-cycle grant and
+    the ask (a full cycle) was granted in full.
+
+    Second, **the remaining counts, which without it are simply wrong.** A
+    ``Reservation`` is built at reserve time, when ``granted`` slots have just
+    been debited; the run then draws on ``drawn`` of them and its caller's
+    ``finally`` hands ``granted - drawn`` back. Reporting the reservation's own
+    figures skips that refund entirely: a user with 12 pending jobs reserves
+    200, scores 12, refunds 188 — and the Profile card, which renders
+    ``budget_remaining_day`` verbatim as "N of today's scoring budget left",
+    tells them 188 fewer than they have. It never *over*-states, and each cycle
+    re-reads the real counters from Firestore, so this was a reporting bug and
+    not an enforcement one; it is fixed here because here is where the two
+    numbers meet.
+
+    The refund is derived rather than passed because every call site already
+    computes it the same way — ``budget.release(..., reservation.granted -
+    attempted)`` with ``drawn == attempted``. The one place those two could
+    disagree is a caller that reports ``drawn`` for a run it never charged for,
+    which is why ``batch_runs``'s ``min_pending`` short-circuit passes 0.
+
+    Residual imprecision, all of it in the understating direction and all of it
+    display-only: ``release`` swallows its own failures, and ``apply_release``
+    declines a refund whose window has rolled, so a losing refund leaves this
+    number optimistic by at most one grant until the next cycle recomputes it.
     """
     if reservation is None:
         return {}
+    refunded = 0 if drawn is None else max(reservation.granted - drawn, 0)
     return {
         "budget_granted": reservation.granted,
-        "budget_remaining_cycle": reservation.remaining_cycle,
-        "budget_remaining_day": reservation.remaining_day,
+        "budget_remaining_cycle": reservation.remaining_cycle + refunded,
+        "budget_remaining_day": reservation.remaining_day + refunded,
         "budget_capped": reservation.capped
         or (drawn is not None and drawn >= reservation.granted),
     }

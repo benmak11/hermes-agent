@@ -136,6 +136,18 @@ build-backend = "hatchling.build"
 # imports (e.g. `from _shared import ...`) the same way the ADK loader does.
 pythonpath = [".", "agents"]
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "billed: drives a real model on the live GCP project and costs real money. Deselected by default (see addopts); opt in with `-m billed`.",
+]
+# **Spending money must be something you asked for.** Two tests in
+# tests/integration are not mocked: they build a real Runner around the real
+# root_agent and stream through the live ADK routes, ~$0.01-0.02 a run on the
+# production project. The sharp edge is diagnostic rather than financial — a
+# throttled run comes back as `429 RESOURCE_EXHAUSTED`, which reads like a
+# broken test and is actually production quota — so `pytest tests/integration`
+# has to be safe to type. It is: this deselects them, and `-m billed` (which
+# overrides this) is the only way to run them.
+addopts = "-m 'not billed'"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agents","api","models","tools","cli","obs"]
