@@ -27,6 +27,12 @@ failed simply stay pending for a future run, and jobs persisted by an earlier
 partial ingest drop out of the reload — which is what makes re-ingesting
 after a crash safe.
 
+Spend is the one thing statelessness does *not* make safe: re-reading the
+output re-prices the same calls, and the run ledger banks with
+``firestore.Increment``. So each leg's flush is gated on a ``cost_banked_at``
+marker on the run doc, and each leg reaches the ledger exactly once — see the
+flush in :func:`resume` for which way that guard fails.
+
 Runs advance under a claim (update-time precondition + TTL), so a manual
 ``--batch-resume`` racing the worker's tick can't double-submit a paid Pro
 stage. One window stays open: a crash between ``submit_batch`` returning and
@@ -48,6 +54,7 @@ from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from models.job import Job
+from obs.llm_cost import reset_run_cost
 from obs.logging import current_run_id, get_logger
 from tools.matching import budget, jd_cache
 from tools.matching.batch import (
@@ -118,6 +125,27 @@ def _parse_iso(value) -> datetime | None:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+
+
+def _leg_delta(before: dict, after: dict) -> dict[str, int]:
+    """What one ingest leg added to the run's cumulative ``counts``.
+
+    ``run["counts"]`` is a running total across both legs (the parse leg's
+    pre-filter tombstones are still sitting in it when the score leg starts),
+    but ``persist_run_cost`` puts everything under ``jobs`` through
+    ``firestore.Increment`` — so handing it the total would re-add the parse
+    leg's outcomes on the score leg's flush, and the ledger would read roughly
+    double. What an Increment wants is a *delta*, and a delta is only ever
+    correct if it is applied exactly once, which is what the per-leg
+    ``cost_banked_at`` marker in :func:`resume` buys.
+
+    Keys are whatever the legs actually produced (``scored``, ``discarded``,
+    ``failed``, ``parse_failed``, and ``geo_skipped`` when the gate fired), so
+    a new outcome name flows through without a change here. Deliberately no
+    ``pending``: that is a level, not a delta, and the cycle that ordered the
+    run already banked it.
+    """
+    return {key: after.get(key, 0) - before.get(key, 0) for key in after}
 
 
 async def _persist_all(pairs, persist) -> list:
@@ -397,8 +425,12 @@ async def _submit_score_stage(
     return "score"
 
 
-async def _ingest_parse(db, run_ref, run: dict) -> None:
-    """Parse batch finished: feed jd_cache + job docs, then submit scoring."""
+async def _ingest_parse(db, run_ref, run: dict) -> dict[str, int]:
+    """Parse batch finished: feed jd_cache + job docs, then submit scoring.
+
+    Returns this leg's own outcome deltas for the cost ledger — see
+    :func:`_leg_delta`.
+    """
     run_tag = run_ref.id
     out_lines = await fetch_batch_output(f"{run['gcs_root']}/parse")
     profile, pending = await load_profile_and_pending(db, run["user_id"])
@@ -413,6 +445,7 @@ async def _ingest_parse(db, run_ref, run: dict) -> None:
     failed = join_parse_responses(out_lines, by_text)
 
     counts = run.get("counts") or {}
+    before = dict(counts)
     counts["parse_failed"] = counts.get("parse_failed", 0) + len(failed)
 
     parsed_jobs = [j for jobs in by_text.values() for j in jobs if j.jd_parsed]
@@ -443,9 +476,13 @@ async def _ingest_parse(db, run_ref, run: dict) -> None:
         reloaded=len(pending),
         owned=len(owned),
     )
+    # Mutates ``counts`` in place with the pre-filter's tombstone outcomes, so
+    # the delta below covers the whole leg — the failed parse lines *and* the
+    # jobs this leg retired for free before Pro ever saw them.
     await _submit_score_stage(
         db, run_ref, run_tag, run["gcs_root"], profile, owned, counts
     )
+    return _leg_delta(before, counts)
 
 
 def _owned_pending(run: dict, pending: list[tuple], *, fallback: list[Job]) -> list:
@@ -475,8 +512,14 @@ def _owned_pending(run: dict, pending: list[tuple], *, fallback: list[Job]) -> l
     return [(ref, job) for ref, job in pending if job.id in owned]
 
 
-async def _ingest_score(db, run_ref, run: dict) -> None:
-    """Score batch finished: persist matches/tombstones, complete the run."""
+async def _ingest_score(db, run_ref, run: dict) -> dict[str, int]:
+    """Score batch finished: persist matches/tombstones, complete the run.
+
+    Returns this leg's own outcome deltas for the cost ledger — see
+    :func:`_leg_delta`. This is the leg that makes ``jobs.scored`` non-zero,
+    and therefore the one that makes cost-per-scored-job derivable for a batch
+    run at all.
+    """
     run_tag = run_ref.id
     context = await download_text(f"{run['gcs_root']}/score/context.txt")
     out_lines = await fetch_batch_output(f"{run['gcs_root']}/score")
@@ -506,6 +549,7 @@ async def _ingest_score(db, run_ref, run: dict) -> None:
     matches, failed = join_score_responses(out_lines, context, by_block)
 
     counts = run.get("counts") or {}
+    before = dict(counts)
     counts["failed"] = counts.get("failed", 0) + len(failed)
     to_persist = [
         (ref_by_id[job.id], job, matches[job.id])
@@ -532,6 +576,7 @@ async def _ingest_score(db, run_ref, run: dict) -> None:
         }
     )
     log.info("batch_runs.completed", run=run_tag, **counts)
+    return _leg_delta(before, counts)
 
 
 async def resume(
@@ -602,6 +647,9 @@ async def resume(
         # doc) ingest unattributed, exactly as they do today.
         origin = run.get("origin_run_id")
         rebind = {"run_id": origin, "runner": "batch_resume"} if origin else {}
+        leg = "parse" if run.get("stage") == "parse" else "score"
+        banked = bool((run.get("cost_banked_at") or {}).get(leg))
+        leg_counts: dict[str, int] | None = None
         try:
             if job.state not in _USABLE_STATES:
                 await run_ref.update(
@@ -621,11 +669,11 @@ async def resume(
             else:
                 with structlog.contextvars.bound_contextvars(**rebind):
                     try:
-                        if run.get("stage") == "parse":
-                            await _ingest_parse(db, run_ref, run)
+                        if leg == "parse":
+                            leg_counts = await _ingest_parse(db, run_ref, run)
                             summary["advanced"] += 1
                         else:
-                            await _ingest_score(db, run_ref, run)
+                            leg_counts = await _ingest_score(db, run_ref, run)
                             summary["completed"] += 1
                     finally:
                         # In a finally so an ingest that dies after pricing
@@ -634,18 +682,50 @@ async def resume(
                         # — the bounded-map invariant has to hold on the
                         # failure path too.
                         #
-                        # This is NOT idempotent: Increment isn't, and the
-                        # post-TTL retry re-reads the same GCS output and
-                        # re-prices the same calls, so a run that dies
-                        # mid-ingest is banked twice. That's the deliberate
-                        # trade — over-counting is the conservative direction
-                        # for the budget cap this feeds, and losing spend is
-                        # not. Banking it once (a per-leg cost_banked_at
-                        # marker on the run doc, checked before flushing) is
-                        # Phase 1B work.
-                        if origin:
+                        # ``Increment`` is not idempotent and the post-TTL
+                        # retry re-reads the same GCS output and re-prices the
+                        # same calls, so the flush is gated on a per-leg
+                        # ``cost_banked_at`` marker: each of a run's two legs
+                        # reaches the ledger exactly once, whichever attempt
+                        # gets there first.
+                        #
+                        # Bank first, mark second — never the reverse. The
+                        # window between them fails the way this ledger has
+                        # always deliberately failed: a crash (or a failed
+                        # marker write) after the flush leaves the leg
+                        # unmarked, so the retry banks it a second time. Over-
+                        # counting is the conservative direction for the
+                        # budget cap this feeds; marking first would invert
+                        # that into losing real spend.
+                        #
+                        # ``leg_counts`` is None when the ingest raised, so
+                        # that flush banks the spend without the outcome
+                        # counts, and the retry — correctly seeing the leg as
+                        # already banked — does not supply them later. The
+                        # run doc's own cumulative ``counts`` still records
+                        # them; only the ledger's ``jobs`` breakdown is short,
+                        # which is the price of banking the money once.
+                        if origin and not banked:
                             await persist_run_cost(
-                                db, run["user_id"], origin, batch_run=snap.id
+                                db,
+                                run["user_id"],
+                                origin,
+                                batch_run=snap.id,
+                                jobs=leg_counts,
+                            )
+                            await run_ref.update(
+                                {f"cost_banked_at.{leg}": _now().isoformat()}
+                            )
+                        elif origin:
+                            # Already banked by an earlier attempt: drop the
+                            # re-priced totals rather than re-adding them.
+                            # persist_run_cost would normally do this release.
+                            reset_run_cost(origin)
+                            log.info(
+                                "batch_runs.cost_already_banked",
+                                run=snap.id,
+                                leg=leg,
+                                run_id=origin,
                             )
         except Exception:
             # Leave the run claimed; after the TTL the next pass retries the
