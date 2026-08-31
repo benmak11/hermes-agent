@@ -3,8 +3,19 @@
 """Shared fixtures for the unit suite."""
 
 import pytest
+from google.cloud import firestore
 
+import api.routes.applications as routes_applications
+import api.routes.discovery as routes_discovery
+import api.routes.jobs as routes_jobs
+import api.routes.profile as routes_profile
 from tools.matching import budget
+
+
+class _RealFirestoreInTests(BaseException):
+    """Not an ``Exception``, so broad ``except Exception`` handlers in the code
+    under test cannot swallow the one signal that says a test escaped to the
+    live project."""
 
 
 @pytest.fixture(autouse=True)
@@ -57,3 +68,45 @@ def unlimited_budget(monkeypatch):
     monkeypatch.setattr(budget, "reserve", fake_reserve)
     monkeypatch.setattr(budget, "release", fake_release)
     return granted
+
+
+@pytest.fixture(autouse=True)
+def no_production_firestore(monkeypatch, request):
+    """The unit suite must never build a real Firestore client.
+
+    Found 2026-08-30, by looking: ``users/u1/runs`` held **39 real production
+    documents**, one per suite run, written by a test whose fakes stopped one
+    seam short of the cost flush. The suite is supposed to be free and offline;
+    nothing was checking that it actually was, and a leak this quiet only shows
+    up if you go and look at the database.
+
+    Tests that legitimately want a client fake one; this refuses the real
+    constructor, so the next leak fails loudly instead of writing.
+    """
+    if request.node.get_closest_marker("allow_firestore"):
+        return
+
+    def _refuse(*args, **kwargs):
+        # BaseException, not Exception, and that is the whole trick: the code
+        # this guards is telemetry, and telemetry deliberately swallows every
+        # Exception so it can never fail a pipeline (see
+        # tools.run_costs.persist_run_cost). An AssertionError here is caught
+        # by that handler — the write is still prevented, but the suite goes
+        # green and the leak stays invisible, which is exactly how 39
+        # documents accumulated. This propagates through the broad handler.
+        raise _RealFirestoreInTests(
+            "tests/unit built a real firestore.Client — patch the seam under "
+            "test instead (see conftest.no_production_firestore)"
+        )
+
+    monkeypatch.setattr(firestore, "Client", _refuse)
+    monkeypatch.setattr(firestore, "AsyncClient", _refuse)
+
+    # Patching the constructor is not enough on its own: every route module
+    # memoises its client in a module-level ``_db``, so a client built once
+    # (by an earlier test, or an import) is handed out forever and the
+    # constructor above is never reached again. Clearing the cache per test is
+    # what makes the refusal actually bite — this guard was written without it
+    # and silently caught nothing.
+    for mod in (routes_discovery, routes_applications, routes_jobs, routes_profile):
+        monkeypatch.setattr(mod, "_db", None, raising=False)

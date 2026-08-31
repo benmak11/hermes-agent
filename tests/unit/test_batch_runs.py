@@ -99,7 +99,16 @@ class _FakeRunRef:
     async def update(self, fields, option=None):
         if option is not None and self._lose_claim_race:
             raise FailedPrecondition("lost the claim race")
-        self._store.setdefault(self.id, {}).update(fields)
+        doc = self._store.setdefault(self.id, {})
+        for path, value in fields.items():
+            # Firestore reads a dotted key as a path into a nested map and
+            # merges at the leaf, leaving sibling keys alone — which is the
+            # whole point of writing the per-leg cost marker that way.
+            head, _, tail = path.partition(".")
+            if tail:
+                doc.setdefault(head, {})[tail] = value
+            else:
+                doc[path] = value
 
     async def get(self):
         return _FakeSnap(self)
@@ -691,7 +700,21 @@ def test_resume_prices_the_batch_under_the_run_that_ordered_it(harness, monkeypa
 
     assert summary["completed"] == 1
     assert bound_during_ingest == ["cycle-1"]
-    assert harness.cost_flushes == [("u1", "cycle-1", {"batch_run": "r1"})]
+    assert harness.cost_flushes == [
+        (
+            "u1",
+            "cycle-1",
+            {
+                "batch_run": "r1",
+                "jobs": {
+                    "scored": 1,
+                    "discarded": 0,
+                    "failed": 0,
+                    "parse_failed": 0,
+                },
+            },
+        )
+    ]
 
 
 def test_resume_ingests_runs_predating_origin_run_id(harness, monkeypatch):
@@ -748,7 +771,11 @@ def test_resume_banks_cost_when_the_ingest_dies_after_pricing(harness, monkeypat
 
     assert summary["completed"] == 0  # the ingest did not finish
     assert store["r1"]["state"] == "running"  # left claimed for the retry
-    assert harness.cost_flushes == [("u1", "cycle-1", {"batch_run": "r1"})]
+    # No ``jobs``: the leg never returned its counts, so the money is banked
+    # and the outcome breakdown is simply absent rather than guessed at.
+    assert harness.cost_flushes == [
+        ("u1", "cycle-1", {"batch_run": "r1", "jobs": None})
+    ]
     # The point of the test: real spend was banked, not an empty flush.
     banked = harness.banked[0]
     assert banked["calls"] == 1
@@ -767,6 +794,247 @@ def test_resume_does_not_bank_cost_for_a_failed_vertex_job(harness, monkeypatch)
 
     assert summary["failed"] == 1
     assert harness.cost_flushes == []
+
+
+# ------------------------------------------- per-leg job counts on the ledger
+
+
+def _patch_score_ingest(monkeypatch, lines):
+    async def fake_download(path):
+        return "CTX"
+
+    async def fake_fetch(gcs_dir):
+        return lines
+
+    monkeypatch.setattr(batch_runs, "download_text", fake_download)
+    monkeypatch.setattr(batch_runs, "fetch_batch_output", fake_fetch)
+
+
+def _flushed_jobs(harness):
+    """The ``jobs=`` map the single cost flush of a resume pass carried."""
+    assert len(harness.cost_flushes) == 1, harness.cost_flushes
+    return harness.cost_flushes[0][2]["jobs"]
+
+
+def test_score_leg_banks_the_jobs_it_scored(harness, monkeypatch):
+    """The whole point of item 1: without ``jobs=``, ``jobs.scored`` stays 0
+    on the ledger doc for every batch run, so cost-per-scored-job is
+    underivable for exactly the runs big enough to route through a batch."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="score", origin_run_id="cycle-1")
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(
+        monkeypatch,
+        [
+            (object(), _job("j1", parsed=_parsed())),
+            (object(), _job("j2", parsed=_parsed())),
+            (object(), _job("j3", parsed=_parsed())),
+        ],
+    )
+    _patch_score_ingest(
+        monkeypatch,
+        [
+            _line("CTX\n\nBLOCK-j1", _match_json("j1", 85)),
+            _line("CTX\n\nBLOCK-j2", _match_json("j2", 10)),  # tombstoned
+            _line("CTX\n\nBLOCK-j3", "not json"),  # failed line
+        ],
+    )
+
+    _resume(db)
+
+    assert _flushed_jobs(harness) == {
+        "scored": 1,
+        "discarded": 1,
+        "failed": 1,
+        "parse_failed": 0,
+    }
+
+
+def test_score_leg_banks_a_delta_not_the_running_total(harness, monkeypatch):
+    """``run["counts"]`` is cumulative across both legs, and every leaf under
+    ``jobs`` is applied with ``firestore.Increment``. Sending the total would
+    re-add the parse leg's outcomes on the score leg's flush and roughly
+    double the ledger's job counts — so what goes over is this leg's delta."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(
+        stage="score",
+        origin_run_id="cycle-1",
+        # What the parse leg left behind, and already banked itself.
+        counts={"scored": 0, "discarded": 7, "failed": 0, "parse_failed": 3},
+    )
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+    _patch_score_ingest(monkeypatch, [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))])
+
+    _resume(db)
+
+    assert _flushed_jobs(harness) == {
+        "scored": 1,
+        "discarded": 0,
+        "failed": 0,
+        "parse_failed": 0,
+    }
+    # The run doc keeps the cumulative view; only the ledger gets the delta.
+    assert store["r1"]["counts"] == {
+        "scored": 1,
+        "discarded": 7,
+        "failed": 0,
+        "parse_failed": 3,
+    }
+
+
+def test_parse_leg_banks_its_own_failures_and_free_tombstones(harness, monkeypatch):
+    """The parse leg retires out-of-family jobs for free before Pro sees
+    them; those are real outcomes of this leg and belong on its flush."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="parse", origin_run_id="cycle-1")
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(
+        monkeypatch,
+        [
+            (object(), _job("j1", jd_raw="ENG JD")),
+            (object(), _job("j2", jd_raw="SALES JD")),
+            (object(), _job("j3", jd_raw="BROKEN JD")),
+        ],
+    )
+
+    async def fake_fetch(gcs_dir):
+        return [
+            _line("ENG JD", _parsed("engineering").model_dump_json()),
+            _line("SALES JD", _parsed("sales").model_dump_json()),
+            _line("BROKEN JD", "not json"),
+        ]
+
+    monkeypatch.setattr(batch_runs, "fetch_batch_output", fake_fetch)
+
+    _resume(db)
+
+    assert _flushed_jobs(harness) == {
+        "scored": 0,
+        "discarded": 1,  # the out-of-family tombstone
+        "failed": 0,
+        "parse_failed": 1,  # the unparseable line
+    }
+
+
+def test_no_pending_is_banked_from_an_ingest_leg(harness, monkeypatch):
+    """``pending`` is a level, not a delta — and the cycle that ordered the
+    run already banked it. Incrementing it again per leg would inflate the
+    denominator of every cost-per-job number derived from this doc."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="score", origin_run_id="cycle-1")
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+    _patch_score_ingest(monkeypatch, [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))])
+
+    _resume(db)
+
+    assert "pending" not in _flushed_jobs(harness)
+
+
+# ------------------------------------------- banking each leg exactly once
+
+
+def test_a_successful_leg_marks_itself_banked(harness, monkeypatch):
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(stage="score", origin_run_id="cycle-1")
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+    _patch_score_ingest(monkeypatch, [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))])
+
+    _resume(db)
+
+    assert store["r1"]["cost_banked_at"]["score"]
+
+
+def test_a_leg_already_banked_is_not_banked_again(harness, monkeypatch):
+    """The at-least-once flush: a run that died mid-ingest is retried after
+    the claim TTL, re-reads the same GCS output and re-prices the same calls.
+    ``Increment`` is not idempotent, so without the marker that spend lands on
+    the ledger twice."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(
+        stage="score",
+        origin_run_id="cycle-1",
+        cost_banked_at={"score": "2026-08-30T00:00:00+00:00"},
+    )
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+    _patch_score_ingest(monkeypatch, [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))])
+
+    summary = _resume(db)
+
+    assert harness.cost_flushes == []
+    # Not banking is not the same as not ingesting: the retry still has to
+    # finish the run and persist what the first attempt did not.
+    assert summary["completed"] == 1
+    assert harness.results == [("j1", 85.0)]
+    assert store["r1"]["state"] == "done"
+    # persist_run_cost is what normally releases the accumulator entry; the
+    # skip path has to do it by hand or the bounded map leaks one entry per
+    # retried run, carrying re-priced spend into whatever flushes next.
+    assert run_cost_snapshot("cycle-1")["calls"] == 0
+
+
+def test_the_marker_is_per_leg_not_per_run(harness, monkeypatch):
+    """One marker for the whole run would let the parse leg's flush suppress
+    the score leg's — which is the leg that carries almost all the spend."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(
+        stage="score",
+        origin_run_id="cycle-1",
+        cost_banked_at={"parse": "2026-08-30T00:00:00+00:00"},
+    )
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+    _patch_score_ingest(monkeypatch, [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))])
+
+    _resume(db)
+
+    assert _flushed_jobs(harness)["scored"] == 1
+    # ...and the parse leg's marker survived the score leg's write.
+    assert set(store["r1"]["cost_banked_at"]) == {"parse", "score"}
+
+
+def test_the_marker_is_written_after_the_money_is_banked(harness, monkeypatch):
+    """The failure direction, pinned. This ledger feeds a budget cap, so it
+    has always preferred over-counting to losing spend. Marking the leg before
+    flushing would invert that: a crash in between would leave the leg looking
+    banked when nothing was ever written. Bank first, mark second — a failed
+    marker write costs a double-count on retry, never a lost dollar."""
+    store = {}
+
+    class _MarkerRefusingRef(_FakeRunRef):
+        async def update(self, fields, option=None):
+            if any(k.startswith("cost_banked_at") for k in fields):
+                raise RuntimeError("Firestore died writing the marker")
+            return await super().update(fields, option=option)
+
+    ref = _MarkerRefusingRef("r1", store)
+    store["r1"] = _running_doc(stage="score", origin_run_id="cycle-1")
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+    _patch_score_ingest(monkeypatch, [_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))])
+
+    _resume(db)  # the marker failure is caught by resume's per-run guard
+
+    assert _flushed_jobs(harness)["scored"] == 1  # the money reached the ledger
+    assert "cost_banked_at" not in store["r1"]  # the marker did not
 
 
 # ------------------------------------------------- score_or_start_run()

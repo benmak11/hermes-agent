@@ -186,22 +186,45 @@ def test_the_cycle_itself_refuses_before_it_touches_anything(monkeypatch):
     assert asyncio.run(discovery.run_discovery_cycle("u1", trigger="manual")) is None
 
 
+def _no_firestore(*args, **kwargs):
+    raise AssertionError(
+        "the unit suite must not build a real Firestore client — patch the "
+        "seam this test reaches through"
+    )
+
+
 def test_the_cycle_runs_when_nothing_is_bypassing_auth(monkeypatch):
-    """Positive control for the test above — the same fakes, minus the flag."""
+    """Positive control for the test above — the same fakes, minus the flag.
+
+    ``persist_run_cost`` has to be one of those fakes. ``run_discovery`` raising
+    is caught by the cycle's ``except``, and the ``finally`` then flushes the
+    ledger — with the *real* Firestore client, against the real project, under
+    a user id (``u1``) that only exists in this file. Unpatched, this test wrote
+    one production document on every run of the unit suite; 39 of them had
+    accumulated under ``users/u1/runs`` before anyone looked. A "free, offline"
+    suite has to be checked, not assumed.
+    """
     reached: list[str] = []
+    flushed: list[str] = []
 
     async def fake_run_discovery(user_id):
         reached.append(user_id)
         raise RuntimeError("far enough")
 
+    async def fake_persist_run_cost(db, user_id, run_id, **kw):
+        flushed.append(user_id)
+
     monkeypatch.setattr(discovery, "_extend_slot", lambda *a, **kw: True)
     monkeypatch.setattr(discovery, "run_discovery", fake_run_discovery)
     monkeypatch.setattr(discovery, "_release_slot", lambda *a, **kw: True)
     monkeypatch.setattr(discovery, "run_cost_snapshot", lambda run_id: {"cost_usd": 0})
+    monkeypatch.setattr(discovery, "persist_run_cost", fake_persist_run_cost)
+    monkeypatch.setattr(discovery, "_client", _no_firestore)
 
     asyncio.run(discovery.run_discovery_cycle("u1", trigger="manual"))
 
     assert reached == ["u1"]
+    assert flushed == ["u1"]
 
 
 # --------------------------------------------------------------------------

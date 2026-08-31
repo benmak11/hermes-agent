@@ -13,7 +13,7 @@ cycle, and a Firestore failure never propagates into the pipeline.
 
 import asyncio
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +26,7 @@ from models.job import Job
 from models.match import JobMatch, ScoreBreakdown
 from obs import llm_cost
 from obs.llm_cost import record_llm_call, reset_run_cost, run_cost_snapshot
+from tools import run_costs
 from tools.matching import score
 from tools.run_costs import persist_run_cost
 
@@ -229,6 +230,59 @@ def test_empty_by_step_is_omitted_rather_than_written():
     _flush(db, runner="auto_discovery")
     assert "by_step" not in db.written["doc"]
     assert "jobs" not in db.written["doc"]
+
+
+def test_persist_stamps_an_expiry_for_the_ttl_policy():
+    """One ledger doc per cycle, forever, unless something bounds it. Firestore
+    TTL is a per-collection-group policy in GCP (see the module docstring for
+    the gcloud step) that collects on a field this write has to provide."""
+    db = _FakeDB()
+    _flush(db, runner="auto_discovery")
+
+    expires_at = db.written["doc"]["expires_at"]
+    # A real Timestamp, not an ISO string like ended_at: Firestore's TTL
+    # ignores any other type, and ignoring means never deleting — the failure
+    # would be silent and permanent.
+    assert isinstance(expires_at, datetime)
+    due = datetime.now(UTC) + timedelta(days=run_costs.RETENTION_DAYS)
+    assert abs((expires_at - due).total_seconds()) < 60
+
+
+def test_expiry_is_a_literal_and_not_swept_into_the_increments():
+    """Everything under llm/jobs is wrapped in Increment. An Increment is not
+    a timestamp, so an expiry that landed in either map would disable
+    collection for the doc rather than fail loudly."""
+    db = _FakeDB()
+    _flush(db, runner="auto_discovery", jobs={"scored": 1})
+
+    doc = db.written["doc"]
+    assert not isinstance(doc["expires_at"], Increment)
+    assert "expires_at" not in doc["llm"] and "expires_at" not in doc["jobs"]
+
+
+def test_a_late_wave_extends_the_expiry_rather_than_letting_it_stand():
+    """A batch ingest adds to the originating cycle's doc hours or days later.
+    Retention is measured from the last write, so the doc cannot expire out
+    from under a run that is still being written to."""
+    db = _FakeDB()
+    _flush(db, runner="auto_discovery")
+    first = db.written["doc"]["expires_at"]
+    _flush(db, batch_run="20260710-120000-abc123")
+    assert db.written["doc"]["expires_at"] >= first
+
+
+def test_the_ttl_ops_step_is_documented_next_to_the_field():
+    """Writing ``expires_at`` deletes nothing on its own — the TTL policy is a
+    per-collection-group setting in GCP that no code in this repo applies. The
+    command that activates it lives in the module docstring or nowhere, so it
+    is pinned here: the field name, the collection group, and a docstring raw
+    enough that the shell continuations survive as line breaks rather than
+    being swallowed into one unreadable run-on."""
+    doc = run_costs.__doc__ or ""
+    assert "gcloud firestore fields ttls update expires_at" in doc
+    assert "--collection-group=runs" in doc
+    assert "--enable-ttl" in doc
+    assert " \\\n" in doc  # r"""-quoted, so the pasteable command stays pasteable
 
 
 def test_persist_swallows_firestore_failures():

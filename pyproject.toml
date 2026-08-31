@@ -138,6 +138,7 @@ pythonpath = [".", "agents"]
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "billed: drives a real model on the live GCP project and costs real money. Deselected by default (see addopts); opt in with `-m billed`.",
+    "allow_firestore: opts out of conftest.no_production_firestore, which otherwise refuses a real firestore.Client in the unit suite.",
 ]
 # **Spending money must be something you asked for.** Two tests in
 # tests/integration are not mocked: they build a real Runner around the real
