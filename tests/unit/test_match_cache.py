@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from google.genai import types
 
+import tools.genai_client as genai_client
 import tools.matching.pipeline as pipeline
 import tools.matching.score as score
 from models.job import Job, ParsedJD
@@ -102,7 +103,7 @@ class _FakeModels:
 
 def _install_fake_client(monkeypatch, models: _FakeModels) -> None:
     fake = SimpleNamespace(aio=SimpleNamespace(models=models))
-    monkeypatch.setattr(pipeline.genai, "Client", lambda **kw: fake)
+    monkeypatch.setattr(genai_client.genai, "Client", lambda **kw: fake)
 
 
 def test_prompt_split_separates_static_from_per_job():
@@ -173,7 +174,7 @@ def test_create_match_cache_returns_none_on_failure(monkeypatch):
             raise Exception("Cached content is too small")
 
     fake = SimpleNamespace(aio=SimpleNamespace(caches=_FailingCaches()))
-    monkeypatch.setattr(pipeline.genai, "Client", lambda **kw: fake)
+    monkeypatch.setattr(genai_client.genai, "Client", lambda **kw: fake)
     assert asyncio.run(pipeline.create_match_cache(_profile())) is None
 
 
@@ -219,7 +220,7 @@ def test_creating_a_cache_buries_the_previous_run_s(monkeypatch):
         ]
     )
     monkeypatch.setattr(
-        pipeline.genai,
+        genai_client.genai,
         "Client",
         lambda **kw: SimpleNamespace(aio=SimpleNamespace(caches=caches)),
     )
@@ -237,7 +238,7 @@ def test_a_failing_reap_never_blocks_the_run(monkeypatch):
 
     caches = _UnlistableCaches([])
     monkeypatch.setattr(
-        pipeline.genai,
+        genai_client.genai,
         "Client",
         lambda **kw: SimpleNamespace(aio=SimpleNamespace(caches=caches)),
     )

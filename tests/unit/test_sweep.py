@@ -262,3 +262,44 @@ def test_sweep_allowlist_stays_inside_the_transition_table() -> None:
     for status in sweep.ACTIVE_APP_STATUSES:
         assert state.can_transition(status, "posting_removed"), status
     assert "submitting" not in sweep.ACTIVE_APP_STATUSES
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_lends_its_board_fetches_one_pooled_client(monkeypatch):
+    """The sweep fans out over boards exactly as discovery does, so it opens the
+    same pooled-client scope — and has to open it *around* the gather.
+
+    ``board_client`` keeps the client in a ContextVar, and asyncio tasks inherit
+    the context active when they are *created*. A scope opened inside
+    ``_sweep_board`` would therefore lend the pool to nobody: each task would
+    see an empty ContextVar and build its own client, which is the behaviour
+    this replaced. Asserting every fetch saw the *same* non-None client is what
+    distinguishes the two.
+    """
+    from tools.ats import _http
+
+    # Distinct companies, because the sweep batches by (source, company) —
+    # three jobs at one company would be one board fetch, not three.
+    def _at(i: int) -> dict:
+        return {**_job_doc(job_id=f"j{i}"), "company": f"co{i}"}
+
+    jobs = _Collection({f"j{i}": _Doc(f"j{i}", _at(i)) for i in range(3)})
+    apps = _Collection({})
+    db = _DB(_UserRef({"jobs": jobs, "applications": apps}))
+    monkeypatch.setattr(sweep.firestore, "Client", lambda: db)
+
+    seen: list[object] = []
+
+    async def fake_fetch(platform, slug, url):
+        seen.append(_http._client.get())
+        return {"jobs": [{"id": "still-live"}]}
+
+    monkeypatch.setattr(sweep, "fetch_board_json", fake_fetch)
+
+    await sweep.sweep_postings("u1")
+
+    assert len(seen) == 3, "each board should have been fetched"
+    assert all(c is not None for c in seen), "a fetch ran outside the pooled scope"
+    assert len(set(map(id, seen))) == 1, "fetches did not share one client"
+    # And the scope is released when the sweep returns.
+    assert _http._client.get() is None

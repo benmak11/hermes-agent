@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from google.genai import types
 
+import tools.genai_client as genai_client
 import tools.matching.batch as batch
 from models.job import Job, ParsedJD
 from models.match import JobMatch, ScoreBreakdown
@@ -210,7 +211,7 @@ def test_run_batch_polls_to_success_and_reads_output(monkeypatch):
             return SimpleNamespace(name=name, state=next(states), error=None)
 
     fake = SimpleNamespace(aio=SimpleNamespace(batches=_FakeBatches()))
-    monkeypatch.setattr(batch.genai, "Client", lambda **kw: fake)
+    monkeypatch.setattr(genai_client.genai, "Client", lambda **kw: fake)
 
     async def _no_sleep(_):
         return None
@@ -266,7 +267,7 @@ def test_run_batch_raises_on_failed_job(monkeypatch):
             )
 
     fake = SimpleNamespace(aio=SimpleNamespace(batches=_FakeBatches()))
-    monkeypatch.setattr(batch.genai, "Client", lambda **kw: fake)
+    monkeypatch.setattr(genai_client.genai, "Client", lambda **kw: fake)
 
     async def _no_sleep(_):
         return None

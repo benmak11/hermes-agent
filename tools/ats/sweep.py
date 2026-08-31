@@ -26,7 +26,7 @@ from google.cloud import firestore
 from models.job import Job
 from obs.logging import get_logger
 from tools.applications import state
-from tools.ats._http import fetch_board_json
+from tools.ats._http import board_client, fetch_board_json
 from tools.ats.ashby import BASE as ASHBY_BASE
 from tools.ats.greenhouse import BASE as GREENHOUSE_BASE
 from tools.ats.lever import BASE as LEVER_BASE
@@ -112,10 +112,17 @@ async def sweep_postings(user_id: str) -> dict:
         if result == "removed":
             dead.append(job)
 
-    await asyncio.gather(
-        *(_sweep_board(p, s, js) for (p, s), js in boards.items()),
-        *(_sweep_single(j) for j in singles),
-    )
+    # Entered *before* the gather, not inside the workers: the client lives in
+    # a ContextVar and asyncio tasks inherit the context active when they were
+    # created, so a scope opened inside ``_sweep_board`` would lend the pool to
+    # nobody. Only the board fetches benefit — ``check_posting`` deliberately
+    # builds its own client (``follow_redirects=True`` plus an injectable
+    # transport), so ``_sweep_single`` is unchanged by this.
+    async with board_client():
+        await asyncio.gather(
+            *(_sweep_board(p, s, js) for (p, s), js in boards.items()),
+            *(_sweep_single(j) for j in singles),
+        )
 
     now = datetime.now(UTC).isoformat()
     for job in dead:

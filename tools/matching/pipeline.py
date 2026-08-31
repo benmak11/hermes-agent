@@ -5,7 +5,8 @@
 Deterministic engine (run via cli/run_matching.py), not an ADK agent. A cheap
 pre-filter (:func:`prefilter`) drops out-of-target roles — and, under
 ``GEO_GATE_ENFORCE``, provably unreachable ones — before the expensive Pro
-scoring call. Models are kept in sync with agents/_shared.py.
+scoring call. Model ids come from :mod:`tools.llm_models`, shared with
+agents/_shared.py.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import hashlib
 import os
 import time
 
-from google import genai
 from google.genai import types
 
 from models.job import Job, ParsedJD
@@ -22,15 +22,16 @@ from models.match import JobMatch, ScoreBreakdown
 from models.profile import MasterProfile
 from obs.llm_cost import record_llm_call
 from obs.logging import get_logger
+from tools.genai_client import vertex_client
+from tools.llm_models import FLASH_MODEL, PRO_MODEL
 from tools.matching import geo
 
 log = get_logger("tools.matching")
 
-# Keep in sync with agents/_shared.py. Parsing is high-volume → Flash; scoring
-# is the call worth paying for → Pro (gemini-3.1-pro-preview, since plain
-# "gemini-3-pro" is not in the Vertex catalog for this project).
-FLASH_MODEL = "gemini-flash-latest"
-PRO_MODEL = "gemini-3.1-pro-preview"
+# FLASH_MODEL / PRO_MODEL are imported above from tools.llm_models, the single
+# home for these ids; this module and agents/_shared.py used to declare them
+# separately and keep them aligned by comment. Parsing is high-volume → Flash;
+# scoring is the call worth paying for → Pro.
 
 # Thinking bills as output tokens at the full output rate — telemetry showed it
 # running 1.5x-4x the answer size on both calls below with no thinking_config
@@ -286,7 +287,7 @@ async def create_match_cache(
     :func:`reap_match_caches`) — the display name is a per-user singleton, so
     the only thing that can be standing here is a leak.
     """
-    client = genai.Client(vertexai=True)
+    client = vertex_client()
     display_name = match_cache_display_name(profile.user_id)
     await reap_match_caches(client, display_name)
     try:
@@ -315,7 +316,7 @@ async def create_match_cache(
 
 async def delete_match_cache(cache_name: str) -> None:
     """Best-effort delete; a cache that outlives this also ages out on TTL."""
-    client = genai.Client(vertexai=True)
+    client = vertex_client()
     try:
         await client.aio.caches.delete(name=cache_name)
         log.info("matching.cache.deleted", cache=cache_name)
@@ -576,7 +577,7 @@ def prefilter(
 
 async def parse_jd(job: Job) -> ParsedJD:
     """Cheap structured extraction with Flash — runs on every discovered job."""
-    client = genai.Client(vertexai=True)
+    client = vertex_client()
     try:
         response = await client.aio.models.generate_content(
             model=FLASH_MODEL,
@@ -637,7 +638,7 @@ async def match_job(
         return [f"{context}\n\n{job_block}"], config
 
     # Full scoring uses Pro — this is the call worth paying for.
-    client = genai.Client(vertexai=True)
+    client = vertex_client()
     try:
         if cached_content:
             try:
