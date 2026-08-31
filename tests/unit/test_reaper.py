@@ -322,9 +322,13 @@ def test_submitting_only_ever_leaves_towards_failed():
     """Pins the table rather than the code path: ``submitting →
     ready_for_review`` is not an edge, and the reaper must not need it to be.
 
-    Opening it would let ``run_tailoring``'s bare ``→ ready_for_review`` publish
-    (it passes no ``allowed_from``) move a *live* submission back to reviewable
-    and clear the submitter's lease."""
+    Opening it *used* to be unsafe on top of that: ``run_tailoring`` published
+    with a bare ``→ ready_for_review``, so a slow duplicate tailoring run could
+    have ridden the new edge to move a live submission back to reviewable and
+    clear the submitter's lease. Both of its terminal writes now carry
+    ``allowed_from={"tailoring"}``, so what is left is the plain reason —
+    "ready to send" is the wrong thing to say about an application that may
+    already be at the employer — and the reaper still does not need the edge."""
     assert "ready_for_review" not in state.TRANSITIONS["submitting"]
     assert state.TRANSITIONS["submitting"] == frozenset(
         {"submitted", "failed", "posting_removed"}

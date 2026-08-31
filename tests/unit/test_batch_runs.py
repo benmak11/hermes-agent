@@ -240,10 +240,13 @@ def test_start_below_min_pending_does_nothing(harness, monkeypatch):
         "pending": 1,
         # The reservation was taken before the backlog was known, and the
         # unlimited_budget fixture grants a full cycle; start() gives it all
-        # back when it submits nothing.
+        # back when it submits nothing — so the *reported* remainder is the
+        # untouched budget, not the momentary debit. This used to read 0 and
+        # PER_DAY - PER_CYCLE, i.e. the Profile card telling a user a whole
+        # cycle was gone on a run that never submitted a job.
         "budget_granted": budget.DEFAULT_PER_CYCLE,
-        "budget_remaining_cycle": 0,
-        "budget_remaining_day": budget.DEFAULT_PER_DAY - budget.DEFAULT_PER_CYCLE,
+        "budget_remaining_cycle": budget.DEFAULT_PER_CYCLE,
+        "budget_remaining_day": budget.DEFAULT_PER_DAY,
         "budget_capped": False,
     }
     assert db.store == {} and harness.submitted == []

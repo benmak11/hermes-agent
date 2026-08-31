@@ -1338,14 +1338,69 @@ def test_a_worker_killed_after_the_click_is_reaped_as_uncertain(
     assert "UNKNOWN" in doc.data["timeline"][-1]["note"]
 
 
-def test_only_the_click_emits_its_own_token(submission_world):
-    """The token has to name *one* step. Every other label the submitter emits
-    is display chatter, and if a second one carried SUBMIT_CLICKED the marker
-    would start meaning "we got somewhere near the form"."""
-    source = (REPO_ROOT / "tools" / "submitters" / "greenhouse.py").read_text()
+SUBMITTERS_DIR = REPO_ROOT / "tools" / "submitters"
+
+
+def _end_line(node: ast.AST) -> int:
+    """``node.end_lineno``, which is Optional in the AST but never absent for
+    anything parsed from a file."""
+    return getattr(node, "end_lineno", None) or getattr(node, "lineno", 0)
+
+
+def _submitter_sources() -> dict[str, str]:
+    """Every module under ``tools/submitters`` that drives a form, from disk.
+
+    **Enumerated, never listed.** Lever and Ashby submitters are planned work
+    (the auto-apply-failures plan), and the scan below has to cover a new
+    submitter the day it lands rather than the day someone remembers this test
+    exists — a submitter that emits a plain ``"submitting"`` for its click is
+    invisible to ``run_submission``'s progress callback, so the reaper never
+    sees ``submit_attempted_at`` and writes "nothing was submitted, so it is
+    safe to submit again" about an application that really was filed.
+
+    A module qualifies by containing a ``.click(``, which is exactly the
+    capability that makes the token load-bearing, and is what separates a
+    submitter from ``router.py``, ``storage.py`` and the package ``__init__``.
+    """
+    sources = {}
+    for path in sorted(SUBMITTERS_DIR.glob("*.py")):
+        source = path.read_text()
+        if ".click(" in source:
+            sources[path.name] = source
+    return sources
+
+
+def test_the_submitter_scan_reaches_everything_the_router_dispatches_to():
+    """The scan's blind spot would be a submitter that files an application
+    without a Playwright click — an HTTP POST straight at an ATS API, say. It
+    would still need the token, and ``.click(`` would not find it. So cross-
+    check the enumeration against what ``router.py`` actually dispatches to:
+    a module the router imports but the scan cannot see fails here, loudly,
+    instead of passing the test below vacuously."""
+    found = set(_submitter_sources())
+    assert "greenhouse.py" in found  # the scan is not vacuous
+    router = ast.parse((SUBMITTERS_DIR / "router.py").read_text())
+    dispatched = {
+        f"{node.module}.py"
+        for node in ast.walk(router)
+        if isinstance(node, ast.ImportFrom) and node.level and node.module
+    }
+    assert dispatched <= found, (
+        f"{sorted(dispatched - found)} is dispatched to but not scanned — if it "
+        "can file an application it must emit SUBMIT_CLICKED before doing so"
+    )
+
+
+@pytest.mark.parametrize("module", sorted(_submitter_sources()))
+def test_only_the_click_emits_its_own_token(module):
+    """The token has to name *one* step. Every other label a submitter emits is
+    display chatter, and if a second one carried SUBMIT_CLICKED the marker would
+    start meaning "we got somewhere near the form"."""
+    source = _submitter_sources()[module]
+    tree = ast.parse(source)
     emits = [
         node
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "_emit"
@@ -1353,14 +1408,43 @@ def test_only_the_click_emits_its_own_token(submission_world):
     # ast.unparse because the last emit's token is a conditional expression
     # ("submitted" if confirmed else "submitting"), not a literal.
     tokens = [ast.unparse(node.args[2]) for node in emits]
-    assert tokens.count("SUBMIT_CLICKED") == 1
+    assert tokens.count("SUBMIT_CLICKED") == 1, (
+        f"{module} must name its point of no return exactly once — a click that "
+        'emits a plain "submitting" is indistinguishable from "Attaching '
+        'resume", and the reaper reads that difference'
+    )
     assert "SUBMIT_CLICKED" not in " ".join(t for t in tokens if t != "SUBMIT_CLICKED")
-    assert len(emits) == 6, "a new step was added — does it click anything?"
-    # ...and the first thing awaited after that emit is the click itself. The
-    # marker means "a browser clicked Submit", so anything awaited in between
-    # would be a way to write it and then never click.
-    after = source.split("SUBMIT_CLICKED)", 1)[1]
-    assert after.split("await ")[1].startswith("submit_btn.click()")
+
+    marker = next(n for n in emits if ast.unparse(n.args[2]) == "SUBMIT_CLICKED")
+    marker_end = _end_line(marker)
+    # The first thing awaited after that emit is the click itself. The marker
+    # means "a browser clicked Submit", so anything awaited in between would be
+    # a way to write it and then never click.
+    after = "\n".join(source.splitlines()[marker_end:])
+    first_await = after.split("await ", 1)[1].splitlines()[0].strip()
+    assert first_await.endswith(".click()"), first_await
+    # ...and it is the only click left in that function. This replaces the old
+    # "exactly six steps" tripwire, which only greenhouse could have: after the
+    # point of no return a submitter presses one button, and a second click
+    # down there is a second application nobody counted.
+    enclosing = min(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+            and node.lineno <= marker.lineno <= _end_line(node)
+        ),
+        key=lambda node: _end_line(node) - node.lineno,
+    )
+    clicks = [
+        node
+        for node in ast.walk(enclosing)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "click"
+        and node.lineno > marker_end
+    ]
+    assert len(clicks) == 1, [ast.unparse(c) for c in clicks]
 
 
 def test_a_failing_dry_run_does_not_mark_a_real_application_failed(monkeypatch):
@@ -1822,6 +1906,137 @@ def test_a_successful_publish_clears_the_reapers_recovery_budget(client, monkeyp
     # regenerate had already moved on.
     publish = next(f for f, _o in doc.updates if f.get("status") == "ready_for_review")
     assert publish[reaper.ATTEMPTS_FIELD] is firestore.DELETE_FIELD
+
+
+# --------------------------------------------------------------------------
+# ``run_tailoring``'s two terminal writes name the status they own.
+#
+# Both used to go out bare. That is survivable while a tailoring run is the
+# only thing that ever touches its own document — but the reaper *deliberately*
+# manufactures overlapping runs: it requeues a document whose lease lapsed, and
+# the next dispatch produces a run B on the same document while the evicted
+# run A may still be alive and about to raise.
+# --------------------------------------------------------------------------
+
+
+def _zombie_world(monkeypatch, doc, on_tailor):
+    """``run_tailoring`` for real, with ``on_tailor`` standing in for the paid
+    call — the window in which another process can take the document over."""
+    monkeypatch.setenv("WORKER_MODE", "1")
+    job = _FakeDoc(
+        {
+            "id": "job1",
+            "url": "https://x/y",
+            "company": "Acme",
+            "title": "Staff Engineer",
+            "user_decision": "approved",
+        }
+    )
+    monkeypatch.setattr(
+        applications, "_client", lambda: _FakeDb(_FakeUser(doc, job, {}))
+    )
+    monkeypatch.setattr(
+        applications, "MasterProfile", SimpleNamespace(model_validate=lambda d: d)
+    )
+    monkeypatch.setattr(
+        applications,
+        "Job",
+        SimpleNamespace(model_validate=lambda d: SimpleNamespace(**d)),
+    )
+
+    async def fake_check_posting(job):
+        return "ok"
+
+    async def fake_persist_run_cost(db, user_id, run_id, **meta):
+        pass
+
+    monkeypatch.setattr(applications, "check_posting", fake_check_posting)
+    monkeypatch.setattr(applications, "tailor_application", on_tailor)
+    monkeypatch.setattr(applications, "persist_run_cost", fake_persist_run_cost)
+
+
+@pytest.mark.parametrize("moved_to", ["queued", "submitting"])
+def test_a_zombie_tailoring_run_cannot_fail_a_document_it_no_longer_owns(
+    client, monkeypatch, moved_to
+):
+    """``queued → failed`` and ``submitting → failed`` are both legal edges, so
+    only ``allowed_from={"tailoring"}`` refuses them.
+
+    Without it the run that died gets the last word: on ``queued`` it fails the
+    document the reaper just recovered, and on ``submitting`` it fails — and
+    unleases — an application a browser is at that moment submitting for real,
+    destroying the confirmation evidence for it.
+    """
+    doc = _app_doc("queued")
+    handovers: list[str] = []
+
+    async def evicted_mid_run(job, profile, upload=True):
+        # The reaper found run A's lease expired and put the work back.
+        assert state.try_transition(
+            doc,
+            doc.get(),
+            "queued",
+            allowed_from={"tailoring"},
+            lease=state.lease_for("queued", owner="reaper"),
+        )
+        if moved_to == "submitting":
+            # ...run B claimed it, tailored it, and the user clicked Submit.
+            for to, lease in (
+                ("tailoring", state.lease_for("tailoring", owner="B")),
+                ("ready_for_review", state.CLEAR_LEASE),
+                ("submitting", state.lease_for("submitting", owner="submitter")),
+            ):
+                assert state.try_transition(doc, doc.get(), to, lease=lease)
+        handovers.append(doc.data["status"])
+        raise RuntimeError("worker A was evicted and came back to die")
+
+    _zombie_world(monkeypatch, doc, evicted_mid_run)
+
+    client.post("/tasks/tailor", json={"user_id": "u1", "job_id": "job1"})
+
+    assert handovers == [moved_to]  # the handover really happened
+    assert doc.data["status"] == moved_to
+    assert [e["status"] for e in doc.data["timeline"]][-1] != "failed"
+    # And the live owner's claim is still on the document: the failure write
+    # carries CLEAR_LEASE, so a write that lands is a lease that is gone.
+    owner = "reaper" if moved_to == "queued" else "submitter"
+    assert state.lease_owner(doc.data) == owner
+
+
+def test_run_tailorings_terminal_writes_name_the_status_they_own():
+    """The publish is the one this cannot be shown by outcome.
+
+    ``tailoring`` is today the only row in ``state.TRANSITIONS`` with an edge to
+    ``ready_for_review``, so ``allowed_from={"tailoring"}`` on the publish is
+    currently the table's own precondition restated — it changes no behaviour.
+    It is there because ``tools.applications.reaper``'s docstring used to cite
+    that bare write as the reason ``submitting → ready_for_review`` could never
+    be added to the table. Stating the precondition at the call site is what
+    makes that decision the table's to make.
+
+    The claim (``→ tailoring``) is deliberately not in the list: it is the write
+    that *establishes* ownership rather than one that acts on it, and there is
+    no earlier owner for it to trample.
+    """
+    source = (REPO_ROOT / "api" / "routes" / "applications.py").read_text()
+    run_tailoring = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_tailoring"
+    )
+    writes = {
+        ast.literal_eval(node.args[1]): node
+        for node in ast.walk(run_tailoring)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_transition"
+    }
+    assert set(writes) == {"tailoring", "ready_for_review", "failed"}, (
+        "a new status write in run_tailoring — which status does it own?"
+    )
+    for status in ("ready_for_review", "failed"):
+        call = writes[status]
+        assert "allowed_from" in {kw.arg for kw in call.keywords}, ast.unparse(call)
 
 
 # --------------------------------------------------------------------------

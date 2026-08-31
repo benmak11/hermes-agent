@@ -170,11 +170,17 @@ async def start(
     try:
         profile, pending = await load_profile_and_pending(db, user_id, limit)
         if min_pending is not None and len(pending) < min_pending:
-            # Nothing was submitted, so nothing is owed.
+            # Nothing was submitted, so nothing is owed. ``drawn=0`` rather than
+            # ``len(pending)`` for exactly that reason: ``attempted`` is still 0
+            # here, so the ``finally`` below refunds the *whole* grant, and
+            # ``budget.summary`` derives the refund it reports from this number.
+            # Claiming slots this run never charged for would leave the Profile
+            # card under-reporting the budget by the size of the backlog it
+            # declined to touch.
             return {
                 "started": False,
                 "pending": len(pending),
-                **budget.summary(reservation, drawn=len(pending)),
+                **budget.summary(reservation, drawn=0),
             }
         # Committed here, before any submission: _start pays for a batch and
         # only then records its job name, so a Firestore failure on that write

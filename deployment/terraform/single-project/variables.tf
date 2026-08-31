@@ -18,18 +18,6 @@ variable "region" {
   default     = "us-central1"
 }
 
-variable "telemetry_logs_filter" {
-  type        = string
-  description = "Log Sink filter for capturing telemetry data. Captures logs with the `traceloop.association.properties.log_type` attribute set to `tracing`."
-  default     = "labels.service_name=\"hermes\" labels.type=\"agent_telemetry\""
-}
-
-variable "feedback_logs_filter" {
-  type        = string
-  description = "Log Sink filter for capturing feedback data. Captures logs where the `log_type` field is `feedback`."
-  default     = "jsonPayload.log_type=\"feedback\" jsonPayload.service_name=\"hermes\""
-}
-
 variable "llm_cost_logs_filter" {
   type        = string
   description = "Log Sink filter for per-call LLM cost telemetry. Captures the structured `llm.call` events emitted by obs.llm_cost.record_llm_call (token counts + computed USD cost per matching/tailoring/profile-extract call)."

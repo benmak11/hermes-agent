@@ -13,6 +13,7 @@ rather than replaced, and no route writes a status field behind the helper's
 back.
 """
 
+import inspect
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -479,11 +480,65 @@ def test_extra_fields_land_atomically_with_the_status():
     assert len(doc.updates) == 1  # one write, not two
 
 
-@pytest.mark.parametrize("field", ["status", "timeline", "lease"])
-def test_extra_may_not_smuggle_in_an_owned_field(field):
+def _extra_via_try_transition(field):
     doc = _ready()
+    state.try_transition(doc, doc.get(), "submitting", extra={field: "whatever"})
+
+
+def _extra_via_try_claim_lease(field):
+    doc = _submitting()
+    state.try_claim_lease(
+        doc, doc.get(), "submitting", owner="A", extra={field: "whatever"}
+    )
+
+
+def _extra_via_append_note(field):
+    doc = _ready()
+    state.append_note(doc, "submitting", "Attaching resume", extra={field: "whatever"})
+
+
+#: Every function in ``state`` that takes an ``extra=`` payload. All three ride
+#: the same guard, so all three are pinned by the same test: a writer added
+#: later with the guard forgotten is the failure mode, and one of these paths —
+#: ``append_note`` — has no compare-and-swap and no ``allowed_from`` at all, so
+#: its guard is the *only* thing stopping ``extra`` becoming a second, unchecked
+#: writer of ``status``.
+EXTRA_WRITERS = {
+    "try_transition": _extra_via_try_transition,
+    "try_claim_lease": _extra_via_try_claim_lease,
+    "append_note": _extra_via_append_note,
+}
+
+
+def test_every_extra_taking_writer_is_covered():
+    """The list above is the test's scope, so it must not drift from the module."""
+    takes_extra = {
+        name
+        for name, fn in vars(state).items()
+        if inspect.isfunction(fn) and "extra" in inspect.signature(fn).parameters
+    }
+    assert takes_extra == set(EXTRA_WRITERS) | {"_reject_owned", "_payload"}
+
+
+@pytest.mark.parametrize("writer", sorted(EXTRA_WRITERS))
+@pytest.mark.parametrize("field", ["status", "timeline", "lease"])
+def test_extra_may_not_smuggle_in_an_owned_field(field, writer):
     with pytest.raises(ValueError, match=field):
-        state.try_transition(doc, doc.get(), "submitting", extra={field: "whatever"})
+        EXTRA_WRITERS[writer](field)
+
+
+def test_the_owned_field_guard_fires_before_a_claim_is_even_attempted():
+    """``try_claim_lease`` validates ``extra`` *before* its loop, deliberately:
+    a clash is a programming error, not a race, so it has to raise whether or
+    not the attempt ever reaches the network. Here B's claim would be refused
+    outright — A holds the lease — so nothing downstream would ever look at the
+    payload."""
+    doc = _submitting()
+    assert state.try_claim_lease(doc, doc.get(), "submitting", owner="A") is True
+    with pytest.raises(ValueError, match="status"):
+        state.try_claim_lease(
+            doc, doc.get(), "submitting", owner="B", extra={"status": "submitted"}
+        )
 
 
 def test_a_spurious_precondition_failure_is_retried_once_and_succeeds():
@@ -667,6 +722,51 @@ def test_submit_from_failed_is_a_retry(submit_client):
     assert doc.data["status"] == "submitting"
     assert doc.data["last_submitted_at"]
     assert submissions == [("u1", "app-job1", False)]
+
+
+def test_a_retry_clears_the_click_marker_but_not_the_uncertainty(submit_client):
+    """``submit_attempted_at`` is per *attempt*; ``submission_uncertain`` is per
+    *document*, and they must not be cleared together.
+
+    This is the shape ``reaper.release_uncertain`` leaves behind: a ``failed``
+    application that may already be with the employer. The user retries. If the
+    marker survives that retry, a run that dies before the browser ever reaches
+    the button is reported as uncertain all over again — the fork is blunted on
+    exactly the documents most likely to be retried. If the *flag* is cleared,
+    the durable record that an earlier submission may have landed is gone.
+    """
+    client, doc, _submissions = submit_client
+    doc.set(
+        {
+            **doc.data,
+            "status": "failed",
+            reaper.CLICKED_FIELD: "2026-08-01T00:00:00+00:00",
+            reaper.UNCERTAIN_FIELD: True,
+        }
+    )
+
+    assert client.post("/applications/app-job1/submit").status_code == 200
+
+    assert doc.data["status"] == "submitting"
+    assert reaper.CLICKED_FIELD not in doc.data
+    assert doc.data[reaper.UNCERTAIN_FIELD] is True
+    # In the *same* write as the claim. Cleared beside it, a crash in between
+    # leaves a fresh ``submitting`` document wearing the previous attempt's
+    # marker, which is the state this test exists to make unreachable.
+    claim = next(f for f, _o in doc.updates if f.get("status") == "submitting")
+    assert claim[reaper.CLICKED_FIELD] is firestore.DELETE_FIELD
+
+    # What it buys: the reaper's fork now reads this run for what it is.
+    now = datetime.now(UTC)
+    dead = {
+        **doc.data,
+        "lease": state.lease_for(
+            "submitting",
+            owner="A",
+            now=now - timedelta(seconds=state.IN_PROGRESS["submitting"] * 2),
+        ),
+    }
+    assert reaper.classify(dead, now=now) == "release_unstarted"
 
 
 def test_regenerate_requeues_and_rejects_terminal_statuses(monkeypatch):

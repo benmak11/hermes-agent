@@ -283,11 +283,22 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             # Riding the swap rather than the content write above matters: the
             # content write has no precondition, so a reset there could land on
             # a document a regenerate had already moved on.
+            #
+            # ``allowed_from`` is the status this run claimed, for the same
+            # reason every other write in this file carries one: the tailoring
+            # pipeline above is minutes of network, so this swap is decided on a
+            # read that is long stale, and ``tailoring → ready_for_review`` is
+            # not the only way into this document. The reaper deliberately
+            # manufactures overlapping runs — it requeues a document whose lease
+            # lapsed, and run B claims it — so without this, run A finishing
+            # late would publish *its* result over run B's live ``tailoring``
+            # document and clear B's lease with it.
             if not await _transition(
                 app_ref,
                 "ready_for_review",
                 lease=state.CLEAR_LEASE,
                 extra={reaper.ATTEMPTS_FIELD: firestore.DELETE_FIELD},
+                allowed_from={"tailoring"},
             ):
                 task_log.info("tailoring.result_not_published")
             task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
@@ -303,8 +314,24 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             if not (await asyncio.to_thread(app_ref.get)).exists:
                 log_agent_end(task_log, "tailoring", started, outcome="discarded")
                 return  # discarded by a revert while we ran — don't resurrect
+            # Same precondition as the publish above, and the case it guards is
+            # the sharper of the two: a zombie run erroring *after* the reaper
+            # requeued this document and run B claimed it would otherwise mark
+            # B's live ``tailoring`` document ``failed`` and clear B's lease —
+            # failing a run that is working, on the strength of an exception
+            # raised by a run nobody is waiting for.
+            #
+            # It also narrows the one case this block used to cover loosely: an
+            # exception thrown *by the claim itself* now leaves the document in
+            # ``queued`` rather than flipping it to ``failed``. That is the
+            # better answer — ``queued`` is exactly what the reaper re-dispatches
+            # — and this run never owned the document to begin with.
             await _transition(
-                app_ref, "failed", note=str(e)[:300], lease=state.CLEAR_LEASE
+                app_ref,
+                "failed",
+                note=str(e)[:300],
+                lease=state.CLEAR_LEASE,
+                allowed_from={"tailoring"},
             )
             log_agent_end(
                 task_log, "tailoring", started, outcome="failed", error=str(e)[:300]
@@ -974,7 +1001,29 @@ def submit(
         ref,
         snap,
         "submitting",
-        extra={"last_submitted_at": _now(), "submit_attempts": attempt},
+        extra={
+            "last_submitted_at": _now(),
+            "submit_attempts": attempt,
+            # **Per attempt, not per document.** ``submit_attempted_at`` means
+            # "a browser clicked Submit *on this attempt*" — it is the single
+            # fact ``tools.applications.reaper``'s apply fork reads. Left
+            # standing from an earlier attempt it blunts that fork on exactly
+            # the documents most likely to be retried: after a
+            # ``release_uncertain`` the user retries from ``failed``, and if
+            # *that* run dies before ever reaching the button the reaper reports
+            # it as uncertain again — about a run that provably never clicked.
+            #
+            # Cleared here rather than anywhere else because this swap runs in
+            # the API request, before the apply task is dispatched and therefore
+            # before any browser exists: there is no window in which this write
+            # can erase a marker that a live run just set.
+            #
+            # ``submission_uncertain`` is deliberately *not* cleared. That flag
+            # is the durable record that some past submission of this
+            # application may already be with the employer, and it stays true
+            # however many times the user tries again.
+            "submit_attempted_at": firestore.DELETE_FIELD,
+        },
     ):
         raise HTTPException(
             status_code=409, detail=f"cannot submit from status '{status}'"

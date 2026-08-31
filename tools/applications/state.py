@@ -482,8 +482,13 @@ def append_note(ref, status: str, message: str, *, extra: dict | None = None) ->
     two writes could leave the timeline saying the form was being submitted
     while the marker — the thing that stops an automatic re-submission — is
     missing. This is deliberately *not* a compare-and-swap: the marker must land
-    whatever else has happened to the document, and it is only ever set, never
-    cleared, so there is no lost update to protect against.
+    whatever else has happened to the document.
+
+    Nothing is lost by that. The only writer that ever *clears* the marker is
+    the ``→ submitting`` swap in ``api.routes.applications.submit``, which runs
+    in the API request before the apply task is dispatched — so it cannot race
+    a note written by a browser that does not exist yet, and the two can only
+    interleave in the one order that is correct.
     """
     payload = _reject_owned(extra)
     payload[TIMELINE_FIELD] = firestore.ArrayUnion([timeline_event(status, message)])
