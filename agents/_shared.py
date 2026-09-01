@@ -14,6 +14,8 @@ import google.auth
 from google.adk.models import Gemini
 from google.genai import types
 
+from tools.llm_models import COMPUTER_USE_MODEL, FLASH_MODEL, PRO_MODEL
+
 # ---------------------------------------------------------------------------
 # Environment / Vertex AI configuration (runs once on first import).
 # ---------------------------------------------------------------------------
@@ -37,14 +39,11 @@ os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "True")
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
-FLASH_MODEL = "gemini-flash-latest"
-# The Gemini 3 Pro model available to this project is "gemini-3.1-pro-preview".
-# There is no bare "gemini-3-pro" id in the Vertex catalog.
-PRO_MODEL = "gemini-3.1-pro-preview"
-# The Application agent drives a browser via Computer Use. Using the Gemini 3 Pro
-# model here; verify computer-use support when wiring the real browser backend
-# (a dedicated computer-use model may be needed).
-COMPUTER_USE_MODEL = "gemini-3.1-pro-preview"
+# FLASH_MODEL / PRO_MODEL / COMPUTER_USE_MODEL are imported above from
+# tools.llm_models, not redeclared: tools/matching/pipeline.py needs the same
+# ids and used to carry its own copy under a "keep in sync" comment.
+# tools.llm_models is an import-free leaf precisely so this package can reach it
+# without giving up its independence.
 
 _RETRY = types.HttpRetryOptions(attempts=3)
 

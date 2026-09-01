@@ -18,6 +18,7 @@ from google.cloud import firestore
 
 from models.job import Job
 from obs.logging import get_logger
+from tools.ats._http import board_client
 from tools.ats.ashby import fetch_ashby_jobs
 from tools.ats.google_jobs import fetch_google_jobs
 from tools.ats.greenhouse import fetch_greenhouse_jobs
@@ -37,6 +38,15 @@ FETCHERS: dict[Platform, Callable[[str, str], Awaitable[list[Job]]]] = {
 }
 
 
+#: Boards fetched at once. ``all_active_companies()`` is ~198 slugs and the
+#: gather below used to start every one of them simultaneously — 198 sockets
+#: opening at once, against a handful of hosts (72 Ashby, 64 Greenhouse, 60
+#: Lever), which is both the shape most likely to earn a 429 and the reason the
+#: shared client in ``tools.ats._http`` had no pool to reuse. Matches the
+#: ``persist_new_jobs`` bound below and ``tools.ats.sweep``'s 10.
+_FETCH_CONCURRENCY = 20
+
+
 async def _fetch_with_meta(fetcher, slug, user_id, platform, source):
     """Wrapper that returns metadata alongside the fetch result."""
     try:
@@ -47,7 +57,7 @@ async def _fetch_with_meta(fetcher, slug, user_id, platform, source):
         raise RuntimeError(f"{platform}/{slug}: {e}") from e
 
 
-async def run_discovery(user_id: str) -> dict:
+async def run_discovery(user_id: str, concurrency: int = _FETCH_CONCURRENCY) -> dict:
     """Fetch all jobs from all sources for all known + unvetted companies.
 
     Returns a summary dict for SLI tracking later.
@@ -56,11 +66,21 @@ async def run_discovery(user_id: str) -> dict:
     companies = all_active_companies()
     log.info("discovery.start", company_count=len(companies))
 
-    tasks = [
-        _fetch_with_meta(FETCHERS[platform], slug, user_id, platform, source)
-        for platform, slug, source in companies
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _fetch_bounded(platform, slug, source):
+        async with sem:
+            return await _fetch_with_meta(
+                FETCHERS[platform], slug, user_id, platform, source
+            )
+
+    # One client for the whole fan-out: 196 of the 198 boards go through
+    # fetch_board_json, and each was building and tearing down its own.
+    async with board_client():
+        results = await asyncio.gather(
+            *(_fetch_bounded(p, s, src) for p, s, src in companies),
+            return_exceptions=True,
+        )
 
     jobs: list[Job] = []
     failures: list[dict] = []
@@ -110,6 +130,34 @@ async def run_discovery(user_id: str) -> dict:
     }
 
 
+#: Document references per ``get_all`` call. Firestore's BatchGetDocuments RPC
+#: has no documented cap on the *number* of documents per request — unlike
+#: ``in`` queries (30) or batched writes (500) — so the binding constraint is
+#: the request/response size, not a count. 300 stays well inside it even when
+#: every document comes back full, and turns a 300-job cycle's 600 sequential
+#: round trips into 2.
+#:
+#: Note this changes round trips, not billed reads: Firestore bills per document
+#: returned either way. The saving in *reads* comes from the tombstone-first
+#: ordering below, not from the batching.
+_GET_ALL_CHUNK = 300
+
+
+async def _existing_ids(db, refs: list) -> set[str]:
+    """Ids of the documents in ``refs`` that exist, fetched in batches.
+
+    ``get_all`` yields a snapshot for every reference asked about, including
+    missing ones (``exists`` False), and in no guaranteed order — so callers
+    must match on identity, never on position.
+    """
+    found: set[str] = set()
+    for start in range(0, len(refs), _GET_ALL_CHUNK):
+        async for snap in db.get_all(refs[start : start + _GET_ALL_CHUNK]):
+            if snap.exists:
+                found.add(snap.id)
+    return found
+
+
 async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
     """Write only previously-unseen jobs to Firestore. Returns count of new jobs.
 
@@ -135,27 +183,47 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
         )
     db = firestore.AsyncClient()
     sem = asyncio.Semaphore(concurrency)
-    counter = {"new": 0, "discarded": 0}
 
-    async def _persist_one(job: Job) -> None:
+    async def _write(doc_ref, job: Job) -> None:
         async with sem:
-            user_ref = db.collection("users").document(job.user_id)
-            doc_ref = user_ref.collection("jobs").document(job.id)
-            discarded_ref = user_ref.collection("discarded_jobs").document(job.id)
-            snap, discarded = await asyncio.gather(doc_ref.get(), discarded_ref.get())
-            if discarded.exists:
-                counter["discarded"] += 1
-                return
-            if snap.exists:
-                return
             await doc_ref.set(job.model_dump(mode="json"))
-            counter["new"] += 1
 
-    await asyncio.gather(*(_persist_one(j) for j in unique.values()))
+    # Group by user so a chunk never mixes two users' collections, which keeps
+    # the document id enough to identify a snapshot (get_all does not promise
+    # to answer in the order it was asked).
+    by_user: dict[str, list[Job]] = {}
+    for job in unique.values():
+        by_user.setdefault(job.user_id, []).append(job)
+
+    new = seen_before = previously_discarded = 0
+    for user_id, user_jobs in by_user.items():
+        user_ref = db.collection("users").document(user_id)
+        jobs_col = user_ref.collection("jobs")
+        discarded_col = user_ref.collection("discarded_jobs")
+
+        # Tombstones first, then the job docs for whatever survived — the same
+        # precedence the per-job version had (a job that is both tombstoned and
+        # present still resolves as discarded), but expressed as the order of
+        # two batched round trips instead of an if/elif over two reads that
+        # always both happened. Tombstoned jobs are the bulk of a cycle and now
+        # cost one read each instead of two.
+        tombstoned = await _existing_ids(
+            db, [discarded_col.document(j.id) for j in user_jobs]
+        )
+        live = [j for j in user_jobs if j.id not in tombstoned]
+        previously_discarded += len(user_jobs) - len(live)
+
+        present = await _existing_ids(db, [jobs_col.document(j.id) for j in live])
+        fresh = [j for j in live if j.id not in present]
+        seen_before += len(live) - len(fresh)
+        new += len(fresh)
+
+        await asyncio.gather(*(_write(jobs_col.document(j.id), j) for j in fresh))
+
     log.info(
         "discovery.persisted",
-        new_jobs=counter["new"],
-        seen_before=len(unique) - counter["new"] - counter["discarded"],
-        previously_discarded=counter["discarded"],
+        new_jobs=new,
+        seen_before=seen_before,
+        previously_discarded=previously_discarded,
     )
-    return counter["new"]
+    return new

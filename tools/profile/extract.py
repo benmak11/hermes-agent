@@ -13,12 +13,12 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
-from google import genai
 from google.genai import types
 
 from models.profile import MasterProfile
 from obs.llm_cost import record_llm_call
 from obs.logging import get_logger
+from tools.genai_client import vertex_client
 
 log = get_logger("tools.profile.extract")
 
@@ -101,7 +101,7 @@ def extract_profile(raw_text: str, user_id: str) -> MasterProfile:
 
     call_log = log.bind(user_id=user_id, chars=len(raw_text))
     call_log.info("extract.gemini.start", model="gemini-3.1-pro-preview")
-    client = genai.Client(vertexai=True)
+    client = vertex_client()
 
     try:
         response = client.models.generate_content(

@@ -9,6 +9,7 @@ import api.routes.applications as routes_applications
 import api.routes.discovery as routes_discovery
 import api.routes.jobs as routes_jobs
 import api.routes.profile as routes_profile
+from tools import genai_client
 from tools.matching import budget
 
 
@@ -37,6 +38,23 @@ def no_dev_bypass(monkeypatch):
     """
     monkeypatch.delenv("AUTH_DEV_MODE", raising=False)
     monkeypatch.delenv("ALLOW_LIVE_RUNS", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def reset_genai_client():
+    """Never let one test's Vertex client leak into the next.
+
+    ``tools.genai_client`` memoises a ``genai.Client`` per event loop so a
+    backlog run stops building one per call. A memo and a monkeypatched
+    constructor are a bad pair: whichever test runs first wins, and every test
+    after it gets that client no matter what it patched — which is precisely how
+    ``no_production_firestore`` below spent weeks catching nothing while 39 real
+    documents piled up. Clearing before *and* after keeps the memo from being
+    load-bearing in either direction.
+    """
+    genai_client.reset_vertex_client()
+    yield
+    genai_client.reset_vertex_client()
 
 
 @pytest.fixture

@@ -53,6 +53,10 @@ log = get_logger("api.discovery")
 router = APIRouter(tags=["discovery"])
 
 # In-process throttle so polling endpoints don't re-read settings on every hit.
+# Deliberately per-instance and not moved to Firestore: it is a throttle, not a
+# lock — correctness against multiple Cloud Run instances is the slot lease's
+# job (_LEASE_SECONDS below), and the worst a missed throttle costs is one extra
+# settings read. Decided and closed in Phase 3; please don't re-litigate.
 _TICK_CHECK_EVERY = timedelta(minutes=5)
 _last_tick_check: dict[str, datetime] = {}
 

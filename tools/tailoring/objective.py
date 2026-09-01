@@ -4,12 +4,12 @@
 
 from __future__ import annotations
 
-from google import genai
 from google.genai import types
 
 from models.job import Job
 from models.profile import MasterProfile
 from obs.llm_cost import record_llm_call
+from tools.genai_client import vertex_client
 
 # Objective writing is low-volume and benefits from a little warmth/variation, so
 # Flash at a higher temperature is the right cost/quality point.
@@ -62,7 +62,7 @@ async def generate_objective(profile: MasterProfile, job: Job) -> str:
     template = _select_template(profile, job)
     jd_summary = job.jd_parsed.summary if job.jd_parsed else job.jd_raw[:1000]
 
-    client = genai.Client(vertexai=True)
+    client = vertex_client()
     response = await client.aio.models.generate_content(
         model=OBJECTIVE_MODEL,
         contents=[

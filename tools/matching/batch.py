@@ -33,7 +33,6 @@ import uuid
 from datetime import UTC, datetime
 from functools import cache
 
-from google import genai
 from google.cloud import firestore
 from google.genai import _transformers, types
 from pydantic import ValidationError
@@ -42,6 +41,7 @@ from models.job import Job, ParsedJD
 from models.match import JobMatch
 from obs.llm_cost import record_llm_call
 from obs.logging import get_logger
+from tools.genai_client import vertex_client
 from tools.matching import budget, jd_cache
 from tools.matching.pipeline import (
     _MATCH_MAX_OUTPUT_TOKENS,
@@ -238,7 +238,7 @@ async def submit_batch(
         f"{gcs_dir}/input.jsonl", payload, content_type="application/jsonl"
     )
 
-    client = genai.Client(vertexai=True)
+    client = vertex_client()
     job = await client.aio.batches.create(
         model=model,
         src=f"{gcs_dir}/input.jsonl",
@@ -259,7 +259,7 @@ async def submit_batch(
 
 async def get_batch_job(name: str) -> types.BatchJob:
     """One state poll — cheap enough to run per tick per in-flight run."""
-    client = genai.Client(vertexai=True)
+    client = vertex_client()
     return await client.aio.batches.get(name=name)
 
 
@@ -296,7 +296,7 @@ async def _run_batch(
         model=model, lines=lines, gcs_dir=gcs_dir, display_name=display_name
     )
 
-    client = genai.Client(vertexai=True)
+    client = vertex_client()
     job = None
     deadline = time.monotonic() + timeout_seconds
     while job is None or job.state not in _DONE_STATES:
