@@ -158,7 +158,50 @@ async def submit_greenhouse(
         page = await browser.new_page(viewport={"width": 1280, "height": 1600})
         try:
             await _emit(on_progress, f"Opening {job.url}", "submitting")
-            await page.goto(job.url, wait_until="domcontentloaded", timeout=30000)
+            response = await page.goto(
+                job.url, wait_until="domcontentloaded", timeout=30000
+            )
+
+            # **Check the status before reading the DOM.** An error page has no
+            # email field and no file input, so without this it falls through to
+            # the custom-wrapper check below and is reported as "this employer
+            # uses a custom careers wrapper" — a permanent, structural verdict —
+            # when the truth may be a transient 406 from the ATS's bot
+            # detection. That misdiagnosis is not hypothetical: a 50-posting
+            # measurement on 2026-09-01 tripped Greenhouse's rate limiting and
+            # returned 48 false ``custom_wrapper`` bails, which would have sent
+            # the fix at the wrong problem entirely.
+            #
+            # ``goto`` returns None only for a same-document navigation, which
+            # this never is; treat it as unknown rather than assuming failure.
+            status = response.status if response is not None else None
+            if status is not None and status >= 400:
+                # A challenge page is often 403 and *is* a captcha, so prefer
+                # that more specific (and more actionable) reason when present.
+                if await _detect_captcha(page):
+                    await page.screenshot(path=pre_path, full_page=True)
+                    job_log.warning("submit.bail", reason="captcha", status=status)
+                    return {
+                        "success": False,
+                        "error": "CAPTCHA present — solve it in a browser, then retry.",
+                        "pre_submit_screenshot": pre_path,
+                    }
+                await page.screenshot(path=pre_path, full_page=True)
+                gone = status in (404, 410)
+                reason = "posting_gone" if gone else "fetch_blocked"
+                job_log.warning("submit.bail", reason=reason, status=status)
+                return {
+                    "success": False,
+                    "error": (
+                        f"posting returned HTTP {status} — the listing is gone"
+                        if gone
+                        else f"could not load the posting (HTTP {status}) — the "
+                        "ATS refused the request, which is usually transient; "
+                        "retry later"
+                    ),
+                    "status": status,
+                    "pre_submit_screenshot": pre_path,
+                }
 
             # Wait for the form itself, not networkidle (which never settles on
             # the new job-boards app). The form may live behind an "Apply"
@@ -194,13 +237,21 @@ async def submit_greenhouse(
             file_input = page.locator('input[type="file"]').first
             if not (await email_field.count() and await file_input.count()):
                 await page.screenshot(path=pre_path, full_page=True)
-                job_log.warning("submit.bail", reason="custom_wrapper")
+                job_log.warning("submit.bail", reason="custom_wrapper", status=status)
                 return {
                     "success": False,
+                    # Hedged deliberately. The 200 above rules out the error
+                    # pages that used to land here, but "served a page with no
+                    # Greenhouse form in it" still has more than one cause — a
+                    # custom wrapper, a client-rendered block, a redirect to a
+                    # closed-role notice. The screenshot is what settles it, so
+                    # point at that rather than asserting the cause.
                     "error": (
-                        "Not a standard Greenhouse form (custom careers wrapper) — "
-                        "needs the Computer Use path, which is deferred. Apply manually."
+                        "No Greenhouse application form on the page — most often a "
+                        "custom careers wrapper, which needs the Computer Use path "
+                        "(deferred). Check the screenshot and apply manually."
                     ),
+                    "status": status,
                     "pre_submit_screenshot": pre_path,
                 }
 
