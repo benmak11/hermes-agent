@@ -6,6 +6,7 @@ import pytest
 from google.cloud import firestore
 
 import api.routes.applications as routes_applications
+import api.routes.companies as routes_companies
 import api.routes.discovery as routes_discovery
 import api.routes.jobs as routes_jobs
 import api.routes.profile as routes_profile
@@ -126,5 +127,11 @@ def no_production_firestore(monkeypatch, request):
     # constructor above is never reached again. Clearing the cache per test is
     # what makes the refusal actually bite — this guard was written without it
     # and silently caught nothing.
-    for mod in (routes_discovery, routes_applications, routes_jobs, routes_profile):
+    for mod in (
+        routes_discovery,
+        routes_applications,
+        routes_companies,
+        routes_jobs,
+        routes_profile,
+    ):
         monkeypatch.setattr(mod, "_db", None, raising=False)

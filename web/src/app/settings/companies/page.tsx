@@ -16,8 +16,13 @@ import type {
 import { avatarColor, initial } from "@/lib/ui";
 import { TopNav } from "@/components/TopNav";
 
-type Tab = "unvetted" | "known" | "blocklist";
-type Row = { platform: string; slug: string; paused?: boolean };
+type Tab = "unvetted" | "known" | "excluded" | "blocklist";
+type Row = {
+  platform: string;
+  slug: string;
+  paused?: boolean;
+  excluded?: boolean;
+};
 
 export default function CompaniesPage() {
   const { user, loading } = useAuth();
@@ -54,19 +59,32 @@ export default function CompaniesPage() {
   const flatten = (group?: Record<string, CompanyEntry[]>): Row[] =>
     group
       ? Object.entries(group).flatMap(([platform, rows]) =>
-          rows.map((r) => ({ platform, slug: r.slug, paused: r.paused })),
+          rows.map((r) => ({
+            platform,
+            slug: r.slug,
+            paused: r.paused,
+            excluded: r.excluded,
+          })),
         )
       : [];
 
   const counts = {
     unvetted: flatten(data?.unvetted).length,
     known: flatten(data?.known).length,
+    excluded: data?.excluded.length ?? 0,
     blocklist: data?.blocklist.length ?? 0,
   };
 
   const rows = useMemo(() => {
-    const list =
-      tab === "unvetted" ? flatten(data?.unvetted) : flatten(data?.known);
+    const list: Row[] =
+      tab === "unvetted"
+        ? flatten(data?.unvetted)
+        : tab === "known"
+          ? flatten(data?.known)
+          : // "Excluded" is the user's own overlay, listed from its own array
+            // rather than filtered out of the pool: an exclusion can outlive
+            // the pool entry it was made against.
+            (data?.excluded ?? []).map((e) => ({ ...e, excluded: true }));
     const q = search.trim().toLowerCase();
     return q ? list.filter((r) => r.slug.toLowerCase().includes(q)) : list;
   }, [tab, data, search]);
@@ -95,8 +113,17 @@ export default function CompaniesPage() {
         >
           <TabBtn active={tab === "unvetted"} onClick={() => setTab("unvetted")} label="Unvetted" count={counts.unvetted} />
           <TabBtn active={tab === "known"} onClick={() => setTab("known")} label="Known" count={counts.known} />
+          <TabBtn active={tab === "excluded"} onClick={() => setTab("excluded")} label="Excluded by me" count={counts.excluded} />
           <TabBtn active={tab === "blocklist"} onClick={() => setTab("blocklist")} label="Blocklist" count={counts.blocklist} />
         </div>
+
+        <p className="mt-2.5 text-[13px]" style={{ color: "var(--subtle)" }}>
+          {tab === "blocklist"
+            ? "Blocked for everyone — part of the shared company list, not something you set."
+            : tab === "excluded"
+              ? "Companies you have excluded. They stay in the shared list; Hermes just stops fetching them for you."
+              : "Excluding a company stops future fetches for you only. Jobs already found stay in your list."}
+        </p>
 
         {tab !== "blocklist" && (
           <div className="mt-[18px] flex items-center justify-between">
@@ -116,9 +143,13 @@ export default function CompaniesPage() {
               style={{ color: "var(--subtle)" }}
             >
               {Object.keys(
-                (tab === "unvetted" ? data?.unvetted : data?.known) ?? {},
+                (tab === "unvetted"
+                  ? data?.unvetted
+                  : tab === "known"
+                    ? data?.known
+                    : undefined) ?? {},
               ).join(" · ") || "—"}{" "}
-              · {counts[tab]} discovered
+              · {counts[tab]} {tab === "excluded" ? "excluded" : "discovered"}
             </span>
           </div>
         )}
@@ -151,7 +182,9 @@ export default function CompaniesPage() {
             )
           ) : rows.length === 0 ? (
             <p className="p-3 text-sm" style={{ color: "var(--muted)" }}>
-              No companies.
+              {tab === "excluded"
+                ? "You haven't excluded any companies."
+                : "No companies."}
             </p>
           ) : (
             (showAll ? rows : rows.slice(0, 30)).map((r) => {
@@ -172,8 +205,10 @@ export default function CompaniesPage() {
                     <span
                       className="text-sm font-medium"
                       style={{
-                        color: r.paused ? "var(--subtle)" : "var(--text)",
-                        textDecoration: r.paused ? "line-through" : "none",
+                        color:
+                          r.paused || r.excluded ? "var(--subtle)" : "var(--text)",
+                        textDecoration:
+                          r.paused || r.excluded ? "line-through" : "none",
                       }}
                     >
                       {r.slug}
@@ -181,28 +216,31 @@ export default function CompaniesPage() {
                     <span className="font-mono text-[11px]" style={{ color: "var(--subtle)" }}>
                       {r.platform}
                     </span>
+                    {r.paused && (
+                      <span className="font-mono text-[11px]" style={{ color: "var(--subtle)" }}>
+                        paused for everyone
+                      </span>
+                    )}
                   </div>
                   <div className="flex gap-2">
-                    {tab === "unvetted" ? (
-                      <>
-                        <RowBtn primary onClick={() => action.mutate({ platform: r.platform, slug: r.slug, action: "promote" })}>
-                          Promote
-                        </RowBtn>
-                        <RowBtn onClick={() => action.mutate({ platform: r.platform, slug: r.slug, action: "dismiss" })}>
-                          Dismiss
-                        </RowBtn>
-                        <RowBtn danger onClick={() => action.mutate({ platform: r.platform, slug: r.slug, action: "block", reason: "blocked from UI" })}>
-                          Block
-                        </RowBtn>
-                      </>
+                    {r.excluded ? (
+                      // No un-exclude endpoint exists yet, so this is a state,
+                      // not a disabled button pretending to be one.
+                      <span className="text-[13px]" style={{ color: "var(--muted)" }}>
+                        Excluded by you
+                      </span>
                     ) : (
                       <>
-                        <RowBtn
-                          onClick={() => action.mutate({ platform: r.platform, slug: r.slug, action: "pause" })}
-                          disabled={r.paused}
-                        >
-                          {r.paused ? "Paused" : "Pause"}
-                        </RowBtn>
+                        {tab === "unvetted" && (
+                          <RowBtn onClick={() => action.mutate({ platform: r.platform, slug: r.slug, action: "dismiss" })}>
+                            Dismiss
+                          </RowBtn>
+                        )}
+                        {tab === "known" && (
+                          <RowBtn onClick={() => action.mutate({ platform: r.platform, slug: r.slug, action: "pause" })}>
+                            Pause
+                          </RowBtn>
+                        )}
                         <RowBtn danger onClick={() => action.mutate({ platform: r.platform, slug: r.slug, action: "block", reason: "blocked from UI" })}>
                           Block
                         </RowBtn>
@@ -265,36 +303,33 @@ function TabBtn({
   );
 }
 
+// The `primary` variant went with the Promote button — it had no other caller.
 function RowBtn({
   onClick,
   children,
-  primary,
   danger,
   disabled,
 }: {
   onClick: () => void;
   children: React.ReactNode;
-  primary?: boolean;
   danger?: boolean;
   disabled?: boolean;
 }) {
   const base =
     "h-[30px] rounded-[7px] px-[13px] text-xs disabled:opacity-50 disabled:cursor-default";
-  const style: React.CSSProperties = primary
-    ? { background: "var(--text)", color: "var(--surface)", fontWeight: 600 }
-    : danger
-      ? {
-          background: "var(--surface)",
-          border: "1px solid var(--danger-border)",
-          color: "var(--danger)",
-          fontWeight: 500,
-        }
-      : {
-          background: "var(--surface)",
-          border: "1px solid var(--border)",
-          color: "var(--label)",
-          fontWeight: 500,
-        };
+  const style: React.CSSProperties = danger
+    ? {
+        background: "var(--surface)",
+        border: "1px solid var(--danger-border)",
+        color: "var(--danger)",
+        fontWeight: 500,
+      }
+    : {
+        background: "var(--surface)",
+        border: "1px solid var(--border)",
+        color: "var(--label)",
+        fontWeight: 500,
+      };
   return (
     <button onClick={onClick} disabled={disabled} className={base} style={style}>
       {children}

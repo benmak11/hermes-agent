@@ -1,9 +1,19 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Centralized loader/writer for the three company files.
+"""Centralized loader for the three company files.
 
 This module is the only thing in the codebase that touches the company YAML
 files. Everything else goes through it.
+
+It is read-only apart from :func:`append_unvetted`, which the offline sweep
+(``cli.discover_companies``) uses to grow the pool from a laptop. The
+promote/block/dismiss/pause mutators that used to live here are gone: they
+edited the YAML inside whichever container served the API request, so under
+``QUEUE_MODE=1`` the crawl — running in a *different* container — never saw
+the edit, and a deploy replaced the filesystem anyway. Per-user exclusions are
+now a Firestore overlay (:mod:`tools.company_prefs`) subtracted at compose time
+by :func:`all_active_companies`; promotion is a reviewed edit to
+``known.yaml``.
 """
 
 from __future__ import annotations
@@ -43,10 +53,6 @@ def _load(path: Path) -> dict:
     return yaml.safe_load(path.read_text()) or {}
 
 
-def _save(filename: str, raw: dict) -> None:
-    (DATA_DIR / filename).write_text(yaml.safe_dump(raw, sort_keys=False))
-
-
 def load_known() -> dict[Platform, list[CompanyEntry]]:
     raw = _load(DATA_DIR / "known.yaml")
     return {p: [CompanyEntry(**c) for c in raw.get(p, [])] for p in PLATFORMS}
@@ -70,7 +76,15 @@ def load_blocklist_detailed() -> list[dict]:
 
 
 def append_unvetted(platform: Platform, new_slugs: list[str]) -> int:
-    """Append new slugs to unvetted.yaml. Returns count actually added (after dedup)."""
+    """Append new slugs to unvetted.yaml. Returns count actually added (after dedup).
+
+    The only writer left in this module, and the only way the global pool grows:
+    ``cli.discover_companies`` runs the sweep on a laptop and the diff is
+    committed. It is a read-modify-write and that is survivable *only* because
+    of where it runs — one process, one working copy, a human reviewing the
+    result. Nothing on the request path may write here; per-user exclusions are
+    an overlay in Firestore (:mod:`tools.company_prefs`).
+    """
     raw = _load(DATA_DIR / "unvetted.yaml")
     existing = {c["slug"] for c in raw.get(platform, [])}
     known = {c.slug for c in load_known()[platform]}
@@ -115,75 +129,3 @@ def all_active_companies(
             if (plat, e.slug) not in exclusions
         )
     return out
-
-
-# ---------------------------------------------------------------------------
-# Mutations (used by the company-management API in Phase 5)
-# ---------------------------------------------------------------------------
-def _remove_slug(filename: str, platform: Platform, slug: str) -> None:
-    raw = _load(DATA_DIR / filename)
-    if raw.get(platform):
-        raw[platform] = [c for c in raw[platform] if c.get("slug") != slug]
-        _save(filename, raw)
-
-
-def promote_to_known(platform: Platform, slug: str) -> None:
-    """Move a discovered company from unvetted.yaml to known.yaml."""
-    _remove_slug("unvetted.yaml", platform, slug)
-    known = _load(DATA_DIR / "known.yaml")
-    if not any(c.get("slug") == slug for c in known.get(platform, [])):
-        known.setdefault(platform, []).append(
-            {"slug": slug, "added": date.today().isoformat()}
-        )
-        _save("known.yaml", known)
-
-
-def block_company(platform: Platform, slug: str, reason: str | None = None) -> None:
-    """Add a company to blocklist.yaml and remove it from known + unvetted."""
-    bl = _load(DATA_DIR / "blocklist.yaml")
-    blocked = bl.get("blocked") or []
-    if not any(
-        e.get("platform") == platform and e.get("slug") == slug for e in blocked
-    ):
-        blocked.append(
-            {
-                "platform": platform,
-                "slug": slug,
-                "blocked_at": date.today().isoformat(),
-                "reason": reason or "",
-            }
-        )
-        bl["blocked"] = blocked
-        _save("blocklist.yaml", bl)
-    _remove_slug("known.yaml", platform, slug)
-    _remove_slug("unvetted.yaml", platform, slug)
-
-
-def dismiss_unvetted(platform: Platform, slug: str) -> None:
-    """Remove a company from unvetted.yaml without blocking it."""
-    _remove_slug("unvetted.yaml", platform, slug)
-
-
-def set_paused(platform: Platform, slug: str, paused: bool = True) -> None:
-    """Toggle the paused flag on a known company (temporarily skip its fetch)."""
-    known = _load(DATA_DIR / "known.yaml")
-    for c in known.get(platform, []):
-        if c.get("slug") == slug:
-            c["paused"] = paused
-    _save("known.yaml", known)
-
-
-def apply_company_action(
-    platform: Platform, slug: str, action: str, reason: str | None = None
-) -> None:
-    """Dispatch a company-management action from the API."""
-    if action == "promote":
-        promote_to_known(platform, slug)
-    elif action == "block":
-        block_company(platform, slug, reason)
-    elif action == "dismiss":
-        dismiss_unvetted(platform, slug)
-    elif action == "pause":
-        set_paused(platform, slug, True)
-    else:
-        raise ValueError(f"unknown company action: {action!r}")
