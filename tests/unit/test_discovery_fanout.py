@@ -13,12 +13,26 @@ from __future__ import annotations
 
 import asyncio
 
+from test_company_prefs import _FakeDB
+
 import tools.discovery.pipeline as discovery
 from tools.ats import _http
 
 
 def _companies(n: int) -> list[tuple[str, str, str]]:
     return [("greenhouse", f"c{i}", "known") for i in range(n)]
+
+
+def _pool(n: int):
+    """Stand in for ``all_active_companies``, which now takes the user's
+    exclusion overlay. These tests are about the fan-out, not the overlay, so
+    they ignore it — ``test_company_prefs.py`` is where it is pinned."""
+    return lambda exclusions=frozenset(): _companies(n)
+
+
+def _no_exclusions() -> _FakeDB:
+    """An empty overlay — the only state that exists until the write path lands."""
+    return _FakeDB()
 
 
 def _tracking_fetcher(state: dict):
@@ -39,10 +53,10 @@ def _tracking_fetcher(state: dict):
 
 def test_fan_out_is_bounded(monkeypatch):
     state = {"live": 0, "peak": 0}
-    monkeypatch.setattr(discovery, "all_active_companies", lambda: _companies(60))
+    monkeypatch.setattr(discovery, "all_active_companies", _pool(60))
     monkeypatch.setitem(discovery.FETCHERS, "greenhouse", _tracking_fetcher(state))
 
-    asyncio.run(discovery.run_discovery("u1", concurrency=5))
+    asyncio.run(discovery.run_discovery("u1", concurrency=5, db=_no_exclusions()))
 
     assert state["peak"] == 5, f"expected 5 boards in flight, saw {state['peak']}"
 
@@ -50,10 +64,10 @@ def test_fan_out_is_bounded(monkeypatch):
 def test_the_default_bound_is_applied(monkeypatch):
     """Not just when a test passes one in — the shipped default binds too."""
     state = {"live": 0, "peak": 0}
-    monkeypatch.setattr(discovery, "all_active_companies", lambda: _companies(198))
+    monkeypatch.setattr(discovery, "all_active_companies", _pool(198))
     monkeypatch.setitem(discovery.FETCHERS, "greenhouse", _tracking_fetcher(state))
 
-    asyncio.run(discovery.run_discovery("u1"))
+    asyncio.run(discovery.run_discovery("u1", db=_no_exclusions()))
 
     assert state["peak"] == discovery._FETCH_CONCURRENCY
     assert state["peak"] < 198
@@ -67,10 +81,10 @@ def test_every_board_is_still_fetched(monkeypatch):
         fetched.append(slug)
         return []
 
-    monkeypatch.setattr(discovery, "all_active_companies", lambda: _companies(198))
+    monkeypatch.setattr(discovery, "all_active_companies", _pool(198))
     monkeypatch.setitem(discovery.FETCHERS, "greenhouse", fetcher)
 
-    summary = asyncio.run(discovery.run_discovery("u1"))
+    summary = asyncio.run(discovery.run_discovery("u1", db=_no_exclusions()))
 
     assert sorted(fetched) == sorted(s for _, s, _ in _companies(198))
     assert len(summary["empty_boards"]) == 198
@@ -84,10 +98,10 @@ def test_a_failing_board_still_lands_in_failures(monkeypatch):
             raise RuntimeError("board exploded")
         return []
 
-    monkeypatch.setattr(discovery, "all_active_companies", lambda: _companies(3))
+    monkeypatch.setattr(discovery, "all_active_companies", _pool(3))
     monkeypatch.setitem(discovery.FETCHERS, "greenhouse", fetcher)
 
-    summary = asyncio.run(discovery.run_discovery("u1"))
+    summary = asyncio.run(discovery.run_discovery("u1", db=_no_exclusions()))
 
     assert [f["slug"] for f in summary["failures"]] == ["c1"]
     assert len(summary["empty_boards"]) == 2
@@ -101,10 +115,10 @@ def test_fetchers_run_inside_the_shared_client_scope(monkeypatch):
         seen.append(_http._client.get())
         return []
 
-    monkeypatch.setattr(discovery, "all_active_companies", lambda: _companies(12))
+    monkeypatch.setattr(discovery, "all_active_companies", _pool(12))
     monkeypatch.setitem(discovery.FETCHERS, "greenhouse", fetcher)
 
-    asyncio.run(discovery.run_discovery("u1"))
+    asyncio.run(discovery.run_discovery("u1", db=_no_exclusions()))
 
     assert len(seen) == 12
     assert all(c is not None for c in seen), "no client was lent to the fetchers"
@@ -112,7 +126,7 @@ def test_fetchers_run_inside_the_shared_client_scope(monkeypatch):
 
 
 def test_the_client_scope_closes_after_the_cycle(monkeypatch):
-    monkeypatch.setattr(discovery, "all_active_companies", lambda: _companies(2))
+    monkeypatch.setattr(discovery, "all_active_companies", _pool(2))
 
     async def fetcher(slug: str, user_id: str):
         return []
@@ -120,7 +134,7 @@ def test_the_client_scope_closes_after_the_cycle(monkeypatch):
     monkeypatch.setitem(discovery.FETCHERS, "greenhouse", fetcher)
 
     async def main():
-        await discovery.run_discovery("u1")
+        await discovery.run_discovery("u1", db=_no_exclusions())
         return _http._client.get()
 
     assert asyncio.run(main()) is None

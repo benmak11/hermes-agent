@@ -25,6 +25,7 @@ from tools.ats.greenhouse import fetch_greenhouse_jobs
 from tools.ats.lever import fetch_lever_jobs
 from tools.ats.meta_jobs import fetch_meta_jobs
 from tools.companies import Platform, all_active_companies
+from tools.company_prefs import load_exclusions
 
 log = get_logger("tools.discovery")
 
@@ -57,14 +58,28 @@ async def _fetch_with_meta(fetcher, slug, user_id, platform, source):
         raise RuntimeError(f"{platform}/{slug}: {e}") from e
 
 
-async def run_discovery(user_id: str, concurrency: int = _FETCH_CONCURRENCY) -> dict:
+async def run_discovery(
+    user_id: str, concurrency: int = _FETCH_CONCURRENCY, db=None
+) -> dict:
     """Fetch all jobs from all sources for all known + unvetted companies.
+
+    The user's company exclusions are read **once**, here, before the fan-out —
+    not per board. Two reasons, and the second is the real one: a lookup per
+    board would be ~198 Firestore reads instead of one, and a write landing
+    mid-cycle would apply to the boards not yet reached and not to the ones
+    already fetched, so a single cycle would run against two different views of
+    the world. One read, one immutable snapshot, the whole cycle.
+
+    The snapshot is allowed to be slightly stale; the next cycle picks up
+    anything written during this one. Nothing here is a compare-and-swap.
 
     Returns a summary dict for SLI tracking later.
     """
     started = time.monotonic()
-    companies = all_active_companies()
-    log.info("discovery.start", company_count=len(companies))
+    db = db or firestore.AsyncClient()
+    exclusions = await load_exclusions(db, user_id)
+    companies = all_active_companies(exclusions)
+    log.info("discovery.start", company_count=len(companies), excluded=len(exclusions))
 
     sem = asyncio.Semaphore(concurrency)
 

@@ -88,13 +88,32 @@ def append_unvetted(platform: Platform, new_slugs: list[str]) -> int:
     return len(to_add)
 
 
-def all_active_companies() -> list[tuple[Platform, str, Literal["known", "unvetted"]]]:
-    """Flat list of (platform, slug, source) tuples to fetch on a daily run."""
+def all_active_companies(
+    exclusions: frozenset[tuple[Platform, str]] = frozenset(),
+) -> list[tuple[Platform, str, Literal["known", "unvetted"]]]:
+    """Flat list of (platform, slug, source) tuples to fetch on a daily run.
+
+    ``exclusions`` is the per-user overlay read by
+    :func:`tools.company_prefs.load_exclusions` — the pool above is global and
+    stays in YAML; what one user has excluded is subtracted here, at compose
+    time, so nothing about the shared pool has to know a user exists.
+
+    It defaults to empty, which composes exactly the set this has always
+    composed. That default is what makes every existing caller unchanged.
+    """
     out: list[tuple[Platform, str, Literal["known", "unvetted"]]] = []
     for plat, entries in load_known().items():
-        out.extend((plat, e.slug, "known") for e in entries if not e.paused)
+        out.extend(
+            (plat, e.slug, "known")
+            for e in entries
+            if not e.paused and (plat, e.slug) not in exclusions
+        )
     for plat, entries in load_unvetted().items():
-        out.extend((plat, e.slug, "unvetted") for e in entries)
+        out.extend(
+            (plat, e.slug, "unvetted")
+            for e in entries
+            if (plat, e.slug) not in exclusions
+        )
     return out
 
 
