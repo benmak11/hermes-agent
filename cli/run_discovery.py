@@ -38,6 +38,10 @@ async def main() -> None:
             f"  Failures: {len(summary['failures'])},"
             f" Empty boards: {len(summary['empty_boards'])}"
         )
+        print(
+            f"  Boards fetched: {summary['boards_fetched']},"
+            f" served from cache: {summary['boards_cached']}"
+        )
 
         preferences = await load_job_preferences(args.user_id)
         jobs, dropped = prefilter_jobs(jobs, preferences)

@@ -18,6 +18,7 @@ from google.cloud import firestore
 
 from models.job import Job
 from obs.logging import get_logger
+from tools.ats import board_cache
 from tools.ats._http import board_client
 from tools.ats.ashby import fetch_ashby_jobs
 from tools.ats.google_jobs import fetch_google_jobs
@@ -49,13 +50,27 @@ _FETCH_CONCURRENCY = 20
 
 
 async def _fetch_with_meta(fetcher, slug, user_id, platform, source):
-    """Wrapper that returns metadata alongside the fetch result."""
+    """One board, from the shared cache if it is warm. Returns metadata alongside.
+
+    The cache is consulted *here* rather than inside the fetchers so that the
+    fetchers stay exactly what they are — a board API and its parse — and so
+    ``html_to_text`` keeps running before anything is cached.
+
+    ``tools.ats.board_cache`` never raises: a miss, a cold cache, a corrupt
+    payload and a GCS outage all arrive as ``None``, so anything caught below
+    still means the *fetcher* failed. With ``BOARD_CACHE_TTL_SECONDS`` unset
+    (the shipped default) both calls are no-ops and this is the old code path.
+    """
+    cached = await board_cache.load_jobs(platform, slug, user_id)
+    if cached is not None:
+        return (platform, slug, source, cached, True)
     try:
         jobs = await fetcher(slug, user_id)
-        return (platform, slug, source, jobs)
     except Exception as e:
         # Re-raise so gather captures it; we only get here on programmer errors.
         raise RuntimeError(f"{platform}/{slug}: {e}") from e
+    await board_cache.store_jobs(platform, slug, jobs)
+    return (platform, slug, source, jobs, False)
 
 
 async def run_discovery(
@@ -101,11 +116,18 @@ async def run_discovery(
     failures: list[dict] = []
     empty_boards: list[dict] = []
     jobs_by_platform: Counter[str] = Counter()
+    # How much of this cycle the shared board cache absorbed. Both counters are
+    # reported so the pair adds up to the boards attempted — a lone hit count
+    # cannot tell "the cache is off" from "the cache is cold".
+    boards_cached = boards_fetched = 0
 
     for (platform, slug, source), result in zip(companies, results, strict=True):
         # gather(return_exceptions=True) can hand back BaseExceptions too;
         # narrowing to Exception would leave those to crash the unpack below.
         if isinstance(result, BaseException):
+            # A failure can only come from the fetcher (the cache swallows its
+            # own errors), so the board was genuinely fetched.
+            boards_fetched += 1
             # HTTP failures are already logged (and absorbed) by the fetchers;
             # an exception here is a parse/programmer error worth a traceback.
             log.error(
@@ -117,7 +139,11 @@ async def run_discovery(
             )
             failures.append({"platform": platform, "slug": slug, "error": str(result)})
             continue
-        platform, slug, source, fetched = result
+        platform, slug, source, fetched, from_cache = result
+        if from_cache:
+            boards_cached += 1
+        else:
+            boards_fetched += 1
         if not fetched:
             empty_boards.append({"platform": platform, "slug": slug, "source": source})
             continue
@@ -134,6 +160,8 @@ async def run_discovery(
         failures=len(failures),
         empty_boards=len(empty_boards),
         jobs_by_platform=dict(jobs_by_platform),
+        boards_cached=boards_cached,
+        boards_fetched=boards_fetched,
         duration_ms=duration_ms,
     )
     return {
@@ -141,6 +169,8 @@ async def run_discovery(
         "failures": failures,
         "empty_boards": empty_boards,
         "jobs_by_platform": dict(jobs_by_platform),
+        "boards_cached": boards_cached,
+        "boards_fetched": boards_fetched,
         "duration_ms": duration_ms,
     }
 

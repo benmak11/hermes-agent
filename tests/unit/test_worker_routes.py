@@ -2174,7 +2174,14 @@ def cycle_world(monkeypatch, slot_world):
     async def fake_run_discovery(user_id):
         if hooks.during is not None:
             hooks.during()
-        return {"jobs": [], "jobs_by_platform": {}, "failures": [], "empty_boards": []}
+        return {
+            "jobs": [],
+            "jobs_by_platform": {},
+            "failures": [],
+            "empty_boards": [],
+            "boards_cached": 0,
+            "boards_fetched": 0,
+        }
 
     async def fake_load_prefs(user_id):
         return None
