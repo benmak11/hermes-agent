@@ -35,9 +35,13 @@ export type CompanyEntry = {
   slug: string;
   added?: string | null;
   notes?: string | null;
+  /** Paused in the global pool (a git edit) — skipped for everyone. */
   paused?: boolean;
+  /** Excluded by *this* user's overlay. Not the same thing as `paused`. */
+  excluded?: boolean;
 };
 
+/** An entry on the global blocklist: git-shipped, and applies to every user. */
 export type BlockEntry = {
   platform: string;
   slug: string;
@@ -45,10 +49,20 @@ export type BlockEntry = {
   reason: string;
 };
 
+/** One company the signed-in user has excluded from their own fetch set. */
+export type UserExclusion = {
+  platform: string;
+  slug: string;
+};
+
 export type CompaniesResponse = {
+  /** The global pool, annotated with this user's `excluded` flag. */
   known: Record<string, CompanyEntry[]>;
   unvetted: Record<string, CompanyEntry[]>;
+  /** Global — everyone's blocklist, not this user's doing and not theirs to undo. */
   blocklist: BlockEntry[];
+  /** This user's exclusions, listed separately: one can outlive its pool entry. */
+  excluded: UserExclusion[];
 };
 
 // ---- Profile (mirrors models/profile.py MasterProfile) ----
@@ -166,7 +180,13 @@ export type DiscoverySettingsResponse = {
 export type Decision = "approved" | "rejected" | "starred";
 /** What POST /jobs/{id}/decide accepts — "pending" reverts a decision. */
 export type DecideValue = Decision | "pending";
-export type CompanyActionType = "promote" | "block" | "dismiss" | "pause";
+/**
+ * What POST /companies/action accepts. All three exclude the company from this
+ * user's fetch set and differ only in the reason recorded. `promote` is not
+ * here: it was a global operator action that never changed the fetch set, and
+ * there is no global write path left — promotion is a git edit to known.yaml.
+ */
+export type CompanyActionType = "block" | "dismiss" | "pause";
 
 export type RoleBullets = {
   company: string;

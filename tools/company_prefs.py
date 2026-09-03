@@ -29,15 +29,25 @@ audit and UI grouping, and its vocabulary belongs to the UI. ``state`` is what
 the pipeline acts on. Filtering the fetch set on ``action`` would couple which
 boards get crawled to whatever the buttons happen to be called this month.
 
-This module is the read half. The write half populates these documents; until
-it lands, every overlay is empty and the composed fetch set is byte-identical
-to the one this pipeline has always produced.
+The write half is :func:`set_exclusion`, called from ``POST /companies/action``.
+It is a **blind** ``set()`` and deliberately not a compare-and-swap: the
+document id *is* the key, so two "block stripe" clicks converge on the same
+value, and a block racing an unblock is an ambiguity at the level of the user's
+intent that no precondition can resolve. The concurrency bug worth avoiding
+here is the read-modify-write, and one-document-per-key is what avoids it.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from typing import Literal
+
 from obs.logging import get_logger
 from tools.companies import PLATFORMS, Platform
+
+#: What the user clicked. Audit and UI grouping only — the pipeline reads
+#: ``state``. All three mean "stop fetching this board for me".
+ExclusionAction = Literal["block", "dismiss", "pause"]
 
 log = get_logger("tools.company_prefs")
 
@@ -101,3 +111,60 @@ async def load_exclusions(db, user_id: str) -> frozenset[tuple[Platform, str]]:
             continue
         exclusions.add((platform, slug))
     return frozenset(exclusions)
+
+
+async def set_exclusion(
+    db,
+    user_id: str,
+    platform: Platform,
+    slug: str,
+    *,
+    action: ExclusionAction,
+    reason: str | None = None,
+) -> str:
+    """Record that ``user_id`` no longer wants ``(platform, slug)`` fetched.
+
+    One blind ``set()`` of one document whose id is
+    :func:`exclusion_key`. Explicitly **not** a compare-and-swap, and not a
+    ``merge``: the whole document is the value, every field of it is derived
+    from this one click, and there is no prior state to preserve. Two identical
+    clicks converge; a block racing an unblock is a question about what the user
+    meant, and a precondition would only turn it into a 409 they cannot act on.
+
+    What this must never become is a read-modify-write of a list or map — read
+    the whole set of exclusions, add one, write it back. That is the shape
+    ``tools.companies.append_unvetted`` still has against the YAML (it is a
+    laptop-only, single-writer path, which is why it survives), and under two
+    concurrent API requests the second write silently drops the first.
+
+    Raises ``ValueError`` — from :func:`exclusion_key`, before any I/O — if the
+    pair cannot be a document id. Callers on the request path must turn that
+    into a 4xx rather than letting it 500.
+
+    Returns the document id, for logging.
+    """
+    key = exclusion_key(platform, slug)
+    doc = {
+        "platform": platform,
+        "slug": slug,
+        "state": "excluded",
+        "action": action,
+        "reason": reason,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    await (
+        db.collection("users")
+        .document(user_id)
+        .collection(COLLECTION)
+        .document(key)
+        .set(doc)
+    )
+    log.info(
+        "company_prefs.excluded",
+        user_id=user_id,
+        doc_id=key,
+        platform=platform,
+        slug=slug,
+        action=action,
+    )
+    return key
