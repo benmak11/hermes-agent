@@ -480,6 +480,11 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
                 "jobs_by_platform": summary["jobs_by_platform"],
                 "boards_failed": len(summary["failures"]),
                 "empty_boards": len(summary["empty_boards"]),
+                # What the shared board cache absorbed. Both are 0 while
+                # BOARD_CACHE_TTL_SECONDS is unset; once ops flips it, this is
+                # where the effect becomes visible per cycle.
+                "boards_cached": summary["boards_cached"],
+                "boards_fetched": summary["boards_fetched"],
                 "new_jobs": new,
                 "scored": counts["scored"],
                 "discarded": counts["discarded"],

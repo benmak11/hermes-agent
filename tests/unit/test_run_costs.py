@@ -446,6 +446,8 @@ def _flush_site_harness(monkeypatch, *, counts: dict, cost_calls: int = 1):
             "jobs_by_platform": {},
             "failures": [],
             "empty_boards": [],
+            "boards_cached": 0,
+            "boards_fetched": 0,
         }
 
     async def fake_load_prefs(user_id):
