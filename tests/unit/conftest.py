@@ -5,6 +5,7 @@
 import pytest
 from google.cloud import firestore
 
+import api.routes.account as routes_account
 import api.routes.applications as routes_applications
 import api.routes.companies as routes_companies
 import api.routes.discovery as routes_discovery
@@ -128,6 +129,7 @@ def no_production_firestore(monkeypatch, request):
     # what makes the refusal actually bite — this guard was written without it
     # and silently caught nothing.
     for mod in (
+        routes_account,
         routes_discovery,
         routes_applications,
         routes_companies,

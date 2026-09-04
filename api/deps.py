@@ -51,6 +51,22 @@ def _ensure_firebase() -> None:
     _firebase_ready = True
 
 
+def firebase_auth():
+    """The ``firebase_admin.auth`` module, with the Admin SDK initialised.
+
+    One initialisation for the process, shared with :func:`_verify_token` —
+    ``firebase_admin.initialize_app()`` raises if it is called twice, so a
+    second caller must not run its own. Exported because deleting an account
+    (``api.routes.account``) has to reach the *same* Admin app the token
+    verification uses, and because a function is a seam a test can replace,
+    where ``from firebase_admin import auth`` inside a route body is not.
+    """
+    _ensure_firebase()
+    from firebase_admin import auth as fb_auth
+
+    return fb_auth
+
+
 def _verify_token(token: str | None) -> str:
     """Verify a Firebase ID token (or honor the dev bypass) and return the uid.
 

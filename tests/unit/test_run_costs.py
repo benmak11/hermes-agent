@@ -463,6 +463,12 @@ def _flush_site_harness(monkeypatch, *, counts: dict, cost_calls: int = 1):
         flushes.append((user_id, run_id, kw))
 
     class _StateWriter:
+        def get(self):
+            # The cycle reads this document once before it starts, to refuse a
+            # deleted account (tools.account.delete). A live account is an
+            # ordinary document with no ``deleted_at``.
+            return SimpleNamespace(to_dict=lambda: {})
+
         def set(self, doc, merge=False):
             state.update(doc)
 
@@ -579,6 +585,11 @@ def test_sweep_cycle_flushes_cost(monkeypatch):
         flushes.append((user_id, run_id, kw))
 
     class _StateWriter:
+        def get(self):
+            # The sweep, like the discovery cycle, reads this document once to
+            # refuse a deleted account. This one is live.
+            return SimpleNamespace(to_dict=lambda: {})
+
         def set(self, doc, merge=False):
             pass
 

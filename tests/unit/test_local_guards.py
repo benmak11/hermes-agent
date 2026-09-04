@@ -23,6 +23,7 @@ import ast
 import asyncio
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -214,6 +215,14 @@ def test_the_cycle_runs_when_nothing_is_bypassing_auth(monkeypatch):
     async def fake_persist_run_cost(db, user_id, run_id, **kw):
         flushed.append(user_id)
 
+    # The cycle reads users/{uid} once before it starts, to refuse an account
+    # that has been deleted. Answered here with a live document, so ``_client``
+    # below stays the refusal it is meant to be.
+    monkeypatch.setattr(
+        discovery,
+        "_user_ref",
+        lambda uid: SimpleNamespace(get=lambda: SimpleNamespace(to_dict=lambda: {})),
+    )
     monkeypatch.setattr(discovery, "_extend_slot", lambda *a, **kw: True)
     monkeypatch.setattr(discovery, "run_discovery", fake_run_discovery)
     monkeypatch.setattr(discovery, "_release_slot", lambda *a, **kw: True)
