@@ -143,5 +143,13 @@ async def delete_my_account(
         )
 
     log.info("account.delete.requested", user_id=user_id)
-    counts = await delete_account(_client(), user_id, close_auth=_close_auth)
+    # ``expected`` is the same Auth-preferred email already resolved above (for
+    # the confirmation check) — captured before ``_close_auth`` runs, which is
+    # the only window in which Firebase Admin can still answer for it. See
+    # ``tools.account.delete.delete_account`` for what it is used for (freeing
+    # this user's allowlist seat) and why it is a no-op everywhere that flag
+    # is off, which is every deployment of this PR.
+    counts = await delete_account(
+        _client(), user_id, close_auth=_close_auth, email=expected
+    )
     return {"ok": True, "deleted": counts.as_dict()}

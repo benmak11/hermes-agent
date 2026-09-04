@@ -35,6 +35,7 @@ import api.routes.account as account
 import api.routes.discovery as discovery
 from api.deps import verify_user
 from tools.account import delete as account_delete
+from tools.allowlist import COLLECTION as ALLOWLIST_COLLECTION
 
 DELETED_AT = "2026-09-03T12:00:00+00:00"
 
@@ -433,6 +434,96 @@ def test_a_close_auth_that_raises_stops_the_wipe(world):
     assert "users/u1/jobs/j1" in world.db.docs
     # The tombstone did land, so the loops are already refusing this account.
     assert account_delete.is_deleted(world.db.docs["users/u1"])
+
+
+# ---------------------------------------------------------------------------
+# Seat freeing — the hook PR C left, wired for Phase 4 D1/D2
+# ---------------------------------------------------------------------------
+def _seat(world, email: str = "user@example.com", *, revoked: bool = False) -> str:
+    path = f"{ALLOWLIST_COLLECTION}/{email}"
+    world.db.docs[path] = {"revoked": revoked}
+    return path
+
+
+def test_a_deletion_frees_the_departing_users_seat_when_enforced(world, monkeypatch):
+    monkeypatch.setenv("ALLOWLIST_ENFORCED", "1")
+    seat = _seat(world)
+
+    asyncio.run(
+        account_delete.delete_account(
+            world.db, "u1", close_auth=lambda uid: None, email="User@Example.com"
+        )
+    )
+
+    assert world.db.docs[seat]["revoked"] is True
+
+
+def test_seat_freeing_is_a_no_op_while_unenforced(world, monkeypatch):
+    """The whole point of D1 shipping before D2 flips the flag: every real
+    caller, including this one, must be inert with it unset."""
+    monkeypatch.delenv("ALLOWLIST_ENFORCED", raising=False)
+    seat = _seat(world)
+
+    asyncio.run(
+        account_delete.delete_account(
+            world.db, "u1", close_auth=lambda uid: None, email="user@example.com"
+        )
+    )
+
+    assert world.db.docs[seat]["revoked"] is False
+
+
+def test_seat_freeing_is_skipped_without_an_email_to_free_it_by(world, monkeypatch):
+    """``api.routes.account`` already refuses a deletion with no address
+    anywhere before it would ever reach here; this pins that the function
+    itself does not crash if it is ever called without one regardless."""
+    monkeypatch.setenv("ALLOWLIST_ENFORCED", "1")
+
+    asyncio.run(
+        account_delete.delete_account(
+            world.db, "u1", close_auth=lambda uid: None, email=None
+        )
+    )
+
+    assert not [p for p in world.db.docs if p.startswith(f"{ALLOWLIST_COLLECTION}/")]
+
+
+def test_seat_freeing_lands_after_auth_close_and_before_the_wipe(world, monkeypatch):
+    """The ordering promise ``delete_account`` makes for every step: nothing
+    destructive runs until the inbound paths — the tombstone, the closed
+    login — are shut. This is the same promise applied to the new step."""
+    monkeypatch.setenv("ALLOWLIST_ENFORCED", "1")
+    seat = _seat(world)
+
+    def close(uid):
+        world.db.ops.append(("auth_delete", uid))
+
+    asyncio.run(
+        account_delete.delete_account(
+            world.db, "u1", close_auth=close, email="user@example.com"
+        )
+    )
+
+    ops = world.db.ops
+    auth_idx = ops.index(("auth_delete", "u1"))
+    seat_idx = ops.index(("set", seat))
+    first_destructive = next(
+        i for i, op in enumerate(ops) if op[0] in {"delete", "batch_delete"}
+    )
+    assert auth_idx < seat_idx < first_destructive
+
+
+def test_the_delete_endpoint_frees_the_seat_by_the_confirmed_email(api, monkeypatch):
+    """End to end: the endpoint resolves the Auth email for the confirmation
+    check, and that same value is what frees the seat — never
+    ``users/{uid}.email``."""
+    monkeypatch.setenv("ALLOWLIST_ENFORCED", "1")
+    seat = _seat(api.world, "user@example.com")
+
+    resp = api.client.post("/account/delete", json={"confirm": "User@Example.com"})
+
+    assert resp.status_code == 200
+    assert api.world.db.docs[seat]["revoked"] is True
 
 
 # ---------------------------------------------------------------------------

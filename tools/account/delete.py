@@ -40,6 +40,7 @@ from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from obs.logging import get_logger
+from tools import allowlist
 from tools.company_prefs import COLLECTION as COMPANY_PREFS
 from tools.run_costs import COLLECTION as RUN_COSTS
 from tools.tailoring.render import resume_bucket_name
@@ -209,6 +210,7 @@ async def delete_account(
     user_id: str,
     *,
     close_auth: Callable[[str], None],
+    email: str | None = None,
     now: datetime | None = None,
 ) -> WipeCounts:
     """Close the account, then erase it. **The order is the design.**
@@ -222,6 +224,7 @@ async def delete_account(
        verifiable for up to an hour after the account it names is deleted, so
        the user retrying a half-finished deletion is a reachable path and not
        an exotic one.
+    2b. Free this user's allowlist seat, if they had one — see below.
     3. The wipe, ending with ``users/{uid}`` itself.
 
     **What this does not do, and cannot: make deletion atomic against a cycle
@@ -238,8 +241,17 @@ async def delete_account(
     and ``cli/reset_user.py`` — are re-runnable and cost nothing but a few
     Firestore reads, so an operator who sees residue re-runs the wipe.
 
-    Leaves no seat accounting behind: when the allowlist lands (Phase 4 D1/D2),
-    freeing this user's seat belongs here, between step 2 and step 3.
+    **Seat accounting (Phase 4 D1/D2).** ``email`` is the Auth email the
+    caller resolved *before* calling this — ``api.routes.account`` already
+    looks it up to compare against the typed confirmation, and by the time
+    step 2 has run, ``close_auth`` may have deleted the very Firebase Auth
+    record :func:`tools.allowlist.is_allowed` would otherwise need to be asked
+    about, so it has to be captured ahead of time and handed in rather than
+    looked up here. A no-op — no read, no write — while
+    ``tools.allowlist.enforced()`` is off, which is every deployment of this
+    PR; pass ``None`` when the caller has no address to give (the account had
+    none anywhere, which ``api.routes.account`` already refuses before it
+    would ever reach here).
     """
     user_ref = db.collection("users").document(user_id)
     deleted_at = (now or _now()).isoformat()
@@ -255,6 +267,13 @@ async def delete_account(
     # Blocking Firebase Admin call, off the event loop.
     await asyncio.to_thread(close_auth, user_id)
     log.info("account.auth_closed", user_id=user_id)
+
+    if allowlist.enforced():
+        if email:
+            freed = await allowlist.revoke(db, email, revoked_by="account_deletion")
+            log.info("account.seat_freed", user_id=user_id, freed=freed)
+        else:
+            log.info("account.seat_free_skipped_no_email", user_id=user_id)
 
     counts = await wipe_user_data(db, user_id, execute=True)
     log.info("account.deleted", user_id=user_id, **counts.as_dict())

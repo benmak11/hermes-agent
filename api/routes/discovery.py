@@ -34,12 +34,12 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from google.api_core.exceptions import FailedPrecondition, NotFound
 from google.cloud import firestore
 
-from api.deps import dev_mode, verify_user
+from api.deps import dev_mode, firebase_auth, verify_user
 from api.routes.applications import dispatch_tailor
 from models.settings import DiscoverySettings
 from obs.llm_cost import run_cost_snapshot
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
-from tools import queues
+from tools import allowlist, queues
 from tools.account.delete import is_deleted
 from tools.applications import reaper
 from tools.ats.sweep import sweep_postings
@@ -165,12 +165,57 @@ def _client() -> firestore.Client:
     return _db
 
 
+#: An async client, purely for :func:`_allowlisted` — everything else in this
+#: module is sync-plus-``asyncio.to_thread``, but ``tools.allowlist.is_allowed``
+#: is async (it is shared with ``api.deps``, which runs on an event loop with
+#: no thread hop to spare). Memoising it is safe for the reason ``_client``
+#: above and ``api.routes.account``'s async client both are: one uvicorn loop
+#: for the life of the process. Built at all only when ``cron_tick`` runs with
+#: ``ALLOWLIST_ENFORCED`` on.
+_adb: firestore.AsyncClient | None = None
+
+
+def _async_client() -> firestore.AsyncClient:
+    global _adb
+    if _adb is None:
+        _adb = firestore.AsyncClient()
+    return _adb
+
+
 def _user_ref(user_id: str):
     return _client().collection("users").document(user_id)
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+async def _allowlisted(user_id: str) -> bool:
+    """Is this user's Auth email an active allowlist seat?
+
+    Reached only from :func:`cron_tick`'s fan-out, and only while
+    ``tools.allowlist.enforced()`` is on. That endpoint is the one caller that
+    reaches a user without ever passing through ``verify_user`` — it streams
+    every document in ``users`` — which is exactly why PR C's
+    :func:`is_deleted` check lives at this same seam: a de-allowlisted user's
+    background loops have to stop *here*, or removing them from the allowlist
+    bounds none of their spend.
+
+    Reads the Auth email, never ``users/{uid}.email`` — same reasoning as
+    everywhere else this PR touches: the profile field is résumé-extracted and
+    is not guaranteed to be the login address, where the Auth email is what
+    :func:`tools.allowlist.is_allowed` is keyed on. ``get_user`` is a blocking
+    Firebase Admin call, off the event loop via ``asyncio.to_thread``; a
+    lookup that fails for any reason (the account is gone, the Admin SDK is
+    unreachable) reads as "not allowed" — the same fail-closed bias
+    :func:`tools.allowlist.is_allowed` documents for itself.
+    """
+    try:
+        record = await asyncio.to_thread(firebase_auth().get_user, user_id)
+    except Exception as e:
+        log.info("cron.allowlist_lookup_failed", user_id=user_id, error=str(e))
+        return False
+    return await allowlist.is_allowed(_async_client(), record.email)
 
 
 async def _account_deleted(user_id: str) -> bool:
@@ -964,6 +1009,8 @@ async def cron_tick(
     reap_failed = 0
     reap_truncated = 0
     deleted = 0
+    not_allowlisted = 0
+    enforce_allowlist = allowlist.enforced()
     for uid, doc in users:
         if is_deleted(doc):
             # This fan-out is the one caller that reaches a user without ever
@@ -973,6 +1020,14 @@ async def cron_tick(
             # whole — not just the tick, but the reaper too, which would
             # otherwise dispatch tailoring for a user who is leaving.
             deleted += 1
+            continue
+        if enforce_allowlist and not await _allowlisted(uid):
+            # Same seam, same reason, same shape as the ``is_deleted`` skip
+            # above: a de-allowlisted user's background loops must stop here,
+            # or removing them from the allowlist doesn't bound their spend.
+            # Off entirely while ALLOWLIST_ENFORCED is unset — this whole
+            # branch never runs on the shipped state of this PR.
+            not_allowlisted += 1
             continue
         if not inline:
             background_tasks.add_task(tick_user, uid, force_check=True, doc=doc)
@@ -1007,6 +1062,7 @@ async def cron_tick(
         users=len(users),
         failed=failed,
         deleted=deleted,
+        not_allowlisted=not_allowlisted,
         reaped=reaped,
         reap_failed=reap_failed,
         reap_truncated=reap_truncated,
@@ -1014,8 +1070,10 @@ async def cron_tick(
     )
     # Against the users this tick actually *tried*, not the collection size: a
     # tombstoned account is skipped by design, and counting it as a success
-    # would mask a fan-out where every real user's tick failed.
-    attempted = len(users) - deleted
+    # would mask a fan-out where every real user's tick failed. A
+    # de-allowlisted user is skipped the same way and for the same reason —
+    # always 0 while ALLOWLIST_ENFORCED is off.
+    attempted = len(users) - deleted - not_allowlisted
     if attempted and failed == attempted:
         # Nothing ticked. Almost always environmental (credentials, queue
         # config), so let the scheduler retry it and let it be visible as a
@@ -1031,6 +1089,9 @@ async def cron_tick(
         # counter: a fan-out that suddenly ticks nobody should be readable as
         # "everyone deleted themselves" rather than "the loop is broken".
         "deleted": deleted,
+        # Seat-revoked accounts, skipped whole — see ``deleted`` above for the
+        # identical reasoning. Always 0 while ALLOWLIST_ENFORCED is off.
+        "not_allowlisted": not_allowlisted,
         # Additive to the contract PR C established. The reaper is the one loop
         # here whose *inaction* is invisible — a stuck application looks like an
         # idle one — so the count comes back rather than living only in logs.

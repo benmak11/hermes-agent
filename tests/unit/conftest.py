@@ -5,6 +5,7 @@
 import pytest
 from google.cloud import firestore
 
+import api.deps as api_deps
 import api.routes.account as routes_account
 import api.routes.applications as routes_applications
 import api.routes.companies as routes_companies
@@ -129,6 +130,7 @@ def no_production_firestore(monkeypatch, request):
     # what makes the refusal actually bite — this guard was written without it
     # and silently caught nothing.
     for mod in (
+        api_deps,
         routes_account,
         routes_discovery,
         routes_applications,
@@ -137,3 +139,8 @@ def no_production_firestore(monkeypatch, request):
         routes_profile,
     ):
         monkeypatch.setattr(mod, "_db", None, raising=False)
+    # ``api.routes.discovery`` memoises a *second* client — an async one, used
+    # only by the allowlist check in ``cron_tick`` — beside its usual sync
+    # ``_db``. Same leak shape ``_db`` above exists to close: a client built by
+    # an earlier test would otherwise be handed out to every test after it.
+    monkeypatch.setattr(routes_discovery, "_adb", None, raising=False)
