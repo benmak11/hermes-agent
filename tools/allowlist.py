@@ -39,8 +39,39 @@ deliberately different biases — not an inconsistency to reconcile.
 ``tools.queues.enabled`` (``QUEUE_MODE``) and
 ``tools.matching.pipeline.geo_enforce_enabled`` (``GEO_GATE_ENFORCE``). This
 module works, and is tested, with the flag on; every real caller in this PR
-checks the flag first and is a no-op while it is off. Flipping it on — after
-the three real accounts are seeded — is Phase 4 D2, a separate PR.
+checks the flag first and is a no-op while it is off.
+
+**Ops runbook — flipping this on (Phase 4 D2 closes the code gap; a human
+does this step, by hand, after D2 is reviewed and merged).** No step here is
+run by an agent or by CI — ``gcloud`` against the live services is a human
+action, deliberately outside anything this codebase automates. In order:
+
+1. Confirm both real accounts are already seeded and active
+   (``techedoutben@gmail.com``, ``btmakusha@yahoo.com``) — ``list_entries``
+   via the CLI, or a Firestore console check. Do not skip this: everything
+   below assumes it is already true.
+2. Deploy the D2 PR (the frontend pre-flight check and this comment) to both
+   services. It is inert until step 3 — ``ALLOWLIST_ENFORCED`` is still
+   unset everywhere at this point.
+3. Set ``ALLOWLIST_ENFORCED=1`` on ``hermes-worker`` **first**. It is
+   private and has no user-facing traffic, so a mistake here costs nothing a
+   real user can see.
+4. Verify ``cron_tick`` still processes both real accounts — check worker
+   logs for the allowlist fan-out and confirm ``not_allowlisted`` count is
+   0. A nonzero count means step 1 was wrong (a seed is missing or
+   mis-cased) — fix the seed, do not proceed to step 5 until this reads 0.
+5. Only then set ``ALLOWLIST_ENFORCED=1`` on ``hermes-api``.
+6. Sign in as both seeded accounts (Google and, if applicable, email) and
+   confirm real access — not just a 200 from ``/profile`` in isolation.
+7. Only after 6 is confirmed, remove ``NEXT_PUBLIC_INVITE_CODES`` and the
+   client-side invite gate in ``web/src/app/login/page.tsx`` — a follow-up
+   PR, not part of D2.
+
+**Reversing the order in step 3/5 (api before worker), or skipping step 1 or
+4, risks locking out the two real accounts** — a 403 with no seat to blame it
+on, discovered by a human being unable to sign in, not by an alert. The
+rollback, on whichever service was flipped, is a single flag removal:
+``gcloud run services update <service> --remove-env-vars ALLOWLIST_ENFORCED``.
 """
 
 from __future__ import annotations
