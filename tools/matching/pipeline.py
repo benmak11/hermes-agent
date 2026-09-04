@@ -2,11 +2,10 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Matching pipeline: parse a JD (Flash) then score it against the profile (Pro).
 
-Deterministic engine (run via cli/run_matching.py), not an ADK agent. A cheap
-pre-filter (:func:`prefilter`) drops out-of-target roles — and, under
-``GEO_GATE_ENFORCE``, provably unreachable ones — before the expensive Pro
-scoring call. Model ids come from :mod:`tools.llm_models`, shared with
-agents/_shared.py.
+Deterministic engine, run via cli/run_matching.py. A cheap pre-filter
+(:func:`prefilter`) drops out-of-target roles — and, under ``GEO_GATE_ENFORCE``,
+provably unreachable ones — before the expensive Pro scoring call. Model ids
+come from :mod:`tools.llm_models`.
 """
 
 from __future__ import annotations
@@ -29,9 +28,8 @@ from tools.matching import geo
 log = get_logger("tools.matching")
 
 # FLASH_MODEL / PRO_MODEL are imported above from tools.llm_models, the single
-# home for these ids; this module and agents/_shared.py used to declare them
-# separately and keep them aligned by comment. Parsing is high-volume → Flash;
-# scoring is the call worth paying for → Pro.
+# home for these ids. Parsing is high-volume → Flash; scoring is the call worth
+# paying for → Pro.
 
 # Thinking bills as output tokens at the full output rate — telemetry showed it
 # running 1.5x-4x the answer size on both calls below with no thinking_config
@@ -411,8 +409,8 @@ def geo_enforce_enabled() -> bool:
     """True when the geo gate may *skip* Pro calls, not merely record them.
 
     Off unless explicitly switched on, same shape as ``QUEUE_MODE``
-    (``tools.queues.enabled``) and ``ADK_ENABLED`` (``api.main``). Off is the
-    shipped state: the gate's false-positive rate is measured (0 over 1,127
+    (``tools.queues.enabled``). Off is the shipped state: the gate's
+    false-positive rate is measured (0 over 1,127
     records) but a false positive under enforcement is not one lost job — the
     tombstone is discovery's dedupe key, so it suppresses that posting on every
     future re-discovery too. That is what :func:`score.restore_payload` and

@@ -30,8 +30,7 @@ COPY ./pyproject.toml ./README.md ./uv.lock* ./
 
 # All packages listed in [tool.hatch.build.targets.wheel] must be present so the
 # project wheel builds, and so the API routers can import them at runtime
-# (api.routes.companies -> tools.companies, agents -> models, etc.).
-COPY ./agents ./agents
+# (api.routes.companies -> tools.companies, etc.).
 COPY ./api ./api
 COPY ./models ./models
 COPY ./tools ./tools

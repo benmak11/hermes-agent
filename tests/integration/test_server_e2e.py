@@ -1,24 +1,18 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""The gateway end to end: a real uvicorn process with the ADK surface mounted.
+"""The only end-to-end proof that the gateway actually boots.
 
-**One test in here costs money.** ``test_chat_stream`` posts to ``/run_sse``,
-which drives the real ``root_agent`` against the live GCP project; the other two
-never reach a model (a 422 and a log-only ``/feedback`` write). So that one
-carries the ``billed`` marker, ``pyproject.toml`` deselects the marker by
-default, and::
+Everything else about ``api.main`` is tested in-process against a TestClient.
+This file is the one place a *real* uvicorn subprocess imports ``api.main:app``,
+serves an authenticated route, and is asserted on — which is what catches an
+import-time or middleware-wiring break that a TestClient constructed inside an
+already-working interpreter would not.
 
-    uv run pytest tests/integration
-
-runs the free ones only. Opt into the paid one explicitly::
-
-    uv run pytest tests/integration -m billed
-
-A ``429 RESOURCE_EXHAUSTED`` from that run is production quota, not a bug in the
-test.
+It costs nothing to run: the one request it makes writes a log line. No test
+here drives a model, and ``tests/unit/test_local_guards.py`` asserts that stays
+true.
 """
 
-import json
 import logging
 import os
 import subprocess
@@ -37,7 +31,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BASE_URL = "http://127.0.0.1:8000"
-STREAM_URL = BASE_URL + "/run_sse"
 FEEDBACK_URL = BASE_URL + "/feedback"
 
 HEADERS = {"Content-Type": "application/json"}
@@ -63,9 +56,6 @@ def start_server() -> subprocess.Popen[str]:
     ]
     env = os.environ.copy()
     env["INTEGRATION_TEST"] = "TRUE"
-    # This suite exercises the ADK agent surface (/apps/*, /run_sse), which
-    # api.main does not mount unless asked — see the ADK_ENABLED comment there.
-    env["ADK_ENABLED"] = "1"
     # /feedback now requires a verified caller. Use the local auth bypass rather
     # than minting a real Firebase token for a loopback server.
     env["AUTH_DEV_MODE"] = "1"
@@ -91,11 +81,17 @@ def start_server() -> subprocess.Popen[str]:
 
 
 def wait_for_server(timeout: int = 90, interval: int = 1) -> bool:
-    """Wait for the server to be ready."""
+    """Wait for the server to be ready.
+
+    Probes ``/openapi.json``, which ``api.main`` publishes only when
+    ``deps.dev_mode()`` is true — i.e. this works *because* ``start_server``
+    sets ``AUTH_DEV_MODE=1``. Drop that env var and this poll times out rather
+    than failing on the assertion, so the two move together.
+    """
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            response = requests.get("http://127.0.0.1:8000/docs", timeout=10)
+            response = requests.get("http://127.0.0.1:8000/openapi.json", timeout=10)
             if response.status_code == 200:
                 logger.info("Server is ready")
                 return True
@@ -123,84 +119,6 @@ def server_fixture(request: Any) -> Iterator[subprocess.Popen[str]]:
 
     request.addfinalizer(stop_server)
     yield server_process
-
-
-@pytest.mark.billed
-def test_chat_stream(server_fixture: subprocess.Popen[str]) -> None:
-    """Test the chat stream functionality. Billed: this one really calls Gemini."""
-    logger.info("Starting chat stream test")
-    # Create session first
-    user_id = "test_user_123"
-    session_data = {"state": {"preferred_language": "English", "visit_count": 1}}
-
-    session_url = f"{BASE_URL}/apps/coordinator/users/{user_id}/sessions"
-    session_response = requests.post(
-        session_url,
-        headers=HEADERS,
-        json=session_data,
-        timeout=60,
-    )
-    assert session_response.status_code == 200
-    logger.info(f"Session creation response: {session_response.json()}")
-    session_id = session_response.json()["id"]
-
-    # Then send chat message
-    data = {
-        "app_name": "coordinator",
-        "user_id": user_id,
-        "session_id": session_id,
-        "new_message": {
-            "role": "user",
-            "parts": [{"text": "Hi!"}],
-        },
-        "streaming": True,
-    }
-    response = requests.post(
-        STREAM_URL, headers=HEADERS, json=data, stream=True, timeout=60
-    )
-    assert response.status_code == 200
-
-    # Parse SSE events from response
-    events = []
-    for line in response.iter_lines():
-        if line:
-            # SSE format is "data: {json}"
-            line_str = line.decode("utf-8")
-            if line_str.startswith("data: "):
-                event_json = line_str[6:]  # Remove "data: " prefix
-                event = json.loads(event_json)
-                events.append(event)
-
-    assert events, "No events received from stream"
-    # Check for valid content in the response
-    has_text_content = False
-    for event in events:
-        content = event.get("content")
-        if (
-            content is not None
-            and content.get("parts")
-            and any(part.get("text") for part in content["parts"])
-        ):
-            has_text_content = True
-            break
-
-    assert has_text_content, "Expected at least one event with text content"
-
-
-def test_chat_stream_error_handling(server_fixture: subprocess.Popen[str]) -> None:
-    """Test the chat stream error handling."""
-    logger.info("Starting chat stream error handling test")
-    data = {
-        "input": {"messages": [{"type": "invalid_type", "content": "Cause an error"}]}
-    }
-    response = requests.post(
-        STREAM_URL, headers=HEADERS, json=data, stream=True, timeout=10
-    )
-
-    assert response.status_code == 422, (
-        f"Expected status code 422, got {response.status_code}"
-    )
-    logger.info("Error handling test completed successfully")
 
 
 def test_collect_feedback(server_fixture: subprocess.Popen[str]) -> None:

@@ -11,11 +11,11 @@ log = get_logger("api.telemetry")
 def setup_cloud_otel() -> None:
     """Export traces and logs to Cloud Trace / Cloud Logging.
 
-    ``get_fast_api_app(otel_to_cloud=True)`` installs these exporters as a side
-    effect of building the ADK app. When the ADK surface is disabled (the
-    default — see ``ADK_ENABLED`` in ``api/main.py``) nothing else would, so
-    call this explicitly. It goes through ADK's own helpers so both paths
-    configure OTel identically.
+    Nothing installs these exporters on its own — ``api/main.py`` builds a plain
+    FastAPI app — so this is called explicitly at boot. It goes through the ADK
+    telemetry helpers, which is the only reason ``google-adk`` is still a
+    dependency (see the note on its pin in ``pyproject.toml``); no ADK agent
+    runtime is involved, and this runs on every revision.
 
     Never fatal: telemetry is not worth failing a boot over.
     """

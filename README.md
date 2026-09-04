@@ -1,12 +1,16 @@
 # Hermes
 
-Hermes is a multi-agent **job-search assistant**: it builds a profile from your
+Hermes is an agentic **job-search assistant**: it builds a profile from your
 résumé, discovers and ranks openings against it, tailors a résumé per posting,
-and submits applications — surfaced through a web app and backed by an
-agent/pipeline system on Google Cloud.
+and submits applications — surfaced through a web app and backed by a set of
+LLM-backed pipelines on Google Cloud.
 
-It is built on the [ADK](https://adk.dev/) with Vertex AI Gemini, a FastAPI
-gateway, a Next.js frontend, and Firestore — deployed on Cloud Run.
+Those pipelines run Vertex AI Gemini where judgment is needed and plain Python
+everywhere else: Flash to parse a job description, Pro to score it against the
+profile behind a deterministic geo-eligibility gate and per-user budget caps,
+Flash again to tailor the résumé. They are driven by CLI runners and a Cloud
+Tasks worker, fronted by a FastAPI gateway and a Next.js app, with Firestore
+for state — all deployed on Cloud Run.
 
 ## How it works
 
@@ -20,10 +24,9 @@ onboarding → discovery → matching / vetting → tailoring → application �
                                                  ATS docx)
 ```
 
-An ADK **Coordinator** orchestrates five specialists. In practice the heavy
-lifting for discovery, matching, tailoring, and application runs as
-**deterministic pipelines** (`tools/` + `cli/` runners) that mirror each agent's
-contract; the ADK agents in `agents/` keep the Coordinator and playground wiring.
+That funnel *is* the architecture: each stage is a deterministic pipeline in
+`tools/` with a `cli/` runner for batch work and an API or worker entry point
+for the app, calling a model only at the steps that need one.
 
 ### Screens
 
@@ -47,7 +50,7 @@ The web app (`web/`, Next.js) is where a user rides that funnel:
 
 `/` is job review (approve/skip/star, keyboard-driven, a running score/recommendation
 per posting); `/tracking` is the live application pipeline, filled in as the
-Application agent submits; `/interviews` is a separate, user-owned journal —
+submitter works; `/interviews` is a separate, user-owned journal —
 Hermes logs the score, the user logs stages, outcomes, and what to improve;
 `/settings/companies` is the discovery source list (rescan/block per company);
 `/profile` holds résumé versions, match preferences, skills, and experience.
@@ -58,27 +61,25 @@ Tailored résumés are reviewed and downloaded per application at
 Paywall/monetization UI is in progress and intentionally left out of this
 overview.)
 
-| Agent | Model | Role |
-|-------|-------|------|
-| Coordinator | `gemini-flash-latest` | Orchestrates the end-to-end flow |
-| Discovery | — (ParallelAgent) | Scouts job boards + company careers concurrently |
-| Matching | `gemini-3.1-pro-preview` | Ranks postings against the profile; geo-eligibility gate |
-| Tailoring | `gemini-flash-latest` | Reranks bullets, writes an objective, renders an ATS-safe résumé |
-| Application | `gemini-3.1-pro-preview` | Submits applications (Greenhouse via Playwright) |
-| Tracking | `gemini-flash-latest` | Records application status (deferred) |
+| Stage | Model | What it does |
+|-------|-------|--------------|
+| Discovery (`tools/discovery/`) | — (no model) | Fans out across job boards and company career pages concurrently |
+| Matching (`tools/matching/pipeline.py`) | `gemini-flash-latest` → `gemini-3.1-pro-preview` | Flash parses the JD; a free Python pre-filter and geo-eligibility gate drop what Pro shouldn't be paid to read; Pro scores the rest against the profile |
+| Tailoring (`tools/tailoring/`) | `gemini-flash-latest` | Reranks bullets, writes an objective, renders an ATS-safe résumé |
+| Application (`tools/submitters/`) | — (Playwright) | Submits to Greenhouse by driving the real form; falls back to manual apply |
+| Tracking | — | Records application status (deferred) |
 
 ## Components
 
 | Path | What it is |
 |------|-----------|
-| `agents/` | ADK agents (Coordinator + specialists). `_shared.py` defines the model helpers. |
-| `tools/` | Deterministic pipeline logic — `discovery/`, `matching/`, `tailoring/`, `submitters/`, `profile/`, `ats/`, `gmail/`, `computer_use/`. |
+| `tools/` | The pipelines themselves — `discovery/`, `matching/`, `tailoring/`, `submitters/`, `applications/`, `profile/`, `account/`, `ats/`. |
 | `cli/` | Batch runners for the pipelines (import résumé, sync profile, discovery, matching, tailoring, user migration). |
-| `api/` | FastAPI gateway. Serves the ADK agents **and** the Firestore-backed web API: `routes/{jobs,companies,applications,profile}.py` with Firebase-auth deps. |
+| `api/` | FastAPI gateway. Serves the Firestore-backed web API (`routes/{jobs,companies,applications,profile}.py`, Firebase-auth deps) and the `/tasks/*` worker handlers. |
 | `web/` | Next.js 16 frontend — login, onboarding/profile, job vetting (review/approve/skip/star), applications, company vetting. |
 | `models/` | Pydantic schemas (`profile`, `job`, `match`, `application`). |
 | `deployment/` | Terraform for Cloud Run + supporting infrastructure. |
-| `tests/` | Unit, integration, and eval tests. |
+| `tests/` | Unit and integration tests. |
 
 ## Data & storage
 
@@ -96,14 +97,14 @@ overview.)
   with rescan/block controls), matching with a location-eligibility gate, the
   job-vetting web UI (`/`, approve/skip/star with a score breakdown),
   tailoring (bullets + objective + ATS-safe résumé to GCS with a diff/review
-  screen at `/applications/{id}/review`), the Application agent's Greenhouse
-  path (Playwright submit with SSE progress, screenshots, idempotency, and a
+  screen at `/applications/{id}/review`), the Greenhouse application path
+  (Playwright submit with SSE progress, screenshots, idempotency, and a
   manual-apply fallback), the `/tracking` application-status pipeline (filled
-  in as agents write status), and the `/interviews` journal (user-logged
+  in as the submitter writes status), and the `/interviews` journal (user-logged
   interview stages/outcomes/reflections — Hermes contributes only the match
   score, never auto-tracks).
-- **Deferred:** the Application "Computer Use" browser path for non-Greenhouse
-  ATSes, and the Tracking agent's automatic Gmail-based response detection.
+- **Deferred:** the "Computer Use" browser path for submitting to non-Greenhouse
+  ATSes, and automatic Gmail-based response detection for tracking.
 - **In progress (not covered here):** monetization/paywall.
 
 ## Deployment

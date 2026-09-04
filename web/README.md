@@ -13,7 +13,7 @@ screenshots of these screens.
 | `/login` | Google or email sign-in (Firebase Auth) |
 | `/onboarding`, `/onboarding/review` | Upload a résumé, then confirm/correct what Hermes parsed before matching starts |
 | `/` | Job review — approve/skip/star ranked postings, keyboard-driven, with a score + recommendation breakdown |
-| `/tracking` | Application pipeline (pipeline/starred/skipped tabs), filled in as the Application agent writes status |
+| `/tracking` | Application pipeline (pipeline/starred/skipped tabs), filled in as the submitter writes status |
 | `/applications/{id}/review` | Tailored résumé diff/review + `.docx` download for a single application |
 | `/interviews` | User-owned interview journal — Hermes contributes only the match score; stages, outcomes, and reflections are logged by the user |
 | `/settings/companies` | Discovery source list — rescan or block companies |
