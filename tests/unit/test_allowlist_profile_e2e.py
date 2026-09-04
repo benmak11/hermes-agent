@@ -55,6 +55,13 @@ class _FakeRef:
     def get(self):
         return _FakeSnap(self._data)
 
+    def set(self, data, merge=False):
+        # GET /profile stamps `data_epoch` on a profile that lacks one, so this
+        # read path does write, once per user. Not what these tests are about —
+        # they assert the allowlist gate — but the route has to survive it.
+        if self._data is not None:
+            self._data.update(data)
+
 
 class _FakeCollection:
     def __init__(self, data: dict | None):

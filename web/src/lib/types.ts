@@ -122,6 +122,12 @@ export type Profile = {
   education: ProfileEducation[];
   skills: Record<string, string[]>;
   preferences: JobPreferences;
+  /**
+   * Identifies this incarnation of the user's server-side data. Stamped by the
+   * API on first read; a wipe deletes the document, so the replacement gets a
+   * new one. Client-side review counts are dropped when it changes.
+   */
+  data_epoch?: string | null;
 };
 
 export type ProfileResponse = {
