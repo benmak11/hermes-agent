@@ -16,6 +16,14 @@ the custom-wrapper branch and was reported as a permanent structural verdict.
 A 50-posting measurement on 2026-09-01 tripped Greenhouse's bot detection and
 produced 48 false ``custom_wrapper`` bails from HTTP 406s — a clean run, an
 entirely wrong conclusion, and no test that would have caught it.
+
+Checking the status closed that hole for error *pages*. It did not close it for
+expired postings, which Greenhouse serves as a 302 to the board index that
+Playwright follows to a clean 200: the 2026-09-04 rerun reported 12
+``custom_wrapper`` bails, all 12 of them redirects to
+``.../{board}?error=true`` and none of them a wrapper. So the final URL is
+checked too, and the table test below pins exactly which redirects mean "gone"
+and which are business as usual.
 """
 
 from __future__ import annotations
@@ -48,22 +56,41 @@ class _Locator:
     async def click(self, **_kw) -> None:  # pragma: no cover - not reached here
         raise AssertionError("a bail must not click anything")
 
+    async def fill(self, _value: str, **_kw) -> None:
+        """Reached only once the standard-form check has passed."""
+        return None
+
 
 class _Response:
-    def __init__(self, status: int) -> None:
+    def __init__(self, status: int, url: str) -> None:
         self.status = status
+        # Playwright reports the *final* URL after any redirect chain it
+        # followed, which is the only signal an expired posting leaves behind.
+        self.url = url
 
 
 class _Page:
     """Serves one status and one DOM shape; records the screenshot path."""
 
-    def __init__(self, status: int | None, *, has_form: bool) -> None:
+    def __init__(
+        self,
+        status: int | None,
+        *,
+        has_form: bool,
+        final_url: str | None = None,
+    ) -> None:
         self._status = status
         self._has_form = has_form
+        self._final_url = final_url
         self.shots: list[str] = []
 
-    async def goto(self, _url, **_kw):
-        return None if self._status is None else _Response(self._status)
+    async def goto(self, url, **_kw):
+        # Capture the requested URL: with no redirect, the response URL *is*
+        # the requested one, and a test that compared against "" instead would
+        # pass for the wrong reason.
+        if self._status is None:
+            return None
+        return _Response(self._status, self._final_url or url)
 
     def locator(self, _sel: str) -> _Locator:
         return _Locator(1 if self._has_form else 0)
@@ -107,7 +134,7 @@ class _PW:
         return None
 
 
-def _job() -> Job:
+def _job(url: str = "https://job-boards.greenhouse.io/acme/jobs/1") -> Job:
     from datetime import UTC, datetime
 
     return Job(
@@ -117,7 +144,7 @@ def _job() -> Job:
         source_id="1",
         company="acme",
         title="Staff Engineer",
-        url="https://job-boards.greenhouse.io/acme/jobs/1",
+        url=url,
         jd_raw="Build things.",
         discovered_at=datetime.now(UTC),
     )
@@ -141,13 +168,24 @@ def _profile() -> MasterProfile:
     )
 
 
-async def _run(monkeypatch, tmp_path: Path, status: int | None, *, has_form: bool):
-    page = _Page(status, has_form=has_form)
+async def _run(
+    monkeypatch,
+    tmp_path: Path,
+    status: int | None,
+    *,
+    has_form: bool,
+    final_url: str | None = None,
+    job_url: str = "https://job-boards.greenhouse.io/acme/jobs/1",
+):
+    page = _Page(status, has_form=has_form, final_url=final_url)
     monkeypatch.setattr(gh, "async_playwright", lambda: _PW(page))
     monkeypatch.setattr(gh, "_detect_captcha", _no_captcha)
     resume = tmp_path / "r.docx"
     resume.write_bytes(b"x")
-    return await gh.submit_greenhouse(_job(), _profile(), resume, dry_run=True), page
+    return (
+        await gh.submit_greenhouse(_job(job_url), _profile(), resume, dry_run=True),
+        page,
+    )
 
 
 async def _no_captcha(_page) -> bool:
@@ -223,3 +261,148 @@ async def test_a_missing_response_is_not_treated_as_failure(monkeypatch, tmp_pat
 
     assert "no greenhouse application form" in result["error"].lower()
     assert result.get("status") is None
+
+
+# --------------------------------------------------------------------------
+# Expired postings: a 302 to the board index that Playwright follows to a 200.
+# --------------------------------------------------------------------------
+
+_POSTING = "https://job-boards.greenhouse.io/acme/jobs/1"
+
+
+@pytest.mark.parametrize(
+    ("final", "expected"),
+    [
+        # Landed somewhere that no longer names a posting -> gone.
+        ("https://job-boards.greenhouse.io/acme?error=true", "error=true"),
+        ("https://job-boards.greenhouse.io/acme", "board index"),
+        ("https://boards.eu.greenhouse.io/acme?error=true", "error=true"),
+        ("https://job-boards.greenhouse.io/acme/?error=true", "error=true"),
+        ("https://job-boards.greenhouse.io/", "board index"),
+        # Still names a posting. The boards. -> job-boards. migration is a real
+        # past incident, and locale prefixes and trailing slashes are routine:
+        # calling any of these "gone" would tombstone live postings.
+        ("https://job-boards.greenhouse.io/acme/jobs/1", None),
+        ("https://job-boards.greenhouse.io/acme/jobs/1/", None),
+        ("https://job-boards.greenhouse.io/acme/jobs/1?gh_src=abc", None),
+        ("https://job-boards.greenhouse.io/en/acme/jobs/1", None),
+        ("https://boards.eu.greenhouse.io/acme/jobs/1", None),
+        # The case that makes the `jobs` guard load-bearing, and the only one
+        # that does. Every other "still a posting" row above is already excluded
+        # by the segment count, so deleting the guard leaves them passing — this
+        # is the row that turns a *live* posting into a tombstone without it.
+        ("https://job-boards.greenhouse.io/acme/jobs/1?error=true", None),
+        # Two segments and a real form — not a board index.
+        ("https://job-boards.greenhouse.io/embed/job_app?token=1", None),
+        # Off Greenhouse entirely: that is a wrapper, and custom_wrapper is the
+        # honest verdict even with ?error=true glued on.
+        ("https://careers.acme.com/careers", None),
+        ("https://careers.acme.com/careers?error=true", None),
+        # Not-greenhouse.io suffix confusion.
+        ("https://notgreenhouse.io/acme", None),
+        # No redirect at all.
+        (_POSTING, None),
+        ("", None),
+    ],
+)
+def test_redirected_off_posting(final, expected):
+    assert gh._redirected_off_posting(_POSTING, final) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final",
+    [
+        "https://job-boards.greenhouse.io/acme?error=true",
+        "https://job-boards.greenhouse.io/acme",
+    ],
+)
+async def test_a_200_redirect_to_the_board_index_is_gone(monkeypatch, tmp_path, final):
+    """The regression measured on 2026-09-04. Greenhouse expires postings with
+    a 302 to the board index, so the status is 200 and the page has no form —
+    which used to read as ``custom_wrapper``, a permanent structural verdict
+    about a posting that merely closed."""
+    result, page = await _run(
+        monkeypatch, tmp_path, 200, has_form=False, final_url=final
+    )
+
+    assert result["success"] is False
+    assert "gone" in result["error"].lower()
+    assert "wrapper" not in result["error"].lower()
+    assert "transient" not in result["error"].lower()
+    # 200 is the honest status of the *final* response; final_url is what lets
+    # a measurement tell this mechanism apart from a 404.
+    assert result["status"] == 200
+    assert result["final_url"] == final
+    assert page.shots, "the screenshot is still the evidence of record"
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_bail_clicks_nothing(monkeypatch, tmp_path):
+    """Pins the early placement. On a board index ``a:has-text("Apply")`` can
+    match a link to a *different* posting; the Apply fallback would click it
+    and we would fill a form for a job nobody asked to apply to. Bailing before
+    the email-field wait forecloses that (``_Locator.click`` raises)."""
+    result, _page = await _run(
+        monkeypatch,
+        tmp_path,
+        200,
+        has_form=False,
+        final_url="https://job-boards.greenhouse.io/acme?error=true",
+    )
+
+    assert result["final_url"].endswith("?error=true")
+
+
+@pytest.mark.asyncio
+async def test_a_wrapper_on_the_employers_own_domain_stays_a_wrapper(
+    monkeypatch, tmp_path
+):
+    """Host scope. A redirect off Greenhouse is what a genuine custom careers
+    wrapper looks like, and it needs the Computer Use path, not a tombstone."""
+    result, _page = await _run(
+        monkeypatch,
+        tmp_path,
+        200,
+        has_form=False,
+        final_url="https://careers.acme.com/careers",
+    )
+
+    assert "no greenhouse application form" in result["error"].lower()
+    assert "final_url" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_board_migration_redirect_still_applies(monkeypatch, tmp_path):
+    """boards. -> job-boards. is a redirect Greenhouse really does, to a URL
+    that still names the posting. Treating it as gone would break every legacy
+    board link we hold."""
+    result, _page = await _run(
+        monkeypatch,
+        tmp_path,
+        200,
+        has_form=True,
+        job_url="https://boards.greenhouse.io/acme/jobs/1",
+        final_url="https://job-boards.greenhouse.io/acme/jobs/1",
+    )
+
+    # Reaching the fill loop at all proves the standard-form check passed, so
+    # neither the redirect branch nor the wrapper branch fired.
+    assert "kept resetting" in result["error"].lower()
+    assert "final_url" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_job_app_embed_is_not_a_board_index(monkeypatch, tmp_path):
+    """Two path segments, and a real application form. The ``<= 1 segment``
+    rule is what keeps /embed/job_app out of the gone branch."""
+    result, _page = await _run(
+        monkeypatch,
+        tmp_path,
+        200,
+        has_form=True,
+        final_url="https://job-boards.greenhouse.io/embed/job_app?token=1",
+    )
+
+    assert "kept resetting" in result["error"].lower()
+    assert "final_url" not in result
