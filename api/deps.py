@@ -5,14 +5,40 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime, timedelta
 
 from fastapi import Header, HTTPException, Query
+from google.cloud import firestore
 
 from obs.logging import bind_request_context, get_logger
+from tools import allowlist
 
 log = get_logger("api.auth")
 
 _firebase_ready = False
+
+# An async client, like ``api.routes.account`` and for the same reason: this
+# runs on the one uvicorn loop for the life of the process, so memoising it is
+# safe. Only built at all once ``ALLOWLIST_ENFORCED`` is on — see
+# :func:`_check_allowlist` — so this stays unused, and unbuilt, on every
+# deployment until Phase 4 D2 flips the flag.
+_db: firestore.AsyncClient | None = None
+
+
+def _client() -> firestore.AsyncClient:
+    global _db
+    if _db is None:
+        _db = firestore.AsyncClient()
+    return _db
+
+
+# In-process cache so a hot endpoint doesn't pay a Firestore read on every
+# request. Same shape as ``api.routes.discovery._last_tick_check`` and the
+# same justification: this is a cache, not a lock — a revocation can bite up
+# to ``_ALLOWLIST_CHECK_EVERY`` late, which is acceptable for a seat gate, and
+# nothing here needs to be correct across more than one process at a time.
+_ALLOWLIST_CHECK_EVERY = timedelta(minutes=5)
+_allowlist_cache: dict[str, tuple[datetime, bool]] = {}
 
 
 def dev_mode() -> bool:
@@ -67,11 +93,54 @@ def firebase_auth():
     return fb_auth
 
 
-def _verify_token(token: str | None) -> str:
+async def _check_allowlist(uid: str, email: str | None) -> None:
+    """Refuse with a 403 iff enforcement is on and ``uid`` isn't allowed in.
+
+    A no-op read straight through while ``ALLOWLIST_ENFORCED`` is unset — the
+    whole point of D1 shipping before D2 flips it. Called only from the branch
+    of :func:`_verify_token` that has a real decoded token; the dev bypass
+    returns before this is ever reached, by construction (see that function).
+
+    **Fails closed on an absent email claim** rather than falling through to a
+    500: a token with no ``email`` is a shape a caller could produce, and
+    enforcement being on means "prove you're allowed", not "crash if you
+    can't prove it".
+    """
+    if not allowlist.enforced():
+        return
+    if not email:
+        log.warning("auth.allowlist_no_email", user_id=uid)
+        raise HTTPException(
+            status_code=403,
+            detail="this account has no email claim to check against the allowlist",
+        )
+
+    now = datetime.now(UTC)
+    cached = _allowlist_cache.get(uid)
+    if cached is not None and now - cached[0] < _ALLOWLIST_CHECK_EVERY:
+        allowed = cached[1]
+    else:
+        allowed = await allowlist.is_allowed(_client(), email)
+        _allowlist_cache[uid] = (now, allowed)
+
+    if not allowed:
+        log.warning("auth.allowlist_denied", user_id=uid)
+        raise HTTPException(
+            status_code=403, detail="this account is not on the allowlist"
+        )
+
+
+async def _verify_token(token: str | None) -> str:
     """Verify a Firebase ID token (or honor the dev bypass) and return the uid.
 
     Binds the resolved ``user_id`` into the log context so every subsequent line
     for this request (route, background task, tools) carries it.
+
+    The allowlist check runs **after** the dev bypass, never before it: the
+    bypass returns before this function does anything else, so a local
+    process with ``AUTH_DEV_USER`` set reaches no Firestore at all, allowlist
+    included — local dev and the ``me`` demo account must keep working exactly
+    as before this PR.
     """
     if dev_mode() and os.getenv("AUTH_DEV_USER"):
         uid = os.environ["AUTH_DEV_USER"]
@@ -91,7 +160,9 @@ def _verify_token(token: str | None) -> str:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}") from e
 
     uid = decoded["uid"]
+    email = decoded.get("email")
     bind_request_context(user_id=uid)
+    await _check_allowlist(uid, email)
     return uid
 
 
@@ -108,7 +179,7 @@ async def verify_user(authorization: str | None = Header(default=None)) -> str:
         if authorization and authorization.startswith("Bearer ")
         else None
     )
-    return _verify_token(token)
+    return await _verify_token(token)
 
 
 async def verify_user_query(token: str | None = Query(default=None)) -> str:
@@ -117,4 +188,4 @@ async def verify_user_query(token: str | None = Query(default=None)) -> str:
     For SSE (EventSource) endpoints, where the browser cannot set an
     Authorization header.
     """
-    return _verify_token(token)
+    return await _verify_token(token)
