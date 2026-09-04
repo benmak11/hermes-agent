@@ -16,6 +16,10 @@ covers both. The new app differs in ways this module must work around: the
 questions are react-select comboboxes, and persistent analytics connections
 mean ``networkidle`` never reliably settles.
 
+Expired postings do not 404: Greenhouse 302s them to the employer's board
+index (usually with ``?error=true``), which Playwright follows to a clean 200.
+Those are detected by the *final* URL and reported as gone, not as a wrapper.
+
 Safety:
 - ``dry_run=True`` fills the form and screenshots but never clicks Submit — used
   to validate against real postings without applying.
@@ -28,6 +32,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, async_playwright
@@ -115,6 +120,24 @@ async def _emit(on_progress: ProgressFn | None, message: str, status: str) -> No
         await result
 
 
+def _redirected_off_posting(requested: str, final: str) -> str | None:
+    """Why `final` is no longer the posting we asked for, or None."""
+    if not final or final == requested:
+        return None
+    parts = urlparse(final)
+    host = (parts.hostname or "").lower()
+    if host != "greenhouse.io" and not host.endswith(".greenhouse.io"):
+        return None  # left Greenhouse -> a wrapper, not our call
+    segments = [s for s in parts.path.split("/") if s]
+    if "jobs" in segments:
+        return None  # still names a posting: migration, locale, slash
+    if "true" in parse_qs(parts.query).get("error", []):
+        return "error=true"
+    if len(segments) <= 1:
+        return "board index"
+    return None
+
+
 async def _detect_captcha(page: Page) -> bool:
     for sel in (
         'iframe[src*="recaptcha"]',
@@ -200,6 +223,49 @@ async def submit_greenhouse(
                         "retry later"
                     ),
                     "status": status,
+                    "pre_submit_screenshot": pre_path,
+                }
+
+            # **A 200 is not proof the posting still exists.** Greenhouse
+            # expires postings as a 302 to the employer's board index (usually
+            # ``?error=true``), which Playwright follows, so the status check
+            # above passes and a job-list page arrives instead of a form. Of
+            # the 50 postings measured on 2026-09-04, 12 bailed as
+            # ``custom_wrapper``; hand-checking all 12 found every one
+            # redirecting to ``job-boards.greenhouse.io/{board}?error=true``
+            # and *no* genuine wrapper — a reported 24% wrapper rate against a
+            # true rate of zero.
+            #
+            # This sits before the email-field wait for two reasons: it skips
+            # the ~10s selector timeout (every false "wrapper" in the
+            # measurement took ~10.8s), and it forecloses the Apply fallback
+            # below, where ``a:has-text("Apply")`` could match a link on a
+            # board *index* and click through to a different posting whose
+            # form we would then fill. The timing says that did not happen in
+            # the 12, but placing the check here removes it permanently.
+            #
+            # Residual risk: a block page served as a 200 redirect to the board
+            # root lands here as ``posting_gone`` and is indistinguishable from
+            # expiry by URL alone. It shows up only as a cross-board spike of
+            # ``posting_gone`` with ``final_url`` set.
+            final_url = response.url if response is not None else None
+            detail = _redirected_off_posting(job.url, final_url or "")
+            if detail:
+                await page.screenshot(path=pre_path, full_page=True)
+                job_log.warning(
+                    "submit.bail",
+                    reason="posting_gone",
+                    status=status,
+                    final_url=final_url,
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"posting redirected to {final_url} ({detail}) — the listing "
+                        "is gone"
+                    ),
+                    "status": status,
+                    "final_url": final_url,
                     "pre_submit_screenshot": pre_path,
                 }
 
