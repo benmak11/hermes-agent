@@ -12,12 +12,13 @@ import {
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
+import { apiFetch, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { auth } from "@/lib/firebase";
 
 type Mode = "signin" | "signup";
-type Phase = "idle" | "creating";
-type ErrState = { tone: "recover" | "error"; title?: string; body: string };
+type Phase = "idle" | "creating" | "checking";
+type ErrState = { tone: "recover" | "error" | "locked"; title?: string; body: string };
 
 // Invite codes are a SOFT, client-side gate (see globals note): they ship in the
 // public bundle, so this restricts a casual visitor, not a determined one. Real
@@ -115,12 +116,24 @@ export default function LoginPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [created, setCreated] = useState(false);
+  // Set the instant a Google sign-in comes back 403 from the allowlist
+  // pre-flight, and never cleared automatically — only a fresh sign-in
+  // attempt resets it. This exists as its own flag, separate from `phase`,
+  // because `auth.signOut()` clearing `user` via onIdTokenChanged is async:
+  // there is a window after we decide "locked out" but before Firebase's
+  // listener has actually nulled `user` out, and the redirect effect below
+  // must not race that window and let a locked-out session through.
+  const [lockedOut, setLockedOut] = useState(false);
 
   // Already-signed-in visitor, or a successful sign in / Google → home. The
   // create-account flow handles its own handoff (below), so it's excluded.
+  // Also held off during "checking" (the post-Google allowlist pre-flight)
+  // and once locked out — see withGoogle.
   useEffect(() => {
-    if (!loading && user && !created && phase !== "creating") router.push("/");
-  }, [loading, user, created, phase, router]);
+    if (!loading && user && !created && phase === "idle" && !lockedOut) {
+      router.push("/");
+    }
+  }, [loading, user, created, phase, lockedOut, router]);
 
   // New account created → show the success beat, then hand off to onboarding.
   useEffect(() => {
@@ -141,16 +154,49 @@ export default function LoginPage() {
     setMode(next);
     setError(null);
     setNotice(null);
+    setLockedOut(false);
   }
 
   async function withGoogle() {
     setError(null);
     setNotice(null);
+    setLockedOut(false);
+    setPhase("checking");
     try {
       await signInWithPopup(auth, new GoogleAuthProvider());
     } catch (e) {
       setError(describeAuthError(errCode(e)));
+      setPhase("idle");
+      return;
     }
+
+    // A real Firebase session now exists. Probe the allowlist with an
+    // endpoint we'd call right after landing anyway (GET /profile is the
+    // first-run gate) *before* the redirect effect can act on it — moving an
+    // existing, cheap, single-Firestore-read call earlier, not adding a new
+    // one. A 403 here is the allowlist refusing this account; anything else
+    // (network error, 500, ...) is "the backend had a bad moment", which
+    // must not be treated as "you are not allowed" — those need different
+    // messages, and only one of them is grounds for signing the user back
+    // out of a session they otherwise validly hold.
+    try {
+      await apiFetch("/profile");
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 403) {
+        setLockedOut(true);
+        await auth.signOut();
+        setError({
+          tone: "locked",
+          title: "This account isn't on the invite list",
+          body: "Your Google sign-in worked, but Hermes is invite-only right now and this address hasn't been added. Ask whoever invited you for access, then try again.",
+        });
+        setPhase("idle");
+        return;
+      }
+      // Network error, 500, etc. — the backend, not the allowlist. Let the
+      // sign-in stand; don't conflate "unreachable" with "not allowed".
+    }
+    setPhase("idle");
   }
 
   async function onForgotPassword() {
@@ -181,6 +227,7 @@ export default function LoginPage() {
     e.preventDefault();
     setError(null);
     setNotice(null);
+    setLockedOut(false);
 
     if (mode === "signin") {
       try {
@@ -329,6 +376,29 @@ export default function LoginPage() {
                 Create an account →
               </button>
             </div>
+          ) : error?.tone === "locked" ? (
+            <div
+              className="mt-[18px] rounded-[10px] border px-3.5 py-[13px]"
+              style={{
+                borderColor: "var(--border)",
+                background: "color-mix(in srgb, var(--accent) 7%, var(--surface))",
+              }}
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  className="flex h-[18px] w-[18px] items-center justify-center rounded-full text-xs"
+                  style={{ background: "var(--accent)", color: "var(--surface)" }}
+                >
+                  🔒
+                </span>
+                <span className="text-[13px] font-semibold" style={{ color: "var(--text)" }}>
+                  {error.title}
+                </span>
+              </div>
+              <p className="mt-2 text-[13px] leading-relaxed" style={{ color: "var(--muted)" }}>
+                {error.body}
+              </p>
+            </div>
           ) : error ? (
             <p className="mt-[18px] text-sm" style={{ color: "var(--danger)" }}>
               {error.body}
@@ -345,17 +415,28 @@ export default function LoginPage() {
           <button
             type="button"
             onClick={withGoogle}
+            disabled={phase === "checking"}
             className="mt-[18px] flex h-[42px] w-full items-center justify-center gap-2.5 rounded-[9px] border text-sm font-semibold"
             style={{
               background: "var(--surface)",
               borderColor: "var(--border)",
               color: "var(--text)",
+              cursor: phase === "checking" ? "not-allowed" : "pointer",
             }}
           >
-            <span className="font-bold" style={{ color: "#4285f4" }}>
-              G
-            </span>{" "}
-            {mode === "signin" ? "Continue with Google" : "Sign up with Google"}
+            {phase === "checking" ? (
+              <>
+                <Spinner size={15} color="var(--muted)" />
+                Checking access…
+              </>
+            ) : (
+              <>
+                <span className="font-bold" style={{ color: "#4285f4" }}>
+                  G
+                </span>{" "}
+                {mode === "signin" ? "Continue with Google" : "Sign up with Google"}
+              </>
+            )}
           </button>
 
           <div className="my-5 flex items-center gap-3">
