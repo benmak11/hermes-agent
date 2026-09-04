@@ -18,13 +18,6 @@ dependencies = [
     "google-cloud-aiplatform[evaluation]>=1.156.0",
     "fastapi>=0.115.8,<1.0.0",
     "uvicorn[standard]~=0.34.0",
-    # ORPHANED as of the agents/ removal: their only consumer was the Cloud SQL
-    # session URI that fed the ADK app, and no such instance ever existed. Left
-    # in place because dropping them needs a re-lock and a full image rebuild —
-    # removal belongs in a dependency-pruning PR of its own, not here. Nothing
-    # imports either module.
-    "asyncpg>=0.30.0,<1.0.0",
-    "sqlalchemy>=2,<3",
     "python-multipart>=0.0.20,<1.0.0",
     # --- Hermes application (Phase 1.8) ---
     "google-genai>=1.0",
@@ -119,7 +112,7 @@ deprecated = "ignore"
 # "cach" is the deliberate substring match on cache-shaped error messages in
 # tools/matching/pipeline.py; "unparseable" is a valid spelling this codebase
 # uses consistently.
-ignore-words-list = "rouge,cach,unparseable"
+ignore-words-list = "cach,unparseable"
 # "./frontend" is the pre-Next.js app dir; kept for old branches. The web app
 # lives in ./web now — skip its dependencies and build output, not our code.
 skip = "./locust_env/*,uv.lock,.venv,./frontend,**/package-lock.json,./web/node_modules,./web/.next,./data"

@@ -20,14 +20,6 @@ type Mode = "signin" | "signup";
 type Phase = "idle" | "creating" | "checking";
 type ErrState = { tone: "recover" | "error" | "locked"; title?: string; body: string };
 
-// Invite codes are a SOFT, client-side gate (see globals note): they ship in the
-// public bundle, so this restricts a casual visitor, not a determined one. Real
-// enforcement would gate account creation server-side. Comma-separated, matched
-// case-insensitively. When unset, account creation is treated as not enabled.
-const INVITE_CODES = (process.env.NEXT_PUBLIC_INVITE_CODES ?? "")
-  .split(",")
-  .map((c) => c.trim().toUpperCase())
-  .filter(Boolean);
 
 /** Map a Firebase auth error code to copy a human can act on. */
 function describeAuthError(code: string): ErrState {
@@ -111,7 +103,6 @@ export default function LoginPage() {
   const [mode, setMode] = useState<Mode>("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [inviteCode, setInviteCode] = useState("");
   const [error, setError] = useState<ErrState | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -142,13 +133,9 @@ export default function LoginPage() {
     return () => clearTimeout(t);
   }, [created, router]);
 
-  const inviteEntered = inviteCode.trim().length > 0;
-  const inviteConfigured = INVITE_CODES.length > 0;
-  const inviteValid =
-    inviteConfigured && INVITE_CODES.includes(inviteCode.trim().toUpperCase());
   const pwStrength = strength(password);
   const canCreate =
-    inviteValid && !!email.trim() && password.length >= 6 && phase !== "creating";
+    !!email.trim() && password.length >= 6 && phase !== "creating";
 
   function switchMode(next: Mode) {
     setMode(next);
@@ -239,16 +226,10 @@ export default function LoginPage() {
       return;
     }
 
-    // Create account (invite-gated).
-    if (!inviteValid) {
-      setError({
-        tone: "error",
-        body: inviteConfigured
-          ? "Enter a valid invite code to continue."
-          : "Account creation isn't enabled yet. Ask for an invite.",
-      });
-      return;
-    }
+    // Access is decided server-side by the allowlist: a create that succeeds
+    // here still gets a 403 on the first authenticated call unless the address
+    // holds a seat. The client-side code field this replaced only ever gated
+    // this form, never Google sign-in, and shipped its codes in the bundle.
     setPhase("creating");
     try {
       await createUserWithEmailAndPassword(auth, email.trim(), password);
@@ -451,49 +432,6 @@ export default function LoginPage() {
           </div>
 
           <form onSubmit={onSubmit}>
-            {/* Invite code (create account only) */}
-            {mode === "signup" && (
-              <>
-                <div className="mb-1.5 flex items-center justify-between">
-                  <label className="text-xs font-medium" style={{ color: "var(--label)" }}>
-                    Invite code
-                  </label>
-                  {inviteEntered && (
-                    <span
-                      className="text-[11px]"
-                      style={{
-                        color: inviteValid ? "var(--good)" : "var(--danger)",
-                        fontFamily: "var(--font-mono)",
-                      }}
-                    >
-                      {inviteValid ? "✓ valid" : "not recognized"}
-                    </span>
-                  )}
-                </div>
-                <input
-                  type="text"
-                  placeholder="HERMES-XXXX"
-                  value={inviteCode}
-                  onChange={(e) => setInviteCode(e.target.value)}
-                  disabled={phase === "creating"}
-                  className={`${inputCls} uppercase`}
-                  style={fieldStyle(
-                    inviteEntered
-                      ? inviteValid
-                        ? "var(--good-border)"
-                        : "var(--danger-border)"
-                      : "var(--border)",
-                    true,
-                  )}
-                />
-                {inviteEntered && !inviteValid && (
-                  <p className="mt-1.5 text-xs leading-relaxed" style={{ color: "var(--danger)" }}>
-                    {"This code isn't valid or has already been used. Use the code from your invite email."}
-                  </p>
-                )}
-              </>
-            )}
-
             <label
               className="mb-1.5 mt-3.5 block text-xs font-medium"
               style={{ color: "var(--label)" }}
@@ -585,7 +523,7 @@ export default function LoginPage() {
           >
             {mode === "signin"
               ? "Access is restricted to invited reviewers."
-              : "Don't have a code? Access is invite-only right now."}
+              : "Hermes is invite-only: you can create an account, but you'll need an invited address to get in."}
           </p>
         </>
       )}

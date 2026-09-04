@@ -98,6 +98,7 @@ jobs:
               - "tools/**"
               - "cli/**"
               - "obs/**"
+              - "data/companies/**"
               - "pyproject.toml"
               - "uv.lock"
               - "Dockerfile"
