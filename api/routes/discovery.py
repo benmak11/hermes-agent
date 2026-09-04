@@ -40,6 +40,7 @@ from models.settings import DiscoverySettings
 from obs.llm_cost import run_cost_snapshot
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import queues
+from tools.account.delete import is_deleted
 from tools.applications import reaper
 from tools.ats.sweep import sweep_postings
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
@@ -170,6 +171,29 @@ def _user_ref(user_id: str):
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+async def _account_deleted(user_id: str) -> bool:
+    """Has this user deleted their account? One read, on the cycle's own thread.
+
+    ``tick_user`` and ``cron_tick`` already hold the user document and check
+    :func:`is_deleted` directly; the cycles do not, because they are reached
+    from the worker's ``/tasks/*`` handlers with nothing but a user id — so a
+    deletion that lands while a task sits in the queue is only visible here.
+    One extra ``get`` per cycle, against a crawl that costs a hundred HTTP
+    fetches and a Gemini call per job.
+
+    Deliberately not exception-handled, unlike :func:`_extend_slot` and
+    :func:`_release_slot`. Those are bookkeeping *after* a run has been
+    committed to, and a cycle must not die because its bookkeeping did; this is
+    a precondition *before* one, like :func:`_claim_slot`, which also lets a
+    failed read propagate. A raise here costs a retry of a run that has not
+    happened and spent nothing. Swallowing it would instead mean treating an
+    unreadable document as "not deleted" — the guard turning itself off exactly
+    when Firestore is unhappy.
+    """
+    snap = await asyncio.to_thread(_user_ref(user_id).get)
+    return is_deleted(snap.to_dict())
 
 
 def _parse_ts(value) -> datetime | None:
@@ -443,9 +467,22 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
     kickoff, the worker's ``/tasks/*`` handlers — and under ``TestClient`` a
     background task is not "later", it is now. Refusing before the first
     ``_extend_slot`` write means a refused run touches no Firestore either.
+
+    **And the chokepoint for a deleted account**, for the same reason: a task
+    already on the queue when the user deleted themselves arrives here holding
+    nothing but a user id. The refusal is ahead of every write this function
+    makes, which matters more here than anywhere else — the success write below
+    is a ``set(..., merge=True)`` that would **recreate** the deleted user
+    document, and ``persist_new_jobs`` would refill the subcollection under it.
+    That is also this guard's honest limit: it stops a cycle that has not
+    started, not one already past this line. See
+    :func:`tools.account.delete.delete_account`.
     """
     if live_runs_refused():
         log.warning("discovery.cycle_refused", user_id=user_id, trigger=trigger)
+        return
+    if await _account_deleted(user_id):
+        log.warning("discovery.cycle_account_deleted", user_id=user_id, trigger=trigger)
         return
     with run_context("auto_discovery", user_id=user_id, trigger=trigger) as run_id:
         started = time.monotonic()
@@ -590,9 +627,17 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
     production should not be able to retire a user's queue by accident.
     Refusing before the ``_extend_slot`` write means a refused sweep also
     leaves no lease behind.
+
+    Refuses on a deleted account too — see :func:`run_discovery_cycle`. The
+    sweep's success write is the same recreating ``set(..., merge=True)``, so a
+    swept deleted account would leave a ``users/{uid}`` document behind holding
+    nothing but discovery state.
     """
     if live_runs_refused():
         log.warning("sweep.cycle_refused", user_id=user_id, trigger=trigger)
+        return
+    if await _account_deleted(user_id):
+        log.warning("sweep.cycle_account_deleted", user_id=user_id, trigger=trigger)
         return
     with run_context("liveness_sweep", user_id=user_id, trigger=trigger) as run_id:
         began = _now()
@@ -701,6 +746,11 @@ async def tick_user(
 
     if doc is None:
         doc = (await asyncio.to_thread(_user_ref(user_id).get)).to_dict() or {}
+    if is_deleted(doc):
+        # Nothing here is free: a claimed slot is a write, and a dispatched
+        # cycle is a crawl. Checked on the document the caller already has.
+        log.info("tick.account_deleted", user_id=user_id)
+        return
     settings = DiscoverySettings.model_validate(doc.get("discovery_settings") or {})
     state = doc.get("discovery_state") or {}
 
@@ -867,8 +917,9 @@ async def cron_tick(
 ) -> dict:
     """External scheduler entry point (Cloud Scheduler / GH Actions cron).
 
-    Ticks every user; per-user settings decide whether anything actually runs.
-    On the worker service no app-level guard is needed: the service is
+    Ticks every user; per-user settings decide whether anything actually runs,
+    and a tombstoned account (``deleted_at``) is skipped whole. On the worker
+    service no app-level guard is needed: the service is
     private, so Cloud Run has already verified the scheduler's OIDC token.
     Elsewhere (public hermes-api) the ``CRON_SECRET`` header guards it —
     unset disables the endpoint.
@@ -912,7 +963,17 @@ async def cron_tick(
     reaped = 0
     reap_failed = 0
     reap_truncated = 0
+    deleted = 0
     for uid, doc in users:
+        if is_deleted(doc):
+            # This fan-out is the one caller that reaches a user without ever
+            # passing ``verify_user``: it streams *every* document in ``users``,
+            # so a tombstoned account with a wipe still in flight (or one whose
+            # wipe failed partway) is picked up here and nowhere else. Skipped
+            # whole — not just the tick, but the reaper too, which would
+            # otherwise dispatch tailoring for a user who is leaving.
+            deleted += 1
+            continue
         if not inline:
             background_tasks.add_task(tick_user, uid, force_check=True, doc=doc)
             # Appending to the collection that is already being iterated when
@@ -945,12 +1006,17 @@ async def cron_tick(
         "cron.tick",
         users=len(users),
         failed=failed,
+        deleted=deleted,
         reaped=reaped,
         reap_failed=reap_failed,
         reap_truncated=reap_truncated,
         inline=inline,
     )
-    if users and failed == len(users):
+    # Against the users this tick actually *tried*, not the collection size: a
+    # tombstoned account is skipped by design, and counting it as a success
+    # would mask a fan-out where every real user's tick failed.
+    attempted = len(users) - deleted
+    if attempted and failed == attempted:
         # Nothing ticked. Almost always environmental (credentials, queue
         # config), so let the scheduler retry it and let it be visible as a
         # failing job rather than an hourly 200 that does nothing.
@@ -961,6 +1027,10 @@ async def cron_tick(
         "ok": True,
         "users": len(users),
         "failed": failed,
+        # Tombstoned accounts, skipped whole. Additive, and worth its own
+        # counter: a fan-out that suddenly ticks nobody should be readable as
+        # "everyone deleted themselves" rather than "the loop is broken".
+        "deleted": deleted,
         # Additive to the contract PR C established. The reaper is the one loop
         # here whose *inaction* is invisible — a stuck application looks like an
         # idle one — so the count comes back rather than living only in logs.

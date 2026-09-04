@@ -338,6 +338,7 @@ def test_cron_tick_fans_out_in_request_under_queue_mode(cron_world, monkeypatch)
         "ok": True,
         "users": 2,
         "failed": 0,
+        "deleted": 0,
         "reaped": 0,
         "reap_failed": 0,
         "reap_truncated": 0,
@@ -423,6 +424,7 @@ def test_cron_tick_still_defers_the_fan_out_without_a_queue(cron_world, monkeypa
         "ok": True,
         "users": 2,
         "failed": 0,
+        "deleted": 0,
         # Deferred with the ticks, so nothing was reaped inside the request.
         "reaped": 0,
         "reap_failed": 0,
@@ -461,6 +463,7 @@ def test_one_users_tick_failing_does_not_cost_the_rest_theirs(cron_world, monkey
         "ok": True,
         "users": 2,
         "failed": 1,
+        "deleted": 0,
         "reaped": 0,
         "reap_failed": 0,
         "reap_truncated": 0,
@@ -513,6 +516,7 @@ def test_a_broken_reaper_never_costs_the_tick_its_fan_out(cron_world, monkeypatc
         "ok": True,
         "users": 2,
         "failed": 0,
+        "deleted": 0,
         "reaped": 0,
         "reap_failed": 2,
         "reap_truncated": 0,
@@ -1673,6 +1677,7 @@ def test_dry_run_is_worker_only():
     assert {m.__name__ for m in route_modules} == {
         f"api.routes.{name}"
         for name in (
+            "account",
             "applications",
             "companies",
             "discovery",
@@ -2624,12 +2629,21 @@ def test_a_cycle_survives_a_release_that_cannot_reach_firestore(
     reports its own failure the way it always did, and nothing reaches the task
     handler that the queue would read as "retry this"."""
     slot_world.tick(T0)
-    cycle_world.hooks.during = _explode()
 
-    def unreachable():
-        raise RuntimeError("503 Firestore is unavailable")
+    def die_and_take_firestore_with_it():
+        # Firestore goes away *as the run fails*, not before it: the cycle also
+        # reads this document at the top, to refuse a deleted account, and that
+        # read is a precondition rather than bookkeeping — it happens before
+        # any spend, so a failure there is a retry worth taking. The read this
+        # test is about is the one ``_release_slot`` makes afterwards, from the
+        # ``except`` block, with a paid cycle already behind it.
+        def unreachable():
+            raise RuntimeError("503 Firestore is unavailable")
 
-    cycle_world.doc.get = unreachable
+        cycle_world.doc.get = unreachable
+        raise RuntimeError("the boards all died")
+
+    cycle_world.hooks.during = die_and_take_firestore_with_it
 
     cycle_world.run(T0 + timedelta(minutes=1))  # returns, rather than raising
 

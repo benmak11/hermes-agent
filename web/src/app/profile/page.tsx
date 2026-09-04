@@ -3,12 +3,14 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { signOut } from "firebase/auth";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { auth } from "@/lib/firebase";
 import { saveMinScore, useMinScore } from "@/lib/session";
 import type {
   DiscoverySettings,
@@ -293,6 +295,8 @@ export default function ProfilePage() {
             </Card>
 
             <AutoDiscoveryCard />
+
+            <DeleteAccountCard email={email} />
           </div>
 
           {/* Right column */}
@@ -595,6 +599,121 @@ function IntervalChips({
         );
       })}
     </div>
+  );
+}
+
+/**
+ * Delete account — the only destructive control in the app, so it is built to
+ * be impossible to hit by accident: closed by default, and the confirm button
+ * stays inert until the user has typed their own address. The server checks the
+ * same string against the address it knows (POST /account/delete), so this
+ * match is a courtesy to the user, not the guard.
+ *
+ * On success the Firebase Auth account is already gone server-side. The local
+ * session is dropped rather than left holding an ID token that stays verifiable
+ * for another hour, and the redirect is a `replace` so Back cannot return to a
+ * profile page whose data no longer exists.
+ */
+function DeleteAccountCard({ email }: { email: string }) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [typed, setTyped] = useState("");
+
+  const del = useMutation({
+    mutationFn: () =>
+      apiFetch<{ ok: boolean }>("/account/delete", {
+        method: "POST",
+        body: JSON.stringify({ confirm: typed }),
+      }),
+    onSuccess: async () => {
+      await signOut(auth);
+      router.replace("/login");
+    },
+  });
+
+  const matches =
+    typed.trim().toLowerCase() === email.trim().toLowerCase() && email !== "";
+
+  return (
+    <Card>
+      <MonoLabel>Delete account</MonoLabel>
+      {!open ? (
+        <>
+          <p
+            className="mt-3 font-mono text-[11px] font-medium leading-relaxed"
+            style={{ color: "var(--subtle)" }}
+          >
+            removes your profile, every job and application, your tailored
+            résumés and your login — permanently
+          </p>
+          <button
+            onClick={() => setOpen(true)}
+            className="mt-3 h-[34px] w-full rounded-lg border text-[12.5px] font-semibold"
+            style={{
+              background: "var(--danger-bg)",
+              borderColor: "var(--danger-border)",
+              color: "var(--danger)",
+            }}
+          >
+            Delete account
+          </button>
+        </>
+      ) : (
+        <>
+          <p
+            className="mt-3 text-[13px] leading-relaxed"
+            style={{ color: "var(--label)" }}
+          >
+            This cannot be undone. Type <b>{email}</b> to confirm.
+          </p>
+          <input
+            value={typed}
+            onChange={(e) => setTyped(e.target.value)}
+            placeholder={email}
+            autoComplete="off"
+            className="mt-2.5 h-9 w-full rounded-lg border px-2.5 text-[13px] outline-none"
+            style={{
+              background: "var(--surface-2)",
+              borderColor: "var(--border)",
+              color: "var(--text)",
+            }}
+          />
+          <div className="mt-2.5 flex gap-2">
+            <button
+              onClick={() => {
+                setOpen(false);
+                setTyped("");
+              }}
+              disabled={del.isPending}
+              className="h-[34px] flex-1 rounded-lg border text-[12.5px] font-semibold"
+              style={{
+                background: "var(--surface-2)",
+                borderColor: "var(--border)",
+                color: "var(--label)",
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => del.mutate()}
+              disabled={!matches || del.isPending}
+              className="h-[34px] flex-1 rounded-lg text-[12.5px] font-semibold disabled:opacity-40"
+              style={{ background: "var(--danger)", color: "var(--surface)" }}
+            >
+              {del.isPending ? "Deleting…" : "Delete forever"}
+            </button>
+          </div>
+          {del.isError && (
+            <p
+              className="mt-2.5 font-mono text-[11px] font-medium leading-relaxed"
+              style={{ color: "var(--danger)" }}
+            >
+              {String(del.error)}
+            </p>
+          )}
+        </>
+      )}
+    </Card>
   );
 }
 

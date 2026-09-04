@@ -1,0 +1,3 @@
+# Copyright (c) 2026 Baynham Makusha. All rights reserved.
+# Unauthorized copying, distribution, or use is prohibited.
+"""Account lifecycle: deleting a user and everything that belongs to them."""

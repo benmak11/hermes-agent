@@ -3,7 +3,8 @@
 """FastAPI gateway for the hermes multi-agent system.
 
 Serves the web API used by the Next.js frontend: ``/jobs``, ``/profile``,
-``/applications``, ``/settings``, ``/companies`` (all Firebase-authenticated)
+``/applications``, ``/settings``, ``/companies``, ``/account`` (all
+Firebase-authenticated)
 plus the ``/tasks/*`` worker handlers.
 
 The ADK agent surface (``/run``, ``/run_sse``, ``/apps/*`` and the ``/dev-ui``
@@ -23,6 +24,7 @@ from api.app_utils.middleware import RequestContextMiddleware
 from api.app_utils.telemetry import setup_cloud_otel, setup_telemetry
 from api.app_utils.typing import Feedback
 from api.deps import dev_mode, verify_user
+from api.routes import account as account_routes
 from api.routes import applications as applications_routes
 from api.routes import companies as companies_routes
 from api.routes import discovery as discovery_routes
@@ -155,6 +157,7 @@ app.include_router(companies_routes.router)
 app.include_router(applications_routes.router)
 app.include_router(profile_routes.router)
 app.include_router(discovery_routes.router)
+app.include_router(account_routes.router)
 # /tasks/* handlers; they 404 unless this deployment sets WORKER_MODE=1.
 app.include_router(worker_routes.router)
 
