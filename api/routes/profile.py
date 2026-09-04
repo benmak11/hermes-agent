@@ -16,6 +16,7 @@ read — these endpoints add it:
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime
 
 from fastapi import (
@@ -57,6 +58,30 @@ def _user_ref(user_id: str):
     return _client().collection("users").document(user_id)
 
 
+def _ensure_data_epoch(user_id: str, data: dict) -> dict:
+    """Stamp ``data_epoch`` on a profile that predates it, and return the data.
+
+    The epoch identifies *this incarnation* of the user's server-side data. The
+    browser stores its review tallies against it and discards them when it
+    changes, which is the only way a server-side wipe can reach counts that
+    live in ``localStorage`` — see ``web/src/lib/session.ts``.
+
+    Stamped lazily on read rather than written at onboarding, for one reason:
+    :func:`tools.account.delete.wipe_user_data` **deletes the user document
+    outright**, so a value written at onboarding does not survive to be bumped.
+    A fresh document simply has no epoch, gets a new one here, and the mismatch
+    clears the stale counts. Doing it on read also covers documents created by
+    paths that never touch onboarding at all (the CLI profile sync), and costs
+    one write per user, once, ever.
+    """
+    if data.get("data_epoch"):
+        return data
+    epoch = uuid.uuid4().hex
+    _user_ref(user_id).set({"data_epoch": epoch}, merge=True)
+    log.info("profile.data_epoch_stamped", user_id=user_id, data_epoch=epoch)
+    return {**data, "data_epoch": epoch}
+
+
 @router.get("/profile")
 def get_profile(user_id: str = Depends(verify_user)) -> dict:
     """Return the user's profile and onboarding state (the first-run gate).
@@ -69,6 +94,7 @@ def get_profile(user_id: str = Depends(verify_user)) -> dict:
     data = snap.to_dict() if snap.exists else None
     if not data or not data.get("full_name"):
         return {"profile": None, "onboarding_complete": False}
+    data = _ensure_data_epoch(user_id, data)
     return {
         "profile": data,
         "onboarding_complete": data.get("onboarding_complete", True),

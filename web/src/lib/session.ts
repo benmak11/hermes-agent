@@ -16,6 +16,13 @@ export type SessionStats = {
   starred: number;
   /** Epoch ms of recent decisions — the rolling window for the pace estimate. */
   times: number[];
+  /**
+   * The server's `data_epoch` these counts were accumulated against, or null
+   * for counts stored before this field existed. When it stops matching the
+   * profile's epoch the counts describe jobs that no longer exist, and are
+   * dropped — see `reconcileStats`.
+   */
+  epoch?: string | null;
 };
 
 export const EMPTY_STATS: SessionStats = {
@@ -23,6 +30,7 @@ export const EMPTY_STATS: SessionStats = {
   skipped: 0,
   starred: 0,
   times: [],
+  epoch: null,
 };
 
 const PACE_WINDOW = 8;
@@ -46,6 +54,27 @@ export function loadStats(uid: string): SessionStats {
 
 export function saveStats(uid: string, stats: SessionStats): void {
   writeStored("local", statsKey(uid), JSON.stringify(stats));
+}
+
+/**
+ * Drop stored counts that describe a server-side dataset which no longer
+ * exists, and re-stamp them with the current epoch.
+ *
+ * A wipe (`cli/reset_user.py`, or `POST /account/delete` followed by signing
+ * up again) clears Firestore but cannot reach `localStorage`, so the review
+ * header would go on reporting "29 of 29 reviewed" for an account whose jobs
+ * are gone — `reviewed` comes from here while `remaining` comes from the
+ * server, and `total` is their sum.
+ *
+ * Only acts on a definite disagreement. A null `epoch` argument means the
+ * profile hasn't loaded or the stamp write failed, which is not evidence of
+ * anything and must not throw away a real session's counts.
+ */
+export function reconcileStats(uid: string, epoch: string | null): void {
+  if (!epoch) return;
+  const stored = loadStats(uid);
+  if (stored.epoch === epoch) return;
+  saveStats(uid, { ...EMPTY_STATS, epoch });
 }
 
 /** Live view of the user's session stats. */

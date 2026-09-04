@@ -13,6 +13,7 @@ import {
   clearFirstRun,
   loadStats,
   paceMinutes,
+  reconcileStats,
   recordDecision,
   revertDecision,
   reviewedCount,
@@ -27,7 +28,13 @@ import type { DecideValue, Decision, Job, ProfileResponse } from "@/lib/types";
 import { avatarColor, barColor, initial, recPill, scoreColor } from "@/lib/ui";
 import { TopNav } from "@/components/TopNav";
 
-type PendingResponse = { jobs: Job[] };
+type PendingResponse = {
+  jobs: Job[];
+  /** Pending jobs before any filtering — 0 means nothing has been discovered. */
+  pending_total?: number;
+  /** Pending jobs that have been scored, at any score. */
+  scored_total?: number;
+};
 
 /** A decision in its 6s soft-commit window (mock 07): undoable until it lands. */
 type PendingCommit = { job: Job; decision: Decision };
@@ -123,7 +130,7 @@ export default function VettingPage() {
       // One soft-commit window at a time: a new decision lands the previous one.
       if (pendingRef.current) commitNow();
       queryClient.setQueryData<PendingResponse>(queryKey, (old) =>
-        old ? { jobs: old.jobs.filter((j) => j.id !== job.id) } : old,
+        old ? { ...old, jobs: old.jobs.filter((j) => j.id !== job.id) } : old,
       );
       const p = { job, decision };
       pendingRef.current = p;
@@ -139,7 +146,10 @@ export default function VettingPage() {
     const restore = (p: PendingCommit) => {
       queryClient.setQueryData<PendingResponse>(queryKey, (old) =>
         old
-          ? { jobs: [p.job, ...old.jobs.filter((j) => j.id !== p.job.id)] }
+          ? {
+              ...old,
+              jobs: [p.job, ...old.jobs.filter((j) => j.id !== p.job.id)],
+            }
           : old,
       );
       bumpStats((s) => revertDecision(s, p.decision));
@@ -203,6 +213,14 @@ export default function VettingPage() {
   useEffect(() => {
     if (firstRun && reviewedCount(stats) >= 3) clearFirstRun();
   }, [firstRun, stats]);
+
+  // Counts live in localStorage and survive a server-side wipe, which would
+  // otherwise leave the header reporting a review session for jobs that no
+  // longer exist. Runs before the counts are read below.
+  const dataEpoch = profileData?.profile?.data_epoch ?? null;
+  useEffect(() => {
+    if (uid) reconcileStats(uid, dataEpoch);
+  }, [uid, dataEpoch]);
 
   if (loading || !user || profileLoading || needsOnboarding) {
     return <div className="p-8" style={{ color: "var(--muted)" }}>Loading…</div>;
@@ -296,7 +314,12 @@ export default function VettingPage() {
           <p style={{ color: "var(--danger)" }}>Failed to load: {String(error)}</p>
         )}
         {!isLoading && jobs.length === 0 && !firstRun && (
-          <EmptyState minScore={minScore} onLower={() => saveMinScore(0)} />
+          <EmptyState
+            minScore={minScore}
+            pendingTotal={data?.pending_total ?? null}
+            scoredTotal={data?.scored_total ?? null}
+            onLower={() => saveMinScore(0)}
+          />
         )}
 
         <div className="space-y-4">
@@ -803,13 +826,56 @@ function ChipRow({
   );
 }
 
+/**
+ * An empty queue has three causes and only one of them is the threshold.
+ * Offering "Lower threshold" to an account with no jobs at all — a new invite,
+ * or one whose data was wiped — sends them to a control that cannot help,
+ * which is what it did before these counts existed.
+ */
 function EmptyState({
   minScore,
+  pendingTotal,
+  scoredTotal,
   onLower,
 }: {
   minScore: number;
+  pendingTotal: number | null;
+  scoredTotal: number | null;
   onLower: () => void;
 }) {
+  // Null counts mean an older API that doesn't report them; fall back to the
+  // threshold copy rather than inventing a state we can't actually observe.
+  const nothingDiscovered = pendingTotal === 0;
+  const nothingScoredYet =
+    pendingTotal !== null &&
+    pendingTotal > 0 &&
+    scoredTotal !== null &&
+    scoredTotal === 0;
+
+  const { icon, tone, heading, body, action } = nothingDiscovered
+    ? {
+        icon: "◔",
+        tone: "muted" as const,
+        heading: "No jobs yet",
+        body: "Nothing has been discovered for this account yet. Discovery runs on a schedule, or you can start one from Companies.",
+        action: null,
+      }
+    : nothingScoredYet
+      ? {
+          icon: "◔",
+          tone: "muted" as const,
+          heading: "Scoring in progress",
+          body: `${pendingTotal} job${pendingTotal === 1 ? "" : "s"} discovered and waiting to be scored. They'll appear here as the matcher works through them.`,
+          action: null,
+        }
+      : {
+          icon: "✓",
+          tone: "good" as const,
+          heading: "You're all caught up",
+          body: null,
+          action: "lower" as const,
+        };
+
   return (
     <div
       className="flex h-[340px] items-center justify-center rounded-xl border"
@@ -819,34 +885,41 @@ function EmptyState({
         <div
           className="mx-auto flex h-[52px] w-[52px] items-center justify-center rounded-full border text-2xl"
           style={{
-            background: "var(--good-bg)",
-            borderColor: "var(--good-border)",
-            color: "var(--good)",
+            background: tone === "good" ? "var(--good-bg)" : "var(--surface)",
+            borderColor:
+              tone === "good" ? "var(--good-border)" : "var(--border)",
+            color: tone === "good" ? "var(--good)" : "var(--muted)",
           }}
         >
-          ✓
+          {icon}
         </div>
         <h3 className="mt-[18px] text-lg font-semibold" style={{ color: "var(--text)" }}>
-          {"You're all caught up"}
+          {heading}
         </h3>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--muted)" }}>
-          No jobs above your minimum score of{" "}
-          <span className="font-mono" style={{ color: "var(--text)" }}>
-            {minScore}
-          </span>
-          . Lower the threshold to see more.
+          {body ?? (
+            <>
+              No jobs above your minimum score of{" "}
+              <span className="font-mono" style={{ color: "var(--text)" }}>
+                {minScore}
+              </span>
+              . Lower the threshold to see more.
+            </>
+          )}
         </p>
-        <button
-          onClick={onLower}
-          className="mt-[18px] h-[38px] rounded-[9px] border px-4 text-[13px] font-semibold"
-          style={{
-            background: "var(--surface)",
-            borderColor: "var(--border)",
-            color: "var(--label)",
-          }}
-        >
-          Lower threshold
-        </button>
+        {action === "lower" && (
+          <button
+            onClick={onLower}
+            className="mt-[18px] h-[38px] rounded-[9px] border px-4 text-[13px] font-semibold"
+            style={{
+              background: "var(--surface)",
+              borderColor: "var(--border)",
+              color: "var(--label)",
+            }}
+          >
+            Lower threshold
+          </button>
+        )}
       </div>
     </div>
   );

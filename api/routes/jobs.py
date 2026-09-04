@@ -40,7 +40,18 @@ def list_pending_jobs(
     user_id: str = Depends(verify_user),
     min_score: int = 60,
 ) -> dict:
-    """Return scored, still-pending jobs above min_score, ranked high to low."""
+    """Return scored, still-pending jobs above min_score, ranked high to low.
+
+    Also reports how many pending jobs exist *before* each filter, so the client
+    can tell three states apart that otherwise all render as an empty list:
+    nothing discovered yet, discovered but not scored yet, and scored but all
+    below the threshold. Only the last one is fixed by lowering the threshold,
+    and telling the other two to lower it sends them nowhere.
+
+    Both counts are free: this already streams every pending document and
+    filters in Python, so they are tallies of a pass that was happening anyway,
+    not extra queries.
+    """
     # Opportunistic scheduler tick (throttled in-process): opening the review
     # queue runs any due auto-discovery/sweep loop without external cron infra.
     background_tasks.add_task(tick_user, user_id)
@@ -53,16 +64,24 @@ def list_pending_jobs(
         .stream()
     )
     jobs = []
+    pending_total = 0
+    scored_total = 0
     for snap in snaps:
+        pending_total += 1
         d = snap.to_dict()
         match = d.get("match")
         if not match:  # not scored yet
             continue
+        scored_total += 1
         if match.get("overall_score", 0) < min_score:
             continue
         jobs.append({"id": snap.id, **d})
     jobs.sort(key=lambda j: j["match"]["overall_score"], reverse=True)
-    return {"jobs": jobs}
+    return {
+        "jobs": jobs,
+        "pending_total": pending_total,
+        "scored_total": scored_total,
+    }
 
 
 @router.get("/jobs/decided")
