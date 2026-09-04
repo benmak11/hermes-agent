@@ -93,7 +93,6 @@ jobs:
           # the Dockerfile itself. Keep in sync with /Dockerfile.
           filters: |
             api:
-              - "agents/**"
               - "api/**"
               - "models/**"
               - "tools/**"

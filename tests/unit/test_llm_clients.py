@@ -106,23 +106,16 @@ def test_call_sites_go_through_the_shared_client(fake_clients):
 # -------------------------------------------------------------- the model ids
 
 
-def test_model_ids_have_exactly_one_home(monkeypatch):
-    """``agents/_shared`` and the matching pipeline must resolve to one object.
+def test_pipeline_shares_the_model_ids():
+    """The matching pipeline must resolve to ``llm_models``' own objects.
 
     ``is``, not ``==``: two equal literals in two modules are two objects, which
-    is precisely the state this replaced. Identity is what proves there is one
-    declaration rather than two that currently agree.
+    is precisely the state this replaced. Identity is what proves ``pipeline``
+    *imports* the ids rather than declaring its own and happening to agree.
     """
-    # Set before the first import so _shared's ADC fallback never runs.
-    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "unit-test-project")
-    import _shared
-
     from tools import llm_models
     from tools.matching import pipeline
 
-    assert _shared.FLASH_MODEL is llm_models.FLASH_MODEL
-    assert _shared.PRO_MODEL is llm_models.PRO_MODEL
-    assert _shared.COMPUTER_USE_MODEL is llm_models.COMPUTER_USE_MODEL
     assert pipeline.FLASH_MODEL is llm_models.FLASH_MODEL
     assert pipeline.PRO_MODEL is llm_models.PRO_MODEL
 
@@ -138,15 +131,16 @@ def test_model_ids_are_unchanged():
 
     assert llm_models.FLASH_MODEL == "gemini-flash-latest"
     assert llm_models.PRO_MODEL == "gemini-3.1-pro-preview"
-    assert llm_models.COMPUTER_USE_MODEL == "gemini-3.1-pro-preview"
 
 
 def test_llm_models_stays_import_free():
-    """``agents/`` imports nothing else from ``tools/``; this edge must stay inert.
+    """The model ids must not become environment-dependent.
 
-    No env mutation, no credential lookup, no third-party import — anything that
-    could fail or block at import time would now do so inside the ADK agent
-    loader.
+    No import, no env read, no credential lookup — nothing but constant
+    assignments. An import here is the first step toward ``llm_models`` becoming
+    a config module that picks a model from the environment, at which point
+    ``test_model_ids_are_unchanged`` above can no longer pin anything: the id in
+    production would depend on a Cloud Run env var rather than on this file.
     """
     import ast
     from pathlib import Path

@@ -61,9 +61,9 @@ def _gateway_app_call() -> ast.Call:
     """The bare ``FastAPI(...)`` construction in ``api/main.py``.
 
     Read from source rather than imported: importing ``api.main`` calls
-    ``google.auth.default()``, mounts ADK and — the reason it matters here —
-    runs ``load_dotenv()``, which would put the developer's ``AUTH_DEV_MODE``
-    back into the process for every test that follows.
+    ``google.auth.default()`` and — the reason it matters here — runs
+    ``load_dotenv()``, which would put the developer's ``AUTH_DEV_MODE`` back
+    into the process for every test that follows.
     """
     tree = ast.parse((REPO_ROOT / "api" / "main.py").read_text())
     return next(
@@ -237,7 +237,7 @@ def test_the_cycle_runs_when_nothing_is_bypassing_auth(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# tests/integration bills real Gemini calls
+# tests/integration is free, and these keep it that way
 # --------------------------------------------------------------------------
 
 
@@ -247,21 +247,29 @@ def _pytest_config() -> dict:
 
 
 def test_billed_tests_are_deselected_by_default():
-    """``pytest tests/integration`` has to be safe to type. It costs ~$0.01-0.02
-    a run otherwise, and a throttled one surfaces as ``429 RESOURCE_EXHAUSTED``
-    — which reads like a broken test and is really production quota."""
+    """The deselection stays configured even though nothing carries the marker
+    today.
+
+    ``pytest tests/integration`` has to be safe to type. It is, currently,
+    because no billed test exists — but that is a fact about the tree, not a
+    guarantee. This pins the mechanism that makes a *re-added* billed test
+    opt-in rather than something you discover from a bill; the companion test
+    below pins the absence itself."""
     config = _pytest_config()
     assert any(m.startswith("billed:") for m in config["markers"])
     assert "not billed" in config["addopts"]
 
 
-def test_every_unmocked_integration_test_carries_the_marker():
-    """The two that reach a live model, pinned by name.
+def test_integration_suite_costs_nothing():
+    """``tests/integration`` contains no billed test at all.
 
-    Neither is mocked: one builds a real ``Runner`` around the real
-    ``root_agent``, the other posts to ``/run_sse`` on a real server. Nothing
-    can detect a *new* billed test automatically, so this at least stops these
-    two losing their marker quietly.
+    It used to hold two that drove a live model. Both are gone, so the whole
+    directory is free to run — no marker, no deselect, no ``-m billed``
+    caveat needed to type ``pytest tests/integration``.
+
+    The guard inverts rather than disappears: it now fails the moment someone
+    adds a paid test back, which is the point at which that property, and the
+    README/docstrings resting on it, stop being true.
     """
     marked = set()
     for path in sorted((REPO_ROOT / "tests" / "integration").glob("test_*.py")):
@@ -271,7 +279,7 @@ def test_every_unmocked_integration_test_carries_the_marker():
                 continue
             if any(ast.unparse(d) == "pytest.mark.billed" for d in node.decorator_list):
                 marked.add(node.name)
-    assert marked == {"test_agent_stream", "test_chat_stream"}
+    assert marked == set()
 
 
 # ---------------------------------------------------------------------------

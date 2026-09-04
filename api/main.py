@@ -1,19 +1,17 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""FastAPI gateway for the hermes multi-agent system.
+"""FastAPI gateway for the hermes pipelines.
 
 Serves the web API used by the Next.js frontend: ``/jobs``, ``/profile``,
 ``/applications``, ``/settings``, ``/companies``, ``/account`` (all
-Firebase-authenticated)
-plus the ``/tasks/*`` worker handlers.
+Firebase-authenticated) plus the ``/tasks/*`` worker handlers, which the same
+image answers only when deployed with ``WORKER_MODE=1``.
 
-The ADK agent surface (``/run``, ``/run_sse``, ``/apps/*`` and the ``/dev-ui``
-console) is a development tool and is mounted only when ``ADK_ENABLED=1``.
-See the comment on that flag below.
+The work itself lives in ``tools/`` (deterministic pipelines) and ``cli/``
+(their batch runners); this module is the HTTP edge in front of them.
 """
 
 import os
-from urllib.parse import quote
 
 import google.auth
 from dotenv import load_dotenv
@@ -38,7 +36,7 @@ from tools import queues
 # Cloud Run, where env is provided by Terraform and no .env file is shipped.
 load_dotenv()
 
-# Structured logging first, so everything below (telemetry, ADK, route imports)
+# Structured logging first, so everything below (telemetry, route imports)
 # logs through the same JSON-on-stdout pipeline Cloud Logging ingests.
 configure_logging()
 setup_telemetry()
@@ -47,108 +45,46 @@ logger = get_logger(__name__)
 
 # Origins allowed to call the API (the Next.js frontend). Configure via
 # WEB_ORIGINS or ALLOW_ORIGINS (comma-separated); defaults to local dev.
-# Exactly one CORSMiddleware must end up installed — two would duplicate the
-# Access-Control-Allow-Origin header and break the browser — so it is added in
-# the non-ADK branch below only, since get_fast_api_app adds its own.
+# Exactly one CORSMiddleware ends up installed below — two would duplicate the
+# Access-Control-Allow-Origin header and break the browser.
 _origins_env = (
     os.getenv("WEB_ORIGINS") or os.getenv("ALLOW_ORIGINS") or "http://localhost:3000"
 )
 allow_origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
 
-# Artifact bucket for ADK (created by Terraform, passed via env var)
-logs_bucket_name = os.environ.get("LOGS_BUCKET_NAME")
-
-# Agents live in the sibling "agents/" directory at the project root.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AGENTS_DIR = os.path.join(PROJECT_ROOT, "agents")
-
-# Cloud SQL session configuration
-db_user = os.environ.get("DB_USER", "postgres")
-db_name = os.environ.get("DB_NAME", "postgres")
-db_pass = os.environ.get("DB_PASS")
-instance_connection_name = os.environ.get("INSTANCE_CONNECTION_NAME")
-
-session_service_uri = None
-if instance_connection_name and db_pass:
-    # Use Unix socket for Cloud SQL
-    # URL-encode username and password to handle special characters (e.g., '[', '?', '#', '$')
-    # These characters can cause URL parsing errors, especially '[' which triggers IPv6 validation
-    encoded_user = quote(db_user, safe="")
-    encoded_pass = quote(db_pass, safe="")
-    # URL-encode the connection name to prevent colons from being misinterpreted
-    encoded_instance = instance_connection_name.replace(":", "%3A")
-
-    session_service_uri = (
-        f"postgresql+asyncpg://{encoded_user}:{encoded_pass}@"
-        f"/{db_name}"
-        f"?host=/cloudsql/{encoded_instance}"
-    )
-
-artifact_service_uri = f"gs://{logs_bucket_name}" if logs_bucket_name else None
-
-# The ADK agent surface — /run, /run_sse, /apps/*, /list-apps and the /dev-ui
-# console — is a debugging tool, not part of the product: nothing in web/ calls
-# it, the frontend talks only to the routers below. ADK registers those routes
-# with no auth dependency of its own, so on a service deployed
-# --allow-unauthenticated (which hermes-api must be, to serve the browser app)
-# they are an open, billable Gemini endpoint that anyone with the URL can drive.
+# ``/docs`` and ``/openapi.json`` are a development tool, and they were
+# answering 200 unauthenticated on production. Nothing behind them is data or a
+# billable model — they publish the *shape* of the API — so this is
+# reconnaissance aid rather than a vulnerability, and the fix is
+# correspondingly plain: don't publish it.
 #
-# So it is off unless explicitly switched on: set ADK_ENABLED=1 locally to get
-# /dev-ui back for agent work. In production the var is unset and every ADK
-# path 404s.
-ADK_ENABLED = os.getenv("ADK_ENABLED", "").strip().lower() in {"1", "true", "on"}
-
-if ADK_ENABLED:
-    from google.adk.cli.fast_api import get_fast_api_app
-
-    app: FastAPI = get_fast_api_app(
-        agents_dir=AGENTS_DIR,
-        web=True,
-        artifact_service_uri=artifact_service_uri,
-        allow_origins=allow_origins,
-        session_service_uri=session_service_uri,
-        otel_to_cloud=True,
-    )
-else:
-    # ``/docs`` and ``/openapi.json`` are a development tool, exactly like the
-    # ADK surface above, and they were answering 200 unauthenticated on
-    # production. Nothing behind them is data or a billable model — they publish
-    # the *shape* of the API — so this is reconnaissance aid rather than a
-    # vulnerability, and the fix is correspondingly plain: don't publish it.
-    #
-    # Gated on ``deps.dev_mode()`` rather than a flag of its own, because that
-    # is already the codebase's answer to "is this a developer's machine?" —
-    # Terraform never sets AUTH_DEV_MODE, so a deployed revision cannot turn
-    # these back on by accident. (The ADK branch above keeps its own docs, and
-    # needs no gate: ADK_ENABLED is itself unset in production, which is the
-    # whole reason that branch exists.)
-    app = FastAPI(
-        docs_url="/docs" if dev_mode() else None,
-        openapi_url="/openapi.json" if dev_mode() else None,
-        # ``/redoc`` renders the same document from the same URL, so it is the
-        # same surface and moves with them.
-        redoc_url="/redoc" if dev_mode() else None,
-    )
-    # Both of these are side effects of get_fast_api_app, so reproduce them —
-    # dropping the ADK surface should change the agent routes and nothing else.
-    setup_cloud_otel()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allow_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    # Not reproduced: ADK's _OriginCheckMiddleware, which rejects non-safe
-    # methods from unlisted origins. It guards ADK's cookie-less agent routes
-    # against cross-origin form posts; every route here instead requires a
-    # Firebase bearer token, which a cross-origin page cannot attach.
+# Gated on ``deps.dev_mode()`` rather than a flag of its own, because that is
+# already the codebase's answer to "is this a developer's machine?" — Terraform
+# never sets AUTH_DEV_MODE, so a deployed revision cannot turn these back on by
+# accident.
+app = FastAPI(
+    docs_url="/docs" if dev_mode() else None,
+    openapi_url="/openapi.json" if dev_mode() else None,
+    # ``/redoc`` renders the same document from the same URL, so it is the same
+    # surface and moves with them.
+    redoc_url="/redoc" if dev_mode() else None,
+)
+setup_cloud_otel()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# No separate origin check on top of CORS: every route here requires a Firebase
+# bearer token, which a cross-origin page cannot attach.
 
 app.title = "hermes"
-app.description = "API gateway for the hermes multi-agent system"
+app.description = "API gateway for the hermes job-search pipelines"
 
 # Per-request correlation id + structured access log. Added last so it is the
-# outermost middleware and wraps every route (web API and ADK endpoints alike).
+# outermost middleware and wraps every route.
 app.add_middleware(RequestContextMiddleware)
 
 # Web vetting API (Firebase-auth job + company endpoints).
@@ -190,7 +126,6 @@ def collect_feedback(
 # otherwise only answerable by reading the Cloud Run config.
 logger.info(
     "api.boot",
-    adk_enabled=ADK_ENABLED,
     # Reads back the app that was actually built, not the flag that was meant
     # to build it — this line exists to answer "which mode is this revision in?"
     docs_published=app.docs_url is not None,
@@ -200,7 +135,6 @@ logger.info(
     tasks_location=os.getenv("TASKS_LOCATION", "us-central1"),
     # Value never logged — only whether the cron endpoint is reachable at all.
     cron_configured=queues.worker_mode() or bool(os.getenv("CRON_SECRET")),
-    adk_sessions="cloudsql" if session_service_uri else "in_memory",
     allow_origins=allow_origins,
     project_id=project_id,
 )

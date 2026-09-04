@@ -1,19 +1,23 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""The Gemini model ids, in one place.
+"""The Gemini model ids used by the matching pipeline, in one place.
 
-These used to be declared twice — ``agents/_shared.py`` and
-``tools/matching/pipeline.py`` — with identical values and a "keep in sync"
-comment doing the enforcing. Two declarations of a model id is a retune waiting
-to happen: change one, and the deterministic matching pipeline and the ADK
-agents quietly start talking to different models.
+The scoring path — JD parsing and Pro scoring — imports its ids from here
+rather than declaring them, because a model id declared in two modules is a
+retune waiting to happen: change one and the two callers quietly start talking
+to different models.
 
-This module is deliberately **import-free**. ``agents/`` is otherwise a
-self-contained package (its modules import only ``_shared``, their siblings,
-and ``google.adk``), so the one edge it gains here has to be inert: no env
-mutation, no credential lookup, no third-party import, nothing that could fail
-or slow down at import time. The Dockerfile already ships ``tools/`` alongside
-``agents/`` and runs from the repo root, which is what makes the edge resolve.
+**This is not every Gemini call in the repo, and editing these does not retune
+the others.** Deliberate independent declarations, each with its own reasoning
+at the site: ``tools/tailoring/objective.py`` (``OBJECTIVE_MODEL``),
+``tools/profile/extract.py`` (inline), and ``tools/matching/batch.py``
+(``BATCH_FLASH_MODEL``, a genuinely different model — the batch API does not
+serve the ``-latest`` alias). Fold one in only by making it import from here;
+do not assume it already does.
+
+This module is deliberately **import-free** — no env mutation, no credential
+lookup, no third-party import — so that the ids are a property of this file
+rather than of the environment a process happens to boot in.
 
 **Do not change these values as a cleanup.** They are load-bearing catalog ids,
 not preferences (see ``PRO_MODEL`` below).
@@ -21,15 +25,12 @@ not preferences (see ``PRO_MODEL`` below).
 
 from __future__ import annotations
 
-#: High-volume, cheap work: JD parsing, and the ADK agents that only route.
+#: High-volume, cheap work: JD parsing. (Résumé tailoring runs on its own
+#: ``OBJECTIVE_MODEL`` — changing this does not move it.)
 FLASH_MODEL = "gemini-flash-latest"
 
-#: The call worth paying for (scoring, résumé extraction). The Gemini 3 Pro
+#: The call worth paying for: job scoring. (Résumé extraction hardcodes the
+#: same id inline — changing this does not move it.) The Gemini 3 Pro
 #: model available to this project is "gemini-3.1-pro-preview" — there is no
 #: bare "gemini-3-pro" id in its Vertex catalog, and substituting one 404s.
 PRO_MODEL = "gemini-3.1-pro-preview"
-
-#: The Application agent drives a browser via Computer Use. Using the Gemini 3
-#: Pro model here; verify computer-use support when wiring the real browser
-#: backend (a dedicated computer-use model may be needed).
-COMPUTER_USE_MODEL = "gemini-3.1-pro-preview"

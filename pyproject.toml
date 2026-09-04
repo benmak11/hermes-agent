@@ -3,13 +3,14 @@ name = "hermes"
 version = "0.1.0"
 description = ""
 authors = [
-    {name = "Baynham Makusha", email = "btmakusha@gmail.com"},
+    {name = "Ben Makusha", email = "ben@makusha.com"},
 ]
 
-
-
 dependencies = [
-    # --- Scaffold / gateway (kept from agents-cli) ---
+    # --- Gateway + telemetry ---
+    # Retained ONLY for google.adk.telemetry, which api/app_utils/telemetry.py
+    # uses to wire Cloud Trace + Cloud Logging on every revision. No ADK agents
+    # remain in this repo; do not drop this pin without rewriting that module.
     "google-adk[gcp]>=2.0.0,<3.0.0",
     "opentelemetry-instrumentation-google-genai>=0.1.0,<1.0.0",
     "gcsfs>=2024.11.0",
@@ -17,6 +18,11 @@ dependencies = [
     "google-cloud-aiplatform[evaluation]>=1.156.0",
     "fastapi>=0.115.8,<1.0.0",
     "uvicorn[standard]~=0.34.0",
+    # ORPHANED as of the agents/ removal: their only consumer was the Cloud SQL
+    # session URI that fed the ADK app, and no such instance ever existed. Left
+    # in place because dropping them needs a re-lock and a full image rebuild —
+    # removal belongs in a dependency-pruning PR of its own, not here. Nothing
+    # imports either module.
     "asyncpg>=0.30.0,<1.0.0",
     "sqlalchemy>=2,<3",
     "python-multipart>=0.0.20,<1.0.0",
@@ -42,7 +48,6 @@ dependencies = [
 ]
 requires-python = ">=3.11,<3.14"
 
-
 [dependency-groups]
 dev = [
     "pytest>=9.0.2,<10.0.0",
@@ -57,10 +62,6 @@ dev = [
     "ruff",
     "mypy",
     "streamlit",
-]
-eval = [
-    "google-adk[eval]>=2.0.0,<3.0.0",
-    "google-cloud-aiplatform[evaluation]>=1.156.0",
 ]
 lint = [
     "ruff>=0.4.6,<1.0.0",
@@ -91,7 +92,7 @@ ignore = ["E501", "C901", "B006"] # ignore line too long, too complex
 extend-immutable-calls = ["fastapi.File", "fastapi.Form", "fastapi.Body"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["agents", "api"]
+known-first-party = ["api"]
 
 [tool.ty]
 # ty is Astral's Rust-based type checker (same team as ruff/uv)
@@ -123,34 +124,26 @@ ignore-words-list = "rouge,cach,unparseable"
 # lives in ./web now — skip its dependencies and build output, not our code.
 skip = "./locust_env/*,uv.lock,.venv,./frontend,**/package-lock.json,./web/node_modules,./web/.next,./data"
 
-
-
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-
 [tool.pytest.ini_options]
-# "agents" is on the path so agent modules resolve their top-level sibling
-# imports (e.g. `from _shared import ...`) the same way the ADK loader does.
-pythonpath = [".", "agents"]
+pythonpath = ["."]
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "billed: drives a real model on the live GCP project and costs real money. Deselected by default (see addopts); opt in with `-m billed`.",
     "allow_firestore: opts out of conftest.no_production_firestore, which otherwise refuses a real firestore.Client in the unit suite.",
 ]
-# **Spending money must be something you asked for.** Two tests in
-# tests/integration are not mocked: they build a real Runner around the real
-# root_agent and stream through the live ADK routes, ~$0.01-0.02 a run on the
-# production project. The sharp edge is diagnostic rather than financial — a
-# throttled run comes back as `429 RESOURCE_EXHAUSTED`, which reads like a
-# broken test and is actually production quota — so `pytest tests/integration`
-# has to be safe to type. It is: this deselects them, and `-m billed` (which
-# overrides this) is the only way to run them.
+# **Spending money must be something you asked for.** Nothing in
+# `tests/integration` carries the `billed` marker today — tests/unit asserts
+# exactly that, by walking decorators in that directory. The marker and this
+# deselect stay as the standing
+# policy for the next test that does drive a live model: mark it `billed` and
+# it is opt-in only, via `-m billed`, which overrides this line.
 addopts = "-m 'not billed'"
 
 [tool.hatch.build.targets.wheel]
-packages = ["agents","api","models","tools","cli","obs"]
+packages = ["api","models","tools","cli","obs"]
 
 

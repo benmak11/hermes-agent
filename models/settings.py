@@ -13,7 +13,7 @@ IntervalHours = Literal[6, 12, 24, 72]
 
 
 class DiscoverySettings(BaseModel):
-    """How often the agents work unattended. Both loops are opt-in.
+    """How often the background pipelines run unattended. Both loops are opt-in.
 
     ``auto_discovery`` runs the discovery pipeline and scores the new arrivals;
     ``liveness_sweep`` re-checks already-discovered postings against their ATS
