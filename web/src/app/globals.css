@@ -60,6 +60,29 @@
   --toast-kbd-text: #d4d4d8;
   --toast-ring-track: #3f3f46;
   --toast-ring: #a1a1aa;
+  /* Warm palette (facelift PR 1). Light-only by design — nothing consumes
+     these yet, and the warm surfaces have no dark counterpart, so they are
+     deliberately NOT mirrored in the dark block below. `--surface` and
+     `--border` already exist in the grey ramp above, hence the `-warm`
+     suffix on the warm equivalents; the grey names are untouched. */
+  --sand: #f7ede0;
+  --cream: #fdf6ea;
+  --surface-warm: #fffcf8;
+  --border-warm-hair: #ecdfcf;
+  --border-warm: #e9cdb9;
+  --ink: #2e2119;
+  --ink-2: #4d3b2e;
+  --ink-3: #6b5847;
+  --ink-4: #7a6a5c;
+  --terracotta: #b8532f;
+  --terracotta-d: #a8471f;
+  --terracotta-h: #9c4223;
+  --terracotta-tint: #fdf3eb;
+  --sage: #4f7a4d;
+  --sage-tint: #eef4e9;
+  --honey: #c98a2e;
+  --honey-tint: #fdf0d9;
+  --brick: #a02d1f;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -135,6 +158,21 @@ body {
 
 .h-pulse {
   animation: hpulse 1.4s ease-in-out infinite;
+}
+
+/* Journey-track "you are here" halo. Named `jpulse`, not `hpulse`: `hpulse`
+   above is the opacity blink behind `.h-pulse` on the review page, and a
+   collision would silently change that animation. */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes jpulse {
+    0%,
+    100% {
+      box-shadow: 0 0 0 0 rgba(184, 83, 47, 0.32);
+    }
+    50% {
+      box-shadow: 0 0 0 9px rgba(184, 83, 47, 0);
+    }
+  }
 }
 
 @keyframes hspin {
