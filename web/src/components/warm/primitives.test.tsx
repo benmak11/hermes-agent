@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { CompanyTile } from "@/components/warm/CompanyTile";
+import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
 import { MatchChip } from "@/components/warm/MatchChip";
 import { Pill } from "@/components/warm/Pill";
 
@@ -57,6 +57,19 @@ describe("CompanyTile", () => {
     expect(sm).toContain("height:28px");
     expect(sm).toContain("border-radius:9px");
     expect(sm).toContain("font-size:12.5px");
+  });
+});
+
+describe("tileHue", () => {
+  it("is deterministic and always a valid hue", () => {
+    const hues = ["violet", "honey", "sage", "terracotta"];
+    for (const seed of ["Stripe", "Plaid", "Datadog", "Acme", ""]) {
+      expect(tileHue(seed)).toBe(tileHue(seed));
+      expect(hues).toContain(tileHue(seed));
+    }
+    // Pinned so a change to the hash or the modulus is a visible diff.
+    expect(tileHue("Stripe")).toBe("honey");
+    expect(tileHue("Plaid")).toBe("violet");
   });
 });
 

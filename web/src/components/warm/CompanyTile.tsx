@@ -10,6 +10,13 @@ const HUES: Record<TileHue, { bg: string; fg: string }> = {
   terracotta: { bg: "var(--terracotta-tint)", fg: "var(--terracotta)" },
 };
 
+/** Deterministic hue for a company name (same hash as lib/ui.avatarColor). */
+export function tileHue(seed: string): TileHue {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return (["violet", "honey", "sage", "terracotta"] as const)[h % 4];
+}
+
 export type TileSize = "sm" | "md";
 
 /** `md` is the board's 34px tile; `sm` the 28px one in list rows. */

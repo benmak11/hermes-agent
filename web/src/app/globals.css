@@ -311,8 +311,59 @@ body {
   }
 }
 
-/* Marketing routes (facelift PR 3): light-only, own ground, even in a dark-mode OS. */
-html:has(.mk) {
+/* Auth + onboarding (facelift PR 5). Same contract as .mk-*: a property that
+   changes on hover/focus/disabled is owned by the class, never set inline. */
+.wm-cta {
+  background: var(--terracotta);
+  color: #fff9f2;
+  box-shadow: 0 2px 8px rgba(184, 83, 47, 0.28);
+}
+.wm-cta:not(:disabled):hover {
+  background: var(--terracotta-h);
+}
+.wm-cta:disabled {
+  background: #f0e3d3;
+  color: #b0a08d;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+.wm-ghost {
+  background: var(--surface-warm);
+}
+.wm-ghost:not(:disabled):hover {
+  background: var(--cream);
+}
+.wm-link {
+  color: var(--terracotta-d);
+}
+.wm-link:hover {
+  color: var(--terracotta-h);
+}
+.wm-seg {
+  color: #96826f;
+}
+.wm-seg:hover {
+  color: var(--ink);
+}
+.wm-input {
+  border: 1px solid #e8dacb;
+  background: #fbf6ef;
+  color: var(--ink);
+}
+.wm-input:focus {
+  border-color: var(--terracotta);
+  box-shadow: 0 0 0 3px rgba(184, 83, 47, 0.14);
+}
+.wm-drop {
+  border-color: #d9c4a8;
+}
+.wm-drop:hover {
+  border-color: #b0a08d;
+}
+
+/* Marketing (PR 3) and auth/onboarding (PR 5) routes: light-only, own ground,
+   even in a dark-mode OS. */
+html:has(.mk, .wm) {
   color-scheme: light;
   background: var(--sand);
 }

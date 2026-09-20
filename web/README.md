@@ -34,8 +34,18 @@ that `/signup` stashes). `MarketingNav` is the only client component — it
 owns the Features dropdown and swaps "Sign in / Request an invite" for
 "Open Hermes →" once Firebase resolves a user. Styles are inline; what inline
 styles cannot express (hover, the reduced-motion transition, the < 720px
-`mk-desktop-only` breakpoint, the `html:has(.mk)` light-only ground) is the
+`mk-desktop-only` breakpoint, the `html:has(.mk, .wm)` light-only ground) is the
 `.mk-*` block at the end of `globals.css`.
+
+The auth and onboarding routes (`/login`, `/signup`, `/onboarding`,
+`/onboarding/review`) live in the `src/app/(auth)/` route group — route groups
+never appear in the URL — whose `layout.tsx` paints the warm gradient ground
+and Plus Jakarta Sans once. Their hover/focus/disabled states are the `.wm-*`
+block in `globals.css`, sibling to `.mk-*` and kept separate on purpose: the
+marketing classes may be reshaped with the marketing site, and the forms need
+`:disabled` and `:focus` rules the marketing set lacks. A property a `.wm-*`
+class changes on hover is never also set inline (inline would win and kill
+the hover).
 
 ## Stack
 
@@ -76,10 +86,17 @@ on the review page. `--font-jakarta` and `--font-instrument` are loaded in
 `--font-sans` is still Geist.
 
 `src/components/warm/` holds the shared primitives (`JourneyTrack`, `Pill`,
-`CompanyTile`, `MatchChip`) and the pure helper `journeyStages.ts` — not
-`journeyTrack.ts`, which would shadow `JourneyTrack.tsx` on a case-insensitive
-filesystem. They use warm tokens and inline styles only and must not import
-`@/lib/firebase`, `@/lib/api`, `next/navigation`, or any CSS.
+`CompanyTile`, `MatchChip`, `Editable`), the style constants in `styles.ts`
+(`SANS`, `SERIF`, `CARD` — a copy of marketing's two font stacks, because the
+auth screens must not import from `components/marketing/`), and the pure
+helper `journeyStages.ts` — not `journeyTrack.ts`, which would shadow
+`JourneyTrack.tsx` on a case-insensitive filesystem. They use warm tokens
+only (Tailwind layout utilities are fine; the palette is not) and must not
+import `@/lib/firebase`, `@/lib/api`, `next/navigation`, or any CSS.
+
+`warm/Editable.tsx` is a warm-skinned fork of `components/editable.tsx`
+(same exports, props and logic); the grey original is kept for `/app/profile`
+and `/app/interviews` until the facelift reaches them and deletes it.
 
 ```bash
 npm test       # vitest, node environment — no jsdom, no browser
