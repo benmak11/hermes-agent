@@ -44,3 +44,27 @@ running for anything past `/login` to load data.
 npm run lint   # eslint
 npm run build  # production build
 ```
+
+## Warm design system (facelift, in progress)
+
+`globals.css` carries a second, light-only token set next to the grey/blue
+ramp: `--sand`, `--cream`, `--ink`…`--ink-4`, `--terracotta*`, `--sage*`,
+`--honey*`, `--brick`, plus `--surface-warm` / `--border-warm` /
+`--border-warm-hair`. The last three are suffixed because `--surface` and
+`--border` already name the grey ones. `@keyframes jpulse` (the journey
+track's halo) is distinct from `hpulse`, the opacity blink behind `.h-pulse`
+on the review page. `--font-jakarta` and `--font-instrument` are loaded in
+`layout.tsx` as variables only; `--font-sans` is still Geist.
+
+`src/components/warm/` holds the shared primitives (`JourneyTrack`, `Pill`,
+`CompanyTile`, `MatchChip`) and the pure helper `journeyStages.ts` — not
+`journeyTrack.ts`, which would shadow `JourneyTrack.tsx` on a case-insensitive
+filesystem. They use warm tokens and inline styles only and must not import
+`@/lib/firebase`, `@/lib/api`, `next/navigation`, or any CSS.
+
+```bash
+npm test       # vitest, node environment — no jsdom, no browser
+```
+
+Tests stay pure: import only `src/lib/*` and `src/components/warm/*`, and
+render components through `react-dom/server`'s `renderToStaticMarkup`.

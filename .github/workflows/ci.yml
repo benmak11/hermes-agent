@@ -41,7 +41,7 @@ jobs:
         run: uv run pytest tests/unit -q
 
   web:
-    name: Web (lint + typecheck + build)
+    name: Web (lint + test + typecheck + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -55,6 +55,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run lint
+      - run: npm test
       - run: npx tsc --noEmit
       # NEXT_PUBLIC_* are inlined at build time and Firebase init throws on a
       # missing apiKey during prerender. These are public-by-design (they ship in
