@@ -3,8 +3,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -26,15 +25,10 @@ type Row = {
 
 export default function CompaniesPage() {
   const { user, loading } = useAuth();
-  const router = useRouter();
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<Tab>("unvetted");
   const [search, setSearch] = useState("");
   const [showAll, setShowAll] = useState(false);
-
-  useEffect(() => {
-    if (!loading && !user) router.push("/login");
-  }, [loading, user, router]);
 
   const { data } = useQuery({
     queryKey: ["companies"],

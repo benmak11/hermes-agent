@@ -10,14 +10,19 @@ screenshots of these screens.
 
 | Route | Screen |
 |---|---|
-| `/login` | Google or email sign-in (Firebase Auth) |
+| `/` | Redirects to `/app` (marketing page arrives in a later PR) |
+| `/login`, `/signup` | Google or email sign-in / create account (Firebase Auth); `/login?next=/app/...` returns you there after sign-in |
 | `/onboarding`, `/onboarding/review` | Upload a résumé, then confirm/correct what Hermes parsed before matching starts |
-| `/` | Job review — approve/skip/star ranked postings, keyboard-driven, with a score + recommendation breakdown |
-| `/tracking` | Application pipeline (pipeline/starred/skipped tabs), filled in as the submitter writes status |
-| `/applications/{id}/review` | Tailored résumé diff/review + `.docx` download for a single application |
-| `/interviews` | User-owned interview journal — Hermes contributes only the match score; stages, outcomes, and reflections are logged by the user |
-| `/settings/companies` | Discovery source list — rescan or block companies |
-| `/profile` | Résumé versions, match preferences, skills, and experience |
+| `/app` | Job review — approve/skip/star ranked postings, keyboard-driven, with a score + recommendation breakdown |
+| `/app/tracking` | Application pipeline (pipeline/starred/skipped tabs), filled in as the submitter writes status |
+| `/app/applications/{id}/review` | Tailored résumé diff/review + `.docx` download for a single application |
+| `/app/interviews` | User-owned interview journal — Hermes contributes only the match score; stages, outcomes, and reflections are logged by the user |
+| `/app/settings/companies` | Discovery source list — rescan or block companies |
+| `/app/profile` | Résumé versions, match preferences, skills, and experience |
+
+Old top-level app paths (`/tracking`, `/profile`, …) 307 to `/app/...` via
+`redirects()` in `next.config.ts`; `/app/*` is gated client-side by
+`src/app/app/layout.tsx`.
 
 ## Stack
 

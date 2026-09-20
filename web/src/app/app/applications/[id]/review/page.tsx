@@ -3,7 +3,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useParams, useRouter } from "next/navigation";
+import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { apiFetch, newRequestId } from "@/lib/api";
@@ -42,15 +42,10 @@ async function downloadResume(appId: string, company: string): Promise<void> {
 
 export default function ReviewPage() {
   const { user, loading } = useAuth();
-  const router = useRouter();
   const params = useParams<{ id: string }>();
   const id = params.id;
   const queryClient = useQueryClient();
   const queryKey = ["application", id] as const;
-
-  useEffect(() => {
-    if (!loading && !user) router.push("/login");
-  }, [loading, user, router]);
 
   const { data: app, isLoading, error } = useQuery({
     queryKey,

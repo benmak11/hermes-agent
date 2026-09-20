@@ -4,8 +4,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -32,12 +31,7 @@ type ListResponse = { applications: Application[] };
  */
 export default function InterviewsPage() {
   const { user, loading } = useAuth();
-  const router = useRouter();
   const entries = useJournal(user?.uid ?? null);
-
-  useEffect(() => {
-    if (!loading && !user) router.push("/login");
-  }, [loading, user, router]);
 
   // "applied" comes from real submissions; the journal never invents it.
   const { data: appsData } = useQuery({
@@ -146,7 +140,7 @@ export default function InterviewsPage() {
 
         <p className="mt-5 text-center">
           <Link
-            href="/tracking"
+            href="/app/tracking"
             className="font-mono text-[11px] font-medium"
             style={{ color: "var(--subtle)" }}
           >
