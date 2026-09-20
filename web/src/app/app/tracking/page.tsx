@@ -4,8 +4,8 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useState } from "react";
 
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -31,17 +31,12 @@ export default function TrackingPage() {
 
 function TrackingInner() {
   const { user, loading } = useAuth();
-  const router = useRouter();
   const queryClient = useQueryClient();
   const params = useSearchParams();
   const initialTab = params.get("tab");
   const [tab, setTab] = useState<Tab>(
     initialTab === "starred" || initialTab === "skipped" ? initialTab : "pipeline",
   );
-
-  useEffect(() => {
-    if (!loading && !user) router.push("/login");
-  }, [loading, user, router]);
 
   const { data: appsData, isLoading } = useQuery({
     queryKey: ["applications"],
@@ -141,7 +136,7 @@ function TrackingInner() {
             {!isLoading && apps.length === 0 && (
               <EmptyCard>
                 Nothing in the pipeline yet. Approve a job in{" "}
-                <Link href="/" className="font-semibold" style={{ color: "var(--accent)" }}>
+                <Link href="/app" className="font-semibold" style={{ color: "var(--accent)" }}>
                   Review
                 </Link>{" "}
                 and the agent takes it from there.
@@ -270,7 +265,7 @@ function pipelineView(app: Application): PipelineView {
         segments: [{ color: good }, { color: good }, { color: IDLE }, { color: IDLE }],
         label: "review resume →",
         labelColor: accent,
-        labelHref: `/applications/${app.id}/review`,
+        labelHref: `/app/applications/${app.id}/review`,
         pill: {
           text: "ready for review",
           bg: "var(--good-bg)",
@@ -349,7 +344,7 @@ function pipelineView(app: Application): PipelineView {
         })),
         label: "failed — open to retry →",
         labelColor: "var(--danger)",
-        labelHref: `/applications/${app.id}/review`,
+        labelHref: `/app/applications/${app.id}/review`,
         pill: {
           text: "failed",
           bg: "var(--danger-bg)",
@@ -381,7 +376,7 @@ function PipelineRow({ app }: { app: Application }) {
           {initial(company)}
         </span>
         <Link
-          href={`/applications/${app.id}/review`}
+          href={`/app/applications/${app.id}/review`}
           className="min-w-0 flex-1 truncate"
         >
           <span

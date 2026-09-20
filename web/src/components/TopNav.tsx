@@ -7,6 +7,7 @@ import Link from "next/link";
 
 import { UserAvatar } from "@/components/UserAvatar";
 import { auth } from "@/lib/firebase";
+import { APP_HOME } from "@/lib/nav";
 
 type Section =
   | "review"
@@ -17,16 +18,16 @@ type Section =
   | "tracking";
 
 const LINKS: { section: Section; href: string; label: string }[] = [
-  { section: "review", href: "/", label: "Review" },
-  { section: "tracking", href: "/tracking", label: "Tracking" },
-  { section: "interviews", href: "/interviews", label: "Interviews" },
-  { section: "companies", href: "/settings/companies", label: "Companies" },
+  { section: "review", href: APP_HOME, label: "Review" },
+  { section: "tracking", href: "/app/tracking", label: "Tracking" },
+  { section: "interviews", href: "/app/interviews", label: "Interviews" },
+  { section: "companies", href: "/app/settings/companies", label: "Companies" },
 ];
 
 /**
  * 56px translucent app nav (mock spec): logo + `/ route` breadcrumb left;
  * Review · Interviews · Companies · Sign out + avatar right, with the current
- * page's link omitted. The avatar opens /profile and wears a blue focus ring
+ * page's link omitted. The avatar opens /app/profile and wears a blue focus ring
  * while there. `center` (session progress) and `pill` (discovery status) are
  * slots for the review screen. Companies keeps its "← Back to jobs" shortcut.
  */
@@ -44,7 +45,7 @@ export function TopNav({
       className="sticky top-0 z-10 flex h-14 items-center justify-between border-b px-6 backdrop-blur"
       style={{ background: "var(--nav-bg)", borderColor: "var(--border)" }}
     >
-      <Link href="/" className="flex items-center gap-2.5">
+      <Link href="/app" className="flex items-center gap-2.5">
         <span
           className="flex h-[26px] w-[26px] items-center justify-center rounded-[7px] text-sm font-bold"
           style={{ background: "var(--text)", color: "var(--surface)" }}
@@ -68,7 +69,7 @@ export function TopNav({
 
       {section === "companies" ? (
         <Link
-          href="/"
+          href="/app"
           className="text-[13px] font-medium"
           style={{ color: "var(--accent)" }}
         >
@@ -95,7 +96,7 @@ export function TopNav({
             Sign out
           </button>
           <Link
-            href="/profile"
+            href="/app/profile"
             aria-label="Profile"
             className="rounded-full"
             style={

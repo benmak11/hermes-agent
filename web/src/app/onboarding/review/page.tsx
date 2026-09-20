@@ -9,6 +9,7 @@ import { useEffect, useState } from "react";
 
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { APP_HOME } from "@/lib/nav";
 import { markFirstRun } from "@/lib/session";
 import type { Profile, ProfileResponse } from "@/lib/types";
 import { avatarColor, initial, resolveUserAvatar } from "@/lib/ui";
@@ -65,7 +66,7 @@ export default function OnboardingReviewPage() {
   // After the celebratory "Profile saved" beat, drop the user into the queue.
   useEffect(() => {
     if (!saved) return;
-    const t = setTimeout(() => router.push("/"), 1700);
+    const t = setTimeout(() => router.push(APP_HOME), 1700);
     return () => clearTimeout(t);
   }, [saved, router]);
 

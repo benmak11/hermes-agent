@@ -43,10 +43,6 @@ export default function ProfilePage() {
   const [draft, setDraft] = useState<Profile | null>(null);
   const minScore = useMinScore();
 
-  useEffect(() => {
-    if (!loading && !user) router.push("/login");
-  }, [loading, user, router]);
-
   const { data, isLoading, error } = useQuery({
     queryKey: ["profile-page"],
     queryFn: () => apiFetch<ProfileResponse>("/profile"),
