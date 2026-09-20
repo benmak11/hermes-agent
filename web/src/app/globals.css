@@ -361,6 +361,45 @@ body {
   border-color: #b0a08d;
 }
 
+/* App nav + review loop (facelift PR 6). Same contract: hover-changing
+   properties live here, never inline. */
+.wm-muted-link {
+  color: var(--ink-4);
+}
+.wm-muted-link:hover {
+  color: var(--ink);
+}
+.wm-nav-active {
+  color: var(--terracotta);
+  font-weight: 700;
+  border-bottom: 2px solid var(--terracotta);
+  padding-bottom: 3px;
+}
+.wm-nav-quiet {
+  color: #a3927f;
+}
+.wm-nav-quiet:hover {
+  color: var(--ink-3);
+}
+.wm-toggle {
+  color: var(--ink-4);
+}
+.wm-toggle:hover,
+.wm-toggle-open {
+  color: var(--ink);
+}
+.wm-toast-btn {
+  background: var(--ink-2);
+}
+.wm-toast-btn:hover {
+  background: var(--ink-3);
+}
+@media (max-width: 899px) {
+  .wm-nav-center {
+    display: none;
+  }
+}
+
 /* Marketing (PR 3) and auth/onboarding (PR 5) routes: light-only, own ground,
    even in a dark-mode OS. */
 html:has(.mk, .wm) {

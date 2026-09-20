@@ -110,3 +110,37 @@ export function resolveUserAvatar(
   if (e) return { kind: "email", text: e[0].toUpperCase() };
   return { kind: "glyph" };
 }
+
+// ---- Warm variants (facelift PR 6). The grey trio above stays for
+// /app/tracking until PR 7; PR 8 deletes it. ----
+
+/** Score numeral colour on the warm cards, keyed by recommendation. */
+export function scoreColorWarm(rec: string): string {
+  if (rec === "strong_apply") return "var(--sage)";
+  if (rec === "apply") return "var(--terracotta)";
+  if (rec === "maybe") return "var(--honey)";
+  return "var(--ink-4)";
+}
+
+export type WarmPillTone = "accent" | "good" | "warn" | "muted";
+
+/** Recommendation → warm `Pill` tone + label (design 07: "● STRONG MATCH"). */
+export function recPillWarm(rec: string): { tone: WarmPillTone; label: string } {
+  switch (rec) {
+    case "strong_apply":
+      return { tone: "good", label: "STRONG MATCH" };
+    case "apply":
+      return { tone: "accent", label: "GOOD MATCH" };
+    case "maybe":
+      return { tone: "warn", label: "MAYBE" };
+    default:
+      return { tone: "muted", label: "WEAK MATCH" };
+  }
+}
+
+/** Fill for a 0-100 breakdown bar on the warm cards. */
+export function barColorWarm(v: number): string {
+  if (v >= 80) return "var(--sage)";
+  if (v >= 60) return "var(--terracotta)";
+  return "var(--honey)";
+}
