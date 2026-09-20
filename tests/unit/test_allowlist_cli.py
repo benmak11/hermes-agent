@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys
 
 import pytest
+from test_account_delete import _FakeDB as _PathFakeDB  # any collection, op log
 from test_allowlist import _FakeDB  # the transactional Firestore fake
 
 import cli.allowlist as allowlist_cli
@@ -225,3 +226,39 @@ def test_add_execute_is_still_transactional_through_the_cli(monkeypatch, capsys)
 
     active = sum(1 for d in db.store.values() if not d.get("revoked"))
     assert active == 2
+
+
+# ---------------------------------------------------------------------------
+# waitlist — read-only
+# ---------------------------------------------------------------------------
+
+
+def test_waitlist_lists_oldest_first_and_writes_nothing(monkeypatch, capsys):
+    """No ``--execute`` because there is nothing to execute: the grant is
+    ``add``. The ordering is the queue — the operator works from the top."""
+    db = _PathFakeDB(
+        {
+            "waitlist/newer@example.com": {
+                "uid": "u2",
+                "source": "footer",
+                "email_verified": True,
+                "first_seen": "2026-09-21T09:30:00+00:00",
+            },
+            "waitlist/older@example.com": {
+                "uid": "u1",
+                "source": None,
+                "email_verified": False,
+                "first_seen": "2026-09-20T12:00:00+00:00",
+            },
+        }
+    )
+    auth = _FakeFirebaseAuth({})
+
+    _run(monkeypatch, ["waitlist"], db, auth)
+
+    out = capsys.readouterr().out
+    assert out.index("older@example.com") < out.index("newer@example.com")
+    assert "unverified" in out.splitlines()[0]
+    assert "verified" in out.splitlines()[1]
+    assert "2 waiting" in out
+    assert db.ops == []

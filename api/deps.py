@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fastapi import Header, HTTPException, Query
@@ -130,22 +131,50 @@ async def _check_allowlist(uid: str, email: str | None) -> None:
         )
 
 
-async def _verify_token(token: str | None) -> str:
-    """Verify a Firebase ID token (or honor the dev bypass) and return the uid.
+@dataclass(frozen=True)
+class Identity:
+    """What a verified token says, before the allowlist has been consulted."""
+
+    uid: str
+    email: str | None
+    email_verified: bool
+
+
+def _bearer(authorization: str | None) -> str | None:
+    """The token inside an ``Authorization: Bearer …`` header, else ``None``."""
+    return (
+        authorization.removeprefix("Bearer ")
+        if authorization and authorization.startswith("Bearer ")
+        else None
+    )
+
+
+def _dev_bypass_uid() -> str | None:
+    """The uid a local process is impersonating, or ``None`` when this is a
+    real deployment (or a local process with no ``AUTH_DEV_USER``). The one
+    place the bypass condition is spelled out, so :func:`_verify_identity`
+    and :func:`_verify_token` cannot disagree about it."""
+    if dev_mode() and os.getenv("AUTH_DEV_USER"):
+        return os.environ["AUTH_DEV_USER"]
+    return None
+
+
+async def _verify_identity(token: str | None) -> Identity:
+    """Verify a Firebase ID token (or honor the dev bypass) and say who it is.
 
     Binds the resolved ``user_id`` into the log context so every subsequent line
     for this request (route, background task, tools) carries it.
 
-    The allowlist check runs **after** the dev bypass, never before it: the
-    bypass returns before this function does anything else, so a local
-    process with ``AUTH_DEV_USER`` set reaches no Firestore at all, allowlist
-    included — local dev and the ``me`` demo account must keep working exactly
-    as before this PR.
+    The dev bypass returns before this function does anything else, so a local
+    process with ``AUTH_DEV_USER`` set reaches no Firestore at all. It yields
+    an :class:`Identity` with no email — the bypass has none to give — which
+    is why callers that need one (the allowlist) must treat ``email=None`` as
+    a real shape, not a bug.
     """
-    if dev_mode() and os.getenv("AUTH_DEV_USER"):
-        uid = os.environ["AUTH_DEV_USER"]
-        bind_request_context(user_id=uid, auth="dev")
-        return uid
+    dev_uid = _dev_bypass_uid()
+    if dev_uid:
+        bind_request_context(user_id=dev_uid, auth="dev")
+        return Identity(uid=dev_uid, email=None, email_verified=False)
 
     if not token:
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -160,10 +189,41 @@ async def _verify_token(token: str | None) -> str:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}") from e
 
     uid = decoded["uid"]
-    email = decoded.get("email")
     bind_request_context(user_id=uid)
-    await _check_allowlist(uid, email)
-    return uid
+    return Identity(
+        uid=uid,
+        email=decoded.get("email"),
+        email_verified=bool(decoded.get("email_verified")),
+    )
+
+
+async def _verify_token(token: str | None) -> str:
+    """Verify the token and the allowlist, returning the uid.
+
+    The allowlist check runs **after** the dev bypass, never before it, and
+    is skipped entirely on the bypass: a local process with ``AUTH_DEV_USER``
+    set reaches no Firestore at all, allowlist included — local dev and the
+    ``me`` demo account must keep working exactly as before, even with
+    ``ALLOWLIST_ENFORCED=1`` (the bypass identity carries no email, and
+    :func:`_check_allowlist` would refuse it).
+    """
+    ident = await _verify_identity(token)
+    if _dev_bypass_uid() is None:
+        await _check_allowlist(ident.uid, ident.email)
+    return ident.uid
+
+
+async def verify_identity(
+    authorization: str | None = Header(default=None),
+) -> Identity:
+    """Token verified, allowlist **not** consulted.
+
+    Only for routes that must answer a stranger — today that is exactly
+    ``POST /account/signup``, which is where a non-allowlisted account gets
+    told it is waitlisted rather than 403'd. Every other route stays on
+    :func:`verify_user`.
+    """
+    return await _verify_identity(_bearer(authorization))
 
 
 async def verify_user(authorization: str | None = Header(default=None)) -> str:
@@ -174,12 +234,7 @@ async def verify_user(authorization: str | None = Header(default=None)) -> str:
     production — it is gated on an explicit env var precisely so it can't be on
     by accident (Cloud Run env is set via Terraform, which does not set it).
     """
-    token = (
-        authorization.removeprefix("Bearer ")
-        if authorization and authorization.startswith("Bearer ")
-        else None
-    )
-    return await _verify_token(token)
+    return await _verify_token(_bearer(authorization))
 
 
 async def verify_user_query(token: str | None = Query(default=None)) -> str:

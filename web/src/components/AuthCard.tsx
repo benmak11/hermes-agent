@@ -15,11 +15,29 @@ import { useEffect, useState } from "react";
 import { apiFetch, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { auth } from "@/lib/firebase";
-import { APP_HOME, safeNext } from "@/lib/nav";
+import { readStored, writeStored } from "@/lib/localStore";
+import { APP_HOME, safeNext, SIGNUP_FROM_KEY } from "@/lib/nav";
+import { signupOutcome, type SignupResult } from "@/lib/signupFlow";
 
 type Mode = "signin" | "signup";
 type Phase = "idle" | "creating" | "checking";
-type ErrState = { tone: "recover" | "error" | "locked"; title?: string; body: string };
+type ErrState = {
+  tone: "recover" | "error" | "locked" | "waitlisted";
+  title?: string;
+  body: string;
+};
+
+/** Auth-card strings (not marketing copy — that lives in marketing/copy.ts). */
+const LOCKED_PANEL: ErrState = {
+  tone: "locked",
+  title: "This account isn't on the invite list",
+  body: "Your Google sign-in worked, but Hermes is invite-only right now and this address hasn't been added. Ask whoever invited you for access, then try again.",
+};
+const WAITLISTED_PANEL: ErrState = {
+  tone: "waitlisted",
+  title: "You're on the list",
+  body: "Hermes is invite-only while we're small. Your account and your place in line are saved — when a seat opens for this address, sign in again and you're in.",
+};
 
 
 /** Map a Firebase auth error code to copy a human can act on. */
@@ -108,8 +126,8 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
   const [notice, setNotice] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [created, setCreated] = useState(false);
-  // Set the instant a Google sign-in comes back 403 from the allowlist
-  // pre-flight, and never cleared automatically — only a fresh sign-in
+  // Set the instant a sign-in comes back "not allowed" from the admission
+  // check (see admit), and never cleared automatically — only a fresh sign-in
   // attempt resets it. This exists as its own flag, separate from `phase`,
   // because `auth.signOut()` clearing `user` via onIdTokenChanged is async:
   // there is a window after we decide "locked out" but before Firebase's
@@ -119,8 +137,8 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
 
   // Already-signed-in visitor, or a successful sign in / Google → home. The
   // create-account flow handles its own handoff (below), so it's excluded.
-  // Also held off during "checking" (the post-Google allowlist pre-flight)
-  // and once locked out — see withGoogle.
+  // Also held off during "checking" (the post-auth admission check) and once
+  // locked out — see admit.
   useEffect(() => {
     if (!loading && user && !created && phase === "idle" && !lockedOut) {
       router.push(safeNext(next) ?? APP_HOME);
@@ -145,6 +163,64 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
     setLockedOut(false);
   }
 
+  /** End the session here: flag first, then sign out, then explain. The flag
+   *  must land before signOut so the redirect effect can't race the async
+   *  onIdTokenChanged null-out (see lockedOut above). */
+  async function lockOut(panel: ErrState) {
+    setLockedOut(true);
+    await auth.signOut();
+    setError(panel);
+  }
+
+  /** Yesterday's Google pre-flight (GET /profile, 403 == not allowed), kept
+   *  only for the minutes between the web and api deploys when
+   *  POST /account/signup still 404s. A 403 here is the allowlist refusing
+   *  this account; anything else (network error, 500, ...) is "the backend
+   *  had a bad moment", which must not be treated as "you are not allowed". */
+  async function legacyProbe(): Promise<boolean> {
+    try {
+      await apiFetch("/profile");
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 403) {
+        await lockOut(LOCKED_PANEL);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Post-auth admission. True = carry on; false = the session was ended here.
+   *  Records the marketing CTA the visitor came in through (stashed by /signup)
+   *  and clears it once the outcome is known — kept on fallback/error so the
+   *  next attempt still carries it. */
+  async function admit(provider: "google" | "email"): Promise<boolean> {
+    const source = readStored("session", SIGNUP_FROM_KEY);
+    let result: SignupResult;
+    try {
+      const r = await apiFetch<{ allowed: boolean }>("/account/signup", {
+        method: "POST",
+        body: JSON.stringify({ source }),
+      });
+      result = { kind: "ok", allowed: r.allowed };
+    } catch (e) {
+      result = { kind: "error", status: e instanceof ApiError ? e.status : null };
+    }
+    switch (signupOutcome(result)) {
+      case "continue":
+        writeStored("session", SIGNUP_FROM_KEY, null);
+        return true;
+      case "waitlist":
+        writeStored("session", SIGNUP_FROM_KEY, null);
+        await lockOut(WAITLISTED_PANEL);
+        return false;
+      case "locked":
+        await lockOut(LOCKED_PANEL);
+        return false;
+      case "fallback":
+        return provider === "google" ? legacyProbe() : true;
+    }
+  }
+
   async function withGoogle() {
     setError(null);
     setNotice(null);
@@ -158,33 +234,14 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
       return;
     }
 
-    // A real Firebase session now exists. Probe the allowlist with an
-    // endpoint we'd call right after landing anyway (GET /profile is the
-    // first-run gate) *before* the redirect effect can act on it — moving an
-    // existing, cheap, single-Firestore-read call earlier, not adding a new
-    // one. A 403 here is the allowlist refusing this account; anything else
-    // (network error, 500, ...) is "the backend had a bad moment", which
-    // must not be treated as "you are not allowed" — those need different
-    // messages, and only one of them is grounds for signing the user back
-    // out of a session they otherwise validly hold.
+    // A real Firebase session now exists. Decide admission *before* the
+    // redirect effect can act on it; on "not allowed" admit() has already
+    // signed the user back out and lockedOut holds the effect off.
     try {
-      await apiFetch("/profile");
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 403) {
-        setLockedOut(true);
-        await auth.signOut();
-        setError({
-          tone: "locked",
-          title: "This account isn't on the invite list",
-          body: "Your Google sign-in worked, but Hermes is invite-only right now and this address hasn't been added. Ask whoever invited you for access, then try again.",
-        });
-        setPhase("idle");
-        return;
-      }
-      // Network error, 500, etc. — the backend, not the allowlist. Let the
-      // sign-in stand; don't conflate "unreachable" with "not allowed".
+      await admit("google");
+    } finally {
+      setPhase("idle");
     }
-    setPhase("idle");
   }
 
   async function onForgotPassword() {
@@ -218,11 +275,20 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
     setLockedOut(false);
 
     if (mode === "signin") {
+      // "checking" goes on before the await, as withGoogle does: the phase
+      // guard on the redirect effect must already hold when onIdTokenChanged
+      // sets `user`, whatever order the scheduler flushes them in.
+      setPhase("checking");
       try {
         await signInWithEmailAndPassword(auth, email.trim(), password);
-        // The redirect effect takes it from here.
+        // Same admission as Google: a waitlisted address that comes back and
+        // signs in gets the panel here, not a raw 403 on /app — and this is
+        // the exact path the operator's grant relies on ("sign in again").
+        await admit("email");
       } catch (err) {
         setError(describeAuthError(errCode(err)));
+      } finally {
+        setPhase("idle"); // on "continue" the redirect effect takes it from here
       }
       return;
     }
@@ -234,11 +300,16 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
     setPhase("creating");
     try {
       await createUserWithEmailAndPassword(auth, email.trim(), password);
-      setCreated(true); // keep phase "creating" so the redirect effect stays out
     } catch (err) {
       setPhase("idle");
       setError(describeAuthError(errCode(err)));
+      return;
     }
+    // Phase stays "creating" through the admission check so the redirect
+    // effect stays out; a stranger gets the waitlist panel instead of
+    // /onboarding and a 403 there.
+    if (await admit("email")) setCreated(true);
+    else setPhase("idle");
   }
 
   const card = (
@@ -358,20 +429,28 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
                 Create an account →
               </button>
             </div>
-          ) : error?.tone === "locked" ? (
+          ) : error?.tone === "locked" || error?.tone === "waitlisted" ? (
             <div
               className="mt-[18px] rounded-[10px] border px-3.5 py-[13px]"
-              style={{
-                borderColor: "var(--border)",
-                background: "color-mix(in srgb, var(--accent) 7%, var(--surface))",
-              }}
+              style={
+                error.tone === "waitlisted"
+                  ? { borderColor: "var(--good-border)", background: "var(--good-bg)" }
+                  : {
+                      borderColor: "var(--border)",
+                      background: "color-mix(in srgb, var(--accent) 7%, var(--surface))",
+                    }
+              }
             >
               <div className="flex items-center gap-2">
                 <span
                   className="flex h-[18px] w-[18px] items-center justify-center rounded-full text-xs"
-                  style={{ background: "var(--accent)", color: "var(--surface)" }}
+                  style={
+                    error.tone === "waitlisted"
+                      ? { background: "var(--good)", color: "var(--surface)" }
+                      : { background: "var(--accent)", color: "var(--surface)" }
+                  }
                 >
-                  🔒
+                  {error.tone === "waitlisted" ? "✓" : "🔒"}
                 </span>
                 <span className="text-[13px] font-semibold" style={{ color: "var(--text)" }}>
                   {error.title}
@@ -490,10 +569,22 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
             {mode === "signin" ? (
               <button
                 type="submit"
-                className="mt-[18px] h-[42px] w-full rounded-[9px] text-sm font-semibold"
-                style={{ background: "var(--text)", color: "var(--surface)" }}
+                disabled={phase === "checking"}
+                className="mt-[18px] flex h-[42px] w-full items-center justify-center gap-2.5 rounded-[9px] text-sm font-semibold"
+                style={{
+                  background: "var(--text)",
+                  color: "var(--surface)",
+                  cursor: phase === "checking" ? "not-allowed" : "pointer",
+                }}
               >
-                Sign in
+                {phase === "checking" ? (
+                  <>
+                    <Spinner size={15} />
+                    Checking access…
+                  </>
+                ) : (
+                  "Sign in"
+                )}
               </button>
             ) : (
               <button

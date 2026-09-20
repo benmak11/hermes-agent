@@ -9,7 +9,7 @@
  */
 
 const lede =
-  "Hermes finds the roles and writes the applications from your real history. You approve them with a tap — and every interview that follows shows up on one map.";
+  "Hermes finds the roles and writes the applications from your real history. You approve them with a tap and every interview that follows shows up on one map.";
 
 export const copy = {
   meta: { title: "Hermes — the job search, run for you", description: lede },
@@ -30,7 +30,7 @@ export const copy = {
   },
   hero: {
     badgeNew: "New",
-    badge: "Journeys — see where you stand in every interview",
+    badge: "Journeys are ways to see where you stand in every interview",
     h1Line1: "Hermes does the applying.",
     h1Em: "You",
     h1Line2Rest: " do the interviews.",

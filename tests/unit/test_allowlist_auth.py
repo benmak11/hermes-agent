@@ -223,3 +223,40 @@ def test_the_result_is_cached_for_five_minutes_keyed_by_uid(monkeypatch):
     clock["now"] = base + timedelta(minutes=6)
     asyncio.run(deps.verify_user(authorization="Bearer tok"))
     assert calls == ["user@example.com", "user@example.com"]  # cache expired
+
+
+# ---------------------------------------------------------------------------
+# 4. verify_identity: token verified, allowlist never consulted
+# ---------------------------------------------------------------------------
+
+
+def test_verify_identity_never_consults_the_allowlist(monkeypatch):
+    """The one dependency that answers a stranger — ``POST /account/signup``
+    decides admission itself, so this must hand back a denied address rather
+    than 403 it. Enforcement fully on, and neither Firestore nor the
+    predicate is reachable."""
+    monkeypatch.setenv("ALLOWLIST_ENFORCED", "1")
+    _patch_decoded(
+        monkeypatch,
+        {"uid": "u1", "email": "nope@example.com", "email_verified": False},
+    )
+    monkeypatch.setattr(allowlist, "is_allowed", _explode_async)
+    monkeypatch.setattr(deps, "_client", _explode)
+
+    ident = asyncio.run(deps.verify_identity(authorization="Bearer tok"))
+
+    assert ident == deps.Identity("u1", "nope@example.com", False)
+
+
+def test_verify_identity_returns_no_email_under_the_dev_bypass(monkeypatch):
+    """The bypass has no email to give; the route treats that as a real shape
+    (and with enforcement off, admits it) rather than a bug."""
+    monkeypatch.setenv("AUTH_DEV_MODE", "1")
+    monkeypatch.setenv("AUTH_DEV_USER", "demo")
+    monkeypatch.setenv("ALLOWLIST_ENFORCED", "1")
+    monkeypatch.setattr(allowlist, "is_allowed", _explode_async)
+    monkeypatch.setattr(deps, "_client", _explode)
+
+    ident = asyncio.run(deps.verify_identity(authorization=None))
+
+    assert ident == deps.Identity("demo", None, False)
