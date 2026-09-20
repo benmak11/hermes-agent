@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { apiUpload } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { Profile } from "@/lib/types";
+import { CARD, SERIF } from "@/components/warm/styles";
 
 type Phase = "idle" | "uploading" | "parsing";
 type FileMeta = { name: string; size?: number; kind: string };
@@ -22,12 +23,14 @@ const DEV_TOOLS =
   process.env.NODE_ENV !== "production" ||
   process.env.NEXT_PUBLIC_DEV_TOOLS === "1";
 
+// Exactly five: the interval cap and the progress maths read its length, so
+// the count sets the visible timing.
 const PARSE_STEPS = [
-  "Read document",
-  "Extract work history",
-  "Identify skills & expertise",
-  "Detect location & work preferences",
-  "Save profile to your account",
+  "Reading your resume",
+  "Your work history",
+  "Skills & expertise",
+  "Where and how you want to work",
+  "Saving your profile",
 ];
 
 // A canned resume so a user can try the flow without their own file. Runs the
@@ -133,38 +136,37 @@ export default function OnboardingPage() {
   }, [pasteText, submit]);
 
   if (loading || !user) {
-    return <div className="p-8" style={{ color: "var(--muted)" }}>Loading…</div>;
+    return <div className="p-8" style={{ color: "var(--ink-4)" }}>Loading…</div>;
   }
 
   return (
     <main className="flex flex-1 items-center justify-center p-6">
-      <div className="w-[540px] max-w-full">
-        <Brand />
+      <div style={{ ...CARD, width: "min(560px, 100%)", padding: 36 }}>
         <StepRail step={1} />
 
         {phase === "idle" && (
           <div className="h-phase">
             <h1
-              className="mt-[22px] text-center text-[26px] font-semibold tracking-tight"
-              style={{ color: "var(--text)" }}
+              className="mt-6 text-center text-[34px] font-normal"
+              style={{ fontFamily: SERIF, lineHeight: 1.15, color: "var(--ink)" }}
             >
-              Upload your resume
+              Start with your resume
             </h1>
             <p
-              className="mx-auto mt-2.5 max-w-[440px] text-center text-sm leading-relaxed"
-              style={{ color: "var(--muted)" }}
+              className="mt-3 text-center text-[14.5px]"
+              style={{ color: "var(--ink-4)", lineHeight: 1.6, textWrap: "pretty" }}
             >
-              Hermes reads it once to learn your experience and skills &mdash; then
-              finds and ranks jobs automatically.
+              We read it once to learn your experience, your skills, and the kind
+              of work you actually want &mdash; then go find and rank jobs for you.
             </p>
 
             {error && (
               <div
-                className="mt-4 rounded-[10px] border px-3.5 py-2.5 text-[13px]"
+                className="mt-4 rounded-[14px] border px-3.5 py-[11px] text-[13.5px]"
                 style={{
-                  background: "var(--surface)",
-                  borderColor: "var(--danger-border)",
-                  color: "var(--danger)",
+                  background: "#fdeeea",
+                  borderColor: "#f2cfc3",
+                  color: "var(--brick)",
                 }}
               >
                 {error}
@@ -183,10 +185,12 @@ export default function OnboardingPage() {
                 const f = e.dataTransfer.files?.[0];
                 if (f) onFile(f);
               }}
-              className="mt-6 block cursor-pointer rounded-[14px] border-[1.5px] border-dashed px-6 py-10 text-center transition-colors"
+              className="wm-drop mt-[26px] block cursor-pointer rounded-[20px] border-[1.5px] border-dashed px-[26px] py-9 text-center transition-colors"
               style={{
-                background: "var(--surface)",
-                borderColor: dragging ? "var(--accent)" : "var(--border-strong)",
+                background: dragging ? "var(--terracotta-tint)" : "#fdf7ee",
+                // Border colour lives on .wm-drop (rest + hover); inline only
+                // while dragging, or the inline value would beat :hover.
+                ...(dragging ? { borderColor: "var(--terracotta)" } : {}),
               }}
             >
               <input
@@ -200,31 +204,28 @@ export default function OnboardingPage() {
                 }}
               />
               <span
-                className="mx-auto flex h-[46px] w-[46px] items-center justify-center rounded-[11px] border text-xl"
+                className="mx-auto flex h-[54px] w-[54px] items-center justify-center rounded-2xl border text-[22px]"
                 style={{
-                  background: "var(--accent-bg)",
-                  borderColor: "var(--accent-border)",
-                  color: "var(--accent-text)",
+                  background: "var(--honey-tint)",
+                  borderColor: "#f4dfb4",
+                  color: "#9a6216",
                 }}
               >
-                ↑
+                ⬆
               </span>
               <span
-                className="mt-3.5 block text-[15px] font-semibold"
-                style={{ color: "var(--text)" }}
+                className="mt-4 block text-base font-semibold"
+                style={{ color: "var(--ink)" }}
               >
-                Drag &amp; drop your resume
+                Drop your resume here
               </span>
               <span
-                className="mt-1 block text-[13px]"
-                style={{ color: "var(--subtle)" }}
+                className="mt-[5px] block text-[13px]"
+                style={{ color: "#a3927f" }}
               >
                 PDF or DOCX &middot; up to 10&nbsp;MB
               </span>
-              <span
-                className="mt-4 inline-flex h-[38px] items-center rounded-[9px] px-[18px] text-[13px] font-semibold"
-                style={{ background: "var(--text)", color: "var(--surface)" }}
-              >
+              <span className="wm-cta mt-5 inline-flex h-[42px] items-center rounded-xl px-[22px] text-sm font-semibold">
                 Browse files
               </span>
             </label>
@@ -233,23 +234,22 @@ export default function OnboardingPage() {
               <div className="mt-4 text-center">
                 <button
                   onClick={onSample}
-                  className="text-[13px] font-semibold"
-                  style={{ color: "var(--accent)" }}
+                  className="wm-link text-[13px] font-semibold"
                 >
                   Use a sample resume →
                 </button>
               </div>
             )}
 
-            <div className="my-[18px] flex items-center gap-3">
-              <span className="h-px flex-1" style={{ background: "var(--border)" }} />
+            <div className="my-[22px] flex items-center gap-3">
+              <span className="h-px flex-1" style={{ background: "var(--border-warm-hair)" }} />
               <span
-                className="font-mono text-[11px]"
-                style={{ color: "var(--subtle)" }}
+                className="text-[10.5px] font-bold"
+                style={{ color: "#b0a08d", letterSpacing: "0.14em" }}
               >
                 OR
               </span>
-              <span className="h-px flex-1" style={{ background: "var(--border)" }} />
+              <span className="h-px flex-1" style={{ background: "var(--border-warm-hair)" }} />
             </div>
 
             {pasteOpen ? (
@@ -259,29 +259,20 @@ export default function OnboardingPage() {
                   onChange={(e) => setPasteText(e.target.value)}
                   rows={8}
                   placeholder="Paste the full text of your resume here…"
-                  className="w-full rounded-[10px] border p-3 text-sm outline-none focus:ring-[3px]"
-                  style={
-                    {
-                      background: "var(--surface)",
-                      borderColor: "var(--border)",
-                      color: "var(--text)",
-                      "--tw-ring-color": "var(--ring)",
-                    } as React.CSSProperties
-                  }
+                  className="wm-input w-full rounded-[13px] p-3 text-[14px] outline-none"
                 />
                 <div className="mt-2.5 flex items-center justify-between">
                   <button
                     onClick={() => setPasteOpen(false)}
                     className="text-[13px] font-medium"
-                    style={{ color: "var(--muted)" }}
+                    style={{ color: "var(--ink-4)" }}
                   >
                     ← Back to upload
                   </button>
                   <button
                     onClick={onPaste}
                     disabled={!pasteText.trim()}
-                    className="h-[38px] rounded-[9px] px-[18px] text-[13px] font-semibold disabled:opacity-40"
-                    style={{ background: "var(--text)", color: "var(--surface)" }}
+                    className="wm-cta h-[42px] rounded-xl px-[22px] text-sm font-semibold"
                   >
                     Build my profile →
                   </button>
@@ -290,22 +281,18 @@ export default function OnboardingPage() {
             ) : (
               <button
                 onClick={() => setPasteOpen(true)}
-                className="flex h-10 w-full items-center justify-center gap-2 rounded-[9px] border text-[13px] font-semibold"
-                style={{
-                  background: "var(--surface)",
-                  borderColor: "var(--border)",
-                  color: "var(--label)",
-                }}
+                className="wm-ghost flex h-[42px] w-full items-center justify-center gap-2 rounded-[13px] border text-[13.5px] font-semibold"
+                style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
               >
                 ¶ Paste resume text
               </button>
             )}
 
             <p
-              className="mt-[18px] text-center text-xs"
-              style={{ color: "var(--subtle)" }}
+              className="mt-[18px] text-center text-[12.5px]"
+              style={{ color: "#a3927f" }}
             >
-              🔒 Stored privately in your account. Used only to match you to jobs.
+              Kept private. Used only to match you to jobs &mdash; never shared.
             </p>
           </div>
         )}
@@ -317,27 +304,11 @@ export default function OnboardingPage() {
   );
 }
 
-function Brand() {
-  return (
-    <div className="flex items-center justify-center gap-2.5">
-      <span
-        className="flex h-7 w-7 items-center justify-center rounded-lg text-[15px] font-bold"
-        style={{ background: "var(--text)", color: "var(--surface)" }}
-      >
-        H
-      </span>
-      <span className="text-base font-semibold" style={{ color: "var(--text)" }}>
-        Hermes
-      </span>
-    </div>
-  );
-}
-
 function StepRail({ step }: { step: 1 | 2 }) {
   return (
-    <div className="mt-5 flex items-center justify-center gap-2 font-mono text-[11px] font-semibold">
+    <div className="flex items-center justify-center gap-2.5 text-[11.5px] font-bold">
       <RailItem n={1} label="Upload" active={step === 1} done={step > 1} />
-      <span className="h-px w-[26px]" style={{ background: "var(--border)" }} />
+      <span className="h-px w-[30px]" style={{ background: "#dfd0bd" }} />
       <RailItem n={2} label="Review" active={step === 2} done={false} />
     </div>
   );
@@ -357,15 +328,15 @@ function RailItem({
   const on = active || done;
   return (
     <span
-      className="inline-flex items-center gap-1.5"
-      style={{ color: on ? "var(--text)" : "var(--subtle)" }}
+      className="inline-flex items-center gap-[7px]"
+      style={{ color: on ? "var(--ink)" : "#b0a08d" }}
     >
       <span
-        className="flex h-[18px] w-[18px] items-center justify-center rounded-full border text-[10px]"
+        className="flex h-5 w-5 items-center justify-center rounded-full border text-[11px]"
         style={
           on
-            ? { background: "var(--text)", color: "var(--surface)", borderColor: "var(--text)" }
-            : { borderColor: "var(--border-strong)", color: "var(--subtle)" }
+            ? { background: "var(--terracotta)", color: "#fff9f2", borderColor: "var(--terracotta)" }
+            : { borderColor: "#dfd0bd", color: "#b0a08d" }
         }
       >
         {done ? "✓" : n}
@@ -389,28 +360,29 @@ function FileChip({
 }) {
   return (
     <div
-      className="flex items-center gap-3 rounded-xl border px-4 py-3"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      className="flex items-center gap-[13px] rounded-2xl border px-[17px] py-3.5"
+      style={{ background: "#fbf6ef", borderColor: "var(--border-warm-hair)" }}
     >
       <span
-        className="flex h-[42px] w-[34px] flex-none items-center justify-center rounded-md border font-mono text-[10px] font-bold"
+        className="flex h-11 w-9 flex-none items-center justify-center rounded-lg border text-[10px] font-bold"
         style={{
-          background: "var(--surface-2)",
-          borderColor: "var(--danger-border)",
-          color: "var(--danger)",
+          background: "#fdeeea",
+          borderColor: "#f2cfc3",
+          color: "var(--terracotta)",
+          letterSpacing: "0.06em",
         }}
       >
         {file?.kind ?? "DOC"}
       </span>
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-semibold" style={{ color: "var(--text)" }}>
+        <div className="truncate text-[14.5px] font-semibold" style={{ color: "var(--ink)" }}>
           {file?.name ?? "resume"}
         </div>
-        <div className="mt-0.5 font-mono text-xs" style={{ color: "var(--subtle)" }}>
+        <div className="mt-0.5 text-[12.5px]" style={{ color: "#a3927f" }}>
           {fmtSize(file?.size) || "resume"}
         </div>
       </div>
-      <span className="font-mono text-[11px] font-semibold" style={{ color: status.color }}>
+      <span className="text-[11.5px] font-bold" style={{ color: status.color }}>
         {status.text}
       </span>
     </div>
@@ -420,14 +392,14 @@ function FileChip({
 function ProgressBar({ pct, duration }: { pct: number; duration: string }) {
   return (
     <div
-      className="mt-[18px] h-1.5 overflow-hidden rounded-full"
-      style={{ background: "var(--surface-2)" }}
+      className="mt-5 h-2 overflow-hidden rounded-full"
+      style={{ background: "#f0e3d3" }}
     >
       <div
         className="h-full rounded-full"
         style={{
           width: `${pct}%`,
-          background: "var(--accent)",
+          background: "linear-gradient(90deg,#d9873f,var(--terracotta))",
           transition: `width ${duration}`,
         }}
       />
@@ -443,14 +415,14 @@ function UploadingView({ file }: { file: FileMeta | null }) {
   }, []);
   return (
     <div className="mt-6 h-phase">
-      <FileChip file={file} status={{ text: `${pct}%`, color: "var(--accent)" }} />
+      <FileChip file={file} status={{ text: `${pct}%`, color: "var(--terracotta-d)" }} />
       <h1
-        className="mt-[26px] text-center text-[22px] font-semibold tracking-tight"
-        style={{ color: "var(--text)" }}
+        className="mt-7 text-center text-[30px] font-normal"
+        style={{ fontFamily: SERIF, lineHeight: 1.15, color: "var(--ink)" }}
       >
-        Uploading…
+        Sending your resume…
       </h1>
-      <p className="mt-2 text-center text-[13px]" style={{ color: "var(--muted)" }}>
+      <p className="mt-2 text-center text-[14.5px]" style={{ color: "var(--ink-4)" }}>
         Securely transferring your resume.
       </p>
       <ProgressBar pct={pct} duration="0.12s linear" />
@@ -473,71 +445,78 @@ function ParsingView({ file }: { file: FileMeta | null }) {
 
   return (
     <div className="mt-6 h-phase">
-      <FileChip file={file} status={{ text: "uploaded ✓", color: "var(--good)" }} />
+      <FileChip file={file} status={{ text: "uploaded ✓", color: "var(--sage)" }} />
       <h1
-        className="mt-6 text-center text-[22px] font-semibold tracking-tight"
-        style={{ color: "var(--text)" }}
+        className="mt-7 text-center text-[30px] font-normal"
+        style={{ fontFamily: SERIF, lineHeight: 1.15, color: "var(--ink)" }}
       >
-        Building your profile…
+        Getting to know you…
       </h1>
-      <p className="mt-2 text-center text-[13px]" style={{ color: "var(--muted)" }}>
+      <p className="mt-2 text-center text-[14.5px]" style={{ color: "var(--ink-4)" }}>
         Hermes is extracting your experience and saving it to your account.
       </p>
       <ProgressBar pct={pct} duration="0.4s cubic-bezier(0.22,0.61,0.36,1)" />
 
-      <div className="mt-5 flex flex-col gap-[11px]">
+      <div className="mt-6 flex flex-col gap-[13px]">
         {PARSE_STEPS.map((label, i) => {
           const state = i < active ? "done" : i === active ? "active" : "todo";
           return (
             <div
               key={label}
-              className="flex items-center gap-3"
+              className="flex items-center gap-[13px]"
               style={{ opacity: state === "todo" ? 0.5 : 1 }}
             >
               {state === "done" ? (
                 <span
-                  className="h-pop flex h-[22px] w-[22px] items-center justify-center rounded-full border text-xs"
+                  className="h-pop flex h-6 w-6 items-center justify-center rounded-full border text-xs"
                   style={{
-                    background: "var(--good-bg)",
-                    borderColor: "var(--good-border)",
-                    color: "var(--good)",
+                    background: "var(--sage-tint)",
+                    borderColor: "#cfe0c8",
+                    color: "var(--sage)",
                   }}
                 >
                   ✓
                 </span>
               ) : state === "active" ? (
                 <span
-                  className="inline-block h-[22px] w-[22px] rounded-full"
+                  className="inline-block h-6 w-6 rounded-full"
                   style={{
-                    border: "2px solid var(--accent)",
+                    border: "2px solid var(--terracotta)",
                     borderTopColor: "transparent",
                     animation: "hspin 0.8s linear infinite",
                   }}
                 />
               ) : (
                 <span
-                  className="h-[22px] w-[22px] rounded-full border"
-                  style={{ background: "var(--surface)", borderColor: "var(--border-strong)" }}
+                  className="h-6 w-6 rounded-full border"
+                  style={{ background: "var(--surface-warm)", borderColor: "#dfd0bd" }}
                 />
               )}
               <span
-                className="flex-1 text-sm"
+                className="flex-1 text-[14.5px]"
                 style={{
-                  color: state === "active" ? "var(--text)" : "var(--label)",
+                  color: state === "todo" ? "var(--ink-4)" : "var(--ink)",
                   fontWeight: state === "active" ? 600 : 400,
                 }}
               >
                 {label}
               </span>
               {state === "active" && (
-                <span className="font-mono text-xs" style={{ color: "var(--accent)" }}>
-                  scanning…
+                <span
+                  className="text-[12.5px] font-semibold"
+                  style={{ color: "var(--terracotta-d)" }}
+                >
+                  reading…
                 </span>
               )}
             </div>
           );
         })}
       </div>
+
+      <p className="mt-[22px] text-center text-[12.5px]" style={{ color: "#a3927f" }}>
+        About fifteen seconds. Feel free to stretch.
+      </p>
     </div>
   );
 }

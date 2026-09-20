@@ -18,6 +18,7 @@ import { auth } from "@/lib/firebase";
 import { readStored, writeStored } from "@/lib/localStore";
 import { APP_HOME, safeNext, SIGNUP_FROM_KEY } from "@/lib/nav";
 import { signupOutcome, type SignupResult } from "@/lib/signupFlow";
+import { CARD, SERIF } from "@/components/warm/styles";
 
 type Mode = "signin" | "signup";
 type Phase = "idle" | "creating" | "checking";
@@ -87,7 +88,7 @@ function strength(pw: string): number {
   return s;
 }
 
-function Spinner({ size = 15, color = "var(--surface)" }: { size?: number; color?: string }) {
+function Spinner({ size = 15, color = "#fff9f2" }: { size?: number; color?: string }) {
   return (
     <span
       className="inline-block rounded-full border-2"
@@ -102,17 +103,27 @@ function Spinner({ size = 15, color = "var(--surface)" }: { size?: number; color
   );
 }
 
+// Border, background, colour and the focus ring are owned by `.wm-input`.
 const inputCls =
-  "h-[42px] w-full rounded-[9px] border px-[13px] text-sm outline-none focus:ring-[3px]";
+  "wm-input h-[46px] w-full rounded-[13px] px-[14px] text-[14.5px] outline-none";
 
-function fieldStyle(borderColor = "var(--border)", mono = false): React.CSSProperties {
-  return {
-    background: "var(--surface)",
-    borderColor,
-    color: "var(--text)",
-    "--tw-ring-color": "var(--accent)",
-    ...(mono ? { fontFamily: "var(--font-mono)", letterSpacing: "1px" } : {}),
-  } as React.CSSProperties;
+/** Micro-label above each field. */
+const labelCls = "block text-[12.5px] font-semibold";
+const labelStyle: React.CSSProperties = { color: "var(--ink-3)" };
+
+/** Per-mode h1 (the sub and footer ternaries sit inline below). */
+const HEADLINE: Record<Mode, string> = {
+  signin: "Welcome back.",
+  signup: "Let's get you set up.",
+};
+
+/** 18px status dot at the head of a panel. */
+const dotCls =
+  "flex h-[18px] w-[18px] flex-none items-center justify-center rounded-full text-[11px] font-bold";
+
+/** The 04 file-card treatment, tinted per panel tone. */
+function panelStyle(bg: string, border: string): React.CSSProperties {
+  return { background: bg, border: `1px solid ${border}`, borderRadius: 16, padding: "14px 17px" };
 }
 
 export function AuthCard({ initialMode, next }: { initialMode: Mode; next: string | null }) {
@@ -313,61 +324,70 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
   }
 
   const card = (
-    <div
-      className="w-[384px] rounded-2xl border p-8 shadow-sm"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-    >
+    <div style={{ ...CARD, width: "min(440px, 100%)", padding: 36 }}>
       {created ? (
         <div className="py-4 text-center">
           <span
             className="h-pop mx-auto inline-flex h-11 w-11 items-center justify-center rounded-full text-[22px]"
             style={{
-              background: "var(--good-bg)",
-              border: "1px solid var(--good-border)",
-              color: "var(--good)",
+              background: "var(--sage-tint)",
+              border: "1px solid #cfe0c8",
+              color: "var(--sage)",
             }}
           >
             ✓
           </span>
-          <div className="mt-3.5 text-base font-semibold" style={{ color: "var(--text)" }}>
+          <div className="mt-3.5 text-base font-semibold" style={{ color: "var(--ink)" }}>
             Account created
           </div>
-          <div className="mt-1.5 text-sm leading-relaxed" style={{ color: "var(--muted)" }}>
+          <div className="mt-1.5 text-sm leading-relaxed" style={{ color: "var(--ink-4)" }}>
             {"Welcome to Hermes. Let's build your profile from your résumé."}
           </div>
           <div
-            className="mt-4 flex items-center justify-center gap-2 text-xs"
-            style={{ color: "var(--subtle)", fontFamily: "var(--font-mono)" }}
+            className="mt-4 flex items-center justify-center gap-2 text-[12.5px]"
+            style={{ color: "#a3927f" }}
           >
-            <Spinner size={13} color="var(--subtle)" />
+            <Spinner size={13} color="#a3927f" />
             Taking you to upload your résumé…
           </div>
         </div>
       ) : (
         <>
           {/* Brand */}
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-[11px]">
             <span
-              className="flex h-[30px] w-[30px] items-center justify-center rounded-lg text-base font-bold"
-              style={{ background: "var(--text)", color: "var(--surface)" }}
+              className="flex h-[34px] w-[34px] items-center justify-center rounded-[11px] text-[17px] font-bold"
+              style={{ background: "var(--terracotta)", color: "#fff9f2" }}
             >
               H
             </span>
-            <span className="text-lg font-semibold" style={{ color: "var(--text)" }}>
+            <span
+              className="text-[19px] font-bold"
+              style={{ color: "var(--ink)", letterSpacing: "-0.01em" }}
+            >
               Hermes
             </span>
           </div>
 
-          <p className="mt-4 text-sm leading-relaxed" style={{ color: "var(--muted)" }}>
+          <h1
+            className="mt-[22px] text-[30px] font-normal"
+            style={{ fontFamily: SERIF, lineHeight: 1.15, color: "var(--ink)" }}
+          >
+            {HEADLINE[mode]}
+          </h1>
+          <p
+            className="mt-2 text-[14.5px]"
+            style={{ color: "var(--ink-4)", lineHeight: 1.55 }}
+          >
             {mode === "signin"
-              ? "Sign in to review your matched jobs."
-              : "Create your reviewer account."}
+              ? "Your matches have been piling up while you were away."
+              : "Two minutes now, and the job search runs itself after."}
           </p>
 
           {/* Sign in / Create account toggle */}
           <div
-            className="mt-[18px] flex gap-[3px] rounded-[10px] border p-[3px]"
-            style={{ background: "var(--bg)", borderColor: "var(--border)" }}
+            className="mt-[22px] flex gap-1 rounded-[14px] border p-1"
+            style={{ background: "#f6ede1", borderColor: "var(--border-warm-hair)" }}
           >
             {(["signin", "signup"] as const).map((m) => {
               const active = mode === m;
@@ -376,15 +396,15 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
                   key={m}
                   type="button"
                   onClick={() => switchMode(m)}
-                  className="h-8 flex-1 rounded-[7px] text-[13px] font-semibold"
+                  className={`h-9 flex-1 rounded-[11px] text-[13.5px] font-semibold${active ? "" : " wm-seg"}`}
                   style={
                     active
                       ? {
-                          background: "var(--surface)",
-                          color: "var(--text)",
-                          boxShadow: "0 1px 2px rgba(0,0,0,0.07)",
+                          background: "var(--surface-warm)",
+                          color: "var(--ink)",
+                          boxShadow: "0 1px 3px rgba(94,63,39,0.10)",
                         }
-                      : { background: "transparent", color: "var(--muted)" }
+                      : { background: "transparent" } // colour lives on .wm-seg so :hover can win
                   }
                 >
                   {m === "signin" ? "Sign in" : "Create account"}
@@ -395,79 +415,69 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
 
           {/* Humanized error / notice */}
           {error?.tone === "recover" ? (
-            <div
-              className="mt-[18px] rounded-[10px] border px-3.5 py-[13px]"
-              style={{
-                borderColor: "var(--danger-border)",
-                background: "color-mix(in srgb, var(--danger) 9%, var(--surface))",
-              }}
-            >
+            <div className="mt-[22px]" style={panelStyle("#fdeeea", "#f2cfc3")}>
               <div className="flex items-center gap-2">
-                <span
-                  className="flex h-[18px] w-[18px] items-center justify-center rounded-full text-xs font-bold"
-                  style={{ background: "var(--danger)", color: "var(--surface)" }}
-                >
+                <span className={dotCls} style={{ background: "var(--brick)", color: "#fff9f2" }}>
                   !
                 </span>
-                <span className="text-[13px] font-semibold" style={{ color: "var(--danger)" }}>
+                <span className="text-[13.5px] font-semibold" style={{ color: "var(--brick)" }}>
                   {error.title}
                 </span>
               </div>
-              <p className="mt-2 text-[13px] leading-relaxed" style={{ color: "var(--danger)" }}>
+              <p
+                className="mt-2 text-[13.5px]"
+                style={{ color: "var(--brick)", lineHeight: 1.55 }}
+              >
                 {error.body}
               </p>
               <button
                 type="button"
                 onClick={() => switchMode("signup")}
-                className="mt-[11px] h-[34px] w-full rounded-lg border text-[13px] font-semibold"
-                style={{
-                  borderColor: "var(--danger-border)",
-                  background: "var(--surface)",
-                  color: "var(--danger)",
-                }}
+                className="wm-ghost mt-[11px] h-9 w-full rounded-[11px] border text-[13px] font-semibold"
+                style={{ borderColor: "#f2cfc3", color: "var(--brick)" }}
               >
                 Create an account →
               </button>
             </div>
           ) : error?.tone === "locked" || error?.tone === "waitlisted" ? (
             <div
-              className="mt-[18px] rounded-[10px] border px-3.5 py-[13px]"
+              className="mt-[22px]"
               style={
                 error.tone === "waitlisted"
-                  ? { borderColor: "var(--good-border)", background: "var(--good-bg)" }
-                  : {
-                      borderColor: "var(--border)",
-                      background: "color-mix(in srgb, var(--accent) 7%, var(--surface))",
-                    }
+                  ? panelStyle("var(--sage-tint)", "#cfe0c8")
+                  : panelStyle("var(--honey-tint)", "#f4dfb4")
               }
             >
               <div className="flex items-center gap-2">
                 <span
-                  className="flex h-[18px] w-[18px] items-center justify-center rounded-full text-xs"
+                  className={dotCls}
                   style={
                     error.tone === "waitlisted"
-                      ? { background: "var(--good)", color: "var(--surface)" }
-                      : { background: "var(--accent)", color: "var(--surface)" }
+                      ? { background: "var(--sage)", color: "#fff9f2" }
+                      : { background: "#9a6216", color: "#fff9f2" }
                   }
                 >
-                  {error.tone === "waitlisted" ? "✓" : "🔒"}
+                  {error.tone === "waitlisted" ? "✓" : "!"}
                 </span>
-                <span className="text-[13px] font-semibold" style={{ color: "var(--text)" }}>
+                <span className="text-[13.5px] font-semibold" style={{ color: "var(--ink)" }}>
                   {error.title}
                 </span>
               </div>
-              <p className="mt-2 text-[13px] leading-relaxed" style={{ color: "var(--muted)" }}>
+              <p
+                className="mt-2 text-[13.5px]"
+                style={{ color: "var(--ink-3)", lineHeight: 1.55 }}
+              >
                 {error.body}
               </p>
             </div>
           ) : error ? (
-            <p className="mt-[18px] text-sm" style={{ color: "var(--danger)" }}>
+            <p className="mt-[22px] text-[13.5px]" style={{ color: "var(--brick)" }}>
               {error.body}
             </p>
           ) : null}
 
           {notice && (
-            <p className="mt-[18px] text-sm" style={{ color: "var(--good)" }}>
+            <p className="mt-[22px] text-[13.5px]" style={{ color: "var(--sage)" }}>
               {notice}
             </p>
           )}
@@ -477,22 +487,21 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
             type="button"
             onClick={withGoogle}
             disabled={phase === "checking"}
-            className="mt-[18px] flex h-[42px] w-full items-center justify-center gap-2.5 rounded-[9px] border text-sm font-semibold"
+            className="wm-ghost mt-5 flex h-[46px] w-full items-center justify-center gap-2.5 rounded-[13px] border text-[14.5px] font-semibold"
             style={{
-              background: "var(--surface)",
-              borderColor: "var(--border)",
-              color: "var(--text)",
+              borderColor: "#e8dacb",
+              color: "var(--ink)",
               cursor: phase === "checking" ? "not-allowed" : "pointer",
             }}
           >
             {phase === "checking" ? (
               <>
-                <Spinner size={15} color="var(--muted)" />
+                <Spinner size={15} color="#a3927f" />
                 Checking access…
               </>
             ) : (
               <>
-                <span className="font-bold" style={{ color: "#4285f4" }}>
+                <span className="font-bold" style={{ color: "var(--terracotta)" }}>
                   G
                 </span>{" "}
                 {mode === "signin" ? "Continue with Google" : "Sign up with Google"}
@@ -500,22 +509,19 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
             )}
           </button>
 
-          <div className="my-5 flex items-center gap-3">
-            <span className="h-px flex-1" style={{ background: "var(--border)" }} />
+          <div className="my-[22px] flex items-center gap-3">
+            <span className="h-px flex-1" style={{ background: "var(--border-warm-hair)" }} />
             <span
-              className="text-[11px] tracking-wider"
-              style={{ color: "var(--subtle)", fontFamily: "var(--font-mono)" }}
+              className="text-[10.5px] font-bold"
+              style={{ color: "#b0a08d", letterSpacing: "0.14em" }}
             >
               OR
             </span>
-            <span className="h-px flex-1" style={{ background: "var(--border)" }} />
+            <span className="h-px flex-1" style={{ background: "var(--border-warm-hair)" }} />
           </div>
 
           <form onSubmit={onSubmit}>
-            <label
-              className="mb-1.5 mt-3.5 block text-xs font-medium"
-              style={{ color: "var(--label)" }}
-            >
+            <label className={`${labelCls} mb-[7px]`} style={labelStyle}>
               Email
             </label>
             <input
@@ -525,19 +531,17 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
               onChange={(e) => setEmail(e.target.value)}
               disabled={phase === "creating"}
               className={inputCls}
-              style={fieldStyle()}
             />
 
-            <div className="mb-1.5 mt-3.5 flex items-center justify-between">
-              <label className="text-xs font-medium" style={{ color: "var(--label)" }}>
+            <div className="mb-[7px] mt-4 flex items-center justify-between">
+              <label className={labelCls} style={labelStyle}>
                 Password
               </label>
               {mode === "signin" && (
                 <button
                   type="button"
                   onClick={onForgotPassword}
-                  className="text-xs font-medium"
-                  style={{ color: "var(--accent)" }}
+                  className="wm-link text-[12.5px] font-semibold"
                 >
                   Forgot password?
                 </button>
@@ -550,7 +554,6 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
               onChange={(e) => setPassword(e.target.value)}
               disabled={phase === "creating"}
               className={inputCls}
-              style={fieldStyle()}
             />
 
             {/* Strength meter (create account only) */}
@@ -560,7 +563,7 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
                   <span
                     key={i}
                     className="h-1 flex-1 rounded-[2px]"
-                    style={{ background: i < pwStrength ? "var(--good)" : "var(--border)" }}
+                    style={{ background: i < pwStrength ? "var(--sage)" : "#f0e3d3" }}
                   />
                 ))}
               </div>
@@ -570,16 +573,14 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
               <button
                 type="submit"
                 disabled={phase === "checking"}
-                className="mt-[18px] flex h-[42px] w-full items-center justify-center gap-2.5 rounded-[9px] text-sm font-semibold"
+                className="wm-cta mt-[22px] flex h-[48px] w-full items-center justify-center gap-2.5 rounded-[13px] text-[15px] font-semibold"
                 style={{
-                  background: "var(--text)",
-                  color: "var(--surface)",
                   cursor: phase === "checking" ? "not-allowed" : "pointer",
                 }}
               >
                 {phase === "checking" ? (
                   <>
-                    <Spinner size={15} />
+                    <Spinner size={15} color="#b0a08d" />
                     Checking access…
                   </>
                 ) : (
@@ -590,32 +591,27 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
               <button
                 type="submit"
                 disabled={!canCreate}
-                className="mt-5 flex h-[42px] w-full items-center justify-center gap-2.5 rounded-[9px] text-sm font-semibold"
-                style={{
-                  background: canCreate ? "var(--text)" : "var(--skeleton)",
-                  color: canCreate ? "var(--surface)" : "var(--subtle)",
-                  cursor: canCreate ? "pointer" : "not-allowed",
-                }}
+                className="wm-cta mt-6 flex h-[48px] w-full items-center justify-center gap-2.5 rounded-[13px] text-[15px] font-semibold"
               >
                 {phase === "creating" ? (
                   <>
-                    <Spinner size={15} />
+                    <Spinner size={15} color="#b0a08d" />
                     Creating your account…
                   </>
                 ) : (
-                  "Create account"
+                  "Create my account"
                 )}
               </button>
             )}
           </form>
 
           <p
-            className="mt-[18px] text-center text-xs leading-relaxed"
-            style={{ color: "var(--subtle)" }}
+            className="mt-[18px] text-center text-[12.5px] leading-relaxed"
+            style={{ color: "#a3927f" }}
           >
             {mode === "signin"
-              ? "Access is restricted to invited reviewers."
-              : "Hermes is invite-only: you can create an account, but you'll need an invited address to get in."}
+              ? "Invite-only while we're still small — thanks for being early."
+              : "Invite-only while we're still small — create your account and we'll hold your place in line."}
           </p>
         </>
       )}

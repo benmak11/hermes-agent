@@ -12,19 +12,34 @@ import { useAuth } from "@/lib/auth";
 import { APP_HOME } from "@/lib/nav";
 import { markFirstRun } from "@/lib/session";
 import type { Profile, ProfileResponse } from "@/lib/types";
-import { avatarColor, initial, resolveUserAvatar } from "@/lib/ui";
+import { initial, resolveUserAvatar } from "@/lib/ui";
+import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
 import {
   ChipEditor,
   Divider,
   InlineText,
   MonoLabel,
   PencilBtn,
-} from "@/components/editable";
+} from "@/components/warm/Editable";
+import { Pill } from "@/components/warm/Pill";
+import { CARD, SERIF } from "@/components/warm/styles";
+
+/** The tinted sub-card each field group sits in (design 05). */
+const SUB_CARD: React.CSSProperties = {
+  borderRadius: 18,
+  border: "1px solid var(--border-warm-hair)",
+  background: "#fdf7ee",
+  padding: "16px 18px",
+};
+
+function cap(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 
 /**
  * Confirm & correct (mock 05): every parsed field is click-to-edit before
  * Matching runs, so a bad parse never becomes bad matches. Edits patch the
- * profile doc on "Looks good — find me jobs".
+ * profile doc on "Looks right — find me jobs".
  */
 export default function OnboardingReviewPage() {
   const { user, loading } = useAuth();
@@ -73,11 +88,11 @@ export default function OnboardingReviewPage() {
   if (saved) return <SavedView />;
 
   if (loading || !user || isLoading || !draft) {
-    return <div className="p-8" style={{ color: "var(--muted)" }}>Loading…</div>;
+    return <div className="p-8" style={{ color: "var(--ink-4)" }}>Loading…</div>;
   }
   if (error) {
     return (
-      <div className="p-8" style={{ color: "var(--danger)" }}>
+      <div className="p-8" style={{ color: "var(--brick)" }}>
         Failed to load your profile: {String(error)}
       </div>
     );
@@ -116,30 +131,26 @@ export default function OnboardingReviewPage() {
   }
 
   return (
-    <main className="mx-auto w-full max-w-[560px] flex-1 px-6 py-11">
-      <h1
-        className="text-center text-[23px] font-semibold tracking-tight"
-        style={{ color: "var(--text)" }}
-      >
-        {"Here's what Hermes learned"}
-      </h1>
-      <p
-        className="mt-2 text-center text-[13.5px] leading-normal"
-        style={{ color: "var(--muted)" }}
-      >
-        Everything is editable — click any field to correct it before we start
-        matching.
-      </p>
+    <main className="mx-auto w-full flex-1 px-6 py-8" style={{ maxWidth: 872 }}>
+      <div style={{ ...CARD, padding: "32px 36px" }}>
+        <h1
+          className="text-[32px] font-normal"
+          style={{ fontFamily: SERIF, lineHeight: 1.15, color: "var(--ink)" }}
+        >
+          {"Here's what we learned"}
+        </h1>
+        <p
+          className="mt-2.5 text-sm"
+          style={{ color: "var(--ink-4)", lineHeight: 1.55 }}
+        >
+          Change anything — you know yourself better than we do.
+        </p>
 
-      <div
-        className="mt-[22px] rounded-xl border p-[18px]"
-        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-      >
         {/* Name row — sets the avatar initials */}
-        <div className="flex items-center gap-[13px]">
+        <div className="mt-[22px] flex items-center gap-[13px]">
           <span
             className="flex h-11 w-11 flex-none items-center justify-center rounded-full text-base font-bold"
-            style={{ background: "var(--text)", color: "var(--surface)" }}
+            style={{ background: "var(--ink)", color: "#fff9f2" }}
           >
             {av.kind === "glyph" ? "•" : av.text}
           </span>
@@ -155,8 +166,8 @@ export default function OnboardingReviewPage() {
             </div>
           </div>
           <span
-            className="flex-none font-mono text-[11px] font-medium"
-            style={{ color: "var(--good)" }}
+            className="flex-none text-[11.5px] font-semibold"
+            style={{ color: "var(--sage)" }}
           >
             sets your avatar
           </span>
@@ -164,13 +175,14 @@ export default function OnboardingReviewPage() {
 
         <Divider />
 
-        {/* Target role + location */}
-        <div className="flex gap-4">
-          <div className="flex-1">
+        {/* Target role + location & work style */}
+        <div className="flex flex-wrap gap-3.5">
+          <div style={{ ...SUB_CARD, flex: "1 1 240px" }}>
             <MonoLabel>Target role</MonoLabel>
-            <div className="mt-1.5">
+            <div className="mt-2">
               <InlineText
                 value={draft.preferences.target_titles?.[0] ?? ""}
+                textClass="text-base font-semibold"
                 placeholder="e.g. Senior Backend Engineer"
                 onSave={(v) => {
                   const titles = [...(draft.preferences.target_titles ?? [])];
@@ -183,82 +195,90 @@ export default function OnboardingReviewPage() {
               />
             </div>
           </div>
-          <div className="w-[170px]">
-            <MonoLabel>Location</MonoLabel>
-            <div className="mt-1.5">
+          <div style={{ ...SUB_CARD, flex: "1 1 240px" }}>
+            <MonoLabel>Location &amp; work style</MonoLabel>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
               <InlineText
                 value={draft.location}
+                textClass="text-base font-semibold"
                 placeholder="City, State"
                 onSave={(v) => v !== draft.location && patch({ location: v })}
               />
+              {/* Read-only here; edited on /app/profile. */}
+              {draft.preferences.remote_policy?.map((s) => (
+                <Pill key={s} tone="warn">
+                  {cap(s)}
+                </Pill>
+              ))}
             </div>
           </div>
         </div>
 
-        <Divider />
-
         {/* Skills */}
-        <div className="flex items-center justify-between">
-          <MonoLabel>Skills · {skills.length} found</MonoLabel>
-          <span
-            className="font-mono text-[11px] font-medium"
-            style={{ color: "var(--subtle)" }}
-          >
-            × to remove
-          </span>
+        <div className="mt-3.5" style={SUB_CARD}>
+          <div className="flex items-center justify-between">
+            <MonoLabel>Skills · {skills.length} found</MonoLabel>
+            <span className="text-[11.5px] font-medium" style={{ color: "#a3927f" }}>
+              × to remove
+            </span>
+          </div>
+          <div className="mt-3">
+            <ChipEditor items={skills} onRemove={removeSkill} onAdd={addSkill} />
+          </div>
         </div>
-        <div className="mt-2.5">
-          <ChipEditor items={skills} onRemove={removeSkill} onAdd={addSkill} />
-        </div>
-
-        <Divider />
 
         {/* Experience */}
-        <MonoLabel>Experience · {draft.experience.length} roles</MonoLabel>
-        <ExperienceRows
-          experience={draft.experience}
-          onChange={(experience) => patch({ experience })}
-        />
-      </div>
+        <div className="mt-3.5" style={SUB_CARD}>
+          <MonoLabel>Experience · {draft.experience.length} roles</MonoLabel>
+          <ExperienceRows
+            experience={draft.experience}
+            onChange={(experience) => patch({ experience })}
+          />
+        </div>
 
-      <div className="mt-[18px] flex gap-2.5">
-        <button
-          onClick={() => save.mutate(draft)}
-          disabled={save.isPending}
-          className="h-11 flex-1 rounded-[9px] text-sm font-semibold disabled:opacity-50"
-          style={{ background: "var(--text)", color: "var(--surface)" }}
+        <div
+          className="mt-6 flex flex-wrap items-center justify-between gap-5 pt-5"
+          style={{ borderTop: "1px solid #f0e3d3" }}
         >
-          {save.isPending ? "Saving…" : "Looks good — find me jobs →"}
-        </button>
-        <Link
-          href="/onboarding"
-          className="flex h-11 items-center rounded-[9px] border px-[18px] text-[13px] font-semibold"
-          style={{
-            background: "var(--surface)",
-            borderColor: "var(--border)",
-            color: "var(--label)",
-          }}
-        >
-          Re-upload
-        </Link>
-      </div>
+          <span className="text-[13.5px]" style={{ color: "var(--ink-4)" }}>
+            You can refine this anytime from{" "}
+            <b style={{ color: "var(--ink)" }}>Profile</b>.
+          </span>
+          <div className="flex gap-2.5">
+            <Link
+              href="/onboarding"
+              className="wm-ghost flex h-[46px] items-center rounded-[13px] border px-[18px] text-[13.5px] font-semibold"
+              style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
+            >
+              Re-upload
+            </Link>
+            <button
+              onClick={() => save.mutate(draft)}
+              disabled={save.isPending}
+              className="wm-cta h-[46px] rounded-[13px] px-6 text-[14.5px] font-semibold"
+            >
+              {save.isPending ? "Saving…" : "Looks right — find me jobs →"}
+            </button>
+          </div>
+        </div>
 
-      {save.isError && (
-        <p className="mt-3 text-center text-sm" style={{ color: "var(--danger)" }}>
-          Could not save: {String(save.error)}
+        {save.isError && (
+          <p className="mt-3 text-center text-[13.5px]" style={{ color: "var(--brick)" }}>
+            Could not save: {String(save.error)}
+          </p>
+        )}
+
+        <p
+          className="mt-3 text-center text-[11.5px] font-medium"
+          style={{ color: "#a3927f" }}
+        >
+          edits saved to profiles/{"{uid}"}
+          {fieldsCorrected > 0 &&
+            ` · ${fieldsCorrected} field${fieldsCorrected === 1 ? "" : "s"} corrected`}
+          {skillsRemoved > 0 &&
+            ` · ${skillsRemoved} skill${skillsRemoved === 1 ? "" : "s"} removed`}
         </p>
-      )}
-
-      <p
-        className="mt-3 text-center font-mono text-[11px] font-medium"
-        style={{ color: "var(--subtle)" }}
-      >
-        edits saved to profiles/{"{uid}"}
-        {fieldsCorrected > 0 &&
-          ` · ${fieldsCorrected} field${fieldsCorrected === 1 ? "" : "s"} corrected`}
-        {skillsRemoved > 0 &&
-          ` · ${skillsRemoved} skill${skillsRemoved === 1 ? "" : "s"} removed`}
-      </p>
+      </div>
     </main>
   );
 }
@@ -289,7 +309,7 @@ function ExperienceRows({
         <button
           onClick={() => setShowAll(true)}
           className="ml-[38px] self-start text-xs font-medium"
-          style={{ color: "var(--muted)" }}
+          style={{ color: "var(--ink-4)" }}
         >
           Show {hidden} more…
         </button>
@@ -306,17 +326,11 @@ function ExperienceRow({
   onChange: (r: Profile["experience"][number]) => void;
 }) {
   const [editing, setEditing] = useState(false);
-  const av = avatarColor(role.company);
   const years = `${fmtYear(role.start)}–${role.end ? fmtYear(role.end) : "Present"}`;
 
   return (
     <div className="flex items-center gap-2.5">
-      <span
-        className="flex h-7 w-7 flex-none items-center justify-center rounded-[7px] text-xs font-bold"
-        style={{ background: av.bg, color: av.color }}
-      >
-        {initial(role.company)}
-      </span>
+      <CompanyTile initial={initial(role.company)} hue={tileHue(role.company)} size="sm" />
       {editing ? (
         <span className="flex flex-1 gap-2">
           <RowInput
@@ -331,16 +345,15 @@ function ExperienceRow({
           />
           <button
             onClick={() => setEditing(false)}
-            className="text-xs font-semibold"
-            style={{ color: "var(--accent)" }}
+            className="wm-link text-xs font-semibold"
           >
             done
           </button>
         </span>
       ) : (
         <>
-          <span className="flex-1 text-[13.5px]" style={{ color: "var(--label)" }}>
-            <b style={{ color: "var(--text)" }}>{role.role}</b> · {role.company} ·{" "}
+          <span className="flex-1 text-[13.5px]" style={{ color: "var(--ink-2)" }}>
+            <b style={{ color: "var(--ink)" }}>{role.role}</b> · {role.company} ·{" "}
             {years}
           </span>
           <PencilBtn onClick={() => setEditing(true)} />
@@ -369,12 +382,12 @@ function RowInput({
       onKeyDown={(e) => {
         if (e.key === "Enter" && draft.trim()) onCommit(draft.trim());
       }}
-      className="h-8 min-w-0 flex-1 rounded-lg px-2 text-[13px] outline-none"
+      className="h-8 min-w-0 flex-1 rounded-[10px] px-2 text-[13px] outline-none"
       style={{
-        background: "var(--surface)",
-        border: "2px solid var(--accent)",
-        color: "var(--text)",
-        boxShadow: "0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent)",
+        background: "var(--surface-warm)",
+        border: "2px solid var(--terracotta)",
+        color: "var(--ink)",
+        boxShadow: "0 0 0 3px rgba(184,83,47,0.13)",
       }}
     />
   );
@@ -392,30 +405,30 @@ function SavedView() {
         <div
           className="h-pop mx-auto flex h-14 w-14 items-center justify-center rounded-full border text-2xl"
           style={{
-            background: "var(--good-bg)",
-            borderColor: "var(--good-border)",
-            color: "var(--good)",
+            background: "var(--sage-tint)",
+            borderColor: "#cfe0c8",
+            color: "var(--sage)",
           }}
         >
           ✓
         </div>
         <h1
-          className="mt-[18px] text-[23px] font-semibold tracking-tight"
-          style={{ color: "var(--text)" }}
+          className="mt-[18px] text-[30px] font-normal"
+          style={{ fontFamily: SERIF, lineHeight: 1.15, color: "var(--ink)" }}
         >
           Profile saved
         </h1>
-        <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--muted)" }}>
+        <p className="mt-2 text-[14.5px] leading-relaxed" style={{ color: "var(--ink-4)" }}>
           Saved to your account. Discovery and Matching are running now.
         </p>
         <div
-          className="mt-5 inline-flex items-center gap-2.5 text-[13px] font-medium"
-          style={{ color: "var(--label)" }}
+          className="mt-5 inline-flex items-center gap-2.5 text-[13.5px] font-medium"
+          style={{ color: "var(--ink-3)" }}
         >
           <span
             className="inline-block h-4 w-4 rounded-full"
             style={{
-              border: "2px solid var(--accent)",
+              border: "2px solid var(--terracotta)",
               borderTopColor: "transparent",
               animation: "hspin 0.8s linear infinite",
             }}
