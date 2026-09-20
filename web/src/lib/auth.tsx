@@ -3,13 +3,12 @@
 "use client";
 
 import { onIdTokenChanged, type User } from "firebase/auth";
-import { createContext, useContext, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
+import { AuthContext } from "@/lib/authContext";
 import { auth } from "@/lib/firebase";
 
-type AuthState = { user: User | null; loading: boolean };
-
-const AuthContext = createContext<AuthState>({ user: null, loading: true });
+export { useAuth } from "@/lib/authContext";
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
@@ -30,8 +29,4 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       {children}
     </AuthContext.Provider>
   );
-}
-
-export function useAuth(): AuthState {
-  return useContext(AuthContext);
 }

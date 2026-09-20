@@ -10,7 +10,8 @@ screenshots of these screens.
 
 | Route | Screen |
 |---|---|
-| `/` | Redirects to `/app` (marketing page arrives in a later PR) |
+| `/` | Marketing site (static; hero is demo data through the shared `JourneyTrack`) |
+| `/security`, `/contact`, `/terms` | Placeholder pages (heading + paragraph) under the marketing nav and footer, until they are designed |
 | `/login`, `/signup` | Google or email sign-in / create account (Firebase Auth); `/login?next=/app/...` returns you there after sign-in |
 | `/onboarding`, `/onboarding/review` | Upload a résumé, then confirm/correct what Hermes parsed before matching starts |
 | `/app` | Job review — approve/skip/star ranked postings, keyboard-driven, with a score + recommendation breakdown |
@@ -23,6 +24,18 @@ screenshots of these screens.
 Old top-level app paths (`/tracking`, `/profile`, …) 307 to `/app/...` via
 `redirects()` in `next.config.ts`; `/app/*` is gated client-side by
 `src/app/app/layout.tsx`.
+
+The marketing routes live in the `src/app/(marketing)/` route group, whose
+`layout.tsx` is the shared chrome (sand wrapper, `MarketingNav`, `Footer`).
+Sections are in `src/components/marketing/`: every string is in `copy.ts`
+and every href in `links.ts` (hashes are `/#x` so the nav works from the
+placeholder pages; the four "Request an invite" CTAs carry `?from=` sources
+that `/signup` stashes). `MarketingNav` is the only client component — it
+owns the Features dropdown and swaps "Sign in / Request an invite" for
+"Open Hermes →" once Firebase resolves a user. Styles are inline; what inline
+styles cannot express (hover, the reduced-motion transition, the < 720px
+`mk-desktop-only` breakpoint, the `html:has(.mk)` light-only ground) is the
+`.mk-*` block at the end of `globals.css`.
 
 ## Stack
 
@@ -59,7 +72,8 @@ ramp: `--sand`, `--cream`, `--ink`…`--ink-4`, `--terracotta*`, `--sage*`,
 `--border` already name the grey ones. `@keyframes jpulse` (the journey
 track's halo) is distinct from `hpulse`, the opacity blink behind `.h-pulse`
 on the review page. `--font-jakarta` and `--font-instrument` are loaded in
-`layout.tsx` as variables only; `--font-sans` is still Geist.
+`layout.tsx` as variables (preloaded, consumed by the marketing site);
+`--font-sans` is still Geist.
 
 `src/components/warm/` holds the shared primitives (`JourneyTrack`, `Pill`,
 `CompanyTile`, `MatchChip`) and the pure helper `journeyStages.ts` — not
@@ -71,5 +85,8 @@ filesystem. They use warm tokens and inline styles only and must not import
 npm test       # vitest, node environment — no jsdom, no browser
 ```
 
-Tests stay pure: import only `src/lib/*` and `src/components/warm/*`, and
-render components through `react-dom/server`'s `renderToStaticMarkup`.
+Tests stay pure: import only `src/lib/*`, `src/components/warm/*` and
+`src/components/marketing/*`, and render components through
+`react-dom/server`'s `renderToStaticMarkup`. Components that only read auth
+import `useAuth` from `src/lib/authContext.ts` (no Firebase import) so tests
+can wrap them in `AuthContext.Provider`; `src/lib/auth.tsx` re-exports it.
