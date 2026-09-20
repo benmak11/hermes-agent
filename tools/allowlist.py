@@ -17,6 +17,23 @@ nothing bounds *how many* users get in. This module is that bound::
         "revoked":    bool,
       }
 
+Beside it, the queue of people who signed in without a seat::
+
+    waitlist/{lowercased-email}
+      {
+        "uid":            "Firebase Auth uid of the account they created",
+        "email":          "user@example.com",
+        "source":         "hero" | "closing" | "nav" | "footer" | None,
+        "email_verified": bool,
+        "first_seen":     "2026-09-20T12:00:00+00:00",
+        "last_seen":      "2026-09-20T12:00:00+00:00",
+      }
+
+Written by ``POST /account/signup`` for a non-allowlisted account, listed by
+``cli.allowlist waitlist``, and removed on the grantee's first allowed sign-in
+(or on account deletion). Keyed through the same :func:`_key` as the allowlist
+so an operator's later ``add`` of the address lands on a matching id.
+
 **Keyed on email, not uid.** At invite time an operator only has an email
 address — the account may not exist yet — and this has to match what Firebase
 Auth carries on the token being verified, which is what ``api.deps`` checks
@@ -65,7 +82,9 @@ action, deliberately outside anything this codebase automates. In order:
    confirm real access — not just a 200 from ``/profile`` in isolation.
 7. Only after 6 is confirmed, remove ``NEXT_PUBLIC_INVITE_CODES`` and the
    client-side invite gate in ``web/src/app/login/page.tsx`` — a follow-up
-   PR, not part of D2.
+   PR, not part of D2. From then on, granting someone from ``cli.allowlist
+   waitlist`` is just ``add``; their waitlist doc clears itself on their next
+   sign-in.
 
 **Reversing the order in step 3/5 (api before worker), or skipping step 1 or
 4, risks locking out the two real accounts** — a 403 with no seat to blame it
@@ -261,4 +280,65 @@ async def list_entries(db) -> list[dict]:
     return [
         {"email": snap.id, **(snap.to_dict() or {})}
         async for snap in db.collection(COLLECTION).stream()
+    ]
+
+
+#: Top-level collection of people who created an account without a seat.
+#: Keyed exactly like ``COLLECTION`` — through :func:`_key` — so that the
+#: operator's later ``allowlist add`` of the same address lands on a matching id.
+WAITLIST_COLLECTION = "waitlist"
+
+
+async def record_waitlist(
+    db,
+    *,
+    uid: str,
+    email: str | None,
+    source: str | None,
+    email_verified: bool,
+    now: datetime | None = None,
+) -> bool:
+    """Record (or refresh) ``email``'s place in line. ``True`` iff created.
+
+    ``first_seen`` and ``source`` are written on create only; a repeat call
+    moves ``last_seen`` and nothing else. Read-then-write, not a transaction:
+    two racing first calls each write the same ``first_seen`` to the second,
+    which is not an outcome worth a transaction's machinery.
+    """
+    key = _key(email)
+    if not key:
+        raise ValueError("email must not be blank")
+    ref = db.collection(WAITLIST_COLLECTION).document(key)
+    stamp = (now or datetime.now(UTC)).isoformat()
+    snap = await ref.get()
+    if snap.exists:
+        await ref.set({"last_seen": stamp}, merge=True)
+        return False
+    await ref.set(
+        {
+            "uid": uid,
+            "email": key,
+            "source": source,
+            "email_verified": email_verified,
+            "first_seen": stamp,
+            "last_seen": stamp,
+        }
+    )
+    log.info("waitlist.recorded", email_key=key, source=source)
+    return True
+
+
+async def remove_from_waitlist(db, email: str | None) -> None:
+    """Drop ``email``'s waitlist doc. A no-op on a blank address or an absent doc."""
+    key = _key(email)
+    if not key:
+        return
+    await db.collection(WAITLIST_COLLECTION).document(key).delete()
+
+
+async def list_waitlist(db) -> list[dict]:
+    """Every waitlist document, for the CLI. Unordered (the CLI sorts)."""
+    return [
+        {"email": snap.id, **(snap.to_dict() or {})}
+        async for snap in db.collection(WAITLIST_COLLECTION).stream()
     ]

@@ -225,6 +225,9 @@ async def delete_account(
        the user retrying a half-finished deletion is a reachable path and not
        an exotic one.
     2b. Free this user's allowlist seat, if they had one — see below.
+    2c. Drop this user's ``waitlist/{email}`` doc, if they had one. Not gated
+       on ``enforced()``: the doc can predate a flag flip, and deleting an
+       absent doc is a no-op.
     3. The wipe, ending with ``users/{uid}`` itself.
 
     **What this does not do, and cannot: make deletion atomic against a cycle
@@ -274,6 +277,10 @@ async def delete_account(
             log.info("account.seat_freed", user_id=user_id, freed=freed)
         else:
             log.info("account.seat_free_skipped_no_email", user_id=user_id)
+
+    if email:
+        await allowlist.remove_from_waitlist(db, email)
+        log.info("account.waitlist_cleared", user_id=user_id)
 
     counts = await wipe_user_data(db, user_id, execute=True)
     log.info("account.deleted", user_id=user_id, **counts.as_dict())

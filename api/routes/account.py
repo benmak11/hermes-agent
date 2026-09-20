@@ -1,6 +1,17 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""``POST /account/delete`` — the user's own door out of the product.
+"""``POST /account/signup`` and ``POST /account/delete`` — the doors in and out.
+
+**Signup** is the one route that answers a *stranger*: it runs on
+:func:`api.deps.verify_identity` (token verified, allowlist not consulted),
+records where the visitor came from, and answers ``{"allowed": bool}``. An
+allowlisted account gets ``users/{uid}`` stamped once with ``signup_source``
+and ``signed_up_at``; anyone else gets a ``waitlist/{email}`` doc and nothing
+under ``users/`` at all, so the operator can grant a seat later with
+``cli.allowlist add``. The allowlist stays the only gate — every other route
+still 403s a stranger through :func:`api.deps.verify_user`.
+
+**Delete** is the user's own door out of the product.
 
 Runs :func:`tools.account.delete.delete_account`, which is the same wipe
 ``cli/reset_user.py`` performs, in the order that matters: tombstone, close the
@@ -21,14 +32,17 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from datetime import UTC, datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from google.cloud import firestore
 from pydantic import BaseModel
 
-from api.deps import firebase_auth, verify_user
+from api.deps import Identity, firebase_auth, verify_identity, verify_user
 from obs.logging import get_logger
-from tools.account.delete import delete_account
+from tools import allowlist
+from tools.account.delete import delete_account, is_deleted
 
 router = APIRouter(tags=["account"])
 log = get_logger("api.account")
@@ -45,6 +59,82 @@ def _client() -> firestore.AsyncClient:
     if _db is None:
         _db = firestore.AsyncClient()
     return _db
+
+
+#: The four marketing CTAs (web/src/lib/nav.ts SIGNUP_SOURCES). Anything else
+#: is stored as null — the client is not trusted to name its own source.
+SIGNUP_SOURCES = frozenset({"hero", "closing", "nav", "footer"})
+
+
+class Signup(BaseModel):
+    """``source`` is which marketing CTA the visitor came in through, if any."""
+
+    source: str | None = None
+
+
+@router.post("/account/signup")
+async def signup(
+    body: Signup,
+    # ``Annotated`` rather than ``= Depends(...)``: ruff's B008 only exempts a
+    # ``Depends`` default when the annotation is a builtin like ``str``.
+    ident: Annotated[Identity, Depends(verify_identity)],
+) -> dict:
+    """Admit or waitlist the account behind this token. See the module docstring.
+
+    Timestamps are ISO-8601 strings, like every other timestamp this codebase
+    writes — not ``SERVER_TIMESTAMP``. The allowed branch is read-then-merge so
+    a repeat sign-in costs one read and no write, ``signup_source`` records the
+    *first* entry point, and a doc tombstoned by ``POST /account/delete`` is
+    never recreated by a token that outlives the account (up to an hour).
+
+    The allowlist read here is deliberately **not** the 5-minute TTL cache
+    ``api.deps`` keeps for the other routes: a fresh grant must be visible on
+    the very next sign-in.
+    """
+    source = body.source if body.source in SIGNUP_SOURCES else None
+    db = _client()
+
+    if allowlist.enforced():
+        if not ident.email:
+            log.warning("account.signup.no_email", user_id=ident.uid)
+            raise HTTPException(
+                status_code=403,
+                detail="this account has no email claim to check against the allowlist",
+            )
+        allowed = await allowlist.is_allowed(db, ident.email)
+    else:
+        allowed = True  # mirrors _check_allowlist: unenforced == everyone in
+
+    if not allowed:
+        created = await allowlist.record_waitlist(
+            db,
+            uid=ident.uid,
+            email=ident.email,
+            source=source,
+            email_verified=ident.email_verified,
+        )
+        log.info(
+            "account.signup.waitlisted",
+            user_id=ident.uid,
+            source=source,
+            created=created,
+        )
+        return {"allowed": False}
+
+    user_ref = db.collection("users").document(ident.uid)
+    existing = (await user_ref.get()).to_dict() or {}
+    if not existing.get("signed_up_at") and not is_deleted(existing):
+        await user_ref.set(
+            {"signup_source": source, "signed_up_at": datetime.now(UTC).isoformat()},
+            merge=True,
+        )
+        log.info("account.signup.admitted", user_id=ident.uid, source=source)
+    # Outside the first-time branch on purpose: a revoke -> waitlisted sign-in
+    # -> re-grant sequence would otherwise leave a stale waitlist doc for
+    # someone who is in. One cheap delete per allowed sign-in.
+    if ident.email:
+        await allowlist.remove_from_waitlist(db, ident.email)
+    return {"allowed": True}
 
 
 class DeleteAccount(BaseModel):

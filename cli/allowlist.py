@@ -27,6 +27,7 @@ Usage:
     python -m cli.allowlist add --uid U6WbOc8MjhBpKD3 --note "beta" --execute
     python -m cli.allowlist add --email user@example.com --max-users 10 --execute
     python -m cli.allowlist list
+    python -m cli.allowlist waitlist                                          # read-only
     python -m cli.allowlist revoke --email user@example.com --execute
 """
 
@@ -128,6 +129,27 @@ async def _cmd_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     print(f"\n{len(active)} active, {len(revoked)} revoked, {len(entries)} total.")
 
 
+async def _cmd_waitlist(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    """Everyone who signed in without a seat, oldest first. Read-only, so no
+    ``--execute``; granting one of them is ``add`` (their waitlist doc clears
+    itself on their next sign-in — see ``tools.allowlist``)."""
+    db = firestore.AsyncClient()
+    entries = await allowlist.list_waitlist(db)
+    entries.sort(key=lambda e: e.get("first_seen", ""))  # oldest first
+    for e in entries:
+        verified = "verified" if e.get("email_verified") else "unverified"
+        print(
+            f"  {e['email']:40s} {e.get('source') or '-':8s} "
+            f"{e.get('first_seen', '')[:19]}  {verified}"
+        )
+    print(
+        f"\n{len(entries)} waiting. "
+        "Grant with: python -m cli.allowlist add --email <addr> --execute"
+    )
+
+
 async def _cmd_revoke(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> None:
@@ -177,6 +199,7 @@ def main() -> None:
     )
 
     sub.add_parser("list", help="List every allowlist entry.")
+    sub.add_parser("waitlist", help="List everyone waiting for a seat, oldest first.")
 
     revoke = sub.add_parser("revoke", help="Free a seat.")
     _identifier_args(revoke)
@@ -192,7 +215,12 @@ def main() -> None:
     args = parser.parse_args()
     bind_run_context("allowlist_cli", command=args.command)
 
-    handler = {"add": _cmd_add, "list": _cmd_list, "revoke": _cmd_revoke}[args.command]
+    handler = {
+        "add": _cmd_add,
+        "list": _cmd_list,
+        "waitlist": _cmd_waitlist,
+        "revoke": _cmd_revoke,
+    }[args.command]
     asyncio.run(handler(args, parser))
 
 

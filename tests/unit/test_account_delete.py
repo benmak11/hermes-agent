@@ -36,6 +36,7 @@ import api.routes.discovery as discovery
 from api.deps import verify_user
 from tools.account import delete as account_delete
 from tools.allowlist import COLLECTION as ALLOWLIST_COLLECTION
+from tools.allowlist import WAITLIST_COLLECTION
 
 DELETED_AT = "2026-09-03T12:00:00+00:00"
 
@@ -524,6 +525,48 @@ def test_the_delete_endpoint_frees_the_seat_by_the_confirmed_email(api, monkeypa
 
     assert resp.status_code == 200
     assert api.world.db.docs[seat]["revoked"] is True
+
+
+def test_a_deletion_clears_the_departing_users_waitlist_doc(world, monkeypatch):
+    """Not gated on ``enforced()`` — the doc can predate a flag flip — and
+    keyed through the same normalisation the signup route wrote it under.
+    Ordered like seat freeing: after the login is closed, before anything
+    destructive runs."""
+    monkeypatch.delenv("ALLOWLIST_ENFORCED", raising=False)
+    path = f"{WAITLIST_COLLECTION}/user@example.com"
+    world.db.docs[path] = {"uid": "u1", "source": "hero"}
+
+    def close(uid):
+        world.db.ops.append(("auth_delete", uid))
+
+    asyncio.run(
+        account_delete.delete_account(
+            world.db, "u1", close_auth=close, email="User@Example.com"
+        )
+    )
+
+    assert path not in world.db.docs
+    ops = world.db.ops
+    auth_idx = ops.index(("auth_delete", "u1"))
+    waitlist_idx = ops.index(("delete", path))
+    first_destructive = next(
+        i
+        for i, op in enumerate(ops)
+        if op[0] in {"delete", "batch_delete"} and op[1] != path
+    )
+    assert auth_idx < waitlist_idx < first_destructive
+
+
+def test_the_delete_endpoint_clears_the_waitlist_by_the_confirmed_email(api):
+    """End to end, and by the Auth email the confirmation was checked
+    against — never ``users/{uid}.email``."""
+    path = f"{WAITLIST_COLLECTION}/user@example.com"
+    api.world.db.docs[path] = {"uid": "u1", "source": "hero"}
+
+    resp = api.client.post("/account/delete", json={"confirm": "User@Example.com"})
+
+    assert resp.status_code == 200
+    assert path not in api.world.db.docs
 
 
 # ---------------------------------------------------------------------------
