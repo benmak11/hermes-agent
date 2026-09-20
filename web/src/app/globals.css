@@ -253,3 +253,66 @@ body {
     stroke-dashoffset: 50.3;
   }
 }
+
+/* Marketing site (facelift PR 3). Hover/media rules that inline styles can't
+   express. A property that changes on hover is owned by the class and never
+   set inline, so nothing needs !important. */
+.mk-link {
+  color: #5c4a3b;
+}
+.mk-link:hover {
+  color: var(--terracotta);
+}
+
+.mk-cta {
+  background: var(--terracotta);
+  color: #fff9f2;
+}
+
+.mk-cta:hover {
+  background: var(--terracotta-h);
+}
+
+.mk-ghost {
+  background: var(--surface-warm);
+}
+
+.mk-ghost:hover {
+  background: var(--cream);
+}
+
+.mk-menu {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 66px;
+}
+
+.mk-menu-item:hover {
+  background: var(--cream);
+}
+
+.mk-menu-panel {
+  transition:
+    opacity 0.16s ease,
+    transform 0.16s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mk-menu-panel {
+    transition: none;
+  }
+}
+
+/* Last, so it beats .mk-menu's display. The only place the breakpoint lives. */
+@media (max-width: 719px) {
+  .mk-desktop-only {
+    display: none;
+  }
+}
+
+/* Marketing routes (facelift PR 3): light-only, own ground, even in a dark-mode OS. */
+html:has(.mk) {
+  color-scheme: light;
+  background: var(--sand);
+}

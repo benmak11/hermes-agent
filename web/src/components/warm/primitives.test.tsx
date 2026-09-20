@@ -12,7 +12,7 @@ describe("Pill", () => {
     expect(good).toContain(">ok<");
 
     const accent = renderToStaticMarkup(<Pill tone="accent">a</Pill>);
-    expect(accent).toContain("color:var(--terracotta)");
+    expect(accent).toContain("color:var(--terracotta-d)");
     expect(accent).toContain("border:1px solid var(--border-warm)");
 
     const warn = renderToStaticMarkup(<Pill tone="warn">w</Pill>);
@@ -41,6 +41,22 @@ describe("CompanyTile", () => {
       expect(html).toContain(`color:${fg}`);
       expect(html).toContain(">S<");
     }
+  });
+
+  it("defaults to the 34px board tile and shrinks to 28px for size=sm", () => {
+    const md = renderToStaticMarkup(<CompanyTile initial="S" hue="violet" />);
+    expect(md).toContain("width:34px");
+    expect(md).toContain("height:34px");
+    expect(md).toContain("border-radius:11px");
+    expect(md).toContain("font-size:14px");
+
+    const sm = renderToStaticMarkup(
+      <CompanyTile initial="A" hue="honey" size="sm" />,
+    );
+    expect(sm).toContain("width:28px");
+    expect(sm).toContain("height:28px");
+    expect(sm).toContain("border-radius:9px");
+    expect(sm).toContain("font-size:12.5px");
   });
 });
 

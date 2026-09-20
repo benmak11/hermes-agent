@@ -6,8 +6,11 @@ import type { CSSProperties } from "react";
 export type PillTone = "accent" | "good" | "warn" | "muted";
 
 const TONES: Record<PillTone, CSSProperties> = {
+  // `--terracotta-d`, not `--terracotta`: the seam doc's contrast rule says
+  // terracotta below 13px must be the dark shade (11.5px on the tint is
+  // 4.45:1 with the base, 5.35:1 with this).
   accent: {
-    color: "var(--terracotta)",
+    color: "var(--terracotta-d)",
     background: "var(--terracotta-tint)",
     border: "1px solid var(--border-warm)",
   },

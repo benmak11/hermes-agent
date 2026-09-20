@@ -19,15 +19,14 @@ const geistMono = Geist_Mono({
 });
 
 // Warm-facelift faces. Exposed as CSS variables only — `--font-sans` still
-// points at Geist, so nothing renders differently until a screen opts in.
-// `preload: false` because nothing uses them yet: with the default, every
-// route would preload ~57 KB of woff2 for text it never renders. Flip it on
-// in the PR that makes a screen consume them.
+// points at Geist, so a screen renders them only by opting in (the marketing
+// site does; the app screens follow in later facelift PRs). Loaded once here
+// because a second loader call is a second hosted instance.
 const jakarta = Plus_Jakarta_Sans({
   variable: "--font-jakarta",
   subsets: ["latin"],
   weight: "variable",
-  preload: false,
+  preload: true,
 });
 
 const instrument = Instrument_Serif({
@@ -35,7 +34,7 @@ const instrument = Instrument_Serif({
   subsets: ["latin"],
   weight: "400",
   style: ["normal", "italic"],
-  preload: false,
+  preload: true,
 });
 
 export const metadata: Metadata = {
