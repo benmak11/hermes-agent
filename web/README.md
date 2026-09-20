@@ -43,9 +43,18 @@ never appear in the URL — whose `layout.tsx` paints the warm gradient ground
 and Plus Jakarta Sans once. Their hover/focus/disabled states are the `.wm-*`
 block in `globals.css`, sibling to `.mk-*` and kept separate on purpose: the
 marketing classes may be reshaped with the marketing site, and the forms need
-`:disabled` and `:focus` rules the marketing set lacks. A property a `.wm-*`
-class changes on hover is never also set inline (inline would win and kill
-the hover).
+`:disabled` and `:focus` rules the marketing set lacks. The same block now
+also carries the app nav (`wm-nav-active`, `wm-muted-link`, `wm-nav-quiet`,
+`wm-nav-center`) and the review loop (`wm-toggle`, `wm-toast-btn`). A property
+a `.wm-*` class changes on hover is never also set inline (inline would win
+and kill the hover).
+
+The facelift reaches `/app` in stages. `TopNav` (the 60px warm header) is
+shared, so it is warm on every `/app` page already; only the review page
+(`/app`) wraps its body in the warm ground (`GROUND` from `warm/styles.ts`,
+page-scoped rather than in `app/layout.tsx` so the grey pages keep their
+dark-mode ramp). Tracking, profile, companies and interviews keep their grey
+bodies under the warm nav until PR 7/8 re-skin them.
 
 ## Stack
 
@@ -87,8 +96,9 @@ on the review page. `--font-jakarta` and `--font-instrument` are loaded in
 
 `src/components/warm/` holds the shared primitives (`JourneyTrack`, `Pill`,
 `CompanyTile`, `MatchChip`, `Editable`), the style constants in `styles.ts`
-(`SANS`, `SERIF`, `CARD` — a copy of marketing's two font stacks, because the
-auth screens must not import from `components/marketing/`), and the pure
+(`SANS`, `SERIF`, `CARD`, `GROUND` — a copy of marketing's two font stacks,
+because the auth screens must not import from `components/marketing/`; `GROUND`
+is the full-height gradient ground an app screen wraps itself in), and the pure
 helper `journeyStages.ts` — not `journeyTrack.ts`, which would shadow
 `JourneyTrack.tsx` on a case-insensitive filesystem. They use warm tokens
 only (Tailwind layout utilities are fine; the palette is not) and must not
@@ -97,6 +107,12 @@ import `@/lib/firebase`, `@/lib/api`, `next/navigation`, or any CSS.
 `warm/Editable.tsx` is a warm-skinned fork of `components/editable.tsx`
 (same exports, props and logic); the grey original is kept for `/app/profile`
 and `/app/interviews` until the facelift reaches them and deletes it.
+
+`src/lib/ui.ts` likewise carries both palettes: the warm trio
+(`scoreColorWarm`, `recPillWarm`, `barColorWarm`) feeds the review page, while
+the grey trio (`scoreColor`, `recPill`, `barColor`) and `avatarColor` remain
+for tracking, profile, companies and interviews until PR 7/8 switch them over
+and delete the grey set.
 
 ```bash
 npm test       # vitest, node environment — no jsdom, no browser

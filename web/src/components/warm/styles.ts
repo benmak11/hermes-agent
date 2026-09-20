@@ -17,3 +17,15 @@ export const CARD: CSSProperties = {
   background: "var(--surface-warm)",
   boxShadow: "0 1px 2px rgba(94,63,39,0.05), 0 22px 50px rgba(94,63,39,0.12)",
 };
+
+/** Full-height warm ground for an app screen (the (auth) layout paints the same). */
+export const GROUND: CSSProperties = {
+  fontFamily: SANS,
+  color: "var(--ink)",
+  background: "radial-gradient(1100px 620px at 50% -8%, var(--cream) 0%, #f1e4d3 70%)",
+  colorScheme: "light",
+  flex: "1 0 auto",
+  width: "100%",
+  display: "flex",
+  flexDirection: "column",
+};

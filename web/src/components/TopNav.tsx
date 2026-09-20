@@ -6,6 +6,7 @@ import { signOut } from "firebase/auth";
 import Link from "next/link";
 
 import { UserAvatar } from "@/components/UserAvatar";
+import { SANS } from "@/components/warm/styles";
 import { auth } from "@/lib/firebase";
 import { APP_HOME } from "@/lib/nav";
 
@@ -20,16 +21,28 @@ type Section =
 const LINKS: { section: Section; href: string; label: string }[] = [
   { section: "review", href: APP_HOME, label: "Review" },
   { section: "tracking", href: "/app/tracking", label: "Tracking" },
-  { section: "interviews", href: "/app/interviews", label: "Interviews" },
+  { section: "interviews", href: "/app/interviews", label: "Journeys" },
   { section: "companies", href: "/app/settings/companies", label: "Companies" },
 ];
 
+/** The quiet label after the wordmark (design 16: "Hermes  Journeys"). */
+const SECTION_LABEL: Record<Section, string> = {
+  review: "Review",
+  tracking: "Tracking",
+  interviews: "Journeys",
+  companies: "Companies",
+  profile: "Profile",
+  applications: "Your application",
+};
+
 /**
- * 56px translucent app nav (mock spec): logo + `/ route` breadcrumb left;
- * Review · Interviews · Companies · Sign out + avatar right, with the current
- * page's link omitted. The avatar opens /app/profile and wears a blue focus ring
- * while there. `center` (session progress) and `pill` (discovery status) are
- * slots for the review screen. Companies keeps its "← Back to jobs" shortcut.
+ * 60px warm app header (design 16): terracotta logo tile + wordmark + section
+ * label left; Review · Tracking · Journeys · Companies · Sign out + avatar
+ * right, the current page's link active-styled (terracotta underline). The
+ * avatar opens /app/profile and wears a terracotta ring while there. `center`
+ * (session progress) and `pill` (discovery status) are slots for the review
+ * screen; the center slot hides under 900px. Companies keeps its "← Back to
+ * jobs" shortcut. Jakarta is set here so the bar reads warm on every /app page.
  */
 export function TopNav({
   section,
@@ -42,56 +55,51 @@ export function TopNav({
 }) {
   return (
     <header
-      className="sticky top-0 z-10 flex h-14 items-center justify-between border-b px-6 backdrop-blur"
-      style={{ background: "var(--nav-bg)", borderColor: "var(--border)" }}
+      className="sticky top-0 z-10 flex h-[60px] items-center justify-between border-b px-6"
+      style={{ fontFamily: SANS, background: "var(--surface-warm)", borderColor: "#f0e3d3" }}
     >
       <Link href="/app" className="flex items-center gap-2.5">
         <span
-          className="flex h-[26px] w-[26px] items-center justify-center rounded-[7px] text-sm font-bold"
-          style={{ background: "var(--text)", color: "var(--surface)" }}
+          className="flex h-7 w-7 items-center justify-center rounded-[9px] text-sm font-bold"
+          style={{ background: "var(--terracotta)", color: "#fff9f2" }}
         >
           H
         </span>
-        <span className="text-[15px] font-semibold" style={{ color: "var(--text)" }}>
+        <span className="text-[15px] font-bold" style={{ color: "var(--ink)" }}>
           Hermes
         </span>
-        <span
-          className="ml-1.5 font-mono text-xs font-medium"
-          style={{ color: "var(--subtle)" }}
-        >
-          / {section}
+        <span className="text-[12.5px]" style={{ color: "#b0a08d" }}>
+          {SECTION_LABEL[section]}
         </span>
       </Link>
 
       {center && (
-        <div className="absolute left-1/2 -translate-x-1/2">{center}</div>
+        <div className="wm-nav-center absolute left-1/2 -translate-x-1/2">{center}</div>
       )}
 
       {section === "companies" ? (
-        <Link
-          href="/app"
-          className="text-[13px] font-medium"
-          style={{ color: "var(--accent)" }}
-        >
+        <Link href="/app" className="wm-link text-[13px] font-semibold">
           ← Back to jobs
         </Link>
       ) : (
         <div className="flex items-center gap-[18px]">
           {pill}
-          {LINKS.filter((l) => l.section !== section).map((l) => (
+          {LINKS.map((l) => (
             <Link
               key={l.section}
               href={l.href}
-              className="text-[13px] font-medium"
-              style={{ color: "var(--label)" }}
+              className={
+                l.section === section
+                  ? "wm-nav-active text-[13px]"
+                  : "wm-muted-link text-[13px] font-medium"
+              }
             >
               {l.label}
             </Link>
           ))}
           <button
             onClick={() => signOut(auth)}
-            className="text-[13px]"
-            style={{ color: "var(--subtle)" }}
+            className="wm-nav-quiet text-[13px]"
           >
             Sign out
           </button>
@@ -101,7 +109,10 @@ export function TopNav({
             className="rounded-full"
             style={
               section === "profile"
-                ? { boxShadow: "0 0 0 2px var(--bg), 0 0 0 4px var(--accent)" }
+                ? {
+                    boxShadow:
+                      "0 0 0 2px var(--surface-warm), 0 0 0 4px var(--terracotta)",
+                  }
                 : undefined
             }
           >

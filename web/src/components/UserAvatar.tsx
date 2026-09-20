@@ -9,6 +9,7 @@ import { resolveUserAvatar } from "@/lib/ui";
  * The signed-in user's avatar, resolved from their identity (onboarding
  * "Avatar resolution" spec): a name → initials, else the email's first letter,
  * else a neutral person glyph. Falls back to the glyph while auth is loading.
+ * Both branches are the design's 28px honey tile (screen 16).
  */
 export function UserAvatar({ className = "h-7 w-7" }: { className?: string }) {
   const { user } = useAuth();
@@ -18,11 +19,11 @@ export function UserAvatar({ className = "h-7 w-7" }: { className?: string }) {
   if (av.kind === "glyph") {
     return (
       <span
-        className={`${className} flex items-center justify-center rounded-full border`}
+        className={`${className} flex items-center justify-center rounded-full`}
         style={{
-          background: "var(--surface-2)",
-          borderColor: "var(--border)",
-          color: "var(--muted)",
+          background: "var(--honey-tint)",
+          border: "1px solid #f4dfb4",
+          color: "#9a6216",
         }}
         aria-label={label}
         title={label}
@@ -37,8 +38,12 @@ export function UserAvatar({ className = "h-7 w-7" }: { className?: string }) {
 
   return (
     <span
-      className={`${className} flex items-center justify-center rounded-full text-[11px] font-bold`}
-      style={{ background: "var(--text)", color: "var(--surface)" }}
+      className={`${className} flex items-center justify-center rounded-full text-[12px] font-bold`}
+      style={{
+        background: "var(--honey-tint)",
+        border: "1px solid #f4dfb4",
+        color: "#9a6216",
+      }}
       aria-label={label}
       title={label}
     >

@@ -25,8 +25,11 @@ import {
   type SessionStats,
 } from "@/lib/session";
 import type { DecideValue, Decision, Job, ProfileResponse } from "@/lib/types";
-import { avatarColor, barColor, initial, recPill, scoreColor } from "@/lib/ui";
+import { barColorWarm, initial, recPillWarm, scoreColorWarm } from "@/lib/ui";
 import { TopNav } from "@/components/TopNav";
+import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
+import { Pill } from "@/components/warm/Pill";
+import { GROUND, SERIF } from "@/components/warm/styles";
 
 type PendingResponse = {
   jobs: Job[];
@@ -219,7 +222,13 @@ export default function VettingPage() {
   }, [uid, dataEpoch]);
 
   if (loading || !user || profileLoading || needsOnboarding) {
-    return <div className="p-8" style={{ color: "var(--muted)" }}>Loading…</div>;
+    return (
+      <div className="wm" style={GROUND}>
+        <div className="p-8" style={{ color: "var(--ink-4)" }}>
+          Loading…
+        </div>
+      </div>
+    );
   }
 
   const reviewed = reviewedCount(stats);
@@ -228,7 +237,7 @@ export default function VettingPage() {
   const pace = paceMinutes(stats, remaining);
 
   return (
-    <>
+    <div className="wm" style={GROUND}>
       <TopNav
         section="review"
         center={
@@ -238,39 +247,36 @@ export default function VettingPage() {
         }
         pill={firstRun ? <DiscoveryPill /> : undefined}
       />
-      <main className="mx-auto w-full max-w-[760px] flex-1 px-8 py-7">
+      <main className="mx-auto w-full max-w-[920px] flex-1 px-7 py-7">
         <div className="mb-6 flex items-start justify-between gap-5">
           <div>
             <div className="flex items-center gap-2.5">
               <h1
-                className="text-[22px] font-semibold tracking-tight"
-                style={{ color: "var(--text)" }}
+                className="text-[28px] font-normal leading-[1.15]"
+                style={{ fontFamily: SERIF, color: "var(--ink)" }}
               >
                 {firstRun ? "Your first matches" : "Jobs to review"}
               </h1>
               {!firstRun && (
                 <span
-                  className="inline-flex h-[22px] min-w-6 items-center justify-center rounded-full px-[7px] font-mono text-xs font-semibold"
-                  style={{ background: "var(--text)", color: "var(--surface)" }}
+                  className="inline-flex h-[22px] min-w-6 items-center justify-center rounded-full px-[7px] text-[12px] font-bold"
+                  style={{ background: "var(--ink)", color: "#fff9f2" }}
                 >
                   {jobs.length}
                 </span>
               )}
             </div>
             {firstRun ? (
-              <div
-                className="mt-2 font-mono text-[12.5px] font-medium"
-                style={{ color: "var(--muted)" }}
-              >
-                <span style={{ color: "var(--good)", fontWeight: 600 }}>
+              <div className="mt-2 text-[13px]" style={{ color: "var(--ink-4)" }}>
+                <span style={{ color: "var(--sage)", fontWeight: 700 }}>
                   {jobs.length} {jobs.length === 1 ? "match" : "matches"}
                 </span>{" "}
                 so far — start reviewing, more will appear below
               </div>
             ) : (
               <div
-                className="mt-2 flex items-center gap-1.5 text-xs"
-                style={{ color: "var(--muted)" }}
+                className="mt-2 flex items-center gap-1.5 text-[12px]"
+                style={{ color: "var(--ink-4)" }}
               >
                 <Kbd>a</Kbd> approve <Kbd>s</Kbd> skip <Kbd>r</Kbd> star{" "}
                 <Kbd>z</Kbd> undo
@@ -279,12 +285,12 @@ export default function VettingPage() {
           </div>
 
           <label
-            className="flex h-[38px] items-center gap-2.5 rounded-[10px] border px-3.5"
-            style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+            className="flex h-[38px] items-center gap-2.5 rounded-[11px] border px-3.5"
+            style={{ background: "var(--surface-warm)", borderColor: "#e8dacb" }}
           >
             <span
-              className="whitespace-nowrap text-xs font-medium"
-              style={{ color: "var(--muted)" }}
+              className="whitespace-nowrap text-[12px] font-semibold"
+              style={{ color: "var(--ink-4)" }}
             >
               Min score
             </span>
@@ -294,11 +300,11 @@ export default function VettingPage() {
               max={100}
               value={minScore}
               onChange={(e) => saveMinScore(Number(e.target.value))}
-              className="w-[130px] accent-[var(--accent)]"
+              className="w-[130px] accent-[var(--terracotta)]"
             />
             <span
-              className="w-5 text-right font-mono text-[13px] font-semibold tabular-nums"
-              style={{ color: "var(--text)" }}
+              className="w-5 text-right text-[13px] font-bold tabular-nums"
+              style={{ color: "var(--ink)" }}
             >
               {minScore}
             </span>
@@ -307,7 +313,9 @@ export default function VettingPage() {
 
         {isLoading && <LoadingSkeleton />}
         {error && (
-          <p style={{ color: "var(--danger)" }}>Failed to load: {String(error)}</p>
+          <p className="text-[13.5px]" style={{ color: "var(--brick)" }}>
+            Failed to load: {String(error)}
+          </p>
         )}
         {!isLoading && jobs.length === 0 && !firstRun && (
           <EmptyState
@@ -333,34 +341,37 @@ export default function VettingPage() {
 
         {reviewed > 0 && (
           <div
-            className="mt-4 flex items-center gap-3.5 font-mono text-xs font-medium"
-            style={{ color: "var(--muted)" }}
+            className="mt-[18px] flex items-center gap-[18px] text-[12.5px] font-semibold"
+            style={{ color: "var(--ink-4)" }}
           >
             <CountDot
-              color="var(--good)"
+              color="var(--sage)"
               label={`${stats.approved} approved`}
               href="/app/tracking"
             />
             <CountDot
-              color="var(--border-mid)"
-              label={`${stats.skipped} skipped`}
+              color="#b0a08d"
+              label={`${stats.skipped} passed`}
               href="/app/tracking?tab=skipped"
             />
             <CountDot
-              color="var(--star)"
-              label={`${stats.starred} starred`}
+              color="var(--honey)"
+              label={`${stats.starred} saved`}
               href="/app/tracking?tab=starred"
             />
-            <span className="ml-auto" style={{ color: "var(--subtle)" }}>
-              {remaining} remaining
+            <span className="ml-auto font-medium" style={{ color: "#96826f" }}>
+              {remaining} left
               {pace != null ? ` · ~${pace} min at your pace` : ""}
+              <button onClick={undo} className="wm-link ml-[7px] font-semibold">
+                Undo last
+              </button>
             </span>
           </div>
         )}
       </main>
 
       {pending && <UndoToast pending={pending} onUndo={undo} />}
-    </>
+    </div>
   );
 }
 
@@ -373,20 +384,17 @@ function SessionProgress({
 }) {
   const pct = Math.min(100, Math.round((reviewed / total) * 100));
   return (
-    <div className="flex items-center gap-[11px]">
+    <div className="flex items-center gap-3">
       <div
-        className="h-[5px] w-[150px] overflow-hidden rounded-full"
-        style={{ background: "var(--surface-2)" }}
+        className="h-[7px] w-[160px] overflow-hidden rounded-full"
+        style={{ background: "#f0e3d3" }}
       >
         <div
           className="h-full rounded-full"
-          style={{ width: `${pct}%`, background: "var(--good)" }}
+          style={{ width: `${pct}%`, background: "#7d9b6f" }}
         />
       </div>
-      <span
-        className="font-mono text-xs font-semibold"
-        style={{ color: "var(--label)" }}
-      >
+      <span className="text-[12.5px] font-semibold" style={{ color: "var(--ink-3)" }}>
         {reviewed} of {total} reviewed
       </span>
     </div>
@@ -396,17 +404,17 @@ function SessionProgress({
 function DiscoveryPill() {
   return (
     <span
-      className="inline-flex items-center gap-2 rounded-full border px-3 py-[5px] font-mono text-xs font-semibold"
+      className="inline-flex items-center gap-2 rounded-full border px-[14px] py-[7px] text-[12px] font-bold"
       style={{
-        background: "var(--accent-bg)",
-        borderColor: "var(--accent-border)",
-        color: "var(--accent-text)",
+        background: "var(--honey-tint)",
+        borderColor: "#f4dfb4",
+        color: "#9a6216",
       }}
     >
       <span
         className="inline-block h-[11px] w-[11px] rounded-full border-2"
         style={{
-          borderColor: "var(--accent-text)",
+          borderColor: "#9a6216",
           borderTopColor: "transparent",
           animation: "hspin 0.8s linear infinite",
         }}
@@ -420,31 +428,28 @@ function DiscoveryPill() {
 function ScoringCard() {
   return (
     <div
-      className="mt-4 rounded-[14px] px-[22px] py-5"
+      className="mt-4 rounded-[18px] px-[22px] py-5"
       style={{
-        border: "1px dashed var(--border-mid)",
-        background: "color-mix(in srgb, var(--surface) 60%, transparent)",
+        border: "1px dashed #d9c4a8",
+        background: "rgba(255,252,248,0.6)",
       }}
     >
       <div className="flex items-center gap-[11px]">
         <div
           className="h-[34px] w-[34px] rounded-lg h-pulse"
-          style={{ background: "var(--surface-2)" }}
+          style={{ background: "#f0e3d3" }}
         />
         <div className="flex-1">
           <div
             className="h-[13px] w-[220px] rounded h-pulse"
-            style={{ background: "var(--surface-2)" }}
+            style={{ background: "#f0e3d3" }}
           />
           <div
             className="mt-[7px] h-[11px] w-[110px] rounded h-pulse"
-            style={{ background: "var(--divider)" }}
+            style={{ background: "#f6ede1" }}
           />
         </div>
-        <span
-          className="font-mono text-[11px] font-medium"
-          style={{ color: "var(--subtle)" }}
-        >
+        <span className="text-[11.5px] font-semibold" style={{ color: "#a3927f" }}>
           scoring…
         </span>
       </div>
@@ -469,7 +474,7 @@ function CountDot({
   );
   if (href) {
     return (
-      <Link href={href} className="inline-flex items-center gap-1.5">
+      <Link href={href} className="wm-muted-link inline-flex items-center gap-1.5">
         {body}
       </Link>
     );
@@ -492,34 +497,30 @@ function UndoToast({
   return (
     <div
       key={pending.job.id}
-      className="h-slideup fixed bottom-[22px] left-1/2 z-20 flex -translate-x-1/2 items-center gap-3.5 rounded-xl py-[11px] pl-4 pr-3"
+      className="h-slideup fixed bottom-[22px] left-1/2 z-20 flex -translate-x-1/2 items-center gap-3.5 rounded-[14px] py-[11px] pl-4 pr-3"
       style={{
-        background: "var(--toast-bg)",
-        boxShadow: "0 10px 30px rgba(0,0,0,0.3)",
+        background: "var(--ink)",
+        boxShadow: "0 10px 30px rgba(46,33,25,0.35)",
         animationDuration: "0.3s",
       }}
     >
-      <span className="text-[13px]" style={{ color: "var(--toast-text)" }}>
+      <span className="text-[13px]" style={{ color: "#e8dacb" }}>
         {DECISION_VERB[pending.decision]}{" "}
-        <b style={{ color: "var(--toast-strong)" }}>{pending.job.title}</b> ·{" "}
+        <b style={{ color: "#fff9f2" }}>{pending.job.title}</b> ·{" "}
         {pending.job.company}
       </span>
       <button
         onClick={onUndo}
-        className="inline-flex h-[30px] items-center gap-1.5 rounded-lg border px-3 text-[12.5px] font-semibold"
-        style={{
-          background: "var(--toast-btn-bg)",
-          borderColor: "var(--toast-btn-border)",
-          color: "var(--toast-btn-text)",
-        }}
+        className="wm-toast-btn inline-flex h-[30px] items-center gap-1.5 rounded-[9px] border px-3 text-[12.5px] font-semibold"
+        style={{ borderColor: "var(--ink-3)", color: "#fff9f2" }}
       >
         Undo{" "}
         <kbd
-          className="inline-flex h-[17px] min-w-4 items-center justify-center rounded border px-1 font-mono text-[10px] font-semibold"
+          className="inline-flex h-[17px] min-w-4 items-center justify-center rounded border px-1 text-[10px] font-bold"
           style={{
-            background: "var(--toast-kbd-bg)",
-            borderColor: "var(--toast-kbd-border)",
-            color: "var(--toast-kbd-text)",
+            background: "var(--ink-3)",
+            borderColor: "var(--ink-4)",
+            color: "#e8dacb",
           }}
         >
           z
@@ -531,7 +532,7 @@ function UndoToast({
           cy="10"
           r="8"
           fill="none"
-          stroke="var(--toast-ring-track)"
+          stroke="var(--ink-3)"
           strokeWidth="2.5"
         />
         <circle
@@ -539,7 +540,7 @@ function UndoToast({
           cy="10"
           r="8"
           fill="none"
-          stroke="var(--toast-ring)"
+          stroke="#d9873f"
           strokeWidth="2.5"
           strokeDasharray="50.3"
           style={{ animation: `ringDrain ${SOFT_COMMIT_MS}ms linear both` }}
@@ -552,11 +553,11 @@ function UndoToast({
 function Kbd({ children }: { children: React.ReactNode }) {
   return (
     <kbd
-      className="inline-flex h-[19px] min-w-[18px] items-center justify-center rounded-[5px] border px-[5px] font-mono text-[11px] font-semibold"
+      className="inline-flex h-[19px] min-w-[18px] items-center justify-center rounded-[5px] border px-[5px] text-[11px] font-bold"
       style={{
-        background: "var(--surface-2)",
-        borderColor: "var(--border)",
-        color: "var(--label)",
+        background: "#f6ede1",
+        borderColor: "#e8dacb",
+        color: "var(--ink-3)",
       }}
     >
       {children}
@@ -575,43 +576,37 @@ function JobCard({
 }) {
   const [open, setOpen] = useState(false);
   const m = job.match;
-  const av = avatarColor(job.company);
-  const pill = recPill(m.recommendation);
+  const pill = recPillWarm(m.recommendation);
   const dealHits = Math.max(0, Math.round(100 - m.breakdown.deal_breaker_penalty));
 
   return (
     <article
-      className="h-slideup rounded-[14px] border p-[22px]"
+      className="h-slideup rounded-[20px] border p-6"
       style={{
-        background: "var(--surface)",
-        borderColor: isTop ? "var(--border-strong)" : "var(--border)",
-        boxShadow: isTop ? "0 0 0 3px var(--ring)" : "none",
+        background: isTop ? "#fdf7ee" : "var(--surface-warm)",
+        borderColor: isTop ? "#e0c8b6" : "var(--border-warm-hair)",
+        boxShadow: isTop ? "0 0 0 4px rgba(184,83,47,0.07)" : "none",
       }}
     >
       <div className="flex items-start justify-between gap-5">
         <div className="min-w-0">
           <div className="flex items-center gap-[11px]">
-            <span
-              className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-lg text-[15px] font-bold"
-              style={{ background: av.bg, color: av.color }}
-            >
-              {initial(job.company)}
-            </span>
+            <CompanyTile initial={initial(job.company)} hue={tileHue(job.company)} />
             <div className="min-w-0">
               <h2
-                className="truncate text-[17px] font-semibold tracking-tight"
-                style={{ color: "var(--text)" }}
+                className="truncate text-[16px] font-bold"
+                style={{ color: "var(--ink)" }}
               >
                 {job.title}
               </h2>
-              <div className="text-[13px]" style={{ color: "var(--muted)" }}>
+              <div className="text-[13px]" style={{ color: "var(--ink-4)" }}>
                 {job.company}
               </div>
             </div>
           </div>
           <div
-            className="mt-3 flex flex-wrap items-center gap-2 font-mono text-xs font-medium"
-            style={{ color: "var(--muted)" }}
+            className="mt-3 flex flex-wrap items-center gap-2 text-[12.5px] font-medium"
+            style={{ color: "var(--ink-4)" }}
           >
             <span>{job.location ?? "—"}</span>
             <Dot />
@@ -621,18 +616,12 @@ function JobCard({
               href={job.url}
               target="_blank"
               rel="noreferrer"
-              className="font-semibold"
-              style={{ color: "var(--accent)" }}
+              className="wm-link font-semibold"
             >
               View posting ↗
             </a>
             {job.discovered_via === "unvetted" && (
-              <span
-                className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-mono text-[11px] font-semibold"
-                style={{ background: "var(--first-bg)", color: "var(--first-text)" }}
-              >
-                ★ First-time company
-              </span>
+              <Pill tone="warn">★ First-time company</Pill>
             )}
           </div>
         </div>
@@ -640,31 +629,29 @@ function JobCard({
         <div className="flex-shrink-0 text-right">
           <div className="flex items-baseline justify-end gap-0.5">
             <span
-              className="text-[38px] font-bold leading-none tracking-tight tabular-nums"
-              style={{ color: scoreColor(m.recommendation) }}
+              className="tabular-nums"
+              style={{
+                fontFamily: SERIF,
+                fontSize: 44,
+                lineHeight: 1,
+                color: scoreColorWarm(m.recommendation),
+              }}
             >
               {Math.round(m.overall_score)}
             </span>
-            <span className="text-sm font-medium" style={{ color: "var(--subtle)" }}>
-              /100
+            <span className="text-[13px]" style={{ color: "#a3927f" }}>
+              /100 match
             </span>
           </div>
-          <span
-            className="mt-2.5 inline-flex items-center gap-1.5 rounded-full border px-[9px] py-[3px] font-mono text-[11px] font-semibold tracking-wide"
-            style={{ background: pill.bg, borderColor: pill.border, color: pill.color }}
-          >
-            <span
-              className="inline-block h-1.5 w-1.5 rounded-full"
-              style={{ background: pill.dot }}
-            />
-            {pill.label}
-          </span>
+          <div className="mt-2.5">
+            <Pill tone={pill.tone}>● {pill.label}</Pill>
+          </div>
         </div>
       </div>
 
       <p
-        className="mt-4 text-sm leading-relaxed"
-        style={{ color: "var(--label)" }}
+        className="mt-4 text-[13.5px] leading-[1.6]"
+        style={{ color: "var(--ink-3)" }}
       >
         {m.reasoning}
       </p>
@@ -678,29 +665,28 @@ function JobCard({
           <Bar
             label="deal-breakers"
             value={dealHits}
-            fill="var(--danger)"
+            fill="var(--brick)"
             goodWhenZero
           />
           {m.matched_strengths.length > 0 && (
-            <ChipRow label="Strengths" color="var(--good)" items={m.matched_strengths} variant="good" />
+            <ChipRow label="Strengths" color="var(--sage)" items={m.matched_strengths} variant="good" />
           )}
           {m.gaps.length > 0 && (
-            <ChipRow label="Gaps" color="var(--warn)" items={m.gaps} variant="warn" />
+            <ChipRow label="Gaps" color="#9a6216" items={m.gaps} variant="warn" />
           )}
           {m.red_flags_hit.length > 0 && (
-            <ChipRow label="Red flags" color="var(--danger)" items={m.red_flags_hit} variant="warn" />
+            <ChipRow label="Red flags" color="var(--brick)" items={m.red_flags_hit} variant="bad" />
           )}
         </div>
       )}
 
-      <div className="my-[18px] h-px" style={{ background: "var(--divider)" }} />
+      <div className="my-[18px] h-px" style={{ background: "#f0e3d3" }} />
 
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           <button
             onClick={() => onDecide("approved")}
-            className="inline-flex h-[38px] items-center gap-2 rounded-[9px] px-[18px] text-[13px] font-semibold"
-            style={{ background: "var(--text)", color: "var(--surface)" }}
+            className="wm-cta inline-flex h-[38px] items-center gap-2 rounded-[11px] px-[18px] text-[13.5px] font-semibold"
           >
             ✓ Approve
           </button>
@@ -709,8 +695,11 @@ function JobCard({
         </div>
         <button
           onClick={() => setOpen((o) => !o)}
-          className="inline-flex items-center gap-1.5 text-[13px] font-medium"
-          style={{ color: open ? "var(--text)" : "var(--muted)" }}
+          className={
+            open
+              ? "wm-toggle wm-toggle-open inline-flex items-center gap-1.5 text-[13px] font-medium"
+              : "wm-toggle inline-flex items-center gap-1.5 text-[13px] font-medium"
+          }
         >
           {open ? "▾" : "▸"} Breakdown
         </button>
@@ -720,7 +709,7 @@ function JobCard({
 }
 
 function Dot() {
-  return <span style={{ color: "var(--border-strong)", opacity: 0.4 }}>·</span>;
+  return <span style={{ color: "#d9c4a8" }}>·</span>;
 }
 
 function GhostBtn({
@@ -733,12 +722,8 @@ function GhostBtn({
   return (
     <button
       onClick={onClick}
-      className="inline-flex h-[38px] items-center gap-1.5 rounded-[9px] border px-4 text-[13px] font-semibold"
-      style={{
-        background: "var(--surface)",
-        borderColor: "var(--border)",
-        color: "var(--label)",
-      }}
+      className="wm-ghost inline-flex h-[38px] items-center gap-1.5 rounded-[11px] border px-4 text-[13.5px] font-semibold"
+      style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
     >
       {children}
     </button>
@@ -757,19 +742,19 @@ function Bar({
   goodWhenZero?: boolean;
 }) {
   const v = Math.max(0, Math.min(100, Math.round(value)));
-  const color = fill ?? barColor(v);
-  const valueColor = goodWhenZero && v === 0 ? "var(--good)" : "var(--text)";
+  const color = fill ?? barColorWarm(v);
+  const valueColor = goodWhenZero && v === 0 ? "var(--sage)" : "var(--ink)";
   return (
     <div className="flex items-center gap-3.5">
       <span
-        className="w-[118px] font-mono text-xs font-medium"
-        style={{ color: "var(--label)" }}
+        className="w-[118px] text-[12px] font-semibold"
+        style={{ color: "var(--ink-3)" }}
       >
         {label}
       </span>
       <div
         className="h-[7px] flex-1 overflow-hidden rounded-full"
-        style={{ background: "var(--surface-2)" }}
+        style={{ background: "#f0e3d3" }}
       >
         <div
           className="h-full rounded-full"
@@ -777,7 +762,7 @@ function Bar({
         />
       </div>
       <span
-        className="w-7 text-right font-mono text-xs font-semibold tabular-nums"
+        className="w-7 text-right text-[12px] font-bold tabular-nums"
         style={{ color: valueColor }}
       >
         {v}
@@ -785,6 +770,14 @@ function Bar({
     </div>
   );
 }
+
+type ChipVariant = "good" | "warn" | "bad";
+
+const CHIP: Record<ChipVariant, { bg: string; border: string }> = {
+  good: { bg: "var(--sage-tint)", border: "#cfe0c8" },
+  warn: { bg: "var(--honey-tint)", border: "#f4dfb4" },
+  bad: { bg: "#fdeeea", border: "#f2cfc3" },
+};
 
 function ChipRow({
   label,
@@ -795,14 +788,13 @@ function ChipRow({
   label: string;
   color: string;
   items: string[];
-  variant: "good" | "warn";
+  variant: ChipVariant;
 }) {
-  const bg = variant === "good" ? "var(--good-bg)" : "var(--warn-bg)";
-  const border = variant === "good" ? "var(--good-border)" : "var(--warn-border)";
+  const { bg, border } = CHIP[variant];
   return (
     <div className="mt-1">
       <div
-        className="mb-2 font-mono text-[11px] font-semibold uppercase tracking-wide"
+        className="mb-2 text-[11px] font-bold uppercase tracking-[0.08em]"
         style={{ color }}
       >
         {label}
@@ -811,7 +803,7 @@ function ChipRow({
         {items.map((t, i) => (
           <span
             key={i}
-            className="rounded-[7px] border px-2.5 py-1 text-xs"
+            className="rounded-[8px] border px-2.5 py-1 text-[12px]"
             style={{ background: bg, borderColor: border, color }}
           >
             {t}
@@ -874,29 +866,31 @@ function EmptyState({
 
   return (
     <div
-      className="flex h-[340px] items-center justify-center rounded-xl border"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      className="flex h-[340px] items-center justify-center rounded-[20px] border"
+      style={{
+        background: "var(--surface-warm)",
+        borderColor: "var(--border-warm-hair)",
+      }}
     >
       <div className="px-10 text-center">
         <div
           className="mx-auto flex h-[52px] w-[52px] items-center justify-center rounded-full border text-2xl"
           style={{
-            background: tone === "good" ? "var(--good-bg)" : "var(--surface)",
-            borderColor:
-              tone === "good" ? "var(--good-border)" : "var(--border)",
-            color: tone === "good" ? "var(--good)" : "var(--muted)",
+            background: tone === "good" ? "var(--sage-tint)" : "#f6ede1",
+            borderColor: tone === "good" ? "#cfe0c8" : "#e8dacb",
+            color: tone === "good" ? "var(--sage)" : "var(--ink-4)",
           }}
         >
           {icon}
         </div>
-        <h3 className="mt-[18px] text-lg font-semibold" style={{ color: "var(--text)" }}>
+        <h3 className="mt-[18px] text-[18px] font-semibold" style={{ color: "var(--ink)" }}>
           {heading}
         </h3>
-        <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--muted)" }}>
+        <p className="mt-2 text-[14px] leading-relaxed" style={{ color: "var(--ink-4)" }}>
           {body ?? (
             <>
               No jobs above your minimum score of{" "}
-              <span className="font-mono" style={{ color: "var(--text)" }}>
+              <span className="font-semibold" style={{ color: "var(--ink)" }}>
                 {minScore}
               </span>
               . Lower the threshold to see more.
@@ -906,12 +900,8 @@ function EmptyState({
         {action === "lower" && (
           <button
             onClick={onLower}
-            className="mt-[18px] h-[38px] rounded-[9px] border px-4 text-[13px] font-semibold"
-            style={{
-              background: "var(--surface)",
-              borderColor: "var(--border)",
-              color: "var(--label)",
-            }}
+            className="wm-ghost mt-[18px] h-[38px] rounded-[11px] border px-4 text-[13px] font-semibold"
+            style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
           >
             Lower threshold
           </button>
@@ -924,23 +914,26 @@ function EmptyState({
 function LoadingSkeleton() {
   return (
     <div
-      className="rounded-[14px] border p-5"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      className="rounded-[18px] border p-5"
+      style={{
+        background: "var(--surface-warm)",
+        borderColor: "var(--border-warm-hair)",
+      }}
     >
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-[11px]">
-          <div className="h-[34px] w-[34px] rounded-lg h-pulse" style={{ background: "var(--skeleton)" }} />
+          <div className="h-[34px] w-[34px] rounded-lg h-pulse" style={{ background: "#f0e3d3" }} />
           <div>
-            <div className="h-[15px] w-[200px] rounded h-pulse" style={{ background: "var(--skeleton)" }} />
-            <div className="mt-2 h-[11px] w-[90px] rounded h-pulse" style={{ background: "var(--skeleton-2)" }} />
+            <div className="h-[15px] w-[200px] rounded h-pulse" style={{ background: "#f0e3d3" }} />
+            <div className="mt-2 h-[11px] w-[90px] rounded h-pulse" style={{ background: "#f6ede1" }} />
           </div>
         </div>
-        <div className="h-[30px] w-[44px] rounded h-pulse" style={{ background: "var(--skeleton)" }} />
+        <div className="h-[30px] w-[44px] rounded h-pulse" style={{ background: "#f0e3d3" }} />
       </div>
       <div className="mt-[18px] flex flex-col gap-2.5">
-        <div className="h-[11px] w-full rounded h-pulse" style={{ background: "var(--skeleton-2)" }} />
-        <div className="h-[11px] w-full rounded h-pulse" style={{ background: "var(--skeleton-2)" }} />
-        <div className="h-[11px] w-[65%] rounded h-pulse" style={{ background: "var(--skeleton-2)" }} />
+        <div className="h-[11px] w-full rounded h-pulse" style={{ background: "#f6ede1" }} />
+        <div className="h-[11px] w-full rounded h-pulse" style={{ background: "#f6ede1" }} />
+        <div className="h-[11px] w-[65%] rounded h-pulse" style={{ background: "#f6ede1" }} />
       </div>
     </div>
   );
