@@ -20,7 +20,7 @@ type Section =
 
 const LINKS: { section: Section; href: string; label: string }[] = [
   { section: "review", href: APP_HOME, label: "Review" },
-  { section: "tracking", href: "/app/tracking", label: "Tracking" },
+  { section: "tracking", href: "/app/tracking", label: "Applications" },
   { section: "interviews", href: "/app/interviews", label: "Journeys" },
   { section: "companies", href: "/app/settings/companies", label: "Companies" },
 ];
@@ -28,7 +28,7 @@ const LINKS: { section: Section; href: string; label: string }[] = [
 /** The quiet label after the wordmark (design 16: "Hermes  Journeys"). */
 const SECTION_LABEL: Record<Section, string> = {
   review: "Review",
-  tracking: "Tracking",
+  tracking: "Applications",
   interviews: "Journeys",
   companies: "Companies",
   profile: "Profile",

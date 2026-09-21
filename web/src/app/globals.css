@@ -400,6 +400,21 @@ body {
   }
 }
 
+/* Tracking shelves + application review (facelift PR 7). Same contract. */
+.wm-tab {
+  color: var(--ink-4);
+  font-weight: 500;
+}
+.wm-tab:hover {
+  color: var(--ink);
+}
+.wm-tab-active {
+  color: var(--ink);
+  font-weight: 600;
+  background: var(--surface-warm);
+  box-shadow: 0 1px 3px rgba(94, 63, 39, 0.1);
+}
+
 /* Marketing (PR 3) and auth/onboarding (PR 5) routes: light-only, own ground,
    even in a dark-mode OS. */
 html:has(.mk, .wm) {

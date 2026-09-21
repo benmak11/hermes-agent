@@ -9,8 +9,10 @@ import { useEffect, useState } from "react";
 import { apiFetch, newRequestId } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { auth } from "@/lib/firebase";
-import type { Application, RoleBullets } from "@/lib/types";
+import type { Application, ApplicationStatus, RoleBullets } from "@/lib/types";
 import { TopNav } from "@/components/TopNav";
+import { MonoLabel } from "@/components/warm/Editable";
+import { GROUND, SERIF } from "@/components/warm/styles";
 import { statusPill } from "../../status";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080";
@@ -119,43 +121,43 @@ export default function ReviewPage() {
 
   if (loading || !user || isLoading) {
     return (
-      <>
+      <div className="wm" style={GROUND}>
         <TopNav section="applications" />
-        <main className="p-8" style={{ color: "var(--muted)" }}>
+        <main className="p-8 text-[13.5px]" style={{ color: "var(--ink-4)" }}>
           Loading…
         </main>
-      </>
+      </div>
     );
   }
 
   if (error || !app) {
     return (
-      <>
+      <div className="wm" style={GROUND}>
         <TopNav section="applications" />
-        <main className="p-8" style={{ color: "var(--danger)" }}>
+        <main className="p-8 text-[13.5px]" style={{ color: "var(--brick)" }}>
           Failed to load application: {String(error)}
         </main>
-      </>
+      </div>
     );
   }
 
   const pill = statusPill(app.status);
 
   return (
-    <>
+    <div className="wm" style={GROUND}>
       <TopNav section="applications" />
-      <main className="mx-auto w-full max-w-[820px] flex-1 px-8 py-7">
-        <div className="mb-6 flex items-start justify-between gap-5">
+      <main className="mx-auto w-full max-w-[920px] flex-1 px-7 py-7">
+        <div className="mb-5 flex items-start justify-between gap-5">
           <div>
             <h1
-              className="text-[22px] font-semibold tracking-tight"
-              style={{ color: "var(--text)" }}
+              className="text-[28px] font-normal leading-[1.15]"
+              style={{ fontFamily: SERIF, color: "var(--ink)" }}
             >
               {app.job_title ?? app.job_id}
             </h1>
             <div
-              className="mt-1 flex items-center gap-2.5 text-[13px]"
-              style={{ color: "var(--muted)" }}
+              className="mt-1.5 flex items-center gap-3 text-[13px]"
+              style={{ color: "var(--ink-4)" }}
             >
               <span>{app.job_company ?? ""}</span>
               {app.job_url && (
@@ -163,8 +165,7 @@ export default function ReviewPage() {
                   href={app.job_url}
                   target="_blank"
                   rel="noreferrer"
-                  className="font-medium"
-                  style={{ color: "var(--accent)" }}
+                  className="wm-link font-semibold"
                 >
                   View posting ↗
                 </a>
@@ -172,7 +173,7 @@ export default function ReviewPage() {
             </div>
           </div>
           <span
-            className="inline-flex flex-none items-center gap-1.5 rounded-full border px-[10px] py-[4px] font-mono text-[11px] font-semibold"
+            className="inline-flex flex-none items-center gap-[7px] rounded-full border px-3 py-[5px] text-[11.5px] font-bold"
             style={{
               background: pill.bg,
               borderColor: pill.border,
@@ -189,8 +190,8 @@ export default function ReviewPage() {
 
         {(app.status === "queued" || app.status === "tailoring") && (
           <Banner>
-            Tailoring in progress — generating your objective and resume variant.
-            This page updates automatically.
+            We&apos;re writing your objective and resume for this job. This page
+            updates on its own.
           </Banner>
         )}
         {/* "queued" belongs on the banner side, not here: there is no objective
@@ -205,14 +206,13 @@ export default function ReviewPage() {
               onSave={(t) => saveObjective.mutate(t)}
             />
 
-            <Section title="Resume diff — master vs tailored">
+            <Section title="What we changed on your resume">
               <p
-                className="mb-4 text-[13px] leading-relaxed"
-                style={{ color: "var(--muted)" }}
+                className="mb-4 text-[13px] leading-[1.6]"
+                style={{ color: "var(--ink-4)" }}
               >
-                Bullets are reordered by relevance to this JD and pruned per role.
-                Kept bullets show in their tailored order; dropped bullets are
-                dimmed.
+                We moved the lines that matter most for this job to the top, and
+                set the rest aside. Crossed-out lines won&apos;t be sent.
               </p>
               {app.tailored_bullets.map((t) => (
                 <RoleDiff
@@ -227,8 +227,8 @@ export default function ReviewPage() {
 
             {app.resume_variant_uri && (
               <p
-                className="mt-2 break-all font-mono text-[11px]"
-                style={{ color: "var(--subtle)" }}
+                className="mt-2 break-all text-[11px]"
+                style={{ color: "#a3927f" }}
               >
                 Resume: {app.resume_variant_uri}
               </p>
@@ -238,7 +238,7 @@ export default function ReviewPage() {
 
         <SubmissionPanel app={app} />
 
-        <div className="mt-8 flex items-center gap-3">
+        <div className="mt-[22px] flex flex-wrap items-center gap-3">
           <button
             onClick={() => {
               const verb = app.status === "failed" ? "Retry submitting" : "Submit";
@@ -253,8 +253,7 @@ export default function ReviewPage() {
               !(app.status === "ready_for_review" || app.status === "failed") ||
               submit.isPending
             }
-            className="inline-flex h-[40px] items-center gap-2 rounded-[9px] px-5 text-[13px] font-semibold disabled:opacity-40"
-            style={{ background: "var(--text)", color: "var(--surface)" }}
+            className="wm-cta inline-flex h-[46px] items-center gap-2 rounded-[13px] px-[22px] text-[14px] font-semibold"
           >
             ✓ {app.status === "failed" ? "Retry Submit" : "Approve & Submit"}
           </button>
@@ -265,18 +264,17 @@ export default function ReviewPage() {
               app.status === "submitting" ||
               regenerate.isPending
             }
-            className="inline-flex h-[40px] items-center gap-1.5 rounded-[9px] border px-4 text-[13px] font-semibold disabled:opacity-40"
-            style={{
-              background: "var(--surface)",
-              borderColor: "var(--border)",
-              color: "var(--label)",
-            }}
+            className="wm-ghost inline-flex h-[46px] items-center gap-1.5 rounded-[13px] border px-[18px] text-[14px] font-semibold disabled:opacity-40"
+            style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
           >
             ↻ Regenerate
           </button>
+          <span className="text-[12.5px]" style={{ color: "#a3927f" }}>
+            We&apos;ll ask you to confirm first. Nothing is sent until you say so.
+          </span>
         </div>
       </main>
-    </>
+    </div>
   );
 }
 
@@ -289,11 +287,11 @@ function Banner({
 }) {
   return (
     <div
-      className="mb-5 rounded-[10px] border px-4 py-3 text-[13px] leading-relaxed"
+      className="mb-5 rounded-[14px] border px-4 py-3 text-[13px] leading-[1.6]"
       style={{
-        background: danger ? "var(--warn-bg)" : "var(--surface-2)",
-        borderColor: danger ? "var(--warn-border)" : "var(--border)",
-        color: danger ? "var(--danger)" : "var(--label)",
+        background: danger ? "#fdf5f2" : "#fbf6ef",
+        borderColor: danger ? "#f0c8bd" : "#e8dacb",
+        color: danger ? "var(--brick)" : "var(--ink-3)",
       }}
     >
       {children}
@@ -310,12 +308,12 @@ function Section({
 }) {
   return (
     <section
-      className="mb-6 rounded-[14px] border p-[22px]"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      className="mb-3.5 rounded-[18px] border p-5"
+      style={{ background: "var(--surface-warm)", borderColor: "var(--border-warm-hair)" }}
     >
       <h2
-        className="mb-4 text-[15px] font-semibold tracking-tight"
-        style={{ color: "var(--text)" }}
+        className="mb-3 text-[15px] font-bold"
+        style={{ color: "var(--ink)" }}
       >
         {title}
       </h2>
@@ -336,30 +334,24 @@ function ObjectiveEditor({
   const [text, setText] = useState(initial);
   const dirty = text !== initial;
   return (
-    <Section title="Objective">
+    <Section title="Why you want this job — in your words">
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
         rows={4}
-        className="w-full resize-y rounded-[10px] border px-3.5 py-3 text-sm leading-relaxed outline-none"
-        style={{
-          background: "var(--surface-2)",
-          borderColor: "var(--border)",
-          color: "var(--text)",
-        }}
+        className="wm-input w-full resize-y rounded-[14px] px-3.5 py-3.5 text-[13.5px] leading-[1.65] outline-none"
       />
-      <div className="mt-3 flex items-center gap-3">
+      <div className="mt-3.5 flex items-center gap-3.5">
         <button
           onClick={() => onSave(text)}
           disabled={!dirty || saving}
-          className="inline-flex h-[34px] items-center rounded-[8px] px-4 text-[13px] font-semibold disabled:opacity-40"
-          style={{ background: "var(--text)", color: "var(--surface)" }}
+          className="wm-cta inline-flex h-[38px] items-center rounded-[11px] px-[18px] text-[13px] font-semibold"
         >
-          {saving ? "Saving…" : "Save objective"}
+          {saving ? "Saving…" : "Save this"}
         </button>
         {dirty && (
-          <span className="text-xs" style={{ color: "var(--muted)" }}>
-            Unsaved changes
+          <span className="text-[12.5px]" style={{ color: "#a3927f" }}>
+            Not saved yet — press Save this.
           </span>
         )}
       </div>
@@ -367,7 +359,16 @@ function ObjectiveEditor({
   );
 }
 
+/** Panel heading per post-review status (design 13 for `failed`). */
+const PANEL_TITLE: Partial<Record<ApplicationStatus, string>> = {
+  submitting: "Sending it in…",
+  submitted: "Application sent ✓",
+  responded: "They replied",
+  failed: "That one didn't go through",
+};
+
 function SubmissionPanel({ app }: { app: Application }) {
+  const failed = app.status === "failed";
   if (
     app.status === "ready_for_review" ||
     app.status === "tailoring" ||
@@ -386,79 +387,70 @@ function SubmissionPanel({ app }: { app: Application }) {
 
   return (
     <section
-      className="mt-6 rounded-[14px] border p-[22px]"
+      className="mt-6 rounded-[18px] border p-[22px]"
       style={{
-        background: "var(--surface)",
-        borderColor:
-          app.status === "failed" ? "var(--warn-border)" : "var(--border)",
+        background: failed ? "#fdf5f2" : "var(--surface-warm)",
+        borderColor: failed ? "#f0c8bd" : "var(--border-warm-hair)",
       }}
     >
-      <h2
-        className="mb-3 text-[15px] font-semibold tracking-tight"
-        style={{ color: "var(--text)" }}
-      >
-        {app.status === "submitting" && "Submitting application…"}
-        {app.status === "submitted" && "Application submitted ✓"}
-        {app.status === "responded" && "Employer responded"}
-        {app.status === "failed" && "Last attempt failed"}
+      <h2 className="mb-2 text-[16px] font-bold" style={{ color: "var(--ink)" }}>
+        {PANEL_TITLE[app.status]}
       </h2>
 
       {app.status === "failed" && (
         <>
-          <p className="mb-3 text-[13px]" style={{ color: "var(--danger)" }}>
-            {lastFailed?.note ?? "Unknown error."} You can retry, or apply manually
-            below with your tailored resume.
+          <p
+            className="mb-[18px] text-[13.5px] leading-[1.6]"
+            style={{ color: "var(--ink-3)" }}
+          >
+            {lastFailed?.note ?? "Unknown error."} We can try again, or you can
+            send it yourself with the resume we wrote.
           </p>
-          <div className="mb-4 flex flex-wrap items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2.5">
             {app.job_url && (
               <a
                 href={app.job_url}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex h-[34px] items-center gap-1.5 rounded-[8px] px-4 text-[13px] font-semibold"
-                style={{ background: "var(--text)", color: "var(--surface)" }}
+                className="wm-ghost inline-flex h-[40px] items-center gap-1.5 rounded-[12px] border px-[18px] text-[13.5px] font-semibold"
+                style={{ borderColor: "#e8dacb", color: "var(--ink)" }}
               >
-                Apply manually ↗
+                I&apos;ll do this one myself ↗
               </a>
             )}
             <button
               onClick={() =>
                 downloadResume(app.id, app.job_company ?? "company")
               }
-              className="inline-flex h-[34px] items-center gap-1.5 rounded-[8px] border px-4 text-[13px] font-semibold"
-              style={{
-                background: "var(--surface)",
-                borderColor: "var(--border)",
-                color: "var(--label)",
-              }}
+              className="wm-ghost inline-flex h-[40px] items-center gap-1.5 rounded-[12px] border px-[18px] text-[13.5px] font-semibold"
+              style={{ borderColor: "#e8dacb", color: "var(--ink)" }}
             >
-              ↓ Download tailored resume
+              ↓ Download my resume for this job
             </button>
           </div>
         </>
       )}
 
       {notes.length > 0 && (
-        <ol className="space-y-1.5">
-          {notes.map((e, i) => (
-            <li
-              key={i}
-              className="flex gap-2 font-mono text-xs"
-              style={{ color: "var(--muted)" }}
-            >
-              <span style={{ color: "var(--subtle)" }}>
-                {new Date(e.at).toLocaleTimeString()}
-              </span>
-              <span>{e.note}</span>
-            </li>
-          ))}
-        </ol>
+        <div className="mt-[18px]">
+          <MonoLabel>What happened</MonoLabel>
+          <ol className="mt-3 space-y-2">
+            {notes.map((e, i) => (
+              <li key={i} className="flex gap-3 text-[12.5px] leading-[1.6]">
+                <span className="min-w-[64px]" style={{ color: "#b0a08d" }}>
+                  {new Date(e.at).toLocaleTimeString()}
+                </span>
+                <span style={{ color: e.status === "failed" ? "var(--brick)" : "var(--ink-3)" }}>{e.note}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
       )}
 
       {app.confirmation?.screenshot_uri && (
         <p
-          className="mt-3 break-all font-mono text-[11px]"
-          style={{ color: "var(--subtle)" }}
+          className="mt-3 break-all text-[11px]"
+          style={{ color: "#a3927f" }}
         >
           Confirmation screenshot: {app.confirmation.screenshot_uri}
         </p>
@@ -479,29 +471,29 @@ function RoleDiff({
   return (
     <div className="mb-5 last:mb-0">
       <div
-        className="mb-2 text-[13px] font-semibold"
-        style={{ color: "var(--text)" }}
+        className="mb-2.5 text-[13px] font-bold"
+        style={{ color: "var(--ink)" }}
       >
         {tailored.role} — {tailored.company}
       </div>
-      <ul className="space-y-1.5">
+      <ul className="space-y-2">
         {tailored.bullets.map((b, i) => (
           <li
             key={`k-${i}`}
-            className="flex gap-2 text-[13px] leading-relaxed"
-            style={{ color: "var(--label)" }}
+            className="flex gap-2.5 text-[13px] leading-[1.6]"
+            style={{ color: "var(--ink-2)" }}
           >
-            <span style={{ color: "var(--good)" }}>+</span>
+            <span className="font-bold" style={{ color: "var(--sage)" }}>+</span>
             <span>{b}</span>
           </li>
         ))}
         {dropped.map((b, i) => (
           <li
             key={`d-${i}`}
-            className="flex gap-2 text-[13px] leading-relaxed line-through"
-            style={{ color: "var(--subtle)" }}
+            className="flex gap-2.5 text-[13px] leading-[1.6] line-through"
+            style={{ color: "#b0a08d" }}
           >
-            <span>−</span>
+            <span className="no-underline">−</span>
             <span>{b}</span>
           </li>
         ))}
