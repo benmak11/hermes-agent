@@ -19,8 +19,9 @@ import {
   type Stage,
 } from "@/lib/interviews";
 import type { Application } from "@/lib/types";
-import { avatarColor, initial } from "@/lib/ui";
-import { MonoLabel, PencilBtn } from "@/components/editable";
+import { initial } from "@/lib/ui";
+import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
+import { MonoLabel, PencilBtn } from "@/components/warm/Editable";
 import { TopNav } from "@/components/TopNav";
 
 type ListResponse = { applications: Application[] };
@@ -44,7 +45,7 @@ export default function InterviewsPage() {
     return (
       <>
         <TopNav section="interviews" />
-        <main className="p-8" style={{ color: "var(--muted)" }}>
+        <main className="p-8" style={{ color: "var(--ink-4)" }}>
           Loading…
         </main>
       </>
@@ -80,22 +81,22 @@ export default function InterviewsPage() {
           <div>
             <h1
               className="text-[22px] font-semibold tracking-tight"
-              style={{ color: "var(--text)" }}
+              style={{ color: "var(--ink)" }}
             >
               Interviews
             </h1>
             <div
-              className="mt-2 font-mono text-[12.5px] font-medium"
-              style={{ color: "var(--muted)" }}
+              className="mt-2 text-[12.5px] font-medium"
+              style={{ color: "var(--ink-4)" }}
             >
-              <b style={{ color: "var(--text)" }}>{applied}</b> applied ·{" "}
-              <b style={{ color: "var(--accent-text)" }}>{landed}</b> interviews
-              landed · <b style={{ color: "var(--text)" }}>{inProgress}</b> in
-              progress · <b style={{ color: "var(--good)" }}>{offers}</b>{" "}
+              <b style={{ color: "var(--ink)" }}>{applied}</b> applied ·{" "}
+              <b style={{ color: "var(--terracotta-d)" }}>{landed}</b> interviews
+              landed · <b style={{ color: "var(--ink)" }}>{inProgress}</b> in
+              progress · <b style={{ color: "var(--sage)" }}>{offers}</b>{" "}
               {offers === 1 ? "offer" : "offers"}
             </div>
           </div>
-          <span className="text-xs font-medium" style={{ color: "var(--subtle)" }}>
+          <span className="text-xs font-medium" style={{ color: "#a3927f" }}>
             logged by you — Hermes just keeps the score
           </span>
         </div>
@@ -103,9 +104,9 @@ export default function InterviewsPage() {
         {ordered.length === 0 && (
           <div
             className="rounded-[14px] border px-6 py-8 text-center"
-            style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+            style={{ background: "var(--surface-warm)", borderColor: "var(--border-warm-hair)" }}
           >
-            <p className="text-sm leading-relaxed" style={{ color: "var(--muted)" }}>
+            <p className="text-sm leading-relaxed" style={{ color: "var(--ink-4)" }}>
               Nothing logged yet. When an application turns into a recruiter
               call, log it below — stages, notes, and outcomes stay yours.
             </p>
@@ -141,8 +142,8 @@ export default function InterviewsPage() {
         <p className="mt-5 text-center">
           <Link
             href="/app/tracking"
-            className="font-mono text-[11px] font-medium"
-            style={{ color: "var(--subtle)" }}
+            className="text-[11px] font-medium"
+            style={{ color: "#a3927f" }}
           >
             application submissions ↗
           </Link>
@@ -159,23 +160,17 @@ function CardHeader({
   entry: JournalEntry;
   pill: React.ReactNode;
 }) {
-  const av = avatarColor(entry.company);
   return (
     <div className="flex items-center gap-3">
-      <span
-        className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-lg text-[15px] font-bold"
-        style={{ background: av.bg, color: av.color }}
-      >
-        {initial(entry.company)}
-      </span>
+      <CompanyTile initial={initial(entry.company)} hue={tileHue(entry.company)} />
       <div className="min-w-0 flex-1">
         <span
           className="text-[15.5px] font-semibold"
-          style={{ color: "var(--text)" }}
+          style={{ color: "var(--ink)" }}
         >
           {entry.role}
         </span>
-        <span className="text-[13px]" style={{ color: "var(--muted)" }}>
+        <span className="text-[13px]" style={{ color: "var(--ink-4)" }}>
           {" "}
           · {entry.company}
         </span>
@@ -200,17 +195,17 @@ function InProgressCard({
   return (
     <div
       className="rounded-[14px] border px-5 py-[18px]"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      style={{ background: "var(--surface-warm)", borderColor: "var(--border-warm-hair)" }}
     >
       <CardHeader
         entry={entry}
         pill={
           <span
-            className="inline-flex items-center rounded-full border px-2.5 py-[3px] font-mono text-[11px] font-semibold"
+            className="inline-flex items-center rounded-full border px-2.5 py-[3px] text-[11px] font-semibold"
             style={{
-              background: "var(--accent-bg)",
-              borderColor: "var(--accent-border)",
-              color: "var(--accent-text)",
+              background: "var(--terracotta-tint)",
+              borderColor: "var(--border-warm)",
+              color: "var(--terracotta-d)",
             }}
           >
             stage {pos.n} of {pos.of}
@@ -241,14 +236,14 @@ function InProgressCard({
       </div>
 
       <div
-        className="mt-3 flex items-center justify-between font-mono text-[11.5px] font-medium"
-        style={{ color: "var(--subtle)" }}
+        className="mt-3 flex items-center justify-between text-[11.5px] font-medium"
+        style={{ color: "#a3927f" }}
       >
         <span>
           {cur ? (
             <>
               after {cur.name.toLowerCase()}:{" "}
-              <span style={{ color: "var(--accent-text)" }}>
+              <span style={{ color: "var(--terracotta-d)" }}>
                 ✎ what went well / what to improve
               </span>
             </>
@@ -260,7 +255,7 @@ function InProgressCard({
           <button
             onClick={() => onPatch({ outcome: "offer" })}
             className="font-semibold"
-            style={{ color: "var(--good)" }}
+            style={{ color: "var(--sage)" }}
           >
             offer 🎉
           </button>
@@ -269,7 +264,7 @@ function InProgressCard({
               onPatch({ outcome: "rejected", endedAtStage: cur?.name })
             }
             className="font-semibold"
-            style={{ color: "var(--danger)" }}
+            style={{ color: "var(--brick)" }}
           >
             rejected
           </button>
@@ -286,9 +281,9 @@ function StageChip({ stage, onClick }: { stage: Stage; onClick: () => void }) {
         onClick={onClick}
         className="inline-flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1 text-xs font-semibold"
         style={{
-          background: "var(--good-bg)",
-          borderColor: "var(--good-border)",
-          color: "var(--good)",
+          background: "var(--sage-tint)",
+          borderColor: "#cfe0c8",
+          color: "var(--sage)",
         }}
       >
         ✓ {stage.name}
@@ -301,9 +296,9 @@ function StageChip({ stage, onClick }: { stage: Stage; onClick: () => void }) {
         onClick={onClick}
         className="inline-flex items-center gap-1.5 rounded-[7px] px-[11px] py-1 text-xs font-semibold"
         style={{
-          background: "var(--accent-bg)",
-          border: "2px solid var(--accent)",
-          color: "var(--accent-text)",
+          background: "var(--terracotta-tint)",
+          border: "2px solid var(--terracotta)",
+          color: "var(--terracotta-d)",
         }}
       >
         ● {stage.name}
@@ -315,9 +310,9 @@ function StageChip({ stage, onClick }: { stage: Stage; onClick: () => void }) {
       onClick={onClick}
       className="inline-flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1 text-xs font-semibold"
       style={{
-        background: "var(--surface-2)",
-        borderColor: "var(--border)",
-        color: "var(--subtle)",
+        background: "#f6ede1",
+        borderColor: "var(--border-warm-hair)",
+        color: "#a3927f",
       }}
     >
       {stage.name}
@@ -335,9 +330,9 @@ function AddStageChip({ onAdd }: { onAdd: (name: string) => void }) {
         onClick={() => setAdding(true)}
         className="inline-flex items-center gap-1 rounded-[7px] px-[11px] py-1 text-xs font-semibold"
         style={{
-          background: "var(--surface)",
-          border: "1px dashed var(--border-mid)",
-          color: "var(--accent)",
+          background: "var(--surface-warm)",
+          border: "1px dashed #d9c4a8",
+          color: "var(--terracotta)",
         }}
       >
         + Add stage
@@ -362,10 +357,10 @@ function AddStageChip({ onAdd }: { onAdd: (name: string) => void }) {
       placeholder="stage — e.g. Onsite · Thu 10am"
       className="h-[26px] w-48 rounded-[7px] px-2 text-xs outline-none"
       style={{
-        background: "var(--surface)",
-        border: "2px solid var(--accent)",
-        color: "var(--text)",
-        boxShadow: "0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent)",
+        background: "var(--surface-warm)",
+        border: "2px solid var(--terracotta)",
+        color: "var(--ink)",
+        boxShadow: "0 0 0 3px color-mix(in srgb, var(--terracotta) 13%, transparent)",
       }}
     />
   );
@@ -374,11 +369,11 @@ function AddStageChip({ onAdd }: { onAdd: (name: string) => void }) {
 // ---- Offer (celebration) ----
 
 const CONFETTI: React.CSSProperties[] = [
-  { top: 12, right: 150, width: 6, height: 11, borderRadius: 2, background: "var(--star)", transform: "rotate(24deg)", animationDelay: ".05s" },
+  { top: 12, right: 150, width: 6, height: 11, borderRadius: 2, background: "var(--honey)", transform: "rotate(24deg)", animationDelay: ".05s" },
   { top: 30, right: 112, width: 6, height: 6, borderRadius: "50%", background: "#60a5fa", animationDelay: ".15s" },
   { top: 10, right: 84, width: 6, height: 11, borderRadius: 2, background: "#4ade80", transform: "rotate(-18deg)", animationDelay: ".25s" },
   { top: 34, right: 52, width: 6, height: 11, borderRadius: 2, background: "#f472b6", transform: "rotate(40deg)", animationDelay: ".35s" },
-  { top: 14, right: 26, width: 6, height: 6, borderRadius: "50%", background: "var(--star)", animationDelay: ".45s" },
+  { top: 14, right: 26, width: 6, height: 6, borderRadius: "50%", background: "var(--honey)", animationDelay: ".45s" },
 ];
 
 function OfferCard({
@@ -393,7 +388,7 @@ function OfferCard({
   return (
     <div
       className="relative overflow-hidden rounded-[14px] border px-5 py-[18px]"
-      style={{ background: "var(--offer-bg)", borderColor: "var(--good-border)" }}
+      style={{ background: "#f6faf3", borderColor: "#cfe0c8" }}
     >
       {CONFETTI.map((style, i) => (
         <span key={i} className="h-popin absolute" style={{ ...style, animationDuration: ".5s" }} />
@@ -403,8 +398,8 @@ function OfferCard({
         entry={entry}
         pill={
           <span
-            className="h-popin inline-flex items-center gap-1.5 rounded-full px-3 py-1 font-mono text-[11px] font-bold tracking-wide"
-            style={{ background: "var(--good)", color: "var(--surface)" }}
+            className="h-popin inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold tracking-wide"
+            style={{ background: "var(--sage)", color: "var(--surface-warm)" }}
           >
             OFFER 🎉
           </span>
@@ -418,9 +413,9 @@ function OfferCard({
               key={s.id}
               className="inline-flex items-center gap-1.5 rounded-[7px] px-[11px] py-1 text-xs font-semibold"
               style={{
-                background: "var(--good)",
-                border: "1px solid var(--good)",
-                color: "var(--surface)",
+                background: "var(--sage)",
+                border: "1px solid var(--sage)",
+                color: "var(--surface-warm)",
               }}
             >
               ✓ {s.name}
@@ -432,9 +427,9 @@ function OfferCard({
               key={s.id}
               className="inline-flex items-center gap-1.5 rounded-[7px] border px-[11px] py-1 text-xs font-semibold"
               style={{
-                background: "var(--good-bg)",
-                borderColor: "var(--good-border)",
-                color: "var(--good)",
+                background: "var(--sage-tint)",
+                borderColor: "#cfe0c8",
+                color: "var(--sage)",
               }}
             >
               ✓ {s.name}
@@ -443,8 +438,8 @@ function OfferCard({
         )}
         {entry.sessions.length > 0 && (
           <span
-            className="font-mono text-[11px] font-medium"
-            style={{ color: "var(--subtle)" }}
+            className="text-[11px] font-medium"
+            style={{ color: "#a3927f" }}
           >
             →
           </span>
@@ -452,11 +447,11 @@ function OfferCard({
         {entry.sessions.map((s, i) => (
           <span
             key={i}
-            className="rounded-md border px-2 py-[3px] font-mono text-[11px] font-medium"
+            className="rounded-md border px-2 py-[3px] text-[11px] font-medium"
             style={{
-              background: "var(--surface)",
-              borderColor: "var(--offer-divider)",
-              color: "var(--label)",
+              background: "var(--surface-warm)",
+              borderColor: "#cfe0c8",
+              color: "var(--ink-2)",
             }}
           >
             {s}
@@ -467,11 +462,11 @@ function OfferCard({
         />
       </div>
 
-      <div className="my-3.5 h-px" style={{ background: "var(--offer-divider)" }} />
+      <div className="my-3.5 h-px" style={{ background: "#cfe0c8" }} />
 
       <ReflectionBlock
         label="Reflection — what carried it"
-        color="var(--good)"
+        color="var(--sage)"
         value={entry.reflection ?? ""}
         placeholder="What prep or stories made the difference?"
         onSave={(reflection) => onPatch({ reflection })}
@@ -487,11 +482,11 @@ function SessionAdder({ onAdd }: { onAdd: (name: string) => void }) {
     return (
       <button
         onClick={() => setAdding(true)}
-        className="rounded-md px-2 py-[3px] font-mono text-[11px] font-semibold"
+        className="rounded-md px-2 py-[3px] text-[11px] font-semibold"
         style={{
-          background: "var(--surface)",
-          border: "1px dashed var(--good-border)",
-          color: "var(--good)",
+          background: "var(--surface-warm)",
+          border: "1px dashed #cfe0c8",
+          color: "var(--sage)",
         }}
       >
         + session
@@ -514,11 +509,11 @@ function SessionAdder({ onAdd }: { onAdd: (name: string) => void }) {
       }}
       onBlur={commit}
       placeholder="session…"
-      className="h-[24px] w-36 rounded-md px-2 font-mono text-[11px] outline-none"
+      className="h-[24px] w-36 rounded-md px-2 text-[11px] outline-none"
       style={{
-        background: "var(--surface)",
-        border: "2px solid var(--good)",
-        color: "var(--text)",
+        background: "var(--surface-warm)",
+        border: "2px solid var(--sage)",
+        color: "var(--ink)",
       }}
     />
   );
@@ -550,17 +545,17 @@ function RejectedCard({
   return (
     <div
       className="rounded-[14px] border px-5 py-[18px]"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      style={{ background: "var(--surface-warm)", borderColor: "var(--border-warm-hair)" }}
     >
       <CardHeader
         entry={entry}
         pill={
           <span
-            className="inline-flex items-center rounded-full border px-2.5 py-[3px] font-mono text-[11px] font-semibold"
+            className="inline-flex items-center rounded-full border px-2.5 py-[3px] text-[11px] font-semibold"
             style={{
-              background: "var(--danger-bg)",
-              borderColor: "var(--danger-border)",
-              color: "var(--danger)",
+              background: "#fdf5f2",
+              borderColor: "#f0c8bd",
+              color: "var(--brick)",
             }}
           >
             ended at {ended?.name.toLowerCase() ?? "—"} · stage {endedIdx + 1} of{" "}
@@ -573,13 +568,13 @@ function RejectedCard({
         <div
           className="rounded-[10px] border px-3.5 py-3"
           style={{
-            background: "var(--good-panel-bg)",
-            borderColor: "var(--good-panel-border)",
+            background: "#f6faf3",
+            borderColor: "#cfe0c8",
           }}
         >
           <ReflectionBlock
             label="What went well"
-            color="var(--good)"
+            color="var(--sage)"
             value={ended?.wentWell ?? ""}
             placeholder="What worked in this process?"
             onSave={(wentWell) => patchStageNotes({ wentWell })}
@@ -588,13 +583,13 @@ function RejectedCard({
         <div
           className="rounded-[10px] border px-3.5 py-3"
           style={{
-            background: "var(--danger-panel-bg)",
-            borderColor: "var(--danger-panel-border)",
+            background: "#fdf5f2",
+            borderColor: "#f0c8bd",
           }}
         >
           <ReflectionBlock
             label="What to improve"
-            color="var(--danger)"
+            color="var(--brick)"
             value={ended?.toImprove ?? ""}
             placeholder="What would you practice before the next one?"
             onSave={(toImprove) => patchStageNotes({ toImprove })}
@@ -603,8 +598,8 @@ function RejectedCard({
       </div>
 
       <div
-        className="mt-3 font-mono text-[11.5px] font-medium"
-        style={{ color: "var(--subtle)" }}
+        className="mt-3 text-[11.5px] font-medium"
+        style={{ color: "#a3927f" }}
       >
         notes saved per stage · visible next time a similar role comes up
       </div>
@@ -654,11 +649,11 @@ function ReflectionBlock({
           }}
           className="mt-1.5 w-full rounded-lg p-2 text-[13px] leading-relaxed outline-none"
           style={{
-            background: "var(--surface)",
-            border: "2px solid var(--accent)",
-            color: "var(--text)",
+            background: "var(--surface-warm)",
+            border: "2px solid var(--terracotta)",
+            color: "var(--ink)",
             boxShadow:
-              "0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent)",
+              "0 0 0 3px color-mix(in srgb, var(--terracotta) 13%, transparent)",
           }}
         />
       </div>
@@ -671,7 +666,7 @@ function ReflectionBlock({
         <MonoLabel color={color}>{label}</MonoLabel>
         <p
           className="mt-1.5 text-[13px] leading-relaxed"
-          style={{ color: value ? "var(--label)" : "var(--subtle)" }}
+          style={{ color: value ? "var(--ink-2)" : "#a3927f" }}
         >
           {value || placeholder}
         </p>
@@ -704,22 +699,22 @@ function AddEntry({
   }
 
   const inputStyle: React.CSSProperties = {
-    background: "var(--surface)",
-    border: "1px solid var(--border)",
-    color: "var(--text)",
+    background: "var(--surface-warm)",
+    border: "1px solid var(--border-warm-hair)",
+    color: "var(--ink)",
   };
 
   return (
     <div
       className="mt-3.5 flex flex-wrap items-center gap-2.5 rounded-[14px] px-5 py-4"
       style={{
-        border: "1px dashed var(--border-mid)",
-        background: "color-mix(in srgb, var(--surface) 60%, transparent)",
+        border: "1px dashed #d9c4a8",
+        background: "color-mix(in srgb, var(--surface-warm) 60%, transparent)",
       }}
     >
       <span
-        className="font-mono text-[11px] font-semibold uppercase"
-        style={{ color: "var(--subtle)", letterSpacing: "0.05em" }}
+        className="text-[11px] font-semibold uppercase"
+        style={{ color: "#a3927f", letterSpacing: "0.05em" }}
       >
         Log interview
       </span>
@@ -742,7 +737,7 @@ function AddEntry({
         onClick={commit}
         disabled={!company.trim() || !role.trim()}
         className="h-[34px] rounded-lg px-3.5 text-[12.5px] font-semibold disabled:opacity-40"
-        style={{ background: "var(--text)", color: "var(--surface)" }}
+        style={{ background: "var(--ink)", color: "var(--surface-warm)" }}
       >
         + Add
       </button>

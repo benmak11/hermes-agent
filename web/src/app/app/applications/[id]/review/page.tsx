@@ -12,7 +12,7 @@ import { auth } from "@/lib/firebase";
 import type { Application, ApplicationStatus, RoleBullets } from "@/lib/types";
 import { TopNav } from "@/components/TopNav";
 import { MonoLabel } from "@/components/warm/Editable";
-import { GROUND, SERIF } from "@/components/warm/styles";
+import { SERIF } from "@/components/warm/styles";
 import { statusPill } from "../../status";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080";
@@ -121,30 +121,30 @@ export default function ReviewPage() {
 
   if (loading || !user || isLoading) {
     return (
-      <div className="wm" style={GROUND}>
+      <>
         <TopNav section="applications" />
         <main className="p-8 text-[13.5px]" style={{ color: "var(--ink-4)" }}>
           Loading…
         </main>
-      </div>
+      </>
     );
   }
 
   if (error || !app) {
     return (
-      <div className="wm" style={GROUND}>
+      <>
         <TopNav section="applications" />
         <main className="p-8 text-[13.5px]" style={{ color: "var(--brick)" }}>
           Failed to load application: {String(error)}
         </main>
-      </div>
+      </>
     );
   }
 
   const pill = statusPill(app.status);
 
   return (
-    <div className="wm" style={GROUND}>
+    <>
       <TopNav section="applications" />
       <main className="mx-auto w-full max-w-[920px] flex-1 px-7 py-7">
         <div className="mb-5 flex items-start justify-between gap-5">
@@ -274,7 +274,7 @@ export default function ReviewPage() {
           </span>
         </div>
       </main>
-    </div>
+    </>
   );
 }
 

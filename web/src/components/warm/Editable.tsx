@@ -4,9 +4,9 @@
 
 import { useState } from "react";
 
-// Warm-skinned fork of components/editable.tsx (facelift PR 5). Same exports,
-// props and logic; only the palette differs. The grey original stays for
-// /app/profile and /app/interviews until PR 6–8 switch them over.
+// Warm-skinned editable primitives (facelift PR 5; the grey original,
+// components/editable.tsx, was deleted in PR 8 once /app/profile and
+// /app/interviews switched over).
 
 /** 10.5px uppercase micro-label (card/field headers). */
 export function MonoLabel({

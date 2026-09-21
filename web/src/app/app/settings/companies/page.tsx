@@ -12,7 +12,10 @@ import type {
   CompanyActionType,
   CompanyEntry,
 } from "@/lib/types";
-import { avatarColor, initial } from "@/lib/ui";
+import { initial } from "@/lib/ui";
+import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
+import { Pill } from "@/components/warm/Pill";
+import { SERIF } from "@/components/warm/styles";
 import { TopNav } from "@/components/TopNav";
 
 type Tab = "unvetted" | "known" | "excluded" | "blocklist";
@@ -84,34 +87,35 @@ export default function CompaniesPage() {
   }, [tab, data, search]);
 
   if (loading || !user) {
-    return <div className="p-8" style={{ color: "var(--muted)" }}>Loading…</div>;
+    return <div className="p-8 text-[13.5px]" style={{ color: "var(--ink-4)" }}>Loading…</div>;
   }
 
   return (
     <>
       <TopNav section="companies" />
-      <main className="mx-auto w-full max-w-[880px] flex-1 px-8 py-7">
+      <main className="mx-auto w-full max-w-[900px] flex-1 px-7 py-7">
         <h1
-          className="text-[22px] font-semibold tracking-tight"
-          style={{ color: "var(--text)" }}
+          className="text-[28px] font-normal leading-[1.15]"
+          style={{ fontFamily: SERIF, color: "var(--ink)" }}
         >
-          Companies
+          Where we look
         </h1>
-        <p className="mt-[7px] text-[13px]" style={{ color: "var(--muted)" }}>
-          Control which companies Hermes scrapes for new postings.
+        <p className="mt-2 text-[13.5px]" style={{ color: "var(--ink-4)" }}>
+          Choose which companies we watch for new postings. Block the ones you
+          wouldn&apos;t work at.
         </p>
 
         <div
-          className="mt-[18px] inline-flex gap-0.5 rounded-[10px] p-[3px]"
-          style={{ background: "var(--surface-2)" }}
+          className="mt-[18px] inline-flex flex-wrap gap-[3px] rounded-[14px] p-1"
+          style={{ background: "#f6ede1" }}
         >
-          <TabBtn active={tab === "unvetted"} onClick={() => setTab("unvetted")} label="Unvetted" count={counts.unvetted} />
-          <TabBtn active={tab === "known"} onClick={() => setTab("known")} label="Known" count={counts.known} />
+          <TabBtn active={tab === "unvetted"} onClick={() => setTab("unvetted")} label="New finds" count={counts.unvetted} />
+          <TabBtn active={tab === "known"} onClick={() => setTab("known")} label="Watching" count={counts.known} />
           <TabBtn active={tab === "excluded"} onClick={() => setTab("excluded")} label="Excluded by me" count={counts.excluded} />
-          <TabBtn active={tab === "blocklist"} onClick={() => setTab("blocklist")} label="Blocklist" count={counts.blocklist} />
+          <TabBtn active={tab === "blocklist"} onClick={() => setTab("blocklist")} label="Blocked for everyone" count={counts.blocklist} />
         </div>
 
-        <p className="mt-2.5 text-[13px]" style={{ color: "var(--subtle)" }}>
+        <p className="mt-2.5 text-[13px]" style={{ color: "var(--ink-4)" }}>
           {tab === "blocklist"
             ? "Blocked for everyone — part of the shared company list, not something you set."
             : tab === "excluded"
@@ -120,21 +124,16 @@ export default function CompaniesPage() {
         </p>
 
         {tab !== "blocklist" && (
-          <div className="mt-[18px] flex items-center justify-between">
+          <div className="mt-[18px] flex flex-wrap items-center justify-between gap-3">
             <input
               placeholder="Search companies…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="h-9 w-[260px] rounded-[9px] border px-3 text-[13px] outline-none"
-              style={{
-                background: "var(--surface)",
-                borderColor: "var(--border)",
-                color: "var(--text)",
-              }}
+              className="wm-input h-[38px] w-[250px] rounded-[12px] px-[13px] text-[13px] outline-none"
             />
             <span
-              className="font-mono text-[11px] font-medium uppercase tracking-wider"
-              style={{ color: "var(--subtle)" }}
+              className="text-[11.5px] font-semibold uppercase tracking-[0.06em]"
+              style={{ color: "#a3927f" }}
             >
               {Object.keys(
                 (tab === "unvetted"
@@ -149,78 +148,70 @@ export default function CompaniesPage() {
         )}
 
         <div
-          className="mt-3.5 overflow-hidden rounded-xl border"
-          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+          className="mt-[14px] overflow-hidden rounded-[18px] border"
+          style={{ background: "var(--surface-warm)", borderColor: "var(--border-warm-hair)" }}
         >
           {tab === "blocklist" ? (
             (data?.blocklist.length ?? 0) === 0 ? (
-              <p className="p-3 text-sm" style={{ color: "var(--muted)" }}>
-                Empty.
+              <p className="p-4 text-[13.5px]" style={{ color: "var(--ink-4)" }}>
+                Nothing here yet.
               </p>
             ) : (
               data?.blocklist.map((b) => (
                 <div
                   key={`${b.platform}-${b.slug}`}
-                  className="flex items-center justify-between border-b p-3 text-sm last:border-0"
-                  style={{ borderColor: "var(--divider)" }}
+                  className="flex items-center justify-between border-b px-[18px] py-[13px] text-[14px] last:border-0"
+                  style={{ borderColor: "#f4ebdf" }}
                 >
-                  <span style={{ color: "var(--text)" }}>
+                  <span style={{ color: "var(--ink)" }}>
                     {b.slug}{" "}
-                    <span style={{ color: "var(--subtle)" }}>({b.platform})</span>
+                    <span style={{ color: "#a3927f" }}>({b.platform})</span>
                   </span>
-                  <span className="text-[13px]" style={{ color: "var(--muted)" }}>
+                  <span className="text-[12.5px]" style={{ color: "var(--ink-4)" }}>
                     {b.reason} · {b.blocked_at}
                   </span>
                 </div>
               ))
             )
           ) : rows.length === 0 ? (
-            <p className="p-3 text-sm" style={{ color: "var(--muted)" }}>
+            <p className="p-4 text-[13.5px]" style={{ color: "var(--ink-4)" }}>
               {tab === "excluded"
                 ? "You haven't excluded any companies."
-                : "No companies."}
+                : "Nothing here yet."}
             </p>
           ) : (
             (showAll ? rows : rows.slice(0, 30)).map((r) => {
-              const av = avatarColor(r.slug);
               return (
                 <div
                   key={`${r.platform}-${r.slug}`}
-                  className="flex items-center justify-between border-b px-4 py-[11px] last:border-0"
-                  style={{ borderColor: "var(--divider)" }}
+                  className="flex flex-wrap items-center justify-between gap-2 border-b px-[18px] py-[13px] last:border-0"
+                  style={{ borderColor: "#f4ebdf" }}
                 >
-                  <div className="flex items-center gap-[11px]">
+                  <div className="flex items-center gap-3">
+                    <CompanyTile initial={initial(r.slug)} hue={tileHue(r.slug)} size="sm" />
                     <span
-                      className="flex h-7 w-7 items-center justify-center rounded-[7px] text-xs font-bold"
-                      style={{ background: av.bg, color: av.color }}
-                    >
-                      {initial(r.slug)}
-                    </span>
-                    <span
-                      className="text-sm font-medium"
+                      className="text-[14px] font-semibold"
                       style={{
                         color:
-                          r.paused || r.excluded ? "var(--subtle)" : "var(--text)",
+                          r.paused || r.excluded ? "#b0a08d" : "var(--ink)",
                         textDecoration:
                           r.paused || r.excluded ? "line-through" : "none",
                       }}
                     >
                       {r.slug}
                     </span>
-                    <span className="font-mono text-[11px]" style={{ color: "var(--subtle)" }}>
+                    <span className="text-[11.5px]" style={{ color: "#a3927f" }}>
                       {r.platform}
                     </span>
                     {r.paused && (
-                      <span className="font-mono text-[11px]" style={{ color: "var(--subtle)" }}>
-                        paused for everyone
-                      </span>
+                      <Pill tone="muted">paused for everyone</Pill>
                     )}
                   </div>
                   <div className="flex gap-2">
                     {r.excluded ? (
                       // No un-exclude endpoint exists yet, so this is a state,
                       // not a disabled button pretending to be one.
-                      <span className="text-[13px]" style={{ color: "var(--muted)" }}>
+                      <span className="text-[13px]" style={{ color: "var(--ink-4)" }}>
                         Excluded by you
                       </span>
                     ) : (
@@ -249,14 +240,13 @@ export default function CompaniesPage() {
 
         {tab !== "blocklist" && !showAll && rows.length > 30 && (
           <div
-            className="mt-3.5 text-center text-[13px] font-medium"
-            style={{ color: "var(--muted)" }}
+            className="mt-4 text-center text-[13px]"
+            style={{ color: "var(--ink-4)" }}
           >
             Showing 30 of {rows.length} ·{" "}
             <button
               onClick={() => setShowAll(true)}
-              className="font-semibold"
-              style={{ color: "var(--accent)" }}
+              className="wm-link font-semibold"
             >
               Show all
             </button>
@@ -281,16 +271,14 @@ function TabBtn({
   return (
     <button
       onClick={onClick}
-      className="inline-flex items-center gap-[7px] rounded-[7px] px-[13px] py-1.5 text-[13px]"
-      style={{
-        background: active ? "var(--surface)" : "transparent",
-        color: active ? "var(--text)" : "var(--label)",
-        fontWeight: active ? 600 : 500,
-        boxShadow: active ? "0 1px 2px rgba(0,0,0,0.06)" : "none",
-      }}
+      className={
+        active
+          ? "wm-tab wm-tab-active inline-flex items-center gap-[7px] rounded-[11px] px-[15px] py-[7px] text-[13px]"
+          : "wm-tab inline-flex items-center gap-[7px] rounded-[11px] px-[15px] py-[7px] text-[13px]"
+      }
     >
       {label}
-      <span className="font-mono text-[11px] font-semibold" style={{ color: "var(--subtle)" }}>
+      <span className="text-[11.5px]" style={{ color: "#a3927f" }}>
         {count}
       </span>
     </button>
@@ -309,21 +297,13 @@ function RowBtn({
   danger?: boolean;
   disabled?: boolean;
 }) {
-  const base =
-    "h-[30px] rounded-[7px] px-[13px] text-xs disabled:opacity-50 disabled:cursor-default";
-  const style: React.CSSProperties = danger
-    ? {
-        background: "var(--surface)",
-        border: "1px solid var(--danger-border)",
-        color: "var(--danger)",
-        fontWeight: 500,
-      }
-    : {
-        background: "var(--surface)",
-        border: "1px solid var(--border)",
-        color: "var(--label)",
-        fontWeight: 500,
-      };
+  // `.wm-danger` owns every colour of the danger branch (no inline style);
+  // the ghost keeps its border colour inline because `.wm-ghost` only owns
+  // the background.
+  const base = `${danger ? "wm-danger" : "wm-ghost border"} h-[32px] rounded-[10px] px-[13px] text-[12px] font-semibold disabled:opacity-50 disabled:cursor-default`;
+  const style: React.CSSProperties | undefined = danger
+    ? undefined
+    : { borderColor: "#e8dacb", color: "var(--ink-2)" };
   return (
     <button onClick={onClick} disabled={disabled} className={base} style={style}>
       {children}
