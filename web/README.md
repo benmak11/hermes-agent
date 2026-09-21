@@ -49,13 +49,13 @@ also carries the app nav (`wm-nav-active`, `wm-muted-link`, `wm-nav-quiet`,
 a `.wm-*` class changes on hover is never also set inline (inline would win
 and kill the hover).
 
-The facelift reaches `/app` in stages. `TopNav` (the 60px warm header) is
-shared, so it is warm on every `/app` page already; the review page (`/app`),
-tracking (`/app/tracking`) and the application review page
-(`/app/applications/[id]/review`) each wrap their body in the warm ground
-(`GROUND` from `warm/styles.ts`, page-scoped rather than in `app/layout.tsx`
-so the grey pages keep their dark-mode ramp). Profile, companies and
-interviews keep their grey bodies under the warm nav until PR 8 re-skins them.
+Every `/app` page renders on the warm ground: `app/app/layout.tsx` (the auth
+gate) wraps its children in `GROUND` from `warm/styles.ts`, and
+`(auth)/layout.tsx` does the same for login / signup / onboarding, so pages no
+longer paint their own ground. There are no grey pages left; `/app/interviews`
+carries a mechanical warm-token substitution until its own re-skin (PR 9).
+The same `.wm-*` block also holds `wm-danger` (profile's Delete account,
+companies' Block).
 
 ## Stack
 
@@ -85,35 +85,37 @@ npm run build  # production build
 
 ## Warm design system (facelift, in progress)
 
-`globals.css` carries a second, light-only token set next to the grey/blue
-ramp: `--sand`, `--cream`, `--ink`…`--ink-4`, `--terracotta*`, `--sage*`,
-`--honey*`, `--brick`, plus `--surface-warm` / `--border-warm` /
-`--border-warm-hair`. The last three are suffixed because `--surface` and
-`--border` already name the grey ones. `@keyframes jpulse` (the journey
-track's halo) is distinct from `hpulse`, the opacity blink behind `.h-pulse`
-on the review page. `--font-jakarta` and `--font-instrument` are loaded in
-`layout.tsx` as variables (preloaded, consumed by the marketing site);
-`--font-sans` is still Geist.
+`globals.css` carries one light-only token set: `--sand`, `--cream`,
+`--ink`…`--ink-4`, `--terracotta*`, `--sage*`, `--honey*`, `--brick`, plus
+`--surface-warm` / `--border-warm` / `--border-warm-hair`. The grey/blue ramp
+and its `prefers-color-scheme: dark` mirror were deleted in facelift PR 8
+(there is no dark mode; `src/app/theme.test.ts` pins that, along with "no
+source file reads a grey token"). The `-warm` suffix on the last three is a
+leftover from when `--surface` and `--border` named grey tokens; renaming is
+deferred. `@keyframes jpulse` (the journey track's halo) is distinct from
+`hpulse`, the opacity blink behind `.h-pulse` on the review page.
+`--font-jakarta` and `--font-instrument` are loaded in `layout.tsx`; Jakarta
+is the body face and Tailwind's `--font-sans`, Instrument Serif is opted into
+per heading via `SERIF`. Geist is gone.
 
 `src/components/warm/` holds the shared primitives (`JourneyTrack`, `Pill`,
 `CompanyTile`, `MatchChip`, `Editable`), the style constants in `styles.ts`
 (`SANS`, `SERIF`, `CARD`, `GROUND` — a copy of marketing's two font stacks,
 because the auth screens must not import from `components/marketing/`; `GROUND`
-is the full-height gradient ground an app screen wraps itself in), and the pure
+is the full-height gradient ground the two layouts paint), and the pure
 helper `journeyStages.ts` — not `journeyTrack.ts`, which would shadow
 `JourneyTrack.tsx` on a case-insensitive filesystem. They use warm tokens
 only (Tailwind layout utilities are fine; the palette is not) and must not
 import `@/lib/firebase`, `@/lib/api`, `next/navigation`, or any CSS.
 
-`warm/Editable.tsx` is a warm-skinned fork of `components/editable.tsx`
-(same exports, props and logic); the grey original is kept for `/app/profile`
-and `/app/interviews` until the facelift reaches them and deletes it.
+`warm/Editable.tsx` holds the editable primitives (`MonoLabel`, `Divider`,
+`PencilBtn`, `InlineText`, `ChipEditor`) used by profile and interviews; the
+grey `components/editable.tsx` it forked from is gone.
 
-`src/lib/ui.ts` likewise carries both palettes: the warm trio
-(`scoreColorWarm`, `recPillWarm`, `barColorWarm`) feeds the review and
-tracking pages, while the grey trio (`scoreColor`, `recPill`, `barColor`) has
-no consumer left (only `ui.test.ts` still pins it) and `avatarColor` remains
-for profile, companies and interviews, until PR 8 deletes the grey set.
+`src/lib/ui.ts` carries the warm trio (`scoreColor`, `recPill`, `barColor`)
+for the review and tracking pages, plus `initial` and `resolveUserAvatar`.
+Company monograms come from `warm/CompanyTile` (`tileHue` is the hash the
+old `avatarColor` used).
 `app/app/applications/status.ts` holds both application mappers — the review
 header pill (`statusPill`) and the tracking strip (`pipelineView`) — as pure
 functions covered by `status.test.ts`.
@@ -124,6 +126,7 @@ npm test       # vitest, node environment — no jsdom, no browser
 
 Tests stay pure: import only `src/lib/*`, `src/components/warm/*` and
 `src/components/marketing/*`, and render components through
-`react-dom/server`'s `renderToStaticMarkup`. Components that only read auth
+`react-dom/server`'s `renderToStaticMarkup` (`src/app/theme.test.ts` reads
+`globals.css` and the source tree with `node:fs` and imports no app code). Components that only read auth
 import `useAuth` from `src/lib/authContext.ts` (no Firebase import) so tests
 can wrap them in `AuthContext.Provider`; `src/lib/auth.tsx` re-exports it.

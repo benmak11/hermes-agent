@@ -10,10 +10,10 @@ import { Suspense, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { Application, DecideValue, Job } from "@/lib/types";
-import { initial, recPillWarm, scoreColorWarm } from "@/lib/ui";
+import { initial, recPill, scoreColor } from "@/lib/ui";
 import { TopNav } from "@/components/TopNav";
 import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
-import { GROUND, SERIF } from "@/components/warm/styles";
+import { SERIF } from "@/components/warm/styles";
 import { pipelineView } from "../applications/status";
 
 type AppsResponse = { applications: Application[] };
@@ -23,11 +23,11 @@ type Tab = "pipeline" | "starred" | "skipped";
 export default function TrackingPage() {
   // useSearchParams needs a Suspense boundary for prerendering.
   return (
-    <div className="wm" style={GROUND}>
+    <>
       <Suspense fallback={<div className="p-8 text-[13.5px]" style={{ color: "var(--ink-4)" }}>Loading…</div>}>
         <TrackingInner />
       </Suspense>
-    </div>
+    </>
   );
 }
 
@@ -305,8 +305,8 @@ function DecidedList({
       style={{ background: "var(--surface-warm)", borderColor: "var(--border-warm-hair)" }}
     >
       {jobs.map((job) => {
-        const color = scoreColorWarm(job.match.recommendation);
-        const pill = recPillWarm(job.match.recommendation);
+        const color = scoreColor(job.match.recommendation);
+        const pill = recPill(job.match.recommendation);
         return (
           <div
             key={job.id}

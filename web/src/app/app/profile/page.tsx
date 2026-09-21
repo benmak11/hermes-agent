@@ -19,23 +19,25 @@ import type {
   ProfileResponse,
   RemoteStyle,
 } from "@/lib/types";
-import { avatarColor, initial, resolveUserAvatar } from "@/lib/ui";
+import { initial, resolveUserAvatar } from "@/lib/ui";
+import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
 import {
   ChipEditor,
   Divider,
   InlineText,
   MonoLabel,
   PencilBtn,
-} from "@/components/editable";
+} from "@/components/warm/Editable";
+import { SERIF } from "@/components/warm/styles";
 import { TopNav } from "@/components/TopNav";
 
 const REMOTE_OPTIONS: RemoteStyle[] = ["remote", "hybrid", "onsite"];
 
 /**
- * Profile (mock 09): opened from the avatar. Identity band + two-column grid —
- * resume & match preferences left, summary / skills / experience right, all
- * editable in place. Every edit patches profiles/{uid} (autosaved) and re-runs
- * Matching on the next pass.
+ * Profile (Warm Flow 14): opened from the avatar. Identity band + two-column
+ * grid — resume & match preferences left, summary / skills / experience right,
+ * all editable in place. Every edit patches profiles/{uid} (autosaved) and is
+ * read on the next discovery pass.
  */
 export default function ProfilePage() {
   const { user, loading } = useAuth();
@@ -83,7 +85,7 @@ export default function ProfilePage() {
     return (
       <>
         <TopNav section="profile" />
-        <main className="p-8" style={{ color: "var(--muted)" }}>
+        <main className="p-8 text-[13.5px]" style={{ color: "var(--ink-4)" }}>
           Loading…
         </main>
       </>
@@ -93,7 +95,7 @@ export default function ProfilePage() {
     return (
       <>
         <TopNav section="profile" />
-        <main className="p-8" style={{ color: "var(--danger)" }}>
+        <main className="p-8 text-[13.5px]" style={{ color: "var(--brick)" }}>
           Failed to load your profile: {String(error)}
         </main>
       </>
@@ -140,48 +142,47 @@ export default function ProfilePage() {
   return (
     <>
       <TopNav section="profile" />
-      <main className="mx-auto w-full max-w-[940px] flex-1 px-8 py-[26px]">
+      <main className="mx-auto w-full max-w-[960px] flex-1 px-7 py-7">
         {/* Identity band */}
         <div className="mb-5 flex items-center gap-4">
           <span
-            className="flex h-14 w-14 flex-none items-center justify-center rounded-full text-xl font-bold"
-            style={{ background: "var(--text)", color: "var(--surface)" }}
+            className="flex h-[58px] w-[58px] flex-none items-center justify-center rounded-full text-[21px] font-bold"
+            style={{ background: "var(--terracotta)", color: "#fff9f2" }}
           >
             {av.kind === "glyph" ? "•" : av.text}
           </span>
           <div className="min-w-0 flex-1">
-            <InlineText
-              value={draft.full_name}
-              textClass="text-[21px] font-semibold tracking-tight"
-              placeholder="Your name"
-              onSave={(v) => patch({ full_name: v })}
-            />
-            <div
-              className="mt-1 font-mono text-[12.5px] font-medium"
-              style={{ color: "var(--muted)" }}
-            >
+            <div style={{ fontFamily: SERIF }}>
+              <InlineText
+                value={draft.full_name}
+                textClass="text-[28px] font-normal leading-[1.15]"
+                placeholder="Your name"
+                onSave={(v) => patch({ full_name: v })}
+              />
+            </div>
+            <div className="mt-[5px] text-[13px]" style={{ color: "var(--ink-4)" }}>
               {[headline, draft.location, email].filter(Boolean).join(" · ")}
             </div>
           </div>
-          <div className="flex flex-none items-center gap-[7px]">
+          <div className="flex flex-none items-center gap-2">
             {REMOTE_OPTIONS.map((style) => {
               const on = (draft.preferences.remote_policy ?? []).includes(style);
               return (
                 <button
                   key={style}
                   onClick={() => toggleRemote(style)}
-                  className="inline-flex items-center gap-1 rounded-full border px-2.5 py-[3px] font-mono text-[11px] font-semibold"
+                  className="inline-flex items-center gap-1 rounded-full border px-3 py-[5px] text-[11.5px] font-bold"
                   style={
                     on
                       ? {
-                          background: "var(--good-bg)",
-                          borderColor: "var(--good-border)",
-                          color: "var(--good)",
+                          background: "var(--sage-tint)",
+                          borderColor: "#cfe0c8",
+                          color: "var(--sage)",
                         }
                       : {
-                          background: "var(--surface-2)",
-                          borderColor: "var(--border)",
-                          color: "var(--subtle)",
+                          background: "#f6ede1",
+                          borderColor: "var(--border-warm-hair)",
+                          color: "#a3927f",
                         }
                   }
                 >
@@ -193,18 +194,18 @@ export default function ProfilePage() {
           </div>
         </div>
 
-        <div className="grid items-start gap-4 md:grid-cols-[320px_1fr]">
+        <div className="grid items-start gap-4 md:grid-cols-[330px_1fr]">
           {/* Left column */}
           <div className="flex flex-col gap-4">
             <Card>
-              <MonoLabel>Resume</MonoLabel>
-              <div className="mt-3 flex items-center gap-[11px]">
+              <MonoLabel>Your resume</MonoLabel>
+              <div className="mt-3 flex items-center gap-3">
                 <span
-                  className="flex h-9 w-9 flex-none items-center justify-center rounded-lg border font-mono text-[10px] font-bold"
+                  className="flex h-[38px] w-[38px] flex-none items-center justify-center rounded-[11px] border text-[10px] font-bold"
                   style={{
-                    background: "var(--danger-bg)",
-                    borderColor: "var(--danger-border)",
-                    color: "var(--danger)",
+                    background: "var(--terracotta-tint)",
+                    borderColor: "var(--border-warm)",
+                    color: "var(--terracotta)",
                   }}
                 >
                   PDF
@@ -212,45 +213,36 @@ export default function ProfilePage() {
                 <div className="min-w-0 flex-1">
                   <div
                     className="text-[13.5px] font-semibold"
-                    style={{ color: "var(--text)" }}
+                    style={{ color: "var(--ink)" }}
                   >
                     Résumé on file
                   </div>
-                  <div
-                    className="mt-0.5 font-mono text-[11px] font-medium"
-                    style={{ color: "var(--subtle)" }}
-                  >
-                    source of this profile
+                  <div className="mt-0.5 text-[11.5px]" style={{ color: "#a3927f" }}>
+                    what we built your profile from
                   </div>
                 </div>
               </div>
-              <div className="mt-3 flex gap-2">
-                <Link
-                  href="/onboarding"
-                  className="flex h-[34px] flex-1 items-center justify-center rounded-lg text-[12.5px] font-semibold"
-                  style={{ background: "var(--text)", color: "var(--surface)" }}
-                >
-                  Replace
-                </Link>
-              </div>
-              <Divider my={14} />
-              <p
-                className="font-mono text-[11px] font-medium leading-relaxed"
-                style={{ color: "var(--subtle)" }}
+              <Link
+                href="/onboarding"
+                className="wm-ghost mt-[14px] flex h-[38px] w-full items-center justify-center rounded-[12px] border text-[13px] font-semibold"
+                style={{ borderColor: "#e8dacb", color: "var(--ink)" }}
               >
-                re-uploading re-parses your profile — versions are kept, never
-                overwritten
+                Upload a newer one
+              </Link>
+              <p className="mt-3 text-[11.5px] leading-[1.6]" style={{ color: "#a3927f" }}>
+                Upload a newer one and we&apos;ll read it again. Your old resumes
+                are kept.
               </p>
             </Card>
 
             <Card>
-              <MonoLabel>Match preferences</MonoLabel>
-              <div className="mt-3 flex items-center gap-2.5">
+              <MonoLabel>What counts as a match</MonoLabel>
+              <div className="mt-[14px] flex items-center gap-3">
                 <span
-                  className="flex-1 text-[13px] font-medium"
-                  style={{ color: "var(--label)" }}
+                  className="flex-1 text-[13px] font-semibold"
+                  style={{ color: "var(--ink-2)" }}
                 >
-                  Minimum score
+                  Only show jobs scoring at least
                 </span>
                 <input
                   type="range"
@@ -258,18 +250,18 @@ export default function ProfilePage() {
                   max={100}
                   value={minScore}
                   onChange={(e) => saveMinScore(Number(e.target.value))}
-                  className="w-[110px] accent-[var(--accent)]"
+                  className="w-[110px] accent-[var(--terracotta)]"
                 />
                 <span
-                  className="w-5 text-right font-mono text-[13px] font-semibold tabular-nums"
-                  style={{ color: "var(--text)" }}
+                  className="w-[22px] text-right text-[13px] font-bold tabular-nums"
+                  style={{ color: "var(--ink)" }}
                 >
                   {minScore}
                 </span>
               </div>
-              <Divider my={13} />
-              <MonoLabel>Target titles</MonoLabel>
-              <div className="mt-2">
+              <Divider my={14} />
+              <MonoLabel>Job titles you want</MonoLabel>
+              <div className="mt-2.5">
                 <ChipEditor
                   items={draft.preferences.target_titles ?? []}
                   onRemove={(t) =>
@@ -297,33 +289,31 @@ export default function ProfilePage() {
 
           {/* Right column */}
           <div className="flex flex-col gap-4">
-            <Card>
+            <Card wide>
               <SummaryBlock
                 value={draft.objective_template}
                 onSave={(v) => patch({ objective_template: v })}
               />
             </Card>
 
-            <Card>
+            <Card wide>
               <div className="flex items-center justify-between">
                 <MonoLabel>Skills · {skills.length}</MonoLabel>
-                <span
-                  className="font-mono text-[11px] font-medium"
-                  style={{ color: "var(--subtle)" }}
-                >
-                  × to remove
+                <span className="text-[11.5px]" style={{ color: "#a3927f" }}>
+                  tap the × to remove one
                 </span>
               </div>
-              <div className="mt-2.5">
+              <div className="mt-3">
                 <ChipEditor
                   items={skills}
                   onRemove={removeSkill}
                   onAdd={addSkill}
+                  addLabel="+ Add a skill"
                 />
               </div>
             </Card>
 
-            <Card>
+            <Card wide>
               <MonoLabel>
                 Experience · {draft.experience.length} roles
               </MonoLabel>
@@ -335,11 +325,8 @@ export default function ProfilePage() {
           </div>
         </div>
 
-        <p
-          className="mt-5 text-center font-mono text-[11px] font-medium"
-          style={{ color: "var(--subtle)" }}
-        >
-          edits patch profiles/{"{uid}"} · any change re-runs matching ·{" "}
+        <p className="mt-5 text-center text-[12px]" style={{ color: "#a3927f" }}>
+          Saves as you go · your changes are used the next time we look for jobs ·{" "}
           {save.isPending
             ? "saving…"
             : save.isError
@@ -354,10 +341,10 @@ export default function ProfilePage() {
 }
 
 const INTERVALS: { hours: number; label: string }[] = [
-  { hours: 6, label: "6h" },
-  { hours: 12, label: "12h" },
-  { hours: 24, label: "24h" },
-  { hours: 72, label: "3d" },
+  { hours: 6, label: "every 6 hours" },
+  { hours: 12, label: "every 12 hours" },
+  { hours: 24, label: "once a day" },
+  { hours: 72, label: "every 3 days" },
 ];
 
 function relPast(iso?: string | null): string {
@@ -379,7 +366,7 @@ function relNext(iso?: string | null): string {
 }
 
 /**
- * Auto-discovery (user request on top of mock 09): the agents' unattended
+ * Auto-discovery ("What we do while you're away"): the agents' unattended
  * cadence, regulated from the profile. Two opt-in loops — discover+score new
  * jobs, and the liveness sweep that dismisses postings their ATS took down
  * (so the queue, shelves, and tracking never serve a dead posting).
@@ -413,8 +400,8 @@ function AutoDiscoveryCard() {
   if (!data) {
     return (
       <Card>
-        <MonoLabel>Auto-discovery</MonoLabel>
-        <p className="mt-3 text-[13px]" style={{ color: "var(--subtle)" }}>
+        <MonoLabel>What we do while you&apos;re away</MonoLabel>
+        <p className="mt-3 text-[13px]" style={{ color: "#a3927f" }}>
           Loading…
         </p>
       </Card>
@@ -435,14 +422,14 @@ function AutoDiscoveryCard() {
 
   return (
     <Card>
-      <MonoLabel>Auto-discovery</MonoLabel>
+      <MonoLabel>What we do while you&apos;re away</MonoLabel>
 
-      <div className="mt-3 flex items-center gap-2.5">
+      <div className="mt-[14px] flex items-center gap-3">
         <span
-          className="flex-1 text-[13px] font-medium"
-          style={{ color: "var(--label)" }}
+          className="flex-1 text-[13px] font-semibold"
+          style={{ color: "var(--ink-2)" }}
         >
-          Find new jobs
+          Keep looking for new jobs
         </span>
         <Toggle
           on={s.auto_discovery}
@@ -455,18 +442,15 @@ function AutoDiscoveryCard() {
           onChange={(h) => patch({ discovery_interval_hours: h })}
         />
       )}
-      <div
-        className="mt-2 font-mono text-[11px] font-medium"
-        style={{ color: "var(--subtle)" }}
-      >
+      <div className="mt-2.5 text-[11.5px]" style={{ color: "#a3927f" }}>
         {s.auto_discovery
           ? `last ${relPast(data.state.last_discovery_at)} · next ${relNext(data.next_discovery_at)}`
           : "off — run from the CLI or the button below"}
       </div>
       {budget && (
         <div
-          className="mt-1 font-mono text-[11px] font-medium"
-          style={{ color: budget.budget_capped ? "var(--warn)" : "var(--subtle)" }}
+          className="mt-1 text-[11.5px]"
+          style={{ color: budget.budget_capped ? "var(--honey)" : "#a3927f" }}
         >
           {budget.budget_capped
             ? `scored ${budget.budget_granted} — cycle limit reached · ${budget.budget_remaining_day} left today`
@@ -474,14 +458,14 @@ function AutoDiscoveryCard() {
         </div>
       )}
 
-      <Divider my={13} />
+      <Divider my={14} />
 
-      <div className="flex items-center gap-2.5">
+      <div className="flex items-center gap-3">
         <span
-          className="flex-1 text-[13px] font-medium"
-          style={{ color: "var(--label)" }}
+          className="flex-1 text-[13px] font-semibold"
+          style={{ color: "var(--ink-2)" }}
         >
-          Invalidate stale postings
+          Hide jobs that have closed
         </span>
         <Toggle
           on={s.liveness_sweep}
@@ -494,49 +478,33 @@ function AutoDiscoveryCard() {
           onChange={(h) => patch({ sweep_interval_hours: h })}
         />
       )}
-      <div
-        className="mt-2 font-mono text-[11px] font-medium"
-        style={{ color: "var(--subtle)" }}
-      >
+      <div className="mt-2.5 text-[11.5px]" style={{ color: "#a3927f" }}>
         {s.liveness_sweep
           ? `last ${relPast(data.state.last_sweep_at)} · next ${relNext(data.next_sweep_at)}`
           : "off — taken-down postings stay until acted on"}
         {sweep && ` · ${sweep.removed} removed of ${sweep.checked} checked`}
       </div>
 
-      <Divider my={13} />
-
-      <div className="flex gap-2">
+      <div className="mt-[14px] flex gap-2">
         <button
           onClick={() => trigger.mutate("run")}
           disabled={trigger.isPending}
-          className="h-[30px] flex-1 rounded-[7px] border text-xs font-semibold"
-          style={{
-            background: "var(--surface)",
-            borderColor: "var(--border)",
-            color: "var(--label)",
-          }}
+          className="wm-ghost h-[34px] flex-1 rounded-[11px] border text-[12px] font-semibold"
+          style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
         >
           Run discovery now
         </button>
         <button
           onClick={() => trigger.mutate("sweep")}
           disabled={trigger.isPending}
-          className="h-[30px] flex-1 rounded-[7px] border text-xs font-semibold"
-          style={{
-            background: "var(--surface)",
-            borderColor: "var(--border)",
-            color: "var(--label)",
-          }}
+          className="wm-ghost h-[34px] flex-1 rounded-[11px] border text-[12px] font-semibold"
+          style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
         >
           Sweep now
         </button>
       </div>
       {trigger.isSuccess && (
-        <p
-          className="mt-2 font-mono text-[11px] font-medium"
-          style={{ color: "var(--good)" }}
-        >
+        <p className="mt-2 text-[11.5px]" style={{ color: "var(--sage)" }}>
           started — results land here as the agent finishes
         </p>
       )}
@@ -549,12 +517,12 @@ function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
     <button
       onClick={onClick}
       aria-pressed={on}
-      className="relative h-5 w-9 flex-none rounded-full transition-colors"
-      style={{ background: on ? "var(--accent)" : "var(--border-mid)" }}
+      className="relative h-[22px] w-[38px] flex-none rounded-full transition-colors"
+      style={{ background: on ? "var(--terracotta)" : "#d9c4a8" }}
     >
       <span
-        className="absolute top-[2px] h-4 w-4 rounded-full transition-all"
-        style={{ left: on ? 18 : 2, background: "var(--surface)" }}
+        className="absolute top-[2px] h-[18px] w-[18px] rounded-full transition-all"
+        style={{ left: on ? 18 : 2, background: "#fffcf8" }}
       />
     </button>
   );
@@ -568,29 +536,29 @@ function IntervalChips({
   onChange: (hours: number) => void;
 }) {
   return (
-    <div className="mt-2 flex gap-1.5">
+    <div className="mt-2.5 flex flex-wrap gap-[7px]">
       {INTERVALS.map(({ hours, label }) => {
         const active = hours === value;
         return (
           <button
             key={hours}
             onClick={() => onChange(hours)}
-            className="rounded-[7px] border px-2.5 py-1 font-mono text-[11px] font-semibold"
+            className="rounded-[9px] border px-2.5 py-[5px] text-[11.5px] font-semibold"
             style={
               active
                 ? {
-                    background: "var(--text)",
-                    borderColor: "var(--text)",
-                    color: "var(--surface)",
+                    background: "var(--terracotta)",
+                    borderColor: "var(--terracotta)",
+                    color: "#fff9f2",
                   }
                 : {
-                    background: "var(--surface-2)",
-                    borderColor: "var(--border)",
-                    color: "var(--subtle)",
+                    background: "#f6ede1",
+                    borderColor: "var(--border-warm-hair)",
+                    color: "#a3927f",
                   }
             }
           >
-            every {label}
+            {label}
           </button>
         );
       })}
@@ -632,24 +600,16 @@ function DeleteAccountCard({ email }: { email: string }) {
 
   return (
     <Card>
-      <MonoLabel>Delete account</MonoLabel>
+      <MonoLabel color="var(--brick)">Delete account</MonoLabel>
       {!open ? (
         <>
-          <p
-            className="mt-3 font-mono text-[11px] font-medium leading-relaxed"
-            style={{ color: "var(--subtle)" }}
-          >
+          <p className="mt-3 text-[11.5px] leading-[1.6]" style={{ color: "#a3927f" }}>
             removes your profile, every job and application, your tailored
             résumés and your login — permanently
           </p>
           <button
             onClick={() => setOpen(true)}
-            className="mt-3 h-[34px] w-full rounded-lg border text-[12.5px] font-semibold"
-            style={{
-              background: "var(--danger-bg)",
-              borderColor: "var(--danger-border)",
-              color: "var(--danger)",
-            }}
+            className="wm-danger mt-3 h-[34px] w-full rounded-[12px] text-[12.5px] font-semibold"
           >
             Delete account
           </button>
@@ -657,8 +617,8 @@ function DeleteAccountCard({ email }: { email: string }) {
       ) : (
         <>
           <p
-            className="mt-3 text-[13px] leading-relaxed"
-            style={{ color: "var(--label)" }}
+            className="mt-3 text-[13px] leading-[1.6]"
+            style={{ color: "var(--ink-2)" }}
           >
             This cannot be undone. Type <b>{email}</b> to confirm.
           </p>
@@ -667,12 +627,7 @@ function DeleteAccountCard({ email }: { email: string }) {
             onChange={(e) => setTyped(e.target.value)}
             placeholder={email}
             autoComplete="off"
-            className="mt-2.5 h-9 w-full rounded-lg border px-2.5 text-[13px] outline-none"
-            style={{
-              background: "var(--surface-2)",
-              borderColor: "var(--border)",
-              color: "var(--text)",
-            }}
+            className="wm-input mt-2.5 h-[38px] w-full rounded-[12px] px-3 text-[13px] outline-none"
           />
           <div className="mt-2.5 flex gap-2">
             <button
@@ -681,28 +636,24 @@ function DeleteAccountCard({ email }: { email: string }) {
                 setTyped("");
               }}
               disabled={del.isPending}
-              className="h-[34px] flex-1 rounded-lg border text-[12.5px] font-semibold"
-              style={{
-                background: "var(--surface-2)",
-                borderColor: "var(--border)",
-                color: "var(--label)",
-              }}
+              className="wm-ghost h-[34px] flex-1 rounded-[12px] border text-[12.5px] font-semibold"
+              style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
             >
               Cancel
             </button>
             <button
               onClick={() => del.mutate()}
               disabled={!matches || del.isPending}
-              className="h-[34px] flex-1 rounded-lg text-[12.5px] font-semibold disabled:opacity-40"
-              style={{ background: "var(--danger)", color: "var(--surface)" }}
+              className="h-[34px] flex-1 rounded-[12px] text-[12.5px] font-semibold disabled:opacity-40"
+              style={{ background: "var(--brick)", color: "#fff9f2" }}
             >
               {del.isPending ? "Deleting…" : "Delete forever"}
             </button>
           </div>
           {del.isError && (
             <p
-              className="mt-2.5 font-mono text-[11px] font-medium leading-relaxed"
-              style={{ color: "var(--danger)" }}
+              className="mt-2.5 text-[11.5px] leading-[1.6]"
+              style={{ color: "var(--brick)" }}
             >
               {String(del.error)}
             </p>
@@ -713,18 +664,19 @@ function DeleteAccountCard({ email }: { email: string }) {
   );
 }
 
-function Card({ children }: { children: React.ReactNode }) {
+/** Warm card; `wide` is the right column's 20px padding (design 14). */
+function Card({ children, wide }: { children: React.ReactNode; wide?: boolean }) {
   return (
     <div
-      className="rounded-[14px] border px-[18px] py-4"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      className={wide ? "rounded-[18px] border p-5" : "rounded-[18px] border p-[18px]"}
+      style={{ background: "#fdf7ee", borderColor: "var(--border-warm-hair)" }}
     >
       {children}
     </div>
   );
 }
 
-/** "What Matching reads" — the generated candidate summary, edited in place. */
+/** "About you" — the generated candidate summary, edited in place. */
 function SummaryBlock({
   value,
   onSave,
@@ -738,7 +690,7 @@ function SummaryBlock({
   if (editing) {
     return (
       <div>
-        <MonoLabel>Summary — what Matching reads</MonoLabel>
+        <MonoLabel>About you — this is what we match jobs against</MonoLabel>
         <textarea
           autoFocus
           value={text}
@@ -752,20 +704,16 @@ function SummaryBlock({
             }
             if (e.key === "Escape") setEditing(false);
           }}
-          className="mt-2 w-full rounded-lg p-[11px] text-[13.5px] leading-relaxed outline-none"
+          className="mt-2.5 w-full rounded-[12px] p-[11px] text-[13.5px] leading-[1.7] outline-none"
           style={{
-            background: "var(--surface)",
-            border: "2px solid var(--accent)",
-            color: "var(--text)",
-            boxShadow:
-              "0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent)",
+            border: "2px solid var(--terracotta)",
+            background: "var(--surface-warm)",
+            color: "var(--ink)",
+            boxShadow: "0 0 0 3px rgba(184,83,47,0.13)",
           }}
         />
-        <div
-          className="mt-1.5 font-mono text-[11px] font-medium"
-          style={{ color: "var(--subtle)" }}
-        >
-          <span style={{ color: "var(--accent)" }}>↵ save</span> · esc cancel
+        <div className="mt-1.5 text-[11.5px]" style={{ color: "#a3927f" }}>
+          <span style={{ color: "var(--terracotta-d)" }}>↵ save</span> · esc cancel
         </div>
       </div>
     );
@@ -774,13 +722,13 @@ function SummaryBlock({
   return (
     <div className="flex items-start gap-3">
       <div className="flex-1">
-        <MonoLabel>Summary — what Matching reads</MonoLabel>
+        <MonoLabel>About you — this is what we match jobs against</MonoLabel>
         <p
-          className="mt-2 text-[13.5px] leading-relaxed"
-          style={{ color: "var(--label)" }}
+          className="mt-2.5 text-[13.5px] leading-[1.7]"
+          style={{ color: "var(--ink-2)" }}
         >
           {value || (
-            <span style={{ color: "var(--subtle)" }}>
+            <span style={{ color: "#a3927f" }}>
               No summary yet — add the paragraph Matching should read.
             </span>
           )}
@@ -811,7 +759,7 @@ function ExperienceList({
     <div>
       {visible.map((role, i) => (
         <div key={i}>
-          {i > 0 && <Divider my={12} />}
+          {i > 0 && <Divider my={14} />}
           <ExperienceItem
             role={role}
             expanded={i === 0}
@@ -824,8 +772,8 @@ function ExperienceList({
       {hidden > 0 && (
         <button
           onClick={() => setShowAll(true)}
-          className="ml-[38px] mt-2.5 text-xs font-medium"
-          style={{ color: "var(--muted)" }}
+          className="mt-3 pl-[42px] text-[12px] font-semibold"
+          style={{ color: "#a3927f" }}
         >
           Show {hidden} more…
         </button>
@@ -833,8 +781,8 @@ function ExperienceList({
       {showAll && experience.length > 2 && (
         <button
           onClick={() => setShowAll(false)}
-          className="ml-[38px] mt-2.5 text-xs font-medium"
-          style={{ color: "var(--muted)" }}
+          className="mt-3 pl-[42px] text-[12px] font-semibold"
+          style={{ color: "#a3927f" }}
         >
           Show less
         </button>
@@ -853,17 +801,11 @@ function ExperienceItem({
   onChange: (r: Profile["experience"][number]) => void;
 }) {
   const [editing, setEditing] = useState(false);
-  const av = avatarColor(role.company);
   const years = `${fmtYear(role.start)}–${role.end ? fmtYear(role.end) : "Present"}`;
 
   return (
-    <div className="mt-3 flex items-start gap-2.5 first:mt-0">
-      <span
-        className="flex h-7 w-7 flex-none items-center justify-center rounded-[7px] text-xs font-bold"
-        style={{ background: av.bg, color: av.color }}
-      >
-        {initial(role.company)}
-      </span>
+    <div className="mt-[14px] flex items-start gap-3 first:mt-0">
+      <CompanyTile initial={initial(role.company)} hue={tileHue(role.company)} size="sm" />
       <div className="min-w-0 flex-1">
         {editing ? (
           <div className="flex flex-col gap-2">
@@ -892,28 +834,28 @@ function ExperienceItem({
                     ),
                   })
                 }
-                className="w-full rounded-lg border p-2 text-[12.5px] leading-relaxed outline-none"
+                className="w-full rounded-[10px] border p-2 text-[12.5px] leading-[1.6] outline-none"
                 style={{
-                  background: "var(--surface)",
-                  borderColor: "var(--border)",
-                  color: "var(--label)",
+                  background: "var(--surface-warm)",
+                  borderColor: "#e8dacb",
+                  color: "var(--ink-2)",
                 }}
               />
             ))}
           </div>
         ) : (
           <>
-            <div className="text-[13.5px]" style={{ color: "var(--muted)" }}>
-              <b style={{ color: "var(--text)" }}>{role.role}</b> · {role.company}{" "}
+            <div className="text-[13.5px]" style={{ color: "var(--ink-4)" }}>
+              <b style={{ color: "var(--ink)" }}>{role.role}</b> · {role.company}{" "}
               · {years}
             </div>
             {expanded && role.bullets.length > 0 && (
-              <ul className="mt-[7px] flex list-disc flex-col gap-1 pl-4">
+              <ul className="mt-2 flex list-disc flex-col gap-[5px] pl-[18px]">
                 {role.bullets.map((b, i) => (
                   <li
                     key={i}
-                    className="text-[12.5px] leading-normal"
-                    style={{ color: "var(--muted)" }}
+                    className="text-[12.5px] leading-[1.6]"
+                    style={{ color: "var(--ink-4)" }}
                   >
                     {b.text}
                   </li>
@@ -947,12 +889,12 @@ function EditInput({
       onKeyDown={(e) => {
         if (e.key === "Enter" && draft.trim()) onCommit(draft.trim());
       }}
-      className="h-8 min-w-0 flex-1 rounded-lg px-2 text-[13px] outline-none"
+      className="h-8 min-w-0 flex-1 rounded-[10px] px-2 text-[13px] outline-none"
       style={{
-        background: "var(--surface)",
-        border: "2px solid var(--accent)",
-        color: "var(--text)",
-        boxShadow: "0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent)",
+        border: "2px solid var(--terracotta)",
+        background: "var(--surface-warm)",
+        color: "var(--ink)",
+        boxShadow: "0 0 0 3px rgba(184,83,47,0.13)",
       }}
     />
   );

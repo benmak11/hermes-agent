@@ -25,11 +25,11 @@ import {
   type SessionStats,
 } from "@/lib/session";
 import type { DecideValue, Decision, Job, ProfileResponse } from "@/lib/types";
-import { barColorWarm, initial, recPillWarm, scoreColorWarm } from "@/lib/ui";
+import { barColor, initial, recPill, scoreColor } from "@/lib/ui";
 import { TopNav } from "@/components/TopNav";
 import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
 import { Pill } from "@/components/warm/Pill";
-import { GROUND, SERIF } from "@/components/warm/styles";
+import { SERIF } from "@/components/warm/styles";
 
 type PendingResponse = {
   jobs: Job[];
@@ -223,11 +223,11 @@ export default function VettingPage() {
 
   if (loading || !user || profileLoading || needsOnboarding) {
     return (
-      <div className="wm" style={GROUND}>
+      <>
         <div className="p-8" style={{ color: "var(--ink-4)" }}>
           Loading…
         </div>
-      </div>
+      </>
     );
   }
 
@@ -237,7 +237,7 @@ export default function VettingPage() {
   const pace = paceMinutes(stats, remaining);
 
   return (
-    <div className="wm" style={GROUND}>
+    <>
       <TopNav
         section="review"
         center={
@@ -371,7 +371,7 @@ export default function VettingPage() {
       </main>
 
       {pending && <UndoToast pending={pending} onUndo={undo} />}
-    </div>
+    </>
   );
 }
 
@@ -576,7 +576,7 @@ function JobCard({
 }) {
   const [open, setOpen] = useState(false);
   const m = job.match;
-  const pill = recPillWarm(m.recommendation);
+  const pill = recPill(m.recommendation);
   const dealHits = Math.max(0, Math.round(100 - m.breakdown.deal_breaker_penalty));
 
   return (
@@ -634,7 +634,7 @@ function JobCard({
                 fontFamily: SERIF,
                 fontSize: 44,
                 lineHeight: 1,
-                color: scoreColorWarm(m.recommendation),
+                color: scoreColor(m.recommendation),
               }}
             >
               {Math.round(m.overall_score)}
@@ -742,7 +742,7 @@ function Bar({
   goodWhenZero?: boolean;
 }) {
   const v = Math.max(0, Math.min(100, Math.round(value)));
-  const color = fill ?? barColorWarm(v);
+  const color = fill ?? barColor(v);
   const valueColor = goodWhenZero && v === 0 ? "var(--sage)" : "var(--ink)";
   return (
     <div className="flex items-center gap-3.5">

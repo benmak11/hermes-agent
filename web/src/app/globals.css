@@ -1,70 +1,15 @@
 @import "tailwindcss";
 
 @theme inline {
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-jakarta);
 }
 
-/* Semantic tokens — light by default, dark via prefers-color-scheme.
-   Single source of truth for both themes; fixes the contrast bug where body
-   text inherited a near-white foreground over white cards. */
+/* Warm palette. Light-only by design (dark mode was dropped in facelift PR 8
+   until a warm-dark ramp is designed). `--surface-warm` / `--border-warm*`
+   keep their suffix for now — renaming touches every warm file for no
+   visible change; deferred to a later cleanup. */
 :root {
   color-scheme: light;
-  --bg: #f6f6f7;
-  --surface: #ffffff;
-  --surface-2: #f4f4f5;
-  --border: #e7e7e9;
-  --border-mid: #d4d4d8;
-  --border-strong: #18181b;
-  --ring: rgba(24, 24, 27, 0.06);
-  --text: #18181b;
-  --muted: #71717a;
-  --subtle: #a1a1aa;
-  --label: #52525b;
-  --nav-bg: rgba(255, 255, 255, 0.8);
-  --divider: #f0f0f1;
-  --accent: #2563eb;
-  --accent-bg: #eff6ff;
-  --accent-border: #bfdbfe;
-  --accent-text: #1d4ed8;
-  --good: #15803d;
-  --good-bg: #ecfdf5;
-  --good-border: #bbf7d0;
-  --warn: #92400e;
-  --warn-bg: #fffbeb;
-  --warn-border: #fde68a;
-  --first-bg: #fef3c7;
-  --first-text: #92400e;
-  --danger: #dc2626;
-  --danger-bg: #fef2f2;
-  --danger-border: #fecaca;
-  --star: #f59e0b;
-  --skeleton: #e6e6e8;
-  --skeleton-2: #eeeeef;
-  /* Interview journal tints (offer celebration + reflection panels). */
-  --offer-bg: #f7fef9;
-  --offer-divider: #d1fae5;
-  --good-panel-bg: #f8fdf9;
-  --good-panel-border: #e3f5e9;
-  --danger-panel-bg: #fdf9f8;
-  --danger-panel-border: #f5e5e3;
-  /* Undo toast: an inverted surface, so it gets its own ramp. */
-  --toast-bg: #18181b;
-  --toast-text: #e4e4e7;
-  --toast-strong: #ffffff;
-  --toast-btn-bg: #27272a;
-  --toast-btn-border: #3f3f46;
-  --toast-btn-text: #ffffff;
-  --toast-kbd-bg: #3f3f46;
-  --toast-kbd-border: #52525b;
-  --toast-kbd-text: #d4d4d8;
-  --toast-ring-track: #3f3f46;
-  --toast-ring: #a1a1aa;
-  /* Warm palette (facelift PR 1). Light-only by design — nothing consumes
-     these yet, and the warm surfaces have no dark counterpart, so they are
-     deliberately NOT mirrored in the dark block below. `--surface` and
-     `--border` already exist in the grey ramp above, hence the `-warm`
-     suffix on the warm equivalents; the grey names are untouched. */
   --sand: #f7ede0;
   --cream: #fdf6ea;
   --surface-warm: #fffcf8;
@@ -85,64 +30,10 @@
   --brick: #a02d1f;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    color-scheme: dark;
-    --bg: #0a0a0a;
-    --surface: #151517;
-    --surface-2: #1c1c1f;
-    --border: #27272a;
-    --border-mid: #3f3f46;
-    --border-strong: #52525b;
-    --ring: rgba(82, 82, 91, 0.18);
-    --text: #fafafa;
-    --muted: #a1a1aa;
-    --subtle: #71717a;
-    --label: #a1a1aa;
-    --nav-bg: rgba(10, 10, 10, 0.8);
-    --divider: #27272a;
-    --accent: #3b82f6;
-    --accent-bg: #172033;
-    --accent-border: #1e3a8a;
-    --accent-text: #60a5fa;
-    --good: #4ade80;
-    --good-bg: #0e2a1a;
-    --good-border: #14532d;
-    --warn: #fcd34d;
-    --warn-bg: #2a230e;
-    --warn-border: #3f3f1f;
-    --first-bg: #2a230e;
-    --first-text: #fcd34d;
-    --danger: #f87171;
-    --danger-bg: #2a0e0e;
-    --danger-border: #7f1d1d;
-    --star: #fbbf24;
-    --skeleton: #1c1c1f;
-    --skeleton-2: #232327;
-    --offer-bg: #0e1f15;
-    --offer-divider: #14532d;
-    --good-panel-bg: #101a13;
-    --good-panel-border: #1e3a2a;
-    --danger-panel-bg: #1a1010;
-    --danger-panel-border: #3a1e1e;
-    --toast-bg: #fafafa;
-    --toast-text: #3f3f46;
-    --toast-strong: #0a0a0a;
-    --toast-btn-bg: #f4f4f5;
-    --toast-btn-border: #d4d4d8;
-    --toast-btn-text: #18181b;
-    --toast-kbd-bg: #ffffff;
-    --toast-kbd-border: #d4d4d8;
-    --toast-kbd-text: #52525b;
-    --toast-ring-track: #d4d4d8;
-    --toast-ring: #52525b;
-  }
-}
-
 body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, "Segoe UI",
+  background: var(--sand);
+  color: var(--ink);
+  font-family: var(--font-jakarta), -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
 }
 
@@ -415,9 +306,12 @@ body {
   box-shadow: 0 1px 3px rgba(94, 63, 39, 0.1);
 }
 
-/* Marketing (PR 3) and auth/onboarding (PR 5) routes: light-only, own ground,
-   even in a dark-mode OS. */
-html:has(.mk, .wm) {
-  color-scheme: light;
-  background: var(--sand);
+/* Profile + companies (facelift PR 8). Same contract. */
+.wm-danger {
+  background: var(--surface-warm);
+  border: 1px solid #f0c8bd;
+  color: var(--brick);
+}
+.wm-danger:not(:disabled):hover {
+  background: #fdf5f2;
 }

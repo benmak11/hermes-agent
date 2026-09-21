@@ -1,27 +1,12 @@
 import type { Metadata } from "next";
-import {
-  Geist,
-  Geist_Mono,
-  Instrument_Serif,
-  Plus_Jakarta_Sans,
-} from "next/font/google";
+import { Instrument_Serif, Plus_Jakarta_Sans } from "next/font/google";
 import "./globals.css";
 import { Providers } from "./providers";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
-// Warm-facelift faces. Exposed as CSS variables only — `--font-sans` still
-// points at Geist, so a screen renders them only by opting in (the marketing
-// site does; the app screens follow in later facelift PRs). Loaded once here
-// because a second loader call is a second hosted instance.
+// The two faces of the warm design system. Jakarta is the default (globals.css
+// sets it on `body` and as Tailwind's `--font-sans`); Instrument Serif is opted
+// into per heading via `SERIF`. Loaded once here because a second loader call
+// is a second hosted instance.
 const jakarta = Plus_Jakarta_Sans({
   variable: "--font-jakarta",
   subsets: ["latin"],
@@ -50,9 +35,9 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} ${jakarta.variable} ${instrument.variable} h-full antialiased`}
+      className={`${jakarta.variable} ${instrument.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-neutral-50 text-neutral-900">
+      <body className="min-h-full flex flex-col">
         <Providers>{children}</Providers>
       </body>
     </html>

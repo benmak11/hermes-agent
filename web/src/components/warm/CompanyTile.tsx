@@ -10,7 +10,8 @@ const HUES: Record<TileHue, { bg: string; fg: string }> = {
   terracotta: { bg: "var(--terracotta-tint)", fg: "var(--terracotta)" },
 };
 
-/** Deterministic hue for a company name (same hash as lib/ui.avatarColor). */
+/** Deterministic hue for a company name (the hash the grey `lib/ui` avatar
+ *  helper used before facelift PR 8 deleted it). */
 export function tileHue(seed: string): TileHue {
   let h = 0;
   for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
