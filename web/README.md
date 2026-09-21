@@ -50,11 +50,12 @@ a `.wm-*` class changes on hover is never also set inline (inline would win
 and kill the hover).
 
 The facelift reaches `/app` in stages. `TopNav` (the 60px warm header) is
-shared, so it is warm on every `/app` page already; only the review page
-(`/app`) wraps its body in the warm ground (`GROUND` from `warm/styles.ts`,
-page-scoped rather than in `app/layout.tsx` so the grey pages keep their
-dark-mode ramp). Tracking, profile, companies and interviews keep their grey
-bodies under the warm nav until PR 7/8 re-skin them.
+shared, so it is warm on every `/app` page already; the review page (`/app`),
+tracking (`/app/tracking`) and the application review page
+(`/app/applications/[id]/review`) each wrap their body in the warm ground
+(`GROUND` from `warm/styles.ts`, page-scoped rather than in `app/layout.tsx`
+so the grey pages keep their dark-mode ramp). Profile, companies and
+interviews keep their grey bodies under the warm nav until PR 8 re-skins them.
 
 ## Stack
 
@@ -109,10 +110,13 @@ import `@/lib/firebase`, `@/lib/api`, `next/navigation`, or any CSS.
 and `/app/interviews` until the facelift reaches them and deletes it.
 
 `src/lib/ui.ts` likewise carries both palettes: the warm trio
-(`scoreColorWarm`, `recPillWarm`, `barColorWarm`) feeds the review page, while
-the grey trio (`scoreColor`, `recPill`, `barColor`) and `avatarColor` remain
-for tracking, profile, companies and interviews until PR 7/8 switch them over
-and delete the grey set.
+(`scoreColorWarm`, `recPillWarm`, `barColorWarm`) feeds the review and
+tracking pages, while the grey trio (`scoreColor`, `recPill`, `barColor`) has
+no consumer left (only `ui.test.ts` still pins it) and `avatarColor` remains
+for profile, companies and interviews, until PR 8 deletes the grey set.
+`app/app/applications/status.ts` holds both application mappers — the review
+header pill (`statusPill`) and the tracking strip (`pipelineView`) — as pure
+functions covered by `status.test.ts`.
 
 ```bash
 npm test       # vitest, node environment — no jsdom, no browser

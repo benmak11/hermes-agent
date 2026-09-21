@@ -10,22 +10,24 @@ import { Suspense, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { Application, DecideValue, Job } from "@/lib/types";
-import { avatarColor, initial, recPill, scoreColor } from "@/lib/ui";
+import { initial, recPillWarm, scoreColorWarm } from "@/lib/ui";
 import { TopNav } from "@/components/TopNav";
+import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
+import { GROUND, SERIF } from "@/components/warm/styles";
+import { pipelineView } from "../applications/status";
 
 type AppsResponse = { applications: Application[] };
 type JobsResponse = { jobs: Job[] };
 type Tab = "pipeline" | "starred" | "skipped";
 
-/** How recently an application must have been created to get the arrival tint. */
-const JUST_APPROVED_MS = 2 * 60 * 1000;
-
 export default function TrackingPage() {
   // useSearchParams needs a Suspense boundary for prerendering.
   return (
-    <Suspense fallback={<div className="p-8" style={{ color: "var(--muted)" }}>Loading…</div>}>
-      <TrackingInner />
-    </Suspense>
+    <div className="wm" style={GROUND}>
+      <Suspense fallback={<div className="p-8 text-[13.5px]" style={{ color: "var(--ink-4)" }}>Loading…</div>}>
+        <TrackingInner />
+      </Suspense>
+    </div>
   );
 }
 
@@ -71,7 +73,7 @@ function TrackingInner() {
   });
 
   if (loading || !user) {
-    return <div className="p-8" style={{ color: "var(--muted)" }}>Loading…</div>;
+    return <div className="p-8 text-[13.5px]" style={{ color: "var(--ink-4)" }}>Loading…</div>;
   }
 
   const apps = appsData?.applications ?? [];
@@ -90,56 +92,53 @@ function TrackingInner() {
   return (
     <>
       <TopNav section="tracking" />
-      <main className="mx-auto w-full max-w-[820px] flex-1 px-8 py-7">
-        <div className="mb-5 flex items-end justify-between gap-5">
+      <main className="mx-auto w-full max-w-[920px] flex-1 px-7 py-7">
+        <div className="flex items-end justify-between gap-5">
           <div>
             <h1
-              className="text-[22px] font-semibold tracking-tight"
-              style={{ color: "var(--text)" }}
+              className="text-[28px] font-normal leading-[1.15]"
+              style={{ fontFamily: SERIF, color: "var(--ink)" }}
             >
               Applications
             </h1>
-            <div
-              className="mt-2 font-mono text-[12.5px] font-medium"
-              style={{ color: "var(--muted)" }}
-            >
-              <b style={{ color: "var(--text)" }}>{apps.length}</b> in pipeline ·{" "}
-              <b style={{ color: "var(--accent)" }}>{counts.tailoring}</b> tailoring ·{" "}
-              <b style={{ color: "var(--good)" }}>{counts.applied}</b> applied ·{" "}
-              <b style={{ color: "var(--warn)" }}>{counts.responses}</b>{" "}
-              {counts.responses === 1 ? "response" : "responses"}
+            <div className="mt-2 text-[13px]" style={{ color: "var(--ink-4)" }}>
+              <b style={{ color: "var(--ink)" }}>{apps.length}</b> in progress ·{" "}
+              <b style={{ color: "var(--terracotta)" }}>{counts.tailoring}</b> being written ·{" "}
+              <b style={{ color: "var(--sage)" }}>{counts.applied}</b> sent ·{" "}
+              <b style={{ color: "var(--honey)" }}>{counts.responses}</b>{" "}
+              {counts.responses === 1 ? "reply" : "replies"}
             </div>
           </div>
           <div
-            className="flex items-center gap-2 font-mono text-xs font-medium"
-            style={{ color: "var(--subtle)" }}
+            className="flex items-center gap-3 text-[11.5px] font-semibold"
+            style={{ color: "#a3927f" }}
           >
-            <LegendSquare color="var(--border-mid)" label="approved" />
-            <LegendSquare color="var(--accent)" label="tailoring" />
-            <LegendSquare color="var(--good)" label="applied" />
-            <LegendSquare color="var(--star)" label="response" />
+            <LegendSquare color="#dfd0bd" label="you said yes" />
+            <LegendSquare color="var(--terracotta)" label="being written" />
+            <LegendSquare color="var(--sage)" label="sent" />
+            <LegendSquare color="var(--honey)" label="reply" />
           </div>
         </div>
 
         <div
-          className="mb-[18px] inline-flex gap-0.5 rounded-[10px] p-[3px]"
-          style={{ background: "var(--surface-2)" }}
+          className="mt-[18px] mb-4 inline-flex gap-[3px] rounded-[14px] p-1"
+          style={{ background: "#f6ede1" }}
         >
-          <TabBtn active={tab === "pipeline"} onClick={() => setTab("pipeline")} label="Pipeline" count={apps.length} />
-          <TabBtn active={tab === "starred"} onClick={() => setTab("starred")} label="★ Starred" count={starred.length} />
-          <TabBtn active={tab === "skipped"} onClick={() => setTab("skipped")} label="Skipped" count={skipped.length} />
+          <TabBtn active={tab === "pipeline"} onClick={() => setTab("pipeline")} label="In progress" count={apps.length} />
+          <TabBtn active={tab === "starred"} onClick={() => setTab("starred")} label="★ Saved" count={starred.length} />
+          <TabBtn active={tab === "skipped"} onClick={() => setTab("skipped")} label="Not for me" count={skipped.length} />
         </div>
 
         {tab === "pipeline" && (
           <>
-            {isLoading && <p style={{ color: "var(--muted)" }}>Loading…</p>}
+            {isLoading && <p className="text-[13.5px]" style={{ color: "var(--ink-4)" }}>Loading…</p>}
             {!isLoading && apps.length === 0 && (
               <EmptyCard>
-                Nothing in the pipeline yet. Approve a job in{" "}
-                <Link href="/app" className="font-semibold" style={{ color: "var(--accent)" }}>
+                Nothing in progress yet. Say yes to a job in{" "}
+                <Link href="/app" className="wm-link font-bold">
                   Review
                 </Link>{" "}
-                and the agent takes it from there.
+                and we take it from there.
               </EmptyCard>
             )}
             <div className="space-y-3">
@@ -149,11 +148,11 @@ function TrackingInner() {
             </div>
             {apps.length > 0 && (
               <p
-                className="mt-5 text-center font-mono text-[11px] font-medium"
-                style={{ color: "var(--subtle)" }}
+                className="mt-5 text-center text-[11.5px] font-medium"
+                style={{ color: "#a3927f" }}
               >
-                approved → tailoring → applied → response · status written by the
-                tailoring + application agents
+                You say yes → we write your resume → we send it → they reply.
+                Each step updates here on its own.
               </p>
             )}
           </>
@@ -162,7 +161,7 @@ function TrackingInner() {
         {tab === "starred" && (
           <DecidedList
             jobs={starred}
-            empty="No starred jobs. Star a job in Review (r) to shelve it for later."
+            empty="Anything you save for later waits here. Approve it when you're ready, or send it back to Review."
             actions={(job) => (
               <>
                 <RowBtn
@@ -174,7 +173,7 @@ function TrackingInner() {
                 <RowBtn
                   onClick={() => decide.mutate({ id: job.id, decision: "pending" })}
                 >
-                  Back to queue
+                  Show me again later
                 </RowBtn>
               </>
             )}
@@ -184,13 +183,13 @@ function TrackingInner() {
         {tab === "skipped" && (
           <DecidedList
             jobs={skipped}
-            empty="No skipped jobs — everything you passed on would show up here."
+            empty="Anything you say no to waits here. Changed your mind? Bring it back any time."
             actions={(job) => (
               <>
                 <RowBtn
                   onClick={() => decide.mutate({ id: job.id, decision: "pending" })}
                 >
-                  Restore to queue
+                  Bring it back
                 </RowBtn>
                 <RowBtn
                   primary
@@ -207,199 +206,46 @@ function TrackingInner() {
   );
 }
 
-/* ---------- pipeline (mock 04) ---------- */
-
-type Segment = { color: string; pulse?: boolean };
-
-type PipelineView = {
-  segments: Segment[];
-  label: string;
-  labelColor: string;
-  /** When set, the strip label links to the application review page. */
-  labelHref?: string;
-  pill?: { text: string; bg: string; border: string; color: string };
-  /** Card-level tint (arrival / response states). */
-  card?: { bg: string; border: string };
-  rightNote?: { text: string; color: string };
-};
-
-const IDLE = "var(--surface-2)";
-
-function relDays(iso: string | null | undefined): string {
-  if (!iso) return "";
-  const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
-  if (days <= 0) return "today";
-  return `${days}d ago`;
-}
-
-function pipelineView(app: Application): PipelineView {
-  const good = "var(--good)";
-  const accent = "var(--accent)";
-  const createdAt = app.timeline?.[0]?.at;
-  const justApproved =
-    createdAt && Date.now() - new Date(createdAt).getTime() < JUST_APPROVED_MS;
-  const submittedAt =
-    app.confirmation?.submitted_at ?? app.last_submitted_at ?? null;
-
-  switch (app.status) {
-    case "queued":
-    case "tailoring":
-      return {
-        segments: [
-          { color: good },
-          { color: accent, pulse: true },
-          { color: IDLE },
-          { color: IDLE },
-        ],
-        label: "tailoring resume…",
-        labelColor: accent,
-        ...(justApproved
-          ? {
-              card: { bg: "var(--offer-bg)", border: "var(--good-border)" },
-              rightNote: { text: "just approved ✓", color: good },
-            }
-          : {}),
-      };
-    case "ready_for_review":
-      return {
-        segments: [{ color: good }, { color: good }, { color: IDLE }, { color: IDLE }],
-        label: "review resume →",
-        labelColor: accent,
-        labelHref: `/app/applications/${app.id}/review`,
-        pill: {
-          text: "ready for review",
-          bg: "var(--good-bg)",
-          border: "var(--good-border)",
-          color: good,
-        },
-      };
-    case "submitting":
-      return {
-        segments: [
-          { color: good },
-          { color: good },
-          { color: accent, pulse: true },
-          { color: IDLE },
-        ],
-        label: "submitting…",
-        labelColor: accent,
-      };
-    case "submitted":
-      return {
-        segments: [{ color: good }, { color: good }, { color: good }, { color: IDLE }],
-        label: "awaiting response",
-        labelColor: "var(--subtle)",
-        pill: {
-          text: `applied${submittedAt ? ` · ${relDays(submittedAt)}` : ""}`,
-          bg: "var(--good-bg)",
-          border: "var(--good-border)",
-          color: good,
-        },
-      };
-    case "responded":
-      return {
-        segments: [
-          { color: good },
-          { color: good },
-          { color: good },
-          { color: "var(--star)" },
-        ],
-        label: "response received",
-        labelColor: "var(--warn)",
-        pill: {
-          text: "★ recruiter replied",
-          bg: "var(--first-bg)",
-          border: "var(--warn-border)",
-          color: "var(--first-text)",
-        },
-        card: { bg: "var(--warn-bg)", border: "var(--warn-border)" },
-      };
-    case "posting_removed": {
-      // The listing was taken down before we could submit — dismissed by the
-      // agent, nothing to retry. Which segment died mirrors the failed case.
-      const deadSeg = app.last_submitted_at ? 2 : 1;
-      return {
-        segments: [0, 1, 2, 3].map((i) => ({
-          color: i < deadSeg ? good : i === deadSeg ? "var(--danger)" : IDLE,
-        })),
-        label: "listing taken down — dismissed",
-        labelColor: "var(--muted)",
-        pill: {
-          text: "posting removed",
-          bg: "var(--danger-bg)",
-          border: "var(--danger-border)",
-          color: "var(--danger)",
-        },
-      };
-    }
-    case "failed":
-    default: {
-      // Failed after a submit attempt → the applied segment broke; otherwise
-      // tailoring did.
-      const failedSeg = app.last_submitted_at ? 2 : 1;
-      return {
-        segments: [0, 1, 2, 3].map((i) => ({
-          color:
-            i < failedSeg ? good : i === failedSeg ? "var(--danger)" : IDLE,
-        })),
-        label: "failed — open to retry →",
-        labelColor: "var(--danger)",
-        labelHref: `/app/applications/${app.id}/review`,
-        pill: {
-          text: "failed",
-          bg: "var(--danger-bg)",
-          border: "var(--danger-border)",
-          color: "var(--danger)",
-        },
-      };
-    }
-  }
-}
+/* ---------- pipeline (design 10) ---------- */
 
 function PipelineRow({ app }: { app: Application }) {
   const company = app.job_company ?? "—";
-  const av = avatarColor(company);
   const v = pipelineView(app);
   return (
     <div
-      className="h-slideup rounded-xl border px-[18px] py-[15px]"
+      className="h-slideup rounded-[18px] border px-5 py-4"
       style={{
-        background: v.card?.bg ?? "var(--surface)",
-        borderColor: v.card?.border ?? "var(--border)",
+        background: v.card?.bg ?? "var(--surface-warm)",
+        borderColor: v.card?.border ?? "var(--border-warm-hair)",
       }}
     >
-      <div className="flex items-center gap-3">
-        <span
-          className="flex h-[30px] w-[30px] flex-none items-center justify-center rounded-[7px] text-[13px] font-bold"
-          style={{ background: av.bg, color: av.color }}
-        >
-          {initial(company)}
-        </span>
+      <div className="flex items-center gap-[13px]">
+        <CompanyTile initial={initial(company)} hue={tileHue(company)} size="sm" />
         <Link
           href={`/app/applications/${app.id}/review`}
           className="min-w-0 flex-1 truncate"
         >
           <span
             className="text-[14.5px] font-semibold"
-            style={{ color: "var(--text)" }}
+            style={{ color: "var(--ink)" }}
           >
             {app.job_title ?? app.job_id}
           </span>
-          <span className="text-[13px]" style={{ color: "var(--muted)" }}>
+          <span className="text-[14.5px]" style={{ color: "var(--ink-4)" }}>
             {" "}
             · {company}
           </span>
         </Link>
         {v.rightNote ? (
           <span
-            className="flex-none font-mono text-[11px] font-semibold"
+            className="flex-none text-[11.5px] font-bold"
             style={{ color: v.rightNote.color }}
           >
             {v.rightNote.text}
           </span>
         ) : v.pill ? (
           <span
-            className="inline-flex flex-none items-center gap-1.5 rounded-full border px-2.5 py-[3px] font-mono text-[11px] font-semibold"
+            className="inline-flex flex-none items-center rounded-full border px-[11px] py-1 text-[11.5px] font-bold"
             style={{
               background: v.pill.bg,
               borderColor: v.pill.border,
@@ -410,27 +256,25 @@ function PipelineRow({ app }: { app: Application }) {
           </span>
         ) : null}
       </div>
-      <div className="mt-3 flex items-center gap-1.5">
-        <div className="flex flex-1 items-center gap-1.5">
-          {v.segments.map((s, i) => (
-            <span
-              key={i}
-              className={`h-1 flex-1 rounded-sm${s.pulse ? " h-pulse" : ""}`}
-              style={{ background: s.color }}
-            />
-          ))}
-        </div>
+      <div className="mt-3.5 flex items-center gap-2">
+        {v.segments.map((s, i) => (
+          <span
+            key={i}
+            className={`h-[5px] flex-1 rounded-[2px]${s.pulse ? " h-pulse" : ""}`}
+            style={{ background: s.color }}
+          />
+        ))}
         {v.labelHref ? (
           <Link
             href={v.labelHref}
-            className="font-mono text-[11.5px] font-medium"
+            className="min-w-[118px] text-right text-[11.5px] font-semibold"
             style={{ color: v.labelColor }}
           >
             {v.label}
           </Link>
         ) : (
           <span
-            className="font-mono text-[11.5px] font-medium"
+            className="min-w-[118px] text-right text-[11.5px] font-semibold"
             style={{ color: v.labelColor }}
           >
             {v.label}
@@ -441,7 +285,7 @@ function PipelineRow({ app }: { app: Application }) {
   );
 }
 
-/* ---------- starred / skipped shelves ---------- */
+/* ---------- saved / passed shelves (design 11) ---------- */
 
 function DecidedList({
   jobs,
@@ -457,54 +301,42 @@ function DecidedList({
   }
   return (
     <div
-      className="overflow-hidden rounded-xl border"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      className="overflow-hidden rounded-[18px] border"
+      style={{ background: "var(--surface-warm)", borderColor: "var(--border-warm-hair)" }}
     >
       {jobs.map((job) => {
-        const av = avatarColor(job.company);
-        const pill = recPill(job.match.recommendation);
+        const color = scoreColorWarm(job.match.recommendation);
+        const pill = recPillWarm(job.match.recommendation);
         return (
           <div
             key={job.id}
-            className="flex items-center gap-3 border-b px-4 py-3 last:border-0"
-            style={{ borderColor: "var(--divider)" }}
+            className="flex items-center gap-[13px] border-b px-[18px] py-[15px] last:border-0"
+            style={{ borderColor: "#f0e3d3" }}
           >
-            <span
-              className="flex h-[30px] w-[30px] flex-none items-center justify-center rounded-[7px] text-[13px] font-bold"
-              style={{ background: av.bg, color: av.color }}
-            >
-              {initial(job.company)}
-            </span>
+            <CompanyTile initial={initial(job.company)} hue={tileHue(job.company)} size="sm" />
             <div className="min-w-0 flex-1">
               <div className="truncate">
                 <span
                   className="text-[14px] font-semibold"
-                  style={{ color: "var(--text)" }}
+                  style={{ color: "var(--ink)" }}
                 >
                   {job.title}
                 </span>
-                <span className="text-[13px]" style={{ color: "var(--muted)" }}>
+                <span className="text-[14px]" style={{ color: "var(--ink-4)" }}>
                   {" "}
                   · {job.company}
                 </span>
               </div>
-              <div
-                className="mt-0.5 flex items-center gap-2 font-mono text-[11px] font-medium"
-                style={{ color: "var(--subtle)" }}
-              >
-                <span
-                  className="font-semibold tabular-nums"
-                  style={{ color: scoreColor(job.match.recommendation) }}
-                >
-                  {Math.round(job.match.overall_score)}
+              <div className="mt-[3px] flex items-center gap-2.5 text-[11.5px] font-semibold">
+                <span style={{ color }}>
+                  {Math.round(job.match.overall_score)}/100 match
                 </span>
-                <span style={{ color: pill.color }}>{pill.label}</span>
+                <span style={{ color }}>{pill.label}</span>
                 <a
                   href={job.url}
                   target="_blank"
                   rel="noreferrer"
-                  className="font-semibold"
-                  style={{ color: "var(--accent)" }}
+                  className="wm-link"
                 >
                   View posting ↗
                 </a>
@@ -523,7 +355,7 @@ function DecidedList({
 function LegendSquare({ color, label }: { color: string; label: string }) {
   return (
     <span className="inline-flex items-center gap-1.5">
-      <span className="h-2 w-2 rounded-sm" style={{ background: color }} />
+      <span className="h-2 w-2 rounded-[2px]" style={{ background: color }} />
       {label}
     </span>
   );
@@ -543,19 +375,14 @@ function TabBtn({
   return (
     <button
       onClick={onClick}
-      className="inline-flex items-center gap-[7px] rounded-[7px] px-[13px] py-1.5 text-[13px]"
-      style={{
-        background: active ? "var(--surface)" : "transparent",
-        color: active ? "var(--text)" : "var(--label)",
-        fontWeight: active ? 600 : 500,
-        boxShadow: active ? "0 1px 2px rgba(0,0,0,0.06)" : "none",
-      }}
+      className={
+        active
+          ? "wm-tab wm-tab-active inline-flex items-center gap-[7px] rounded-[11px] px-[15px] py-[7px] text-[13px]"
+          : "wm-tab inline-flex items-center gap-[7px] rounded-[11px] px-[15px] py-[7px] text-[13px]"
+      }
     >
       {label}
-      <span
-        className="font-mono text-[11px] font-semibold"
-        style={{ color: "var(--subtle)" }}
-      >
+      <span className="text-[11.5px]" style={{ color: "#a3927f" }}>
         {count}
       </span>
     </button>
@@ -574,17 +401,12 @@ function RowBtn({
   return (
     <button
       onClick={onClick}
-      className="h-[30px] rounded-[7px] px-[13px] text-xs"
-      style={
+      className={
         primary
-          ? { background: "var(--text)", color: "var(--surface)", fontWeight: 600 }
-          : {
-              background: "var(--surface)",
-              border: "1px solid var(--border)",
-              color: "var(--label)",
-              fontWeight: 500,
-            }
+          ? "wm-cta h-[34px] rounded-[11px] px-[14px] text-[12.5px] font-semibold"
+          : "wm-ghost h-[34px] rounded-[11px] border px-[14px] text-[12.5px] font-semibold"
       }
+      style={primary ? undefined : { borderColor: "#e8dacb", color: "var(--ink-2)" }}
     >
       {children}
     </button>
@@ -594,15 +416,10 @@ function RowBtn({
 function EmptyCard({ children }: { children: React.ReactNode }) {
   return (
     <div
-      className="flex h-[220px] items-center justify-center rounded-xl border text-center"
-      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      className="rounded-[18px] border border-dashed px-[22px] py-5 text-[13.5px] leading-[1.6]"
+      style={{ background: "#fdf7ee", borderColor: "#d9c4a8", color: "var(--ink-4)" }}
     >
-      <p
-        className="max-w-[380px] px-8 text-sm leading-relaxed"
-        style={{ color: "var(--muted)" }}
-      >
-        {children}
-      </p>
+      {children}
     </div>
   );
 }
