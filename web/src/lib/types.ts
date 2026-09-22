@@ -242,3 +242,50 @@ export type Application = {
   confirmation?: Confirmation | null;
   timeline: StatusEvent[];
 };
+
+// ---- Journeys (mirrors models/journey.py) ----
+export type JourneySource = "hermes" | "manual";
+export type JourneyOutcome = "in_progress" | "offer" | "rejected" | "withdrawn";
+/** Identical to warm/journeyStages `TrackStatus` — the board feeds the track directly. */
+export type JourneyStageStatus = "done" | "current" | "upcoming";
+export type CheckIn = {
+  rating: number | null;
+  tags: string[];
+  sentence: string | null;
+  at: string;
+};
+export type PrepItem = { text: string; done: boolean; from_journey_id?: string | null };
+export type StageQuestion = {
+  text: string;
+  topic?: string | null;
+  felt?: "good" | "struggled" | null;
+};
+export type JourneyStage = {
+  id: string;
+  name: string;
+  status: JourneyStageStatus;
+  scheduled_at: string | null;
+  format?: string | null;
+  who?: string | null;
+  checkin: CheckIn | null;
+  questions: StageQuestion[];
+  prep: PrepItem[];
+};
+export type Retro = { keep: string | null; change: string | null; next: string | null };
+export type Journey = {
+  id: string;
+  user_id: string;
+  created_at: string;
+  updated_at: string;
+  company: string;
+  role: string;
+  source: JourneySource;
+  application_id: string | null;
+  job_url: string | null;
+  stages: JourneyStage[];
+  outcome: JourneyOutcome;
+  ended_at_stage_id: string | null;
+  retro: Retro | null;
+};
+/** What POST /journeys takes — the server assigns the rest. */
+export type JourneyInput = Omit<Journey, "id" | "user_id" | "created_at" | "updated_at">;

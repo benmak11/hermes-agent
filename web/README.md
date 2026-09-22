@@ -2,7 +2,7 @@
 
 The Next.js 16 (App Router) frontend for Hermes — the surface a user rides the
 job-search funnel through: sign in, review the parsed résumé, watch discovery
-and matching fill in, vet jobs, track applications, and log interviews. See
+and matching fill in, vet jobs, track applications, and track journeys. See
 the root [`README.md`](../README.md) for the end-to-end system and
 screenshots of these screens.
 
@@ -17,7 +17,7 @@ screenshots of these screens.
 | `/app` | Job review — approve/skip/star ranked postings, keyboard-driven, with a score + recommendation breakdown |
 | `/app/tracking` | Application pipeline (pipeline/starred/skipped tabs), filled in as the submitter writes status |
 | `/app/applications/{id}/review` | Tailored résumé diff/review + `.docx` download for a single application |
-| `/app/interviews` | User-owned interview journal — Hermes contributes only the match score; stages, outcomes, and reflections are logged by the user |
+| `/app/journeys` | Journey board — one node track per hiring process past "applied" (`users/{uid}/journeys`); sent applications appear as Applied rows until tracked |
 | `/app/settings/companies` | Discovery source list — rescan or block companies |
 | `/app/profile` | Résumé versions, match preferences, skills, and experience |
 
@@ -52,8 +52,7 @@ and kill the hover).
 Every `/app` page renders on the warm ground: `app/app/layout.tsx` (the auth
 gate) wraps its children in `GROUND` from `warm/styles.ts`, and
 `(auth)/layout.tsx` does the same for login / signup / onboarding, so pages no
-longer paint their own ground. There are no grey pages left; `/app/interviews`
-carries a mechanical warm-token substitution until its own re-skin (PR 9).
+longer paint their own ground. There are no grey pages left.
 The same `.wm-*` block also holds `wm-danger` (profile's Delete account,
 companies' Block).
 
@@ -109,7 +108,7 @@ only (Tailwind layout utilities are fine; the palette is not) and must not
 import `@/lib/firebase`, `@/lib/api`, `next/navigation`, or any CSS.
 
 `warm/Editable.tsx` holds the editable primitives (`MonoLabel`, `Divider`,
-`PencilBtn`, `InlineText`, `ChipEditor`) used by profile and interviews; the
+`PencilBtn`, `InlineText`, `ChipEditor`) used by profile; the
 grey `components/editable.tsx` it forked from is gone.
 
 `src/lib/ui.ts` carries the warm trio (`scoreColor`, `recPill`, `barColor`)

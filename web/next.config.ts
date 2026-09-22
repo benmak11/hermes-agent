@@ -36,7 +36,9 @@ const nextConfig: NextConfig = {
     return [
       { source: "/tracking", destination: "/app/tracking", permanent: false },
       { source: "/profile", destination: "/app/profile", permanent: false },
-      { source: "/interviews", destination: "/app/interviews", permanent: false },
+      { source: "/interviews", destination: "/app/journeys", permanent: false },
+      // The interview journal became the journey board (facelift PR 9).
+      { source: "/app/interviews", destination: "/app/journeys", permanent: false },
       { source: "/settings/companies", destination: "/app/settings/companies", permanent: false },
       { source: "/applications/:path*", destination: "/app/applications/:path*", permanent: false },
     ];

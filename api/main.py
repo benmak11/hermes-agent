@@ -3,9 +3,9 @@
 """FastAPI gateway for the hermes pipelines.
 
 Serves the web API used by the Next.js frontend: ``/jobs``, ``/profile``,
-``/applications``, ``/settings``, ``/companies``, ``/account`` (all
-Firebase-authenticated) plus the ``/tasks/*`` worker handlers, which the same
-image answers only when deployed with ``WORKER_MODE=1``.
+``/applications``, ``/journeys``, ``/settings``, ``/companies``, ``/account``
+(all Firebase-authenticated) plus the ``/tasks/*`` worker handlers, which the
+same image answers only when deployed with ``WORKER_MODE=1``.
 
 The work itself lives in ``tools/`` (deterministic pipelines) and ``cli/``
 (their batch runners); this module is the HTTP edge in front of them.
@@ -27,6 +27,7 @@ from api.routes import applications as applications_routes
 from api.routes import companies as companies_routes
 from api.routes import discovery as discovery_routes
 from api.routes import jobs as jobs_routes
+from api.routes import journeys as journeys_routes
 from api.routes import profile as profile_routes
 from api.routes import worker as worker_routes
 from obs.logging import configure_logging, get_logger
@@ -92,6 +93,7 @@ app.include_router(jobs_routes.router)
 app.include_router(companies_routes.router)
 app.include_router(applications_routes.router)
 app.include_router(profile_routes.router)
+app.include_router(journeys_routes.router)
 app.include_router(discovery_routes.router)
 app.include_router(account_routes.router)
 # /tasks/* handlers; they 404 unless this deployment sets WORKER_MODE=1.
