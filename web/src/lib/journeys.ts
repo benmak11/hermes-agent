@@ -29,6 +29,26 @@ export function useJourneys(enabled: boolean) {
   });
 }
 
+/**
+ * One journey out of the already-cached list. The board has usually filled
+ * `JOURNEYS_KEY` before a row is clicked, so the detail pages render with no
+ * request; `seedPrep` needs every journey anyway, so a `GET /journeys/{id}`
+ * would still force the list fetch.
+ */
+export type JourneyLookup =
+  | { state: "loading" }
+  | { state: "error" }
+  | { state: "missing" }
+  | { state: "ready"; journey: Journey };
+
+export function useJourneyById(id: string, enabled: boolean): JourneyLookup {
+  const q = useJourneys(enabled);
+  if (!enabled || q.isPending) return { state: "loading" };
+  if (q.isError || !q.data) return { state: "error" };
+  const journey = q.data.journeys.find((j) => j.id === id);
+  return journey ? { state: "ready", journey } : { state: "missing" };
+}
+
 export function useJourneyMutations() {
   const queryClient = useQueryClient();
   const onSuccess = () => queryClient.invalidateQueries({ queryKey: JOURNEYS_KEY });

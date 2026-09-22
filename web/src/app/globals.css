@@ -315,3 +315,18 @@ body {
 .wm-danger:not(:disabled):hover {
   background: #fdf5f2;
 }
+
+/* Loop builder + stage detail (facelift PR 10). Same contract: a property
+   that changes on hover lives here, never inline. */
+.wm-tpl {
+  border-color: #e8dacb;
+}
+.wm-tpl:hover {
+  border-color: #d9c4a8;
+}
+.wm-tpl.wm-tpl-on:hover {
+  border-color: var(--terracotta);
+}
+.wm-tpl-on {
+  border-color: var(--terracotta);
+}

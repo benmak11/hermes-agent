@@ -13,6 +13,7 @@ import { Pill } from "@/components/warm/Pill";
 import { SERIF } from "@/components/warm/styles";
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { loopUnknown } from "@/lib/journeyEdit";
 import { JOURNEYS_KEY, importLegacyJournal, useJourneyMutations, useJourneys } from "@/lib/journeys";
 import {
   advanceStages,
@@ -181,9 +182,14 @@ export default function JourneysPage() {
             )}
             {week.map((item) =>
               item.kind === "scheduled" ? (
-                <WeekChip key={`${item.journeyId}:${item.stageId}`}>
-                  <b style={{ color: "var(--ink)" }}>{weekdayTime(item.at)}</b> {item.label}
-                </WeekChip>
+                <Link
+                  key={`${item.journeyId}:${item.stageId}`}
+                  href={`/app/journeys/${item.journeyId}/stages/${item.stageId}`}
+                >
+                  <WeekChip>
+                    <b style={{ color: "var(--ink)" }}>{weekdayTime(item.at)}</b> {item.label}
+                  </WeekChip>
+                </Link>
               ) : (
                 <span
                   key="checkins"
@@ -261,6 +267,56 @@ export default function JourneysPage() {
   );
 }
 
+/**
+ * The wide dashed "rest of the loop unknown" node (screen 16), rendered as a
+ * sibling of `<JourneyTrack>` inside the same flex row: the component is the
+ * marketing↔app seam and has no link or wide-node support, and this node is
+ * both a link and 344px wide. Duplicates only the node itself.
+ */
+function UnknownLoopNode({ href }: { href: string }) {
+  return (
+    <>
+      <div
+        aria-hidden="true"
+        style={{ flex: 1, height: 2, marginTop: 13, background: "#f4ebdf" }}
+      />
+      <Link
+        href={href}
+        style={{
+          width: 344,
+          flex: "none",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
+        <span
+          aria-hidden="true"
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: "50%",
+            boxSizing: "border-box",
+            flex: "none",
+            background: "var(--surface-warm)",
+            border: "1px dashed #d9c4a8",
+          }}
+        />
+        <span
+          className="text-center text-[12.5px] font-semibold"
+          style={{ color: "var(--terracotta-d)" }}
+        >
+          Rest of the loop unknown
+        </span>
+        <span className="text-center text-[11.5px]" style={{ color: "#a3927f" }}>
+          After the call, tell us what they described
+        </span>
+      </Link>
+    </>
+  );
+}
+
 function WeekChip({ children }: { children: React.ReactNode }) {
   return (
     <span
@@ -322,8 +378,13 @@ function LiveRow({
         <SourcePill source={j.source} />
         {next && withinWeek(next.at, now) && <Pill tone="good">{weekdayTime(next.at)}</Pill>}
       </div>
-      <div className="mt-[18px] overflow-x-auto">
-        <JourneyTrack stages={stagesToTrack(j, now)} layout="fixed" />
+      {/* The track must not be a flex item: its connectors are flex:1 and would
+          shrink to zero. Give it a min-width-0 wrapper that grows instead. */}
+      <div className="mt-[18px] flex items-start overflow-x-auto">
+        <div className="min-w-0 flex-1">
+          <JourneyTrack stages={stagesToTrack(j, now)} layout="fixed" />
+        </div>
+        {loopUnknown(j) && <UnknownLoopNode href={`/app/journeys/${j.id}/loop`} />}
       </div>
       <div
         className="mt-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 text-[11.5px] font-medium"
@@ -341,12 +402,32 @@ function LiveRow({
           ) : (
             <span>waiting to hear back</span>
           )}
+          {cur && (
+            <>
+              <span>·</span>
+              <Link
+                href={`/app/journeys/${j.id}/stages/${cur.id}`}
+                className="font-semibold"
+                style={{ color: "var(--terracotta-d)" }}
+              >
+                Open {cur.name.toLowerCase()} →
+              </Link>
+            </>
+          )}
           <span>·</span>
           <AddStageChip
             onAdd={(name) =>
               onSave({ ...j, stages: [...j.stages, newStage(name, cur ? "upcoming" : "current")] })
             }
           />
+          <span>·</span>
+          <Link
+            href={`/app/journeys/${j.id}/loop`}
+            className="font-semibold"
+            style={{ color: "var(--terracotta-d)" }}
+          >
+            {loopUnknown(j) ? "Plan the loop →" : "Edit the loop →"}
+          </Link>
         </div>
         <div className="flex items-center gap-3.5">
           <button
