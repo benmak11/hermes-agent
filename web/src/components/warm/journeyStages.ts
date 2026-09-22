@@ -3,7 +3,7 @@
 
 /**
  * Pure helpers for the warm journey track. Same linear stage model as
- * `advanceStages` in `@/lib/interviews` (before the marker = done, at it =
+ * `advanceStages` in `@/lib/journeysDerive` (before the marker = done, at it =
  * current, after = upcoming), kept separate so the track can render a
  * journey from any list of names without touching the journal's storage.
  *

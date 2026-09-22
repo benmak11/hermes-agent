@@ -11,6 +11,7 @@ import api.routes.applications as routes_applications
 import api.routes.companies as routes_companies
 import api.routes.discovery as routes_discovery
 import api.routes.jobs as routes_jobs
+import api.routes.journeys as routes_journeys
 import api.routes.profile as routes_profile
 from tools import genai_client
 from tools.matching import budget
@@ -136,6 +137,7 @@ def no_production_firestore(monkeypatch, request):
         routes_applications,
         routes_companies,
         routes_jobs,
+        routes_journeys,
         routes_profile,
     ):
         monkeypatch.setattr(mod, "_db", None, raising=False)

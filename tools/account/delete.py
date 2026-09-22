@@ -15,7 +15,7 @@ just by being imported, which is the exact leak ``tests/unit/conftest.py``
 documents. Nothing in ``api/`` or ``tools/`` imports from ``cli/``; this does
 not become the first thing that does.
 
-What is erased for ``users/{uid}``: the four per-user subcollections
+What is erased for ``users/{uid}``: the six per-user subcollections
 (:data:`USER_SUBCOLLECTIONS`), that user's ``batch_runs`` documents (a
 top-level collection, matched on the ``user_id`` field), their GCS blobs under
 ``users/{uid}/`` in the resumes bucket, and the user document itself.
@@ -42,6 +42,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from obs.logging import get_logger
 from tools import allowlist
 from tools.company_prefs import COLLECTION as COMPANY_PREFS
+from tools.journeys import COLLECTION as JOURNEYS
 from tools.run_costs import COLLECTION as RUN_COSTS
 from tools.tailoring.render import resume_bucket_name
 
@@ -56,7 +57,7 @@ DELETED_AT = "deleted_at"
 #: ledger; it goes with the rest, because it is per-user billing detail and
 #: nothing aggregates it across accounts.
 #:
-#: The last two are named by importing the constant the owning module already
+#: The last three are named by importing the constant the owning module already
 #: exports, not by repeating the string — ``company_prefs`` was added by a
 #: later PR than the wipe and was missed here precisely because this list was
 #: hand-maintained. Anything that adds a subcollection under ``users/{uid}``
@@ -67,6 +68,7 @@ USER_SUBCOLLECTIONS = (
     "discarded_jobs",
     RUN_COSTS,
     COMPANY_PREFS,
+    JOURNEYS,
 )
 
 #: Firestore's hard cap on writes per batch.
@@ -82,6 +84,7 @@ class WipeCounts:
     discarded_jobs: int = 0
     runs: int = 0
     company_prefs: int = 0
+    journeys: int = 0
     batch_runs: int = 0
     gcs_blobs: int = 0
     #: Whether ``users/{uid}`` was there to delete. False on a re-run of a wipe
@@ -199,6 +202,7 @@ async def wipe_user_data(
         discarded_jobs=counts["discarded_jobs"],
         runs=counts[RUN_COSTS],
         company_prefs=counts[COMPANY_PREFS],
+        journeys=counts[JOURNEYS],
         batch_runs=counts["batch_runs"],
         gcs_blobs=counts["gcs_blobs"],
         user_doc_existed=user_doc_existed,

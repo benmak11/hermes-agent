@@ -111,8 +111,9 @@ deprecated = "ignore"
 [tool.codespell]
 # "cach" is the deliberate substring match on cache-shaped error messages in
 # tools/matching/pipeline.py; "unparseable" is a valid spelling this codebase
-# uses consistently.
-ignore-words-list = "cach,unparseable"
+# uses consistently; "checkin" is the journey-stage field (models/journey.py
+# and its TS mirror), not a typo of "checking".
+ignore-words-list = "cach,unparseable,checkin"
 # "./frontend" is the pre-Next.js app dir; kept for old branches. The web app
 # lives in ./web now — skip its dependencies and build output, not our code.
 skip = "./locust_env/*,uv.lock,.venv,./frontend,**/package-lock.json,./web/node_modules,./web/.next,./data"

@@ -201,8 +201,10 @@ def world(monkeypatch):
             "users/u1/discarded_jobs/d1": {"score": 12},
             "users/u1/runs/r1": {"cost_usd": 0.03},
             "users/u1/company_prefs/greenhouse:stripe": {"state": "excluded"},
+            "users/u1/journeys/jn1": {"company": "Shopify"},
             "users/u2": {"email": "other@example.com"},
             "users/u2/jobs/j9": {"title": "not mine"},
+            "users/u2/journeys/jn9": {"company": "not mine"},
             "batch_runs/b1": {"user_id": "u1", "state": "running"},
             "batch_runs/b2": {"user_id": "u2", "state": "running"},
             # Shared, content-keyed, and nobody's personal data.
@@ -263,6 +265,7 @@ def test_a_dry_run_counts_everything_and_writes_nothing(world):
         "discarded_jobs": 1,
         "runs": 1,
         "company_prefs": 1,
+        "journeys": 1,
         "batch_runs": 1,
         "gcs_blobs": 2,
         "user_doc_existed": True,
@@ -292,6 +295,7 @@ def test_it_stops_at_this_users_boundary(world):
 
     assert world.db.docs["users/u2"] == {"email": "other@example.com"}
     assert "users/u2/jobs/j9" in world.db.docs
+    assert "users/u2/journeys/jn9" in world.db.docs
     assert world.db.docs["batch_runs/b2"]["user_id"] == "u2"
     assert "users/u2/resume.docx" in world.bucket.names
 
@@ -335,6 +339,7 @@ def test_a_wipe_of_an_already_wiped_account_is_a_no_op(world):
         "discarded_jobs": 0,
         "runs": 0,
         "company_prefs": 0,
+        "journeys": 0,
         "batch_runs": 0,
         "gcs_blobs": 0,
         "user_doc_existed": False,
@@ -875,6 +880,17 @@ def test_a_deleted_account_leaves_no_company_prefs_behind(world):
     assert counts.company_prefs == 1
 
 
+def test_a_deleted_account_leaves_no_journeys_behind(world):
+    """``journeys`` arrived with the facelift's PR 9 — the same class of
+    addition that orphaned ``company_prefs``."""
+    assert "users/u1/journeys/jn1" in world.db.docs
+
+    counts = _wipe(world, execute=True)
+
+    assert "users/u1/journeys/jn1" not in world.db.docs
+    assert counts.journeys == 1
+
+
 def test_every_subcollection_the_code_writes_is_one_the_wipe_deletes():
     """Guards the *class* of bug, not the one instance of it.
 
@@ -886,9 +902,10 @@ def test_every_subcollection_the_code_writes_is_one_the_wipe_deletes():
     """
     from tools.account.delete import USER_SUBCOLLECTIONS
     from tools.company_prefs import COLLECTION as COMPANY_PREFS
+    from tools.journeys import COLLECTION as JOURNEYS
     from tools.run_costs import COLLECTION as RUN_COSTS
 
-    for owned in (RUN_COSTS, COMPANY_PREFS):
+    for owned in (RUN_COSTS, COMPANY_PREFS, JOURNEYS):
         assert owned in USER_SUBCOLLECTIONS, (
             f"{owned!r} is written under users/{{uid}} but the wipe would "
             f"leave it behind"

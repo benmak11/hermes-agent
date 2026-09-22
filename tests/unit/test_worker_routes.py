@@ -1686,6 +1686,7 @@ def test_dry_run_is_worker_only():
             "companies",
             "discovery",
             "jobs",
+            "journeys",
             "profile",
             "worker",
         )
