@@ -18,6 +18,8 @@ screenshots of these screens.
 | `/app/tracking` | Application pipeline (pipeline/starred/skipped tabs), filled in as the submitter writes status |
 | `/app/applications/{id}/review` | Tailored résumé diff/review + `.docx` download for a single application |
 | `/app/journeys` | Journey board — one node track per hiring process past "applied" (`users/{uid}/journeys`); sent applications appear as Applied rows until tracked |
+| `/app/journeys/{id}/loop` | Loop builder — turn what the recruiter described into the journey's stages (templates + an editable draft, confirmed in one PUT) |
+| `/app/journeys/{id}/stages/{stageId}` | One stage — when/format/who, the prep checklist (seeded from past journeys), and the questions they asked |
 | `/app/settings/companies` | Discovery source list — rescan or block companies |
 | `/app/profile` | Résumé versions, match preferences, skills, and experience |
 
