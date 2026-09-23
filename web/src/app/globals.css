@@ -330,3 +330,17 @@ body {
 .wm-tpl-on {
   border-color: var(--terracotta);
 }
+
+/* Stage check-in + outcome retro (facelift PR 11). Same contract. */
+.wm-chip {
+  border: 1px solid #e8dacb;
+}
+.wm-chip:hover {
+  border-color: #d9c4a8;
+}
+.wm-chip-on {
+  border-color: var(--terracotta);
+}
+.wm-chip.wm-chip-on:hover {
+  border-color: var(--terracotta);
+}
