@@ -35,7 +35,23 @@ const NODE_BASE: CSSProperties = {
   flex: "none",
 };
 
-function Node({ status }: { status: TrackStatus }) {
+function Node({ status, ended }: { status: TrackStatus; ended?: boolean }) {
+  if (ended) {
+    return (
+      <span
+        aria-hidden="true"
+        style={{
+          ...NODE_BASE,
+          background: "var(--brick)",
+          color: "#fdf5f2",
+          fontSize: 13,
+          fontWeight: 800,
+        }}
+      >
+        ✕
+      </span>
+    );
+  }
   if (status === "done") {
     return (
       <span
@@ -117,12 +133,14 @@ export function JourneyTrack({
               gap: 8,
             }}
           >
-            <Node status={stage.status} />
+            <Node status={stage.status} ended={stage.ended} />
             <span
               style={{
                 fontSize: 12.5,
                 textAlign: "center",
-                ...NAME_STYLE[stage.status],
+                ...(stage.ended
+                  ? { fontWeight: 700, color: "var(--brick)" }
+                  : NAME_STYLE[stage.status]),
               }}
             >
               {stage.name}

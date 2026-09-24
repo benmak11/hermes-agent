@@ -20,6 +20,8 @@ screenshots of these screens.
 | `/app/journeys` | Journey board — one node track per hiring process past "applied" (`users/{uid}/journeys`); sent applications appear as Applied rows until tracked |
 | `/app/journeys/{id}/loop` | Loop builder — turn what the recruiter described into the journey's stages (templates + an editable draft, confirmed in one PUT) |
 | `/app/journeys/{id}/stages/{stageId}` | One stage — when/format/who, the prep checklist (seeded from past journeys), and the questions they asked |
+| `/app/journeys/{id}/stages/{stageId}/checkin` | The two-minute check-in after a stage — how it felt, what came up, one optional sentence; skipping writes nothing |
+| `/app/journeys/{id}/retro` | Outcome retro — the arc replayed, your check-ins as evidence, three prompts; this is where a journey is closed |
 | `/app/settings/companies` | Discovery source list — rescan or block companies |
 | `/app/profile` | Résumé versions, match preferences, skills, and experience |
 

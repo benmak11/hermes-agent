@@ -17,6 +17,8 @@ export type TrackStage = {
   id: string;
   name: string;
   status: TrackStatus;
+  /** Rejected/withdrawn journeys: the stage the process stopped at (brick ✕). */
+  ended?: boolean;
   /** Small line under the name ("2 Sep", "went well", "not booked"). */
   note?: string;
   noteTone?: "good" | "muted" | "accent";

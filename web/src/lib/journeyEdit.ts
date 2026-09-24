@@ -15,8 +15,10 @@
  * items or questions, whatever the UI did.
  */
 
+import type { TrackStage } from "@/components/warm/journeyStages";
 import type { Fmt } from "@/lib/journeysDerive";
-import type { Journey, JourneyStage, PrepItem } from "@/lib/types";
+import { APPLIED_STAGE_ID, advanceStages, currentStage, stagesToTrack } from "@/lib/journeysDerive";
+import type { CheckIn, Journey, JourneyOutcome, JourneyStage, PrepItem } from "@/lib/types";
 
 export type LoopTemplate = { id: string; label: string; stages: string[] };
 
@@ -152,7 +154,8 @@ function improvements(sentence: string): string[] {
  * `retro.change`, then `retro.next`, then the "To improve: …" halves of any
  * check-in sentence (the byte-exact prefix the legacy importer writes,
  * `journeysDerive.ts:321`). Nothing already on this stage's checklist, and no
- * duplicate text, comes back. Thin until PR 11 gives `retro.change` a writer.
+ * duplicate text, comes back. `closeJourney` (below) is what writes
+ * `retro.change`/`retro.next`, so the retro's closing promise is literal.
  *
  * Suggestions only — the caller renders them and writes nothing until a click.
  */
@@ -238,4 +241,233 @@ function dayNumber(d: Date, fmt?: Fmt): number {
   }).formatToParts(d);
   const at = (type: string) => Number(parts.find((p) => p.type === type)?.value);
   return Date.UTC(at("year"), at("month") - 1, at("day")) / DAY_MS;
+}
+
+// ---- check-in + closing a journey (Warm Flow screens 19-20) ----
+
+/** The six the design offers, in its order. Free text either way: a tag the
+ *  user types lands in the same `CheckIn.tags` array and is indistinguishable
+ *  downstream. */
+export const CHECKIN_TAGS: readonly string[] = [
+  "Ran out of time",
+  "Froze on a question",
+  "Went too deep too early",
+  "Didn't ask enough back",
+  "Good rapport",
+  "Told my story well",
+];
+
+/** The form's words. Deliberately a different register from `checkinNote`
+ *  (`journeysDerive.ts:102`): the form asks how it felt, the board reports it. */
+export const RATING_LABELS: Record<1 | 2 | 3 | 4 | 5, string> = {
+  1: "Rough",
+  2: "Shaky",
+  3: "Okay",
+  4: "Good",
+  5: "Great",
+};
+
+/** Screen 20's labels per outcome, as data so a test can cover the copy.
+ *  `in_progress` is unreachable from a closed journey but reachable from the
+ *  retro of a live one; it reuses the rejected set. */
+export const RETRO_COPY: Record<
+  JourneyOutcome,
+  { pill: string; keep: string; change: string; next: string }
+> = {
+  offer: {
+    pill: "OFFER 🎉",
+    keep: "What carried it",
+    change: "What was hardest",
+    next: "Next time, do this",
+  },
+  rejected: {
+    pill: "didn't move on",
+    keep: "What you'd keep",
+    change: "What cost you",
+    next: "Next time, do this",
+  },
+  withdrawn: {
+    pill: "withdrew",
+    keep: "What you'd keep",
+    change: "Why you stepped away",
+    next: "Next time, do this",
+  },
+  in_progress: {
+    pill: "still going",
+    keep: "What you'd keep",
+    change: "What cost you",
+    next: "Next time, do this",
+  },
+};
+
+/**
+ * Board "✓ Done with X". Advances only when the stage is the current one —
+ * `advanceStages` on an already-done stage would move the marker BACK and
+ * demote every later done stage. `needsCheckIn` is false for the Applied
+ * stage and for a stage that already carries a check-in.
+ */
+export function markDone(
+  j: Journey,
+  stageId: string,
+): { journey: Journey; needsCheckIn: boolean } {
+  const stage = j.stages.find((s) => s.id === stageId);
+  if (!stage) return { journey: j, needsCheckIn: false };
+  const journey =
+    stage.status === "current" ? { ...j, stages: advanceStages(j.stages, stageId) } : j;
+  return {
+    journey,
+    needsCheckIn: stage.checkin === null && stage.id !== APPLIED_STAGE_ID,
+  };
+}
+
+/**
+ * Writes the check-in on exactly one stage. `null` (an empty form, or "skip")
+ * leaves `checkin: null` — never `{}`, which `thisWeek` would read as
+ * "checked in" and drop from the waiting count. Also completes the stage when
+ * it is still `current`, so the stage-page entry point is one PUT, not two.
+ */
+export function applyCheckIn(j: Journey, stageId: string, checkin: CheckIn | null): Journey {
+  const stage = j.stages.find((s) => s.id === stageId);
+  if (!stage) return j;
+  const stages = stage.status === "current" ? advanceStages(j.stages, stageId) : j.stages;
+  return { ...j, stages: stages.map((s) => (s.id === stageId ? { ...s, checkin } : s)) };
+}
+
+/** = `applyCheckIn(j, stageId, null)`. Exists so the invariant has a name:
+ *  skipping writes no check-in object at all.
+ *
+ *  **No production caller, deliberately.** The spec gave it one job — skipping
+ *  from the stage page while the stage is still `current` should still mark it
+ *  done — but the user never said the stage was over, so the Skip button
+ *  navigates away and writes nothing at all. Kept as the executable statement
+ *  of "a skip is `null`, never `{}`"; the test is its only caller. */
+export function skipCheckIn(j: Journey, stageId: string): Journey {
+  return applyCheckIn(j, stageId, null);
+}
+
+/**
+ * The form → storage. Returns `null` when nothing was entered — no rating, no
+ * tags, a blank sentence. This is the only constructor of a `CheckIn`, and it
+ * is what keeps an all-null object out of Firestore.
+ */
+export function buildCheckIn(
+  rating: number | null,
+  tags: string[],
+  sentence: string,
+  nowIso: string,
+): CheckIn | null {
+  const kept = tags.map((t) => t.trim()).filter((t) => t !== "");
+  const text = sentence.trim();
+  if (rating === null && kept.length === 0 && text === "") return null;
+  return { rating, tags: kept, sentence: text || null, at: nowIso };
+}
+
+/**
+ * One PUT closes the journey. `ended_at_stage_id` is forced to null for an
+ * offer (an offer did not end at a stage) and validated against `j.stages`
+ * otherwise, because a later loop rebuild can delete the stage it pointed at.
+ * An all-blank retro is stored as `null`, not three nulls.
+ */
+export function closeJourney(
+  j: Journey,
+  outcome: JourneyOutcome,
+  endedAtStageId: string | null,
+  retro: { keep: string; change: string; next: string } | null,
+): Journey {
+  const ended =
+    outcome === "offer" || !endedAtStageId || !j.stages.some((s) => s.id === endedAtStageId)
+      ? null
+      : endedAtStageId;
+  const keep = retro?.keep.trim() ?? "";
+  const change = retro?.change.trim() ?? "";
+  const next = retro?.next.trim() ?? "";
+  const any = keep !== "" || change !== "" || next !== "";
+  return {
+    ...j,
+    outcome,
+    ended_at_stage_id: ended,
+    retro: any
+      ? { keep: keep || null, change: change || null, next: next || null }
+      : null,
+  };
+}
+
+/** The board's inline "where did this stop" expression, named: the current
+ *  stage, else the last done one, else nothing. */
+export function endedAtStageId(j: Journey): string | null {
+  const cur = currentStage(j);
+  if (cur) return cur.id;
+  return [...j.stages].reverse().find((s) => s.status === "done")?.id ?? null;
+}
+
+/** Screen 20's evidence chips: every tag, then the sentence, per checked-in
+ *  stage in stage order. Applied never has one and is skipped anyway. */
+export function checkInEvidence(
+  j: Journey,
+): { stageId: string; stageName: string; text: string }[] {
+  const out: { stageId: string; stageName: string; text: string }[] = [];
+  for (const s of j.stages) {
+    if (s.id === APPLIED_STAGE_ID || !s.checkin) continue;
+    for (const tag of s.checkin.tags) {
+      out.push({ stageId: s.id, stageName: s.name, text: tag });
+    }
+    const sentence = s.checkin.sentence?.trim();
+    if (sentence) out.push({ stageId: s.id, stageName: s.name, text: sentence });
+  }
+  return out;
+}
+
+/**
+ * The week strip's "N check-ins waiting", as the list behind the count. The
+ * predicate is deliberately identical to `thisWeek`'s (`journeysDerive.ts:183`)
+ * — that file has to stay byte-identical, so the two are pinned to the same
+ * number by a test instead of shared code.
+ */
+export function pendingCheckIns(
+  journeys: Journey[],
+): { journeyId: string; stageId: string; stageName: string; company: string }[] {
+  const out: { journeyId: string; stageId: string; stageName: string; company: string }[] = [];
+  for (const j of journeys) {
+    if (j.outcome !== "in_progress") continue;
+    for (const s of j.stages) {
+      if (s.status === "done" && s.checkin === null && s.id !== APPLIED_STAGE_ID) {
+        out.push({ journeyId: j.id, stageId: s.id, stageName: s.name, company: j.company });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Screen 20's replayed map: `stagesToTrack` as the board draws it, then the
+ * brick ✕ on the stage the process stopped at and "never happened" on the
+ * ones after it that never ran. An offer (or a still-live journey) is marked
+ * nowhere — the arc reads as all-done. `journeysDerive.ts` stays untouched.
+ */
+export function retroTrack(j: Journey, now: Date, fmt?: Fmt): TrackStage[] {
+  const track = stagesToTrack(j, now, fmt);
+  if (j.outcome === "offer" || j.outcome === "in_progress") return track;
+  const endedIdx = track.findIndex((t) => t.id === j.ended_at_stage_id);
+  if (endedIdx < 0) return track;
+  return track.map((t, i) => {
+    if (i === endedIdx) return { ...t, ended: true };
+    const s = j.stages[i];
+    if (i > endedIdx && s.status !== "done" && s.checkin === null) {
+      return { ...t, note: "never happened", noteTone: "muted" as const };
+    }
+    return t;
+  });
+}
+
+/** "6 weeks · 4 stages · ended at Technical" (an offer: "· all stages done").
+ *  Both halves are derived — nothing about a journey's length is stored. */
+export function retroSummary(j: Journey, now: Date): string {
+  const days = Math.floor((now.getTime() - new Date(j.created_at).getTime()) / DAY_MS);
+  const weeks = Math.max(1, Math.floor(days / 7));
+  const n = j.stages.length;
+  const tail =
+    j.outcome === "offer"
+      ? "all stages done"
+      : `ended at ${j.stages.find((s) => s.id === j.ended_at_stage_id)?.name ?? "—"}`;
+  return `${weeks} ${weeks === 1 ? "week" : "weeks"} · ${n} ${n === 1 ? "stage" : "stages"} · ${tail}`;
 }

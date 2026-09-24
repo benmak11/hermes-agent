@@ -4,6 +4,7 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
 import { TopNav } from "@/components/TopNav";
@@ -13,10 +14,9 @@ import { Pill } from "@/components/warm/Pill";
 import { SERIF } from "@/components/warm/styles";
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { loopUnknown } from "@/lib/journeyEdit";
+import { loopUnknown, markDone, pendingCheckIns } from "@/lib/journeyEdit";
 import { JOURNEYS_KEY, importLegacyJournal, useJourneyMutations, useJourneys } from "@/lib/journeys";
 import {
-  advanceStages,
   applicationToJourneyInput,
   boardSummary,
   currentStage,
@@ -30,7 +30,7 @@ import {
   weekdayTime,
   withinWeek,
 } from "@/lib/journeysDerive";
-import type { Application, Journey, JourneyStage } from "@/lib/types";
+import type { Application, Journey, JourneyOutcome, JourneyStage } from "@/lib/types";
 import { initial } from "@/lib/ui";
 
 /**
@@ -65,6 +65,7 @@ function newStage(name: string, status: JourneyStage["status"]): JourneyStage {
 
 export default function JourneysPage() {
   const { user, loading } = useAuth();
+  const router = useRouter();
   const queryClient = useQueryClient();
   const journeysQuery = useJourneys(!!user);
   const { data: appsData } = useQuery({
@@ -113,6 +114,9 @@ export default function JourneysPage() {
   const closed = sorted.filter((j) => j.outcome === "rejected" || j.outcome === "withdrawn");
   const untracked = untrackedApplications(apps, journeys);
   const week = thisWeek(journeys, now);
+  // The same predicate the strip counts with, as the list behind the count —
+  // the waiting chip links to the first one.
+  const pending = pendingCheckIns(journeys);
 
   return (
     <>
@@ -191,17 +195,15 @@ export default function JourneysPage() {
                   </WeekChip>
                 </Link>
               ) : (
-                <span
+                <CheckInsChip
                   key="checkins"
-                  className="flex items-center gap-[9px] rounded-[11px] px-[13px] py-[7px] text-[12.5px] font-semibold"
-                  style={{
-                    background: "var(--surface-warm)",
-                    border: "1px dashed #d9c4a8",
-                    color: "var(--terracotta-d)",
-                  }}
-                >
-                  ✎ {item.count} check-in{item.count === 1 ? "" : "s"} waiting for you
-                </span>
+                  count={item.count}
+                  href={
+                    pending.length
+                      ? `/app/journeys/${pending[0].journeyId}/stages/${pending[0].stageId}/checkin`
+                      : null
+                  }
+                />
               ),
             )}
           </div>
@@ -229,6 +231,18 @@ export default function JourneysPage() {
             now={now}
             first={i === 0}
             onSave={(next) => save.mutate(next)}
+            onMarkDone={(stageId) => {
+              // The advance is written first; the check-in is a second PUT on
+              // the next screen, and skipping it leaves the stage waiting.
+              const marked = markDone(j, stageId);
+              save.mutate(marked.journey);
+              if (marked.needsCheckIn) {
+                router.push(`/app/journeys/${j.id}/stages/${stageId}/checkin`);
+              }
+            }}
+            onClose={(outcome: ClosingOutcome) =>
+              router.push(`/app/journeys/${j.id}/retro?outcome=${outcome}`)
+            }
             error={save.isError && save.variables?.id === j.id ? String(save.error) : null}
           />
         ))}
@@ -317,6 +331,33 @@ function UnknownLoopNode({ href }: { href: string }) {
   );
 }
 
+/** The strip's "N check-ins waiting" chip. A link once there is one to go
+ *  to — the count and the destination come from the same predicate. */
+function CheckInsChip({ count, href }: { count: number; href: string | null }) {
+  const chip = (
+    <span
+      className="flex items-center gap-[9px] rounded-[11px] px-[13px] py-[7px] text-[12.5px] font-semibold"
+      style={{
+        background: "var(--surface-warm)",
+        border: "1px dashed #d9c4a8",
+        color: "var(--terracotta-d)",
+      }}
+    >
+      ✎ {count} check-in{count === 1 ? "" : "s"} waiting for you
+    </span>
+  );
+  return href ? <Link href={href}>{chip}</Link> : chip;
+}
+
+/** Reopening a closed journey's retro: same screen, editable, no `?outcome`. */
+function RetroLink({ id }: { id: string }) {
+  return (
+    <Link href={`/app/journeys/${id}/retro`} className="wm-nav-quiet text-[11.5px]">
+      Open the retro →
+    </Link>
+  );
+}
+
 function WeekChip({ children }: { children: React.ReactNode }) {
   return (
     <span
@@ -351,22 +392,29 @@ function SourcePill({ source }: { source: Journey["source"] }) {
   );
 }
 
+/** What the footer can propose. The retro commits it; this file never
+ *  writes an outcome any more. */
+type ClosingOutcome = Exclude<JourneyOutcome, "in_progress">;
+
 function LiveRow({
   journey: j,
   now,
   first,
   onSave,
+  onMarkDone,
+  onClose,
   error,
 }: {
   journey: Journey;
   now: Date;
   first: boolean;
   onSave: (next: Journey) => void;
+  onMarkDone: (stageId: string) => void;
+  onClose: (outcome: ClosingOutcome) => void;
   error: string | null;
 }) {
   const cur = currentStage(j);
   const next = nextUp(j, now);
-  const lastDone = [...j.stages].reverse().find((s) => s.status === "done");
   return (
     <article
       className={`${first ? "mt-4" : "mt-[14px]"} rounded-[18px] border px-[22px] py-5`}
@@ -395,7 +443,7 @@ function LiveRow({
             <button
               className="font-semibold"
               style={{ color: "var(--terracotta-d)" }}
-              onClick={() => onSave({ ...j, stages: advanceStages(j.stages, cur.id) })}
+              onClick={() => onMarkDone(cur.id)}
             >
               ✓ Done with {cur.name.toLowerCase()}
             </button>
@@ -430,30 +478,26 @@ function LiveRow({
           </Link>
         </div>
         <div className="flex items-center gap-3.5">
+          {/* These no longer write. The retro is the commit point, so a
+              misclick costs a back button instead of closing a journey. */}
           <button
             className="font-semibold"
             style={{ color: "var(--sage)" }}
-            onClick={() => onSave({ ...j, outcome: "offer" })}
+            onClick={() => onClose("offer")}
           >
             Offer 🎉
           </button>
           <button
             className="font-semibold"
             style={{ color: "var(--brick)" }}
-            onClick={() =>
-              onSave({
-                ...j,
-                outcome: "rejected",
-                ended_at_stage_id: cur?.id ?? lastDone?.id ?? null,
-              })
-            }
+            onClick={() => onClose("rejected")}
           >
             Didn&apos;t move on
           </button>
           <button
             className="font-semibold"
             style={{ color: "#a3927f" }}
-            onClick={() => onSave({ ...j, outcome: "withdrawn" })}
+            onClick={() => onClose("withdrawn")}
           >
             Withdrew
           </button>
@@ -526,6 +570,7 @@ function OfferRow({ journey: j }: { journey: Journey }) {
       >
         OFFER 🎉
       </span>
+      <RetroLink id={j.id} />
     </article>
   );
 }
@@ -543,6 +588,7 @@ function ClosedRow({ journey: j, onRemove }: { journey: Journey; onRemove: () =>
         ended at {endedName ?? "—"}
       </span>
       <Pill tone="muted">{j.outcome === "rejected" ? "Didn't move on" : "Withdrew"}</Pill>
+      <RetroLink id={j.id} />
       <button className="wm-nav-quiet text-[11.5px]" onClick={onRemove}>
         Remove
       </button>

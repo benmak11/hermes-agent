@@ -1,18 +1,32 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CHECKIN_TAGS,
   LOOP_TEMPLATES,
+  RATING_LABELS,
+  RETRO_COPY,
+  applyCheckIn,
+  buildCheckIn,
   buildStagesFromTemplate,
+  checkInEvidence,
+  closeJourney,
   draftToStages,
   emptyStage,
+  endedAtStageId,
   fromLocalInput,
   hasData,
   loopUnknown,
+  markDone,
   normalizeStatuses,
+  pendingCheckIns,
   relativeWhen,
+  retroSummary,
+  retroTrack,
   seedPrep,
+  skipCheckIn,
   toLocalInput,
 } from "@/lib/journeyEdit";
+import { thisWeek } from "@/lib/journeysDerive";
 import type { CheckIn, Journey, JourneyStage } from "@/lib/types";
 
 const UTC = { timeZone: "UTC" };
@@ -304,5 +318,316 @@ describe("relativeWhen", () => {
     expect(relativeWhen("2026-10-04T09:00:00Z", now, UTC)).toBe("in 13 days");
     expect(relativeWhen("2026-10-05T09:00:00Z", now, UTC)).toBe(null);
     expect(relativeWhen("2026-09-21T11:00:00Z", now, UTC)).toBe(null);
+  });
+});
+
+// ---- check-in + closing a journey (facelift PR 11, screens 19-20) ----
+
+function full(over: Partial<CheckIn> = {}): CheckIn {
+  return { rating: 4, tags: [], sentence: null, at: "2026-09-10T00:00:00Z", ...over };
+}
+
+/** applied(done) · rec(current) · tech(upcoming) — the board's usual shape. */
+function live(over: Partial<JourneyStage> = {}): Journey {
+  return j({
+    stages: [
+      applied(),
+      stage({ id: "rec", name: "Recruiter", status: "current", ...over }),
+      stage({ id: "tech", name: "Technical", status: "upcoming" }),
+    ],
+  });
+}
+
+describe("markDone", () => {
+  // PR11 M1
+  it("advances only the current stage", () => {
+    expect(statuses(markDone(live(), "rec").journey.stages)).toEqual([
+      "done",
+      "done",
+      "current",
+    ]);
+    // Re-clicking a stage that is already done must not move the marker back.
+    expect(statuses(markDone(live(), "applied").journey.stages)).toEqual([
+      "done",
+      "current",
+      "upcoming",
+    ]);
+  });
+
+  // PR11 M2
+  it("reports whether a check-in is wanted", () => {
+    expect(markDone(live(), "rec").needsCheckIn).toBe(true);
+    expect(markDone(live({ checkin: full() }), "rec").needsCheckIn).toBe(false);
+    // Applied is never checked in on.
+    expect(markDone(live(), "applied").needsCheckIn).toBe(false);
+  });
+});
+
+describe("applyCheckIn", () => {
+  // PR11 M3
+  it("writes only the named stage, and completes it when current", () => {
+    const fromCurrent = applyCheckIn(live(), "rec", full({ rating: 3 }));
+    expect(fromCurrent.stages[1].checkin?.rating).toBe(3);
+    expect(statuses(fromCurrent.stages)).toEqual(["done", "done", "current"]);
+
+    // An already-done middle stage: the check-in lands, nothing else moves.
+    const done = j({
+      stages: [
+        applied(),
+        stage({ id: "rec", name: "Recruiter", status: "done" }),
+        stage({ id: "tech", name: "Technical", status: "done" }),
+        stage({ id: "onsite", name: "Onsite", status: "current" }),
+      ],
+    });
+    const edited = applyCheckIn(done, "rec", full({ rating: 5 }));
+    expect(edited.stages[1].checkin?.rating).toBe(5);
+    expect(statuses(edited.stages)).toEqual(statuses(done.stages));
+  });
+});
+
+describe("buildCheckIn", () => {
+  // PR11 M4
+  it("returns null for an empty form, and never an all-null object", () => {
+    expect(buildCheckIn(null, [], "   ", "T")).toBeNull();
+    expect(buildCheckIn(3, [], "", "T")).toEqual({
+      rating: 3,
+      tags: [],
+      sentence: null,
+      at: "T",
+    });
+    expect(buildCheckIn(null, ["Good rapport"], "", "T")).not.toBeNull();
+    expect(buildCheckIn(null, [], " x ", "T")?.sentence).toBe("x");
+    expect(buildCheckIn(null, [" ", "Ran out of time"], "", "T")?.tags).toEqual([
+      "Ran out of time",
+    ]);
+  });
+});
+
+describe("skipCheckIn", () => {
+  // PR11 M5 — the trap this PR exists to avoid: `{}` is truthy, `null` is not.
+  it("leaves the check-in null, and thisWeek still counts the stage", () => {
+    const skipped = skipCheckIn(
+      j({
+        stages: [applied(), stage({ id: "rec", name: "Recruiter", status: "done" })],
+      }),
+      "rec",
+    );
+    expect(skipped.stages[1].checkin).toBeNull();
+    expect(thisWeek([skipped], now)).toEqual([{ kind: "checkins", count: 1 }]);
+  });
+
+  it("still completes a stage that was current", () => {
+    const skipped = skipCheckIn(live(), "rec");
+    expect(statuses(skipped.stages)).toEqual(["done", "done", "current"]);
+    expect(skipped.stages[1].checkin).toBeNull();
+  });
+});
+
+describe("closeJourney", () => {
+  const closable = () =>
+    j({
+      stages: [
+        applied(),
+        stage({ id: "rec", name: "Recruiter", status: "done" }),
+        stage({ id: "tech", name: "Technical", status: "current" }),
+      ],
+    });
+
+  // PR11 M6
+  it("sets outcome, retro and the ended id", () => {
+    const closed = closeJourney(closable(), "rejected", "tech", {
+      keep: " the story ",
+      change: "concurrency",
+      next: "two problems a week",
+    });
+    expect(closed.outcome).toBe("rejected");
+    expect(closed.ended_at_stage_id).toBe("tech");
+    expect(closed.retro).toEqual({
+      keep: "the story",
+      change: "concurrency",
+      next: "two problems a week",
+    });
+
+    // An all-blank retro is stored as null, not three nulls.
+    expect(
+      closeJourney(closable(), "rejected", "tech", { keep: "", change: " ", next: "" }).retro,
+    ).toBeNull();
+    expect(closeJourney(closable(), "withdrawn", "tech", null).retro).toBeNull();
+  });
+
+  // PR11 M7
+  it("rejects a stale ended id and never sets one on an offer", () => {
+    expect(closeJourney(closable(), "rejected", "gone", null).ended_at_stage_id).toBeNull();
+    expect(closeJourney(closable(), "offer", "tech", null).ended_at_stage_id).toBeNull();
+  });
+});
+
+describe("endedAtStageId", () => {
+  it("is the current stage, else the last done one, else null", () => {
+    expect(endedAtStageId(live())).toBe("rec");
+    expect(
+      endedAtStageId(
+        j({
+          stages: [applied(), stage({ id: "rec", name: "Recruiter", status: "done" })],
+        }),
+      ),
+    ).toBe("rec");
+    expect(endedAtStageId(j({ stages: [] }))).toBeNull();
+  });
+});
+
+describe("checkInEvidence", () => {
+  // PR11 M8
+  it("lists tags then the sentence, in stage order, skipping Applied", () => {
+    const evidence = checkInEvidence(
+      j({
+        stages: [
+          stage({
+            id: "applied",
+            name: "Applied",
+            status: "done",
+            // Carries data on purpose: the filter is what must drop it.
+            checkin: full({ tags: ["Ran out of time"], sentence: "applied late" }),
+          }),
+          stage({
+            id: "rec",
+            name: "Recruiter",
+            status: "done",
+            checkin: full({ tags: ["Good rapport", "Told my story well"], sentence: "slow down" }),
+          }),
+          stage({
+            id: "tech",
+            name: "Technical",
+            status: "done",
+            checkin: full({ tags: ["Ran out of time"] }),
+          }),
+        ],
+      }),
+    );
+    expect(evidence.map((e) => [e.stageName, e.text])).toEqual([
+      ["Recruiter", "Good rapport"],
+      ["Recruiter", "Told my story well"],
+      ["Recruiter", "slow down"],
+      ["Technical", "Ran out of time"],
+    ]);
+  });
+});
+
+describe("retroTrack", () => {
+  const arc = (outcome: Journey["outcome"]) =>
+    j({
+      outcome,
+      ended_at_stage_id: "tech",
+      stages: [
+        applied(),
+        stage({ id: "rec", name: "Recruiter", status: "done", checkin: full({ rating: 5 }) }),
+        stage({ id: "tech", name: "Technical", status: "done", checkin: full({ rating: 2 }) }),
+        stage({ id: "onsite", name: "Onsite", status: "upcoming" }),
+      ],
+    });
+
+  // PR11 M9
+  it("marks the ✕ node and the never-happened tail", () => {
+    const track = retroTrack(arc("rejected"), now, UTC);
+    expect(track.map((t) => t.ended ?? false)).toEqual([false, false, true, false]);
+    // The ended stage keeps the note its own check-in earned.
+    expect(track[2].note).toBe("felt shaky");
+    expect(track[3].note).toBe("never happened");
+    expect(track[3].noteTone).toBe("muted");
+  });
+
+  it("marks nothing on an offer", () => {
+    const track = retroTrack(arc("offer"), now, UTC);
+    expect(track.some((t) => t.ended)).toBe(false);
+    expect(track.some((t) => t.note === "never happened")).toBe(false);
+  });
+
+  it("marks nothing when the ended id no longer resolves", () => {
+    const track = retroTrack({ ...arc("rejected"), ended_at_stage_id: "gone" }, now, UTC);
+    expect(track.some((t) => t.ended)).toBe(false);
+  });
+});
+
+describe("retroSummary", () => {
+  // PR11 M10
+  it("counts whole weeks and stages, and says where it ended", () => {
+    const six = j({
+      created_at: "2026-08-10T12:00:00Z",
+      outcome: "rejected",
+      ended_at_stage_id: "tech",
+      stages: [
+        applied(),
+        stage({ id: "rec", name: "Recruiter", status: "done" }),
+        stage({ id: "tech", name: "Technical", status: "done" }),
+        stage({ id: "onsite", name: "Onsite", status: "upcoming" }),
+      ],
+    });
+    expect(retroSummary(six, now)).toBe("6 weeks · 4 stages · ended at Technical");
+    // 39 days is five whole weeks and change — floored, never rounded up.
+    expect(retroSummary({ ...six, created_at: "2026-08-13T12:00:00Z" }, now)).toBe(
+      "5 weeks · 4 stages · ended at Technical",
+    );
+    // Under a week still reads as one week, never "0 weeks".
+    expect(retroSummary({ ...six, created_at: "2026-09-18T12:00:00Z" }, now)).toBe(
+      "1 week · 4 stages · ended at Technical",
+    );
+    expect(retroSummary({ ...six, outcome: "offer" }, now)).toBe(
+      "6 weeks · 4 stages · all stages done",
+    );
+  });
+});
+
+describe("pendingCheckIns", () => {
+  // PR11 M11 — the cross-module pin: `journeysDerive.ts` must stay
+  // byte-identical, so the duplicated predicate is held to the same number.
+  it("agrees with thisWeek's count", () => {
+    const list: Journey[] = [
+      j({
+        id: "closed",
+        outcome: "rejected",
+        stages: [applied(), stage({ id: "x", name: "Screen", status: "done" })],
+      }),
+      j({
+        id: "a",
+        company: "Shopify",
+        stages: [
+          applied(),
+          stage({ id: "rec", name: "Recruiter", status: "done", checkin: full() }),
+          stage({ id: "tech", name: "Technical", status: "done" }),
+          stage({ id: "onsite", name: "Onsite", status: "current" }),
+        ],
+      }),
+      j({
+        id: "b",
+        company: "Figma",
+        stages: [applied(), stage({ id: "hm", name: "Hiring manager", status: "done" })],
+      }),
+    ];
+    const pending = pendingCheckIns(list);
+    expect(pending.length).toBe(2);
+    expect(pending.map((p) => [p.journeyId, p.stageId, p.stageName, p.company])).toEqual([
+      ["a", "tech", "Technical", "Shopify"],
+      ["b", "hm", "Hiring manager", "Figma"],
+    ]);
+    const week = thisWeek(list, now).find((w) => w.kind === "checkins");
+    expect(week?.count).toBe(pending.length);
+  });
+});
+
+describe("check-in and retro copy", () => {
+  it("carries the design's six tags, five ratings and per-outcome labels", () => {
+    expect(CHECKIN_TAGS).toEqual([
+      "Ran out of time",
+      "Froze on a question",
+      "Went too deep too early",
+      "Didn't ask enough back",
+      "Good rapport",
+      "Told my story well",
+    ]);
+    expect(Object.values(RATING_LABELS)).toEqual(["Rough", "Shaky", "Okay", "Good", "Great"]);
+    expect(RETRO_COPY.offer.keep).toBe("What carried it");
+    expect(RETRO_COPY.rejected.change).toBe("What cost you");
+    expect(RETRO_COPY.withdrawn.change).toBe("Why you stepped away");
+    expect(RETRO_COPY.offer.pill).toBe("OFFER 🎉");
   });
 });

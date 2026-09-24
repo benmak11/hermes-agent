@@ -454,22 +454,40 @@ export default function StageDetailPage() {
 
             <div className="mt-[18px] border-t pt-4" style={{ borderColor: "#f4ebdf" }}>
               <MonoLabel>When it&apos;s over</MonoLabel>
-              {/* The check-in dialog is screen 19 (PR 11). Marking a stage
-                  done stays on the board, which owns `advanceStages`. */}
-              <button
-                disabled
-                className="mt-3 h-[42px] w-full rounded-[12px] border text-[13.5px] font-semibold disabled:opacity-50"
-                style={{
-                  background: "var(--terracotta-tint)",
-                  borderColor: "var(--border-warm)",
-                  color: "var(--terracotta-d)",
-                }}
-              >
-                Do the two-minute check-in
-              </button>
-              <p className="mt-2 text-[11.5px]" style={{ color: "#a3927f" }}>
-                Coming soon.
-              </p>
+              {/* Screen 19. Saving from there completes the stage too when it
+                  is still current, so this is one PUT, not two. An `upcoming`
+                  stage has nothing to check in on yet, and a check-in written
+                  there would be invisible on the board (noteFor only reads it
+                  on a done stage). */}
+              {stage.status === "upcoming" ? (
+                <div
+                  className="mt-3 flex h-[42px] w-full items-center justify-center rounded-[12px] border text-[13.5px] font-semibold opacity-50"
+                  style={{
+                    background: "var(--terracotta-tint)",
+                    borderColor: "var(--border-warm)",
+                    color: "var(--terracotta-d)",
+                  }}
+                >
+                  Do the two-minute check-in
+                </div>
+              ) : (
+                <Link
+                  href={`/app/journeys/${j.id}/stages/${stage.id}/checkin`}
+                  className="mt-3 flex h-[42px] w-full items-center justify-center rounded-[12px] border text-[13.5px] font-semibold"
+                  style={{
+                    background: "var(--terracotta-tint)",
+                    borderColor: "var(--border-warm)",
+                    color: "var(--terracotta-d)",
+                  }}
+                >
+                  Do the two-minute check-in
+                </Link>
+              )}
+              {stage.status === "upcoming" && (
+                <p className="mt-2 text-[11.5px]" style={{ color: "#a3927f" }}>
+                  After it happens — mark the stage done and we&apos;ll ask.
+                </p>
+              )}
             </div>
           </section>
         </div>
