@@ -614,6 +614,7 @@ def test_resumable_batch_run_skips_and_records(monkeypatch, no_holdout):
             None,
             run_ref,
             "tag",
+            "u1",
             "gs://bucket/tag",
             _profile(),
             [(object(), _job("j1"))],

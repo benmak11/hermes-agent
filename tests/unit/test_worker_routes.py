@@ -98,6 +98,42 @@ def test_task_discovery_runs_cycle_inline(client, monkeypatch):
     assert calls == [("u1", "manual")]
 
 
+def test_the_scan_task_route_never_reaches_the_scorer(client, monkeypatch):
+    """T9. The find-only worker route, which exists *because* it is a route.
+
+    Cloud Tasks delivers to whichever hermes-worker revision is live when the
+    task runs — during a rollout, the old one. A ``score: false`` field on
+    ``/tasks/discovery`` would be dropped by an old revision (pydantic ignores
+    extras) and the backlog scored anyway: the guard failing open, silently,
+    on every deploy. A path the old revision does not serve 404s, Cloud Tasks
+    retries with backoff, and nothing is spent in the window.
+    """
+    monkeypatch.setenv("WORKER_MODE", "1")
+    calls = []
+
+    async def fake_cycle(user_id, *, trigger, score=True):
+        calls.append((user_id, trigger, score))
+
+    monkeypatch.setattr(worker, "run_discovery_cycle", fake_cycle)
+
+    resp = client.post(
+        "/tasks/discovery/scan", json={"user_id": "u1", "trigger": "manual"}
+    )
+
+    assert resp.status_code == 200 and resp.json() == {"ok": True}
+    assert calls == [("u1", "manual", False)]
+    # And it is the *route* that says so, not a field the caller passed: an
+    # old revision has no way to be handed this and score anyway.
+    assert discovery.SCAN_TASK_PATH == "/tasks/discovery/scan"
+
+
+def test_the_scan_route_is_worker_only_like_every_other_task(client, monkeypatch):
+    monkeypatch.delenv("WORKER_MODE", raising=False)
+    assert (
+        client.post("/tasks/discovery/scan", json={"user_id": "u1"}).status_code == 404
+    )
+
+
 def test_task_score_returns_counts(client, monkeypatch, cost_flushes):
     monkeypatch.setenv("WORKER_MODE", "1")
     bound = []
@@ -266,15 +302,17 @@ def test_dispatch_cycle_runs_inline_without_queue_mode(monkeypatch):
     monkeypatch.delenv("QUEUE_MODE", raising=False)
     calls = []
 
-    async def fake_cycle(user_id, *, trigger):
-        calls.append((user_id, trigger))
+    async def fake_cycle(user_id, *, trigger, score=True):
+        calls.append((user_id, trigger, score))
 
     monkeypatch.setattr(discovery, "run_discovery_cycle", fake_cycle)
 
     ok = asyncio.run(discovery.dispatch_cycle("discovery", "u1", trigger="cron"))
 
     assert ok is True
-    assert calls == [("u1", "cron")]
+    # ``score`` defaults on and the cron trigger keeps it on: an unattended
+    # run has nobody to make the second click.
+    assert calls == [("u1", "cron", True)]
 
 
 class _FakeUsers:
@@ -2211,6 +2249,14 @@ def cycle_world(monkeypatch, slot_world):
     monkeypatch.setattr(discovery, "persist_new_jobs", fake_persist_new_jobs)
     monkeypatch.setattr(discovery, "score_pending_jobs", fake_score)
     monkeypatch.setattr(discovery, "persist_run_cost", fake_persist_run_cost)
+
+    async def fake_backlog(user_id):
+        # The cycle counts the unscored backlog for the Profile card, through
+        # the async client the conftest guard refuses. These tests are about
+        # the slot lease, not the count.
+        return 0
+
+    monkeypatch.setattr(discovery, "_backlog", fake_backlog)
     monkeypatch.delenv("QUEUE_MODE", raising=False)
 
     def run(at: datetime, *, trigger="cron"):
@@ -2825,3 +2871,49 @@ def test_a_re_stamp_leaves_the_rest_of_the_slot_state_alone(cycle_world, slot_wo
     state = cycle_world.doc.state
     assert state["last_sweep_at"] == "2026-08-25T00:00:00+00:00"
     assert state["last_discovery"] == {"scored": 7}
+
+
+def test_the_backlog_score_route_can_reach_the_batch_path(client, monkeypatch):
+    """``/tasks/score/backlog`` goes through ``score_or_start_run``, which is
+    what routes a big backlog to a half-price Vertex batch.
+
+    Pinned as a distinct route from ``/tasks/score`` because that one is
+    online-only: if the user-facing button is ever repointed at it, this test
+    stays green and the price silently doubles — so the *path* is asserted at
+    the enqueue end too (test_jobs_score_route.py).
+    """
+    monkeypatch.setenv("WORKER_MODE", "1")
+    calls = []
+
+    async def fake_score_or_start_run(user_id, *, cycle_id=budget.CURRENT_RUN):
+        calls.append((user_id, cycle_id))
+        return {
+            "scored": 0,
+            "discarded": 0,
+            "failed": 0,
+            "pending": 0,
+            "batch_run": "r1",
+        }
+
+    monkeypatch.setattr(
+        worker.batch_runs, "score_or_start_run", fake_score_or_start_run
+    )
+
+    async def noop(*a, **kw):
+        return None
+
+    monkeypatch.setattr(worker, "persist_run_cost", noop)
+
+    resp = client.post("/tasks/score/backlog", json={"user_id": "u1"})
+
+    assert resp.status_code == 200 and resp.json()["batch_run"] == "r1"
+    # cycle_id=None: draw down the window discovery opened, never open a
+    # fresh one — or "200 per cycle" resets on every click of the button.
+    assert calls == [("u1", None)]
+
+
+def test_the_backlog_score_route_is_worker_only(client, monkeypatch):
+    monkeypatch.delenv("WORKER_MODE", raising=False)
+    assert (
+        client.post("/tasks/score/backlog", json={"user_id": "u1"}).status_code == 404
+    )

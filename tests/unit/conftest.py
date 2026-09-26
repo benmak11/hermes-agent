@@ -146,3 +146,7 @@ def no_production_firestore(monkeypatch, request):
     # ``_db``. Same leak shape ``_db`` above exists to close: a client built by
     # an earlier test would otherwise be handed out to every test after it.
     monkeypatch.setattr(routes_discovery, "_adb", None, raising=False)
+    # ``api.deps`` memoises a *third* client, for the spend-consent documents
+    # (``spend_client``). Same leak shape, and this one is built as soon as
+    # anybody touches a paid route rather than sitting unused behind a flag.
+    monkeypatch.setattr(api_deps, "_spend_db", None, raising=False)

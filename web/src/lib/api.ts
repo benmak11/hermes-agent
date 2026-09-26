@@ -1,6 +1,9 @@
 // Copyright (c) 2026 Baynham Makusha. All rights reserved.
 // Unauthorized copying, distribution, or use is prohibited.
+import { ApiError } from "@/lib/apiError";
 import { auth } from "@/lib/firebase";
+
+export { ApiError };
 
 const BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080";
 
@@ -14,25 +17,6 @@ export function newRequestId(): string {
   return crypto.randomUUID();
 }
 
-/**
- * Error thrown by the API helpers. Carries the HTTP status and the
- * `X-Request-Id` so a failure surfaced in the UI is traceable to the backend.
- * Subclasses Error, so existing `String(err)` / `err.message` callers keep
- * working — the id is embedded in the message.
- */
-export class ApiError extends Error {
-  readonly status: number;
-  readonly requestId: string;
-  readonly body: string;
-
-  constructor(status: number, body: string, requestId: string) {
-    super(`${status}: ${body} (request ${requestId})`);
-    this.name = "ApiError";
-    this.status = status;
-    this.body = body;
-    this.requestId = requestId;
-  }
-}
 
 /** Run the request, raising an ApiError (with the correlation id) on failure. */
 async function send<T>(

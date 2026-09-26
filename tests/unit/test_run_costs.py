@@ -433,6 +433,15 @@ def test_persist_result_tombstones_under_the_paying_run():
     assert stones["scored_run_id"] == "r1"
 
 
+def _fake_backlog(n: int):
+    """Stand in for the cycle's backlog count (an async Firestore query)."""
+
+    async def _f(user_id):
+        return n
+
+    return _f
+
+
 def _flush_site_harness(monkeypatch, *, counts: dict, cost_calls: int = 1):
     """Patch every seam of run_discovery_cycle except the cost flush itself."""
     flushes: list[tuple] = []
@@ -478,6 +487,10 @@ def _flush_site_harness(monkeypatch, *, counts: dict, cost_calls: int = 1):
     monkeypatch.setattr(discovery, "persist_new_jobs", fake_persist_new_jobs)
     monkeypatch.setattr(discovery, "score_pending_jobs", fake_score)
     monkeypatch.setattr(discovery, "persist_run_cost", fake_persist_run_cost)
+    # The cycle counts the unscored backlog for the Profile card — one query
+    # over ``jobs`` through the async client the conftest guard refuses.
+    # Faked: these tests are about the cost flush, not the count.
+    monkeypatch.setattr(discovery, "_backlog", _fake_backlog(7))
     monkeypatch.setattr(discovery, "_user_ref", lambda uid: _StateWriter())
     monkeypatch.delenv("QUEUE_MODE", raising=False)
     return flushes, state

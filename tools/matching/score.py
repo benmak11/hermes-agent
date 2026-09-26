@@ -437,6 +437,38 @@ async def persist_result(
     return "scored"
 
 
+async def count_unscored(db, user_id: str) -> int:
+    """How many pending jobs still have no ``match`` — the real backlog.
+
+    **The one definition of "waiting to be scored" in this codebase**, and it
+    is deliberately the same filter :func:`load_profile_and_pending` uses, one
+    function above: pending decision, no ``match`` yet. Anything that reports
+    a backlog to the user has to mean exactly this, because the alternative is
+    what shipped first — three call sites reporting three different numbers
+    under one key (jobs newly persisted, jobs a run attempted, jobs a batch
+    reserved), with the UI labelling it as a fourth.
+
+    Unbudgeted and unlimited on purpose: this is the *backlog*, not a grant.
+    What a click will actually cover is ``min(this, the grant)``, and the
+    grant is the estimate's job — see ``tools.spend.estimate``.
+
+    Costs one streamed query over the user's pending jobs, which is what
+    ``GET /jobs/pending`` already pays on every page load. Never called from
+    the estimate path, which must not query ``jobs`` at all.
+    """
+    query = (
+        db.collection("users")
+        .document(user_id)
+        .collection("jobs")
+        .where(filter=FieldFilter("user_decision", "==", "pending"))
+    )
+    total = 0
+    async for snap in query.stream():
+        if "match" not in (snap.to_dict() or {}):
+            total += 1
+    return total
+
+
 async def score_pending_jobs(
     user_id: str,
     *,

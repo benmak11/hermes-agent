@@ -56,7 +56,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from models.job import Job
 from obs.llm_cost import reset_run_cost
 from obs.logging import current_run_id, get_logger
-from tools.matching import budget, jd_cache
+from tools.matching import budget, jd_cache, rates
 from tools.matching.batch import (
     _DONE_STATES,
     _PERSIST_CONCURRENCY,
@@ -113,9 +113,58 @@ BATCH_MIN_PENDING = 50
 # double-submit a Pro batch under a slow-but-alive ingest.
 _CLAIM_TTL_SECONDS = 45 * 60
 
+#: Run states whose committed estimate may still be un-ingested. ``done`` is
+#: not here: both its legs are banked, so its real cost is already on the
+#: ledger and counting the estimate too would double the same money.
+OUTSTANDING_STATES = ("running", "failed")
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _committed(requests: int, *, leg: str, model: str) -> dict:
+    """What this leg has just committed us to paying Google.
+
+    **Committed spend used to be invisible until ingest.** A Vertex batch is
+    billed when Google runs it; our ledger prices it hours later, when a
+    resume pass reads the output. So a run submitted and then abandoned — a
+    failed Vertex job, an orphan, a bucket that went away — was billed and
+    recorded nowhere. On 2026-09-26 the run ledger read ``cost_usd: 0.0,
+    calls: 0`` while a completed batch sat on the invoice. This is the fix:
+    the write that makes the batch trackable is the write that records its
+    price.
+
+    An *estimate*, explicitly, and never mixed with actuals — see
+    :func:`outstanding_committed`.
+    """
+    low, high = rates.committed_usd(requests, leg=leg)
+    return {
+        "requests": requests,
+        "usd_low": low,
+        "usd_high": high,
+        "model": model,
+        "at": _now().isoformat(),
+    }
+
+
+def _log_committed(run_tag: str, user_id: str | None, leg: str, committed: dict):
+    """One line with the dollars on it.
+
+    On its own this closes "invisible until ingest" for anybody reading Cloud
+    Logging, without their needing to know the ``batch_runs`` collection
+    exists.
+    """
+    log.info(
+        "batch.committed",
+        run=run_tag,
+        user_id=user_id,
+        leg=leg,
+        requests=committed["requests"],
+        usd_low=committed["usd_low"],
+        usd_high=committed["usd_high"],
+        model=committed["model"],
+    )
 
 
 def _parse_iso(value) -> datetime | None:
@@ -290,7 +339,20 @@ async def _start(
             gcs_dir=f"{gcs_root}/parse",
             display_name=f"hermes-parse-{run_tag}",
         )
-        await run_ref.update({"job_name": job_name, "claimed_at": None})
+        # The committed estimate rides along with the job name, in the *same*
+        # write. Not a nicety: that write is what makes the batch trackable,
+        # so binding the two means there is no state in which a run is known
+        # and its price is not. A dotted key so the score leg's entry can be
+        # added later without clobbering this one.
+        committed = _committed(len(to_parse), leg="parse", model=BATCH_FLASH_MODEL)
+        await run_ref.update(
+            {
+                "job_name": job_name,
+                "claimed_at": None,
+                "committed.parse": committed,
+            }
+        )
+        _log_committed(run_tag, user_id, "parse", committed)
         log.info(
             "batch_runs.started",
             run=run_tag,
@@ -312,7 +374,7 @@ async def _start(
     # the score stage — or straight to done when nothing is in-family.
     await run_ref.set(doc)
     stage = await _submit_score_stage(
-        db, run_ref, run_tag, gcs_root, profile, pending, counts
+        db, run_ref, run_tag, user_id, gcs_root, profile, pending, counts
     )
     log.info(
         "batch_runs.started",
@@ -344,7 +406,14 @@ async def _persist_prefiltered(ref, job: Job, match, geo_gate: dict | None) -> s
 
 
 async def _submit_score_stage(
-    db, run_ref, run_tag: str, gcs_root: str, profile, pending, counts: dict
+    db,
+    run_ref,
+    run_tag: str,
+    user_id: str,
+    gcs_root: str,
+    profile,
+    pending,
+    counts: dict,
 ) -> str:
     """Pre-filter parsed pending jobs, then submit the Pro batch.
 
@@ -407,6 +476,13 @@ async def _submit_score_stage(
         gcs_dir=f"{gcs_root}/score",
         display_name=f"hermes-score-{run_tag}",
     )
+    # Same rule as the parse leg: job name and price in one write. **This is
+    # the leg that arrives hours after the user's click**, created by
+    # ``/tasks/batch/resume``, and it is the more expensive of the two. The
+    # consent captured at the click covers it only because the estimate is
+    # quoted per job over the whole grant rather than per leg — if that ever
+    # narrows to one leg, this submission starts spending unasked.
+    committed = _committed(len(by_block), leg="score", model=BATCH_PRO_MODEL)
     await run_ref.update(
         {
             "stage": "score",
@@ -414,8 +490,10 @@ async def _submit_score_stage(
             "counts": counts,
             "claimed_at": None,
             "updated_at": _now().isoformat(),
+            "committed.score": committed,
         }
     )
+    _log_committed(run_tag, user_id, "score", committed)
     log.info(
         "batch_runs.score_submitted",
         run=run_tag,
@@ -480,7 +558,7 @@ async def _ingest_parse(db, run_ref, run: dict) -> dict[str, int]:
     # the delta below covers the whole leg — the failed parse lines *and* the
     # jobs this leg retired for free before Pro ever saw them.
     await _submit_score_stage(
-        db, run_ref, run_tag, run["gcs_root"], profile, owned, counts
+        db, run_ref, run_tag, run["user_id"], run["gcs_root"], profile, owned, counts
     )
     return _leg_delta(before, counts)
 
@@ -737,19 +815,29 @@ async def resume(
     return summary
 
 
-async def score_or_start_run(user_id: str) -> dict:
-    """The discovery cycle's scoring seam: online for small backlogs,
-    a resumable batch run for big ones.
+async def score_or_start_run(
+    user_id: str, *, cycle_id: budget.CycleId = budget.CURRENT_RUN
+) -> dict:
+    """The scoring seam: online for small backlogs, a resumable batch run for
+    big ones.
 
     Returns the online scorer's counts dict either way; when a batch run was
     started, the LLM outcomes are zero-so-far (results land when the worker's
     resume ticks ingest them) and ``batch_run`` carries the run tag.
+
+    ``cycle_id`` is passed straight through to both arms and means exactly
+    what it means there. The discovery cycle takes the default and **opens** a
+    window under its own ``run_id``; the ad-hoc backlog score
+    (``/tasks/score/backlog``) passes ``None`` and draws down whatever window
+    is already open, so the per-cycle cap cannot be reset by clicking a button
+    twice. Getting this wrong is not a pricing detail — it is the difference
+    between a cap and a suggestion.
     """
-    run = await start(user_id, min_pending=BATCH_MIN_PENDING)
+    run = await start(user_id, min_pending=BATCH_MIN_PENDING, cycle_id=cycle_id)
     if not run.get("started"):
         # The unstarted run gave its reservation back, so the online scorer
         # takes its own against the same cycle window.
-        return await score_pending_jobs(user_id)
+        return await score_pending_jobs(user_id, cycle_id=cycle_id)
     counts = run["counts"]
     return {
         "scored": counts["scored"],
@@ -768,3 +856,66 @@ async def score_or_start_run(user_id: str) -> dict:
         "batch_run": run["run"],
         **{k: v for k, v in run.items() if k.startswith("budget_")},
     }
+
+
+async def outstanding_committed(db=None, user_id: str | None = None) -> dict:
+    """Money committed to Google that our ledger has not yet priced.
+
+    **Defined as a query, not as arithmetic**, and that is the whole point.
+    The tempting design — add the estimate to the run ledger at submit and
+    subtract it at ingest — cannot be made correct: ``tools.run_costs`` writes
+    every leaf with ``firestore.Increment``, and the documented "bank first,
+    mark second" window in :func:`resume` means the subtraction may run twice
+    or not at all. That yields negative committed totals or double-counted
+    actuals, silently.
+
+    So committed never touches the ledger doc. It lives on the ``batch_runs``
+    doc under a plain idempotent ``set``, and "outstanding" is simply *the
+    legs that have no ``cost_banked_at`` entry*. Re-running this function is
+    free and re-running an ingest cannot corrupt it.
+
+    A failed or orphaned run keeps its committed figure forever, and that is
+    correct rather than untidy: it is the honest record of "Google billed this
+    and we never ingested it". Those are exactly the dollars that were
+    invisible before.
+
+    ``llm.cost_usd`` on the run ledger keeps its own meaning — **actual,
+    priced, ingested**. The two are never summed in code; a UI that wants both
+    shows two lines.
+    """
+    db = db or firestore.AsyncClient()
+    total = {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
+    # ``running`` and ``failed`` both, in one ``in`` query: a failed run's
+    # batch was still paid for. ``done`` is excluded because both its legs
+    # are banked by definition — and the per-leg filter below would drop it
+    # anyway.
+    query = db.collection(COLLECTION).where(
+        filter=FieldFilter("state", "in", list(OUTSTANDING_STATES))
+    )
+    if user_id:
+        query = query.where(filter=FieldFilter("user_id", "==", user_id))
+    async for snap in query.stream():
+        run = snap.to_dict() or {}
+        committed = run.get("committed") or {}
+        banked = run.get("cost_banked_at") or {}
+        counted = False
+        for leg, entry in committed.items():
+            if banked.get(leg):
+                continue
+            total["usd_low"] += float(entry.get("usd_low") or 0.0)
+            total["usd_high"] += float(entry.get("usd_high") or 0.0)
+            total["legs"].append(
+                {
+                    "run": snap.id,
+                    "user_id": run.get("user_id"),
+                    "leg": leg,
+                    "state": run.get("state"),
+                    **entry,
+                }
+            )
+            counted = True
+        if counted:
+            total["runs"] += 1
+    total["usd_low"] = round(total["usd_low"], 4)
+    total["usd_high"] = round(total["usd_high"], 4)
+    return total

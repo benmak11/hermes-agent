@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Shared FastAPI dependencies for the web API (auth)."""
+"""Shared FastAPI dependencies for the web API: auth, and the spend seam."""
 
 from __future__ import annotations
 
@@ -8,11 +8,12 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from fastapi import Header, HTTPException, Query
+from fastapi import Depends, Header, HTTPException, Query, Request
 from google.cloud import firestore
+from pydantic import BaseModel
 
 from obs.logging import bind_request_context, get_logger
-from tools import allowlist
+from tools import allowlist, spend
 
 log = get_logger("api.auth")
 
@@ -244,3 +245,102 @@ async def verify_user_query(token: str | None = Query(default=None)) -> str:
     Authorization header.
     """
     return await _verify_token(token)
+
+
+# ---------------------------------------------------------------------------
+# The spend consent seam
+#
+# ``tools.spend`` holds the logic and imports nothing from FastAPI or from
+# ``api/``; this is the HTTP half, and it lives here for the same reason
+# ``verify_user`` does — it is a dependency, and dependencies are what this
+# module is.
+#
+# **The seam goes on user-facing routes only, never on ``/tasks/*``.** A task
+# handler executes an action that was already consented to at the click;
+# gating it would break the queue path, and the "fix" for that would be a way
+# to bypass the seam, which is how this design fails open.
+# ---------------------------------------------------------------------------
+
+
+class SpendConfirm(BaseModel):
+    """Optional body on a route that can spend: the token from a prior 402."""
+
+    confirm: str | None = None
+
+
+def spend_client() -> firestore.AsyncClient:
+    """Async client for the consent documents.
+
+    Its own memo rather than ``_client()`` above, which exists only for the
+    allowlist and is unbuilt on every deployment until that flag flips; this
+    one is built as soon as anybody clicks a paid button.
+    """
+    global _spend_db
+    if _spend_db is None:
+        _spend_db = firestore.AsyncClient()
+    return _spend_db
+
+
+_spend_db: firestore.AsyncClient | None = None
+
+
+async def _confirm_token(request: Request) -> str | None:
+    """The ``confirm`` field out of the request body, if there is one.
+
+    Read off the raw request rather than declared as a body parameter, so one
+    dependency fits every route regardless of what else that route's body
+    carries. Starlette caches the body on the request, so the route's own
+    model still parses it afterwards.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    token = body.get("confirm")
+    return token if isinstance(token, str) and token else None
+
+
+async def spend_402(db, user_id: str, action: str) -> HTTPException:
+    """The "I need to ask you first" answer, with a fresh quote and token.
+
+    **402, not 409.** 409 already means "wrong application state" on
+    ``/submit`` and ``/regenerate``, and a client that cannot tell those apart
+    will eventually retry the wrong one. ``web/src/lib/api.ts`` surfaces the
+    raw body on ``ApiError``, so the client branches on ``status === 402`` and
+    reads ``detail`` with no helper change.
+    """
+    estimate = await spend.build(db, user_id, action)
+    token = await spend.preflight(db, user_id, action, estimate)
+    return HTTPException(
+        status_code=402,
+        detail={
+            "needs_confirmation": True,
+            "action": action,
+            "estimate": estimate.as_dict(),
+            "confirm_token": token,
+        },
+    )
+
+
+def required(action: str):
+    """Dependency factory: this route spends, so it needs a token for ``action``.
+
+    Returns the :class:`~tools.spend.estimate.Estimate` the user agreed to, so
+    the route can record what was quoted rather than re-deriving it.
+    """
+    if action not in spend.ACTIONS:
+        raise ValueError(f"unknown spend action {action!r}")
+
+    async def dependency(
+        request: Request, user_id: str = Depends(verify_user)
+    ) -> spend.Estimate:
+        db = spend_client()
+        token = await _confirm_token(request)
+        try:
+            return await spend.consume(db, user_id, action, token)
+        except spend.ConsentRequired:
+            raise await spend_402(db, user_id, action) from None
+
+    return dependency
