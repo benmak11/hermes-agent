@@ -142,7 +142,9 @@ export function normalizeStatuses(stages: JourneyStage[]): JourneyStage[] {
 
 const IMPROVE = "To improve: ";
 
-function improvements(sentence: string): string[] {
+/** The legacy importer's "To improve: " halves (journeysDerive.ts:319-322).
+ *  Exported for insights.ts, which must not redeclare the prefix. */
+export function improvements(sentence: string): string[] {
   return sentence
     .split(" · ")
     .filter((part) => part.startsWith(IMPROVE))

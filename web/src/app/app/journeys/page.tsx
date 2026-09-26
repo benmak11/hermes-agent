@@ -138,7 +138,16 @@ export default function JourneysPage() {
               <b style={{ color: "#a3927f" }}>{summary.closed}</b> closed
             </div>
           </div>
-          <div className="flex gap-2.5">
+          <div className="flex flex-wrap gap-2.5">
+            {journeys.length > 0 && (
+              <Link
+                href="/app/journeys/insights"
+                className="wm-ghost flex h-[38px] items-center rounded-[12px] border px-[15px] text-[13px] font-semibold"
+                style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
+              >
+                What you&apos;re learning →
+              </Link>
+            )}
             {summary.closed > 0 && (
               <button
                 className="wm-ghost h-[38px] rounded-[12px] border px-[15px] text-[13px] font-semibold"
