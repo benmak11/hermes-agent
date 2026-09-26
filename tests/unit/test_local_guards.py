@@ -107,11 +107,11 @@ def discovery_client(monkeypatch):
     """``POST /settings/discovery/run`` with both ways out of it recorded."""
     started: list[tuple] = []
 
-    async def fake_run_discovery_cycle(user_id, *, trigger="scheduled"):
-        started.append(("in_process", user_id, trigger))
+    async def fake_run_discovery_cycle(user_id, *, trigger="scheduled", score=True):
+        started.append(("in_process", user_id, trigger, score))
 
-    async def fake_dispatch_cycle(kind, user_id, *, trigger):
-        started.append(("queued", user_id, trigger))
+    async def fake_dispatch_cycle(kind, user_id, *, trigger, score=True):
+        started.append(("queued", user_id, trigger, score))
         return True
 
     monkeypatch.setattr(discovery, "run_discovery_cycle", fake_run_discovery_cycle)
@@ -155,7 +155,11 @@ def test_the_same_request_is_honoured_from_a_deployed_service(
     assert client.post("/settings/discovery/run").status_code == 200
 
     where = "queued" if queue_mode == "1" else "in_process"
-    assert started == [(where, "u1", "manual")]
+    # ``score`` is False: the unconfirmed manual click is the *free* verb
+    # since the spend-consent seam landed. Pinned here as well as in
+    # test_discovery_fanout, because this file is where the shape of what the
+    # route dispatches is asserted.
+    assert started == [(where, "u1", "manual", False)]
 
 
 def test_the_override_hands_a_developer_the_run_back(discovery_client, monkeypatch):
@@ -164,7 +168,7 @@ def test_the_override_hands_a_developer_the_run_back(discovery_client, monkeypat
     monkeypatch.setenv(discovery.LIVE_RUN_OVERRIDE, "1")
 
     assert client.post("/settings/discovery/run").status_code == 200
-    assert started == [("in_process", "u1", "manual")]
+    assert started == [("in_process", "u1", "manual", False)]
 
 
 def test_the_cycle_itself_refuses_before_it_touches_anything(monkeypatch):
@@ -359,3 +363,83 @@ def test_the_sweep_cycle_itself_refuses_before_it_touches_anything(monkeypatch):
     monkeypatch.setattr(discovery, "sweep_postings", explode_async)
 
     assert asyncio.run(discovery.run_sweep_cycle("u1", trigger="manual")) is None
+
+
+# ---------------------------------------------------------------------------
+# The register of everything that can bill a third party
+#
+# The 2026-09-26 spend incident was not a call site anybody had forgotten —
+# it was a *chain* nobody had drawn, from a button to a paid Vertex batch four
+# frames away. Drawing it required first knowing where the money can leave,
+# and that list existed only in someone's head.
+#
+# So it lives here, as a frozen allowlist walked out of the AST. A new call
+# site fails this test, and the fix is to add it to the list *after* deciding
+# which consent seam it sits behind. Deliberately a whole-set equality and not
+# a subset check: a call site that moves or disappears should also make
+# somebody look, because the seam guarding it may now be guarding nothing.
+# ---------------------------------------------------------------------------
+
+#: Every module in this repo that can make a third party charge us, and what
+#: asks before it does. Paths are repo-relative POSIX.
+BILLING_CALL_SITES = {
+    # A: online parse (Flash) + score (Pro). Behind the scoring budget, and
+    # behind the consent seam on every user-facing route that reaches it.
+    "tools/matching/pipeline.py": "gemini",
+    # B: the Vertex batch legs. Priced at ingest, hours later — which is why
+    # they record a committed estimate at submit (batch_runs._committed).
+    "tools/matching/batch.py": "gemini",
+    # C: résumé extraction. **Still ungated** — PUT /profile on first
+    # onboarding completion fires it with no button. Deferred (Phase 5).
+    "tools/profile/extract.py": "gemini",
+    # D: the tailoring objective rewrite, per approved job.
+    "tools/tailoring/objective.py": "gemini",
+    # E: Serper, ~$0.30/1k queries. Operator CLI only — no HTTP route reaches
+    # it — which is the only reason it carries no seam.
+    "tools/discovery/dork.py": "serper",
+}
+
+#: Attribute calls that mean "a Gemini model is about to be billed".
+_BILLED_GEMINI_CALLS = {"generate_content", "batches"}
+_SERPER_HOST = "google.serper.dev"
+
+
+def _module_bills(path: Path) -> str | None:
+    """Which third party this module can charge us with, from its AST alone.
+
+    Source, never import: importing half of these runs ``load_dotenv()`` and
+    ``google.auth.default()``, which is exactly what the rest of this file
+    goes out of its way to avoid.
+    """
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            # ``client.aio.models.generate_content(...)`` and
+            # ``client.aio.batches.create(...)`` — the second is a call on an
+            # attribute *of* ``batches``, so both names are checked.
+            attrs = {node.func.attr}
+            if isinstance(node.func.value, ast.Attribute):
+                attrs.add(node.func.value.attr)
+            if attrs & _BILLED_GEMINI_CALLS:
+                return "gemini"
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _SERPER_HOST in node.value:
+                return "serper"
+    return None
+
+
+def test_every_module_that_can_bill_google_is_registered():
+    found = {}
+    for path in sorted(REPO_ROOT.glob("**/*.py")):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel.startswith((".venv/", "tests/", "web/", "node_modules/")):
+            continue
+        bills = _module_bills(path)
+        if bills:
+            found[rel] = bills
+
+    assert found == BILLING_CALL_SITES, (
+        "the set of modules that can bill a third party changed. Add or "
+        "remove the entry in BILLING_CALL_SITES above, and say in the PR "
+        "which consent seam the call sits behind."
+    )

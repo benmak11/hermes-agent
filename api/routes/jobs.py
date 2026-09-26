@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -13,16 +14,34 @@ from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 from pydantic import BaseModel
 
-from api.deps import verify_user
+from api.deps import SpendConfirm, required, verify_user
 from api.routes.applications import application_id, dispatch_tailor
-from api.routes.discovery import tick_user
+from api.routes.discovery import refuse_live_runs, tick_user
 from models.job import Job
-from obs.logging import get_logger
+from obs.logging import get_logger, run_context
+from tools import queues, spend
 from tools.applications import state as app_state
 from tools.ats.validate import check_posting
+from tools.matching.score import score_pending_jobs
+from tools.run_costs import persist_run_cost
+from tools.spend.estimate import Estimate
 
 router = APIRouter(tags=["jobs"])
 log = get_logger("api.jobs")
+
+#: The spend seam for the one paid route in this module, built once at import
+#: rather than inline in the signature — ``Depends(required(...))`` in an
+#: argument default constructs the dependency on every call (B008), and it is
+#: a singleton by nature.
+SCORE_CONSENT = Depends(required(spend.SCORE_BACKLOG))
+
+#: Where a confirmed backlog score goes on the queue. **Not ``/tasks/score``**
+#: — that handler is online-only, and this intent has to keep reaching
+#: ``batch_runs.score_or_start_run``, which sends a backlog over
+#: ``BATCH_MIN_PENDING`` to a half-price batch. Sending it to the online
+#: scorer would double the cost of the one workflow this route replaced, and
+#: make the batch-rate floor of every quote a price the product cannot reach.
+SCORE_BACKLOG_TASK_PATH = "/tasks/score/backlog"
 
 _db: firestore.Client | None = None
 
@@ -82,6 +101,99 @@ def list_pending_jobs(
         "pending_total": pending_total,
         "scored_total": scored_total,
     }
+
+
+async def run_score_backlog(user_id: str) -> None:
+    """Score this user's pending backlog, in-process, under its own run id.
+
+    The no-queue counterpart of ``/tasks/score``, and deliberately the same
+    shape as it: a ``run_context`` so the spend has a ``run_id`` to accumulate
+    under and the job docs land with a real ``scored_run_id``, and a ledger
+    flush in a ``finally`` so a run that dies after paying still records what
+    it paid.
+
+    ``cycle_id=None``, exactly as the worker task passes: this draws down the
+    window the last discovery cycle opened rather than opening a fresh one, so
+    "200 per cycle" cannot be reset by clicking the button again. The budget
+    is untouched by this PR and this is the path that keeps it that way.
+    """
+    with run_context("score_backlog", user_id=user_id) as run_id:
+        started_at = datetime.now(UTC).isoformat()
+        counts: dict = {}
+        try:
+            counts = await score_pending_jobs(user_id, cycle_id=None)
+        finally:
+            await persist_run_cost(
+                firestore.AsyncClient,
+                user_id,
+                run_id,
+                runner="score_backlog",
+                trigger="manual",
+                started_at=started_at,
+                jobs={
+                    "pending": counts.get("pending", 0),
+                    "scored": counts.get("scored", 0),
+                    "discarded": counts.get("discarded", 0),
+                    "failed": counts.get("failed", 0),
+                },
+            )
+
+
+@router.post("/jobs/score", dependencies=[Depends(refuse_live_runs)])
+async def score_backlog(
+    background_tasks: BackgroundTasks,
+    body: SpendConfirm | None = None,
+    user_id: str = Depends(verify_user),
+    estimate: Estimate = SCORE_CONSENT,
+) -> dict:
+    """The second, priced click: score the jobs discovery already found.
+
+    ``POST /settings/discovery/run`` now finds without scoring. This is the
+    other half — and unlike that route it is *only* ever the paid verb, so it
+    carries the seam as a hard dependency: no valid ``confirm`` token, no work,
+    402 with a fresh quote and a fresh token. There is no unpriced path
+    through here to fall back to.
+
+    **The seam does not grant anything.** ``score_pending_jobs`` takes its own
+    reservation from ``tools.matching.budget`` exactly as it always has, so the
+    per-cycle and per-day caps still bound what a yes can cost — the estimate
+    is a *reading* of that grant, never a substitute for it.
+
+    Refused from a local process for the reason the discovery route is: an
+    enqueue from a laptop hands the same paid work to the real worker, one
+    process further away. That refusal is a **route-level dependency**, not a
+    check in this body, so it runs *before* the seam consumes the token —
+    otherwise a developer's 403 would silently burn a single-use
+    confirmation and they would have to confirm again to be refused again.
+    """
+    log.info(
+        "jobs.score_confirmed",
+        user_id=user_id,
+        units=estimate.units,
+        usd_low=estimate.usd_low,
+        usd_high=estimate.usd_high,
+        rate_source=estimate.rate_source,
+    )
+    quoted = estimate.as_dict()
+    if queues.enabled():
+        # Minute-granular id, like the manual discovery run: a double-click
+        # dedupes, a deliberate re-run a minute later does not.
+        task_id = f"manual-score-{user_id}-{datetime.now(UTC).strftime('%Y%m%d%H%M')}"
+        queued = await asyncio.to_thread(
+            queues.enqueue,
+            "score",
+            SCORE_BACKLOG_TASK_PATH,
+            {"user_id": user_id},
+            task_id=task_id,
+        )
+        return {
+            "ok": True,
+            "mode": "queued",
+            "deduped": not queued,
+            "estimate": quoted,
+        }
+    background_tasks.add_task(run_score_backlog, user_id)
+    return {"ok": True, "mode": "in_process", "estimate": quoted}
 
 
 @router.get("/jobs/decided")
