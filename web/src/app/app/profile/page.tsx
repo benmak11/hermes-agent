@@ -12,12 +12,19 @@ import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { auth } from "@/lib/firebase";
 import { saveMinScore, useMinScore } from "@/lib/session";
+import {
+  rateProvenance,
+  spendConfirmation,
+  usdRange,
+  zeroGrantReason,
+} from "@/lib/spend";
 import type {
   DiscoverySettings,
   DiscoverySettingsResponse,
   Profile,
   ProfileResponse,
   RemoteStyle,
+  SpendConfirmation,
 } from "@/lib/types";
 import { initial, resolveUserAvatar } from "@/lib/ui";
 import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
@@ -370,6 +377,17 @@ function relNext(iso?: string | null): string {
  * cadence, regulated from the profile. Two opt-in loops — discover+score new
  * jobs, and the liveness sweep that dismisses postings their ATS took down
  * (so the queue, shelves, and tracking never serve a dead posting).
+ *
+ * **Finding and scoring are two buttons now.** "Run discovery now" used to
+ * mean both, and under QUEUE_MODE the scoring half submitted a paid Vertex
+ * batch the moment the backlog cleared 50 jobs — which a fresh account always
+ * does. On 2026-09-26 that click spent money with no estimate and no
+ * confirmation. Finding is free and stays one click; scoring asks first,
+ * shows what it would cost, and takes a second one.
+ *
+ * The sheet below is *not* the guarantee. The server decides: `POST
+ * /jobs/score` answers 402 without a valid token no matter what this
+ * component renders, so a bug here costs a confusing screen, not money.
  */
 function AutoDiscoveryCard() {
   const queryClient = useQueryClient();
@@ -386,15 +404,44 @@ function AutoDiscoveryCard() {
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["discovery-settings"] }),
   });
+  const refreshSoon = () =>
+    setTimeout(
+      () => queryClient.invalidateQueries({ queryKey: ["discovery-settings"] }),
+      5000,
+    );
   const trigger = useMutation({
     mutationFn: (kind: "run" | "sweep") =>
       apiFetch(`/settings/discovery/${kind}`, { method: "POST" }),
-    onSuccess: () =>
-      setTimeout(
-        () =>
-          queryClient.invalidateQueries({ queryKey: ["discovery-settings"] }),
-        5000,
-      ),
+    onSuccess: refreshSoon,
+  });
+
+  // The paid half. First click sends no token and is *expected* to be
+  // refused — the 402 is how the estimate gets here in the first place.
+  const [confirmation, setConfirmation] = useState<SpendConfirmation | null>(null);
+  const [scoreError, setScoreError] = useState<string | null>(null);
+  const score = useMutation({
+    mutationFn: (confirm?: string) =>
+      apiFetch("/jobs/score", {
+        method: "POST",
+        body: JSON.stringify(confirm ? { confirm } : {}),
+      }),
+    onMutate: () => setScoreError(null),
+    onSuccess: () => {
+      setConfirmation(null);
+      refreshSoon();
+    },
+    onError: (err) => {
+      const needed = spendConfirmation(err);
+      if (needed) {
+        setConfirmation(needed);
+        return;
+      }
+      // A token can go stale between the sheet opening and the click; the
+      // server mints a fresh one with the 402, so there is nothing to retry
+      // by hand — but anything else is a real failure and has to say so.
+      setConfirmation(null);
+      setScoreError(String(err));
+    },
   });
 
   if (!data) {
@@ -412,6 +459,16 @@ function AutoDiscoveryCard() {
   const patch = (next: Partial<DiscoverySettings>) => save.mutate({ ...s, ...next });
   const sweep = data.state.last_sweep;
   const last = data.state.last_discovery;
+  // The unscored backlog, only from a run that actually reported it.
+  //
+  // **Deliberately not put on the button.** How many are waiting and how many
+  // a click will score are different numbers — the second is min(backlog,
+  // today's grant) and only the server knows it. A button reading "Score 60
+  // found jobs…" above a sheet offering "Score up to 200" is two adjacent
+  // controls disagreeing, and neither figure is the backlog. So the button
+  // makes no claim and this renders as its own line, meaning one thing.
+  const waiting =
+    typeof last?.unscored_backlog === "number" ? last.unscored_backlog : null;
   // Only shown once a run has actually reported a budget — pre-cap runs and
   // operator runs have none, and an invented "0 left" would read as broken.
   const budget =
@@ -485,14 +542,14 @@ function AutoDiscoveryCard() {
         {sweep && ` · ${sweep.removed} removed of ${sweep.checked} checked`}
       </div>
 
-      <div className="mt-[14px] flex gap-2">
+      <div className="mt-[14px] flex flex-wrap gap-2">
         <button
           onClick={() => trigger.mutate("run")}
           disabled={trigger.isPending}
           className="wm-ghost h-[34px] flex-1 rounded-[11px] border text-[12px] font-semibold"
           style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
         >
-          Run discovery now
+          Find new jobs
         </button>
         <button
           onClick={() => trigger.mutate("sweep")}
@@ -503,12 +560,139 @@ function AutoDiscoveryCard() {
           Sweep now
         </button>
       </div>
-      {trigger.isSuccess && (
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button
+          onClick={() => score.mutate(undefined)}
+          disabled={score.isPending}
+          className="wm-ghost h-[34px] flex-1 rounded-[11px] border text-[12px] font-semibold"
+          style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
+        >
+          Score jobs we found…
+        </button>
+      </div>
+      <p className="mt-1.5 text-[11.5px]" style={{ color: "#a3927f" }}>
+        {waiting !== null && `${waiting.toLocaleString()} found and not yet scored. `}
+        Finding is free. Scoring uses AI and costs money — we&apos;ll show you
+        what it would cost before anything runs.
+      </p>
+
+      {confirmation && (
+        <SpendConfirmSheet
+          confirmation={confirmation}
+          waiting={waiting}
+          pending={score.isPending}
+          onCancel={() => setConfirmation(null)}
+          onConfirm={() => score.mutate(confirmation.confirm_token)}
+        />
+      )}
+      {scoreError && (
+        <p className="mt-2 text-[11.5px]" style={{ color: "var(--terracotta-d)" }}>
+          scoring did not start: {scoreError}
+        </p>
+      )}
+      {(trigger.isSuccess || score.isSuccess) && (
         <p className="mt-2 text-[11.5px]" style={{ color: "var(--sage)" }}>
           started — results land here as the agent finishes
         </p>
       )}
     </Card>
+  );
+}
+
+/**
+ * "Here is what that would cost. Yes / not now."
+ *
+ * Renders the server's own quote rather than one computed here: the numbers
+ * arrive with the 402 and the token agrees to *those* numbers, so anything
+ * this component recalculated could disagree with what was actually
+ * authorised. Three things are always shown — how much work, what range, and
+ * where the rate came from — because a figure with no provenance is not
+ * something the user can check.
+ */
+function SpendConfirmSheet({
+  confirmation,
+  waiting,
+  pending,
+  onCancel,
+  onConfirm,
+}: {
+  confirmation: SpendConfirmation;
+  /** The unscored backlog, for relating it to what this click covers. */
+  waiting: number | null;
+  pending: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const e = confirmation.estimate;
+  const nothingToDo = e.units === 0;
+  // **Which cap is actually zero decides what is true**, and they behave
+  // differently. The daily counter rolls at midnight UTC. The per-cycle
+  // counter does not roll at all — only a new discovery cycle clears it (see
+  // budget.apply_reservation: "even after the UTC day has rolled"). Saying
+  // "it resets tomorrow" when the cycle is what is empty sends the user away
+  // for a day to find the same zero.
+  const dayIsSpent = zeroGrantReason(e.caps) === "day";
+
+  return (
+    <div
+      role="dialog"
+      aria-label="Confirm scoring cost"
+      className="mt-3 rounded-[13px] border p-3.5"
+      style={{ borderColor: "#e8dacb", background: "#f6ede1" }}
+    >
+      {nothingToDo ? (
+        <p className="text-[13px] font-semibold" style={{ color: "var(--ink-2)" }}>
+          {dayIsSpent
+            ? "Today's scoring budget is used up — nothing would be" +
+              " scored right now. It resets after midnight UTC."
+            : "This run's scoring budget is used up — nothing would be" +
+              " scored right now. Finding new jobs again opens a fresh one."}
+        </p>
+      ) : (
+        <>
+          <p className="text-[13px] font-semibold" style={{ color: "var(--ink-2)" }}>
+            Score up to {e.units.toLocaleString()} {e.unit}
+            {e.units === 1 ? "" : "s"} for about{" "}
+            {usdRange(e.usd_low, e.usd_high)}?
+          </p>
+          {waiting !== null && waiting > e.units && (
+            <p className="mt-1.5 text-[11.5px]" style={{ color: "#a3927f" }}>
+              {waiting.toLocaleString()} are waiting; today&apos;s budget
+              covers {e.units.toLocaleString()} of them. The rest keep.
+            </p>
+          )}
+          <p className="mt-1.5 text-[11.5px]" style={{ color: "#a3927f" }}>
+            An estimate, not a quote —{" "}
+            {rateProvenance(e.rate_source, e.rate_sample, e.rate_usd)}.
+          </p>
+          <p className="mt-1 text-[11.5px]" style={{ color: "#a3927f" }}>
+            Your caps: {e.caps.per_cycle.toLocaleString()} jobs per run,{" "}
+            {e.caps.per_day.toLocaleString()} per day (
+            {e.caps.remaining_day.toLocaleString()} left today). We can&apos;t
+            spend past them.
+          </p>
+        </>
+      )}
+      <div className="mt-3 flex gap-2">
+        <button
+          onClick={onCancel}
+          disabled={pending}
+          className="wm-ghost h-[32px] flex-1 rounded-[10px] border text-[12px] font-semibold"
+          style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
+        >
+          Not now
+        </button>
+        {!nothingToDo && (
+          <button
+            onClick={onConfirm}
+            disabled={pending}
+            className="wm-cta h-[32px] flex-1 rounded-[10px] text-[12px] font-semibold"
+          >
+            {pending ? "starting…" : `Yes, score ${e.units.toLocaleString()}`}
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 

@@ -126,18 +126,38 @@ class _FakeSnap:
 
 
 class _FakeQuery:
-    def __init__(self, refs):
+    """Streams the given refs, honouring ``==`` and ``in`` field filters.
+
+    The filters used to be ignored, which was fine while every query in this
+    module asked the same question. ``outstanding_committed`` asks a
+    *different* one (which states, whose runs), and a fake that answers "all
+    of them" would let a run this function must skip pass the test."""
+
+    def __init__(self, refs, filters=()):
         self._refs = refs
+        self._filters = tuple(filters)
 
     def where(self, filter=None):
-        return self
+        return _FakeQuery(self._refs, self._filters + ((filter,) if filter else ()))
 
     def limit(self, n):
         return self
 
+    def _matches(self, doc) -> bool:
+        for f in self._filters:
+            value = doc.get(f.field_path)
+            if f.op_string == "in":
+                if value not in f.value:
+                    return False
+            elif value != f.value:
+                return False
+        return True
+
     async def stream(self):
         for ref in self._refs:
-            yield _FakeSnap(ref)
+            snap = _FakeSnap(ref)
+            if self._matches(snap.to_dict() or {}):
+                yield snap
 
 
 class _FakeDB:
@@ -155,7 +175,13 @@ class _FakeDB:
         return _FakeRunRef(tag, self.store)
 
     def where(self, filter=None):
-        return _FakeQuery(self._refs)
+        # The filter is *kept*, not dropped. It used to be discarded here and
+        # only honoured on chained `.where` calls, so the first filter of
+        # every query — which for `outstanding_committed` is the state
+        # filter, the whole point of `OUTSTANDING_STATES` — silently matched
+        # everything. A fake that answers a question nobody asked is how a
+        # test passes for the wrong reason.
+        return _FakeQuery(self._refs).where(filter=filter)
 
     def write_option(self, last_update_time=None):
         return ("precondition", last_update_time)
@@ -638,7 +664,7 @@ def test_started_batch_run_reports_the_same_keys_as_the_online_scorer(monkeypatc
     """Both branches of score_or_start_run feed one caller (the discovery
     cycle's metrics), so they have to agree on their key set."""
 
-    async def fake_start(user_id, *, min_pending):
+    async def fake_start(user_id, *, min_pending, cycle_id=budget.CURRENT_RUN):
         return {
             "started": True,
             "run": "r9",
@@ -1041,23 +1067,52 @@ def test_the_marker_is_written_after_the_money_is_banked(harness, monkeypatch):
 
 
 def test_score_or_start_run_small_backlog_stays_online(monkeypatch):
-    async def fake_start(user_id, *, min_pending):
+    seen = {}
+
+    async def fake_start(user_id, *, min_pending, cycle_id=budget.CURRENT_RUN):
         assert min_pending == batch_runs.BATCH_MIN_PENDING
+        seen["start"] = cycle_id
         return {"started": False, "pending": 3}
 
     online = {"scored": 2, "discarded": 1, "failed": 0, "pending": 3}
 
-    async def fake_online(user_id):
+    async def fake_online(user_id, *, cycle_id=budget.CURRENT_RUN):
+        seen["online"] = cycle_id
         return online
 
     monkeypatch.setattr(batch_runs, "start", fake_start)
     monkeypatch.setattr(batch_runs, "score_pending_jobs", fake_online)
 
     assert asyncio.run(batch_runs.score_or_start_run("u1")) == online
+    # The discovery cycle's default: open a window under the ambient run.
+    assert seen == {"start": budget.CURRENT_RUN, "online": budget.CURRENT_RUN}
+
+
+def test_score_or_start_run_passes_its_cycle_id_to_whichever_arm_runs(monkeypatch):
+    """The ad-hoc backlog score passes ``cycle_id=None`` — draw down the open
+    window, never open a fresh one. Both arms have to honour it, or "200 per
+    cycle" becomes resettable by whichever arm the backlog size happened to
+    pick."""
+    seen = {}
+
+    async def fake_start(user_id, *, min_pending, cycle_id=budget.CURRENT_RUN):
+        seen["start"] = cycle_id
+        return {"started": False, "pending": 3}
+
+    async def fake_online(user_id, *, cycle_id=budget.CURRENT_RUN):
+        seen["online"] = cycle_id
+        return {"scored": 0, "discarded": 0, "failed": 0, "pending": 0}
+
+    monkeypatch.setattr(batch_runs, "start", fake_start)
+    monkeypatch.setattr(batch_runs, "score_pending_jobs", fake_online)
+
+    asyncio.run(batch_runs.score_or_start_run("u1", cycle_id=None))
+
+    assert seen == {"start": None, "online": None}
 
 
 def test_score_or_start_run_big_backlog_returns_run_tag(monkeypatch):
-    async def fake_start(user_id, *, min_pending):
+    async def fake_start(user_id, *, min_pending, cycle_id=budget.CURRENT_RUN):
         return {
             "started": True,
             "run": "r9",
@@ -1072,3 +1127,289 @@ def test_score_or_start_run_big_backlog_returns_run_tag(monkeypatch):
 
     assert counts["batch_run"] == "r9"
     assert counts["pending"] == 904 and counts["discarded"] == 7
+
+
+# ------------------------------------------------- committed cost (Phase 3)
+#
+# **Committed spend used to be invisible until ingest.** Google bills a Vertex
+# batch when it runs it; our ledger prices it hours later, when a resume pass
+# reads the output. So a run submitted and then abandoned was billed and
+# recorded nowhere: on 2026-09-26 a ledger doc read `cost_usd: 0.0, calls: 0`
+# while a completed batch sat on the invoice.
+#
+# The fix is a per-leg estimate written onto the *batch_runs* doc — never onto
+# the Increment-based ledger doc, which cannot carry it (see
+# outstanding_committed's docstring). "Outstanding" is then a query over legs
+# with no cost_banked_at marker, not a subtraction that has to be run exactly
+# once.
+
+
+def test_submitting_a_batch_records_its_committed_estimate_before_any_ingest(
+    harness, monkeypatch
+):
+    """T11. In the same write that records the job name — the write that makes
+    the batch trackable is the write that records its price, so there is no
+    state in which a run is known and its cost is not."""
+    db = _FakeDB()
+    _patch_pending(
+        monkeypatch, [(object(), _job("j1")), (object(), _job("j2", "Other"))]
+    )
+
+    result = asyncio.run(batch_runs.start("u1", db=db))
+
+    doc = db.store[result["run"]]
+    assert doc["job_name"] == "batch/1"
+    committed = doc["committed"]["parse"]
+    assert committed["requests"] == 2  # two distinct jd_raw -> two requests
+    assert committed["model"] == batch_runs.BATCH_FLASH_MODEL
+    assert 0 < committed["usd_low"] < committed["usd_high"]
+    assert committed["at"]
+    # Nothing has been ingested, so the ledger is still untouched — which is
+    # the whole gap this closes.
+    assert doc.get("cost_banked_at") is None
+    assert harness.cost_flushes == []
+
+
+def test_the_score_leg_records_its_own_committed_estimate(harness, monkeypatch):
+    """The Pro leg is created by a *resume* pass hours after the click, and it
+    is the expensive one. Consent captured at the click covers it only because
+    the quote is per job over the whole grant rather than per leg."""
+    job = _job("j1")
+    harness.cache_hits[job.jd_raw] = _parsed()
+    db = _FakeDB()
+    _patch_pending(monkeypatch, [(object(), job)])
+
+    result = asyncio.run(batch_runs.start("u1", db=db))
+
+    committed = db.store[result["run"]]["committed"]["score"]
+    assert committed["model"] == batch_runs.BATCH_PRO_MODEL
+    assert committed["requests"] == 1 and committed["usd_low"] > 0
+
+
+def test_a_second_leg_does_not_clobber_the_first(harness, monkeypatch):
+    """The two entries are written by different processes hours apart, so the
+    write has to be a dotted-path merge and not a whole-map replace."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(
+        stage="parse",
+        origin_run_id="cycle-1",
+        job_ids=["j1"],
+        committed={"parse": {"requests": 1, "usd_low": 0.1, "usd_high": 0.2}},
+    )
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    job = _job("j1")
+    _patch_pending(monkeypatch, [(object(), job)])
+
+    async def fake_fetch(gcs_dir):
+        return [_line(_request_text_for(job), _parsed().model_dump_json())]
+
+    monkeypatch.setattr(batch_runs, "fetch_batch_output", fake_fetch)
+    monkeypatch.setattr(batch_runs, "download_text", _async_value("CTX"))
+
+    _resume(db)
+
+    committed = store["r1"]["committed"]
+    assert set(committed) == {"parse", "score"}
+    assert committed["parse"]["usd_low"] == 0.1  # untouched
+
+
+def _async_value(value):
+    async def _f(*a, **kw):
+        return value
+
+    return _f
+
+
+def _request_text_for(job) -> str:
+    return batch_runs._request_text(batch_runs.build_parse_request(job.jd_raw))
+
+
+def test_ingesting_a_leg_never_adds_the_committed_estimate_to_actual_cost(
+    harness, monkeypatch
+):
+    """T12. ``llm.cost_usd`` means **actual, priced, ingested** and nothing
+    else.
+
+    Adding the estimate to the ledger at submit would have to be subtracted at
+    ingest, and ``tools.run_costs`` writes every leaf with ``Increment`` —
+    with a documented crash window between banking and marking, so the
+    subtraction is not idempotent. The result is negative committed totals or
+    double-counted actuals, silently. So the two never meet: this asserts the
+    banked figure is the priced tokens alone, and that no committed dollars
+    ride along in the flush's metadata either.
+    """
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    committed = {"requests": 100, "usd_low": 5.0, "usd_high": 10.0}
+    store["r1"] = _running_doc(
+        stage="score", origin_run_id="cycle-1", committed={"score": committed}
+    )
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_SUCCEEDED)
+    _patch_pending(monkeypatch, [(object(), _job("j1", parsed=_parsed()))])
+    monkeypatch.setattr(batch_runs, "download_text", _async_value("CTX"))
+    monkeypatch.setattr(
+        batch_runs,
+        "fetch_batch_output",
+        _async_value([_line("CTX\n\nBLOCK-j1", _match_json("j1", 85))]),
+    )
+
+    _resume(db)
+
+    (banked,) = harness.banked
+    # 10 prompt + 5 output tokens of gemini-2.5-flash at the batch rate: cents
+    # of a cent, and nowhere near the $5 estimate sitting on the run doc.
+    assert banked["cost_usd"] < 0.01
+    assert banked["cost_usd"] != committed["usd_low"]
+    # ...and nothing named it into the ledger's metadata by another route.
+    (_user, _run, meta) = harness.cost_flushes[0]
+    assert "committed" not in meta
+    assert committed["usd_low"] not in _dollar_values(meta)
+    # The estimate stays exactly where it was written.
+    assert store["r1"]["committed"]["score"] == committed
+
+
+def _dollar_values(meta) -> set:
+    out = set()
+    for value in meta.values():
+        if isinstance(value, int | float):
+            out.add(float(value))
+        elif isinstance(value, dict):
+            out |= _dollar_values(value)
+    return out
+
+
+def test_outstanding_committed_excludes_legs_already_banked(harness, monkeypatch):
+    """T13. "Outstanding" is *defined* as the legs with no ``cost_banked_at``
+    marker — a query, not arithmetic. That is what makes it safe to re-run and
+    impossible for a retried ingest to corrupt."""
+    store = {}
+    refs = [_FakeRunRef("r1", store), _FakeRunRef("r2", store)]
+    store["r1"] = _running_doc(
+        stage="score",
+        committed={
+            "parse": {"usd_low": 1.0, "usd_high": 2.0},
+            "score": {"usd_low": 8.0, "usd_high": 16.0},
+        },
+        cost_banked_at={"parse": "2026-09-26T00:00:00+00:00"},
+    )
+    store["r2"] = _running_doc(
+        stage="parse", committed={"parse": {"usd_low": 0.5, "usd_high": 1.0}}
+    )
+    db = _FakeDB(refs=refs)
+
+    total = asyncio.run(batch_runs.outstanding_committed(db))
+
+    # r1's parse leg is banked — its real cost is on the ledger now, so
+    # counting the estimate too would be double-counting the same money.
+    assert total["usd_low"] == pytest.approx(8.0 + 0.5)
+    assert total["usd_high"] == pytest.approx(16.0 + 1.0)
+    assert total["runs"] == 2
+    assert all(leg["leg"] != "parse" or leg["run"] != "r1" for leg in total["legs"])
+    assert {leg["leg"] for leg in total["legs"]} == {"score", "parse"}
+
+
+def test_a_failed_run_keeps_its_committed_estimate(harness, monkeypatch):
+    """T14. Google billed it. A failed or orphaned run is precisely the case
+    this exists for — clearing the figure would erase the honest record of
+    money spent and never ingested."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    committed = {"parse": {"requests": 9, "usd_low": 0.4, "usd_high": 0.8}}
+    store["r1"] = _running_doc(stage="parse", committed=committed)
+    db = _FakeDB(refs=[ref])
+    _patch_vertex_state(
+        monkeypatch, types.JobState.JOB_STATE_FAILED, error="out of quota"
+    )
+
+    summary = _resume(db)
+
+    assert summary["failed"] == 1
+    assert store["r1"]["state"] == "failed"
+    assert store["r1"]["committed"] == committed
+
+    # And it keeps showing up as outstanding, forever, because it is.
+    outstanding = asyncio.run(
+        batch_runs.outstanding_committed(_FakeDB(refs=[_FakeRunRef("r1", store)]))
+    )
+    assert outstanding["usd_low"] == pytest.approx(0.4)
+
+
+def test_an_orphaned_run_keeps_its_committed_estimate(harness, monkeypatch):
+    """The other way a run is abandoned: start() died between paying for the
+    batch and recording its job name. Exactly the spend nobody could see."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = _running_doc(
+        stage="parse", committed={"parse": {"usd_low": 0.4, "usd_high": 0.8}}
+    )
+    store["r1"]["job_name"] = None
+    db = _FakeDB(refs=[ref])
+
+    assert _resume(db)["failed"] == 1
+    assert store["r1"]["committed"]["parse"]["usd_low"] == 0.4
+
+
+def test_a_completed_run_is_not_outstanding(harness):
+    """Both its legs are banked, so its *real* cost is on the ledger — adding
+    the estimate as well would double-count the same money.
+
+    Note this one passes on the ``cost_banked_at`` filter, not on the state
+    filter — which is why the test below exists."""
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = {
+        "user_id": "u1",
+        "state": "done",
+        "committed": {"parse": {"usd_low": 3.0, "usd_high": 6.0}},
+        "cost_banked_at": {"parse": "2026-09-26T00:00:00+00:00"},
+    }
+    db = _FakeDB(refs=[ref])
+
+    total = asyncio.run(batch_runs.outstanding_committed(db))
+
+    assert total == {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
+
+
+def test_outstanding_committed_can_be_scoped_to_one_user(harness):
+    store = {}
+    refs = [_FakeRunRef("mine", store), _FakeRunRef("theirs", store)]
+    store["mine"] = _running_doc(committed={"parse": {"usd_low": 1.0, "usd_high": 2.0}})
+    store["theirs"] = {
+        **_running_doc(committed={"parse": {"usd_low": 99.0, "usd_high": 99.0}}),
+        "user_id": "u2",
+    }
+    db = _FakeDB(refs=refs)
+
+    total = asyncio.run(batch_runs.outstanding_committed(db, user_id="u1"))
+
+    assert total["usd_low"] == pytest.approx(1.0) and total["runs"] == 1
+
+
+def test_a_done_run_is_excluded_by_state_even_with_an_unbanked_leg(harness):
+    """The ``OUTSTANDING_STATES`` filter, on its own.
+
+    Every other test here passes through the ``cost_banked_at`` filter, so
+    adding ``"done"`` to ``OUTSTANDING_STATES`` left the whole file green —
+    the state filter was doing real work and nothing was checking it. A
+    completed run whose marker never landed is exactly the case that tells
+    the two filters apart: ``done`` means the pipeline finished and its
+    tokens were priced onto the ledger, so its estimate must not be counted
+    again no matter what the per-leg markers say.
+    """
+    store = {}
+    ref = _FakeRunRef("r1", store)
+    store["r1"] = {
+        "user_id": "u1",
+        "state": "done",
+        "committed": {"score": {"usd_low": 12.0, "usd_high": 24.0}},
+        # Deliberately no cost_banked_at at all.
+    }
+    db = _FakeDB(refs=[ref])
+
+    total = asyncio.run(batch_runs.outstanding_committed(db))
+
+    assert total == {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
+    assert "done" not in batch_runs.OUTSTANDING_STATES

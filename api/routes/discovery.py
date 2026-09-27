@@ -34,19 +34,26 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from google.api_core.exceptions import FailedPrecondition, NotFound
 from google.cloud import firestore
 
-from api.deps import dev_mode, firebase_auth, verify_user
+from api.deps import (
+    SpendConfirm,
+    dev_mode,
+    firebase_auth,
+    spend_402,
+    spend_client,
+    verify_user,
+)
 from api.routes.applications import dispatch_tailor
 from models.settings import DiscoverySettings
 from obs.llm_cost import run_cost_snapshot
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
-from tools import allowlist, queues
+from tools import allowlist, queues, spend
 from tools.account.delete import is_deleted
 from tools.applications import reaper
 from tools.ats.sweep import sweep_postings
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
 from tools.matching import batch_runs
-from tools.matching.score import score_pending_jobs
+from tools.matching.score import count_unscored, score_pending_jobs
 from tools.run_costs import persist_run_cost
 
 log = get_logger("api.discovery")
@@ -129,6 +136,24 @@ LIVE_RUN_REFUSED = (
 )
 
 
+def refuse_live_runs() -> None:
+    """Dependency form of :func:`live_runs_refused`, for paid routes.
+
+    **Exists for an ordering reason, not a style one.** A route that carries
+    the consent seam as a dependency has its token *consumed* — and deleted,
+    single-use — while FastAPI is still solving parameters, before a line of
+    the handler body runs. A ``live_runs_refused()`` check at the top of that
+    body therefore 403s having already spent the user's confirmation, and
+    they have to confirm again to be refused again.
+
+    Route-level ``dependencies=[...]`` are inserted ahead of the signature's
+    own dependencies, so this runs first and the token survives the refusal.
+    Pinned in ``test_jobs_score_route.py``.
+    """
+    if live_runs_refused():
+        raise HTTPException(status_code=403, detail=LIVE_RUN_REFUSED)
+
+
 def live_runs_refused() -> bool:
     """Would starting a real crawl here be a local process driving production?
 
@@ -165,13 +190,13 @@ def _client() -> firestore.Client:
     return _db
 
 
-#: An async client, purely for :func:`_allowlisted` — everything else in this
-#: module is sync-plus-``asyncio.to_thread``, but ``tools.allowlist.is_allowed``
-#: is async (it is shared with ``api.deps``, which runs on an event loop with
-#: no thread hop to spare). Memoising it is safe for the reason ``_client``
-#: above and ``api.routes.account``'s async client both are: one uvicorn loop
-#: for the life of the process. Built at all only when ``cron_tick`` runs with
-#: ``ALLOWLIST_ENFORCED`` on.
+#: An async client, for the two things in this module that are natively async:
+#: :func:`_allowlisted` (``tools.allowlist.is_allowed`` is shared with
+#: ``api.deps``, which runs on an event loop with no thread hop to spare) and
+#: :func:`_backlog`. Everything else here is sync-plus-``asyncio.to_thread``.
+#: Memoising it is safe for the reason ``_client`` above and
+#: ``api.routes.account``'s async client both are: one uvicorn loop for the
+#: life of the process.
 _adb: firestore.AsyncClient | None = None
 
 
@@ -498,8 +523,36 @@ def _release_slot(user_id: str, kind: str, trigger: str, began: datetime) -> boo
     return False
 
 
-async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
-    """Background: discover new jobs, then score them so they reach the queue.
+async def _backlog(user_id: str) -> int | None:
+    """The unscored backlog, or ``None`` when it could not be counted.
+
+    Never raises. This is a *report*, and it runs inside the cycle's ``try``
+    where an exception would mark a run that already did its work — and may
+    already have paid for scoring — as failed. ``None`` rather than 0 for the
+    same reason the Profile card refuses to render an absent budget: a
+    fabricated zero says "nothing is waiting", which is a claim, and a wrong
+    one.
+    """
+    try:
+        return await count_unscored(_async_client(), user_id)
+    except Exception:
+        log.exception("discovery.backlog_count_failed", user_id=user_id)
+        return None
+
+
+async def run_discovery_cycle(
+    user_id: str, *, trigger: str = "scheduled", score: bool = True
+) -> None:
+    """Background: discover new jobs, and (unless ``score`` is off) score them.
+
+    **``score`` separates the two verbs, and only the manual path uses it.**
+    Finding jobs is free; scoring them is the money. A manual "run now" with
+    no scoring consent runs with ``score=False`` and stops at the persist, and
+    the card then offers a second, priced click. Every *unattended* trigger —
+    ``cron``, ``opportunistic``, ``onboarding`` — keeps ``score=True``: there
+    is nobody there to make the second click, so splitting them would mean
+    nothing ever gets scored, and for those the auto-discovery toggle is the
+    consent.
 
     Runs under a ``run_id`` log context, so every line the cycle emits — the
     discovery fetches, the per-job ``matching.scored`` events, the summary —
@@ -529,7 +582,9 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
     if await _account_deleted(user_id):
         log.warning("discovery.cycle_account_deleted", user_id=user_id, trigger=trigger)
         return
-    with run_context("auto_discovery", user_id=user_id, trigger=trigger) as run_id:
+    with run_context(
+        "auto_discovery", user_id=user_id, trigger=trigger, scored=score
+    ) as run_id:
         started = time.monotonic()
         began = _now()
         started_at = began.isoformat()
@@ -547,16 +602,27 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
             preferences = await load_job_preferences(user_id)
             jobs, title_dropped = prefilter_jobs(summary["jobs"], preferences)
             new = await persist_new_jobs(jobs)
+            if not score:
+                # The find-only leg. **Nothing below this line may reach an
+                # LLM**: it is the whole point of the branch, and the counts
+                # are zeros-because-nothing-ran, not zeros-so-far.
+                counts = {"scored": 0, "discarded": 0, "failed": 0}
+                log.info("discovery.found_only", user_id=user_id, new_jobs=new)
             # Big backlogs go to a resumable half-price batch run instead of
             # online scoring — but only where the worker's resume ticks exist
             # to ingest it (QUEUE_MODE); in-process mode stays fully online.
-            if queues.enabled():
+            elif queues.enabled():
                 counts = await batch_runs.score_or_start_run(user_id)
             else:
                 counts = await score_pending_jobs(user_id)
             metrics = {
                 "run_id": run_id,
                 "trigger": trigger,
+                # Whether this cycle was allowed to spend at all. On the
+                # ledger and the Profile card because "0 scored" otherwise
+                # reads as a failure rather than as a run that was never
+                # asked to score.
+                "scored_leg": score,
                 "jobs_fetched": len(summary["jobs"]),
                 "title_filtered": sum(title_dropped.values()),
                 "jobs_by_platform": summary["jobs_by_platform"],
@@ -568,6 +634,21 @@ async def run_discovery_cycle(user_id: str, *, trigger: str = "scheduled") -> No
                 "boards_cached": summary["boards_cached"],
                 "boards_fetched": summary["boards_fetched"],
                 "new_jobs": new,
+                # **The backlog, and nothing else.** Counted the same way by
+                # every branch of this cycle, from the one definition in
+                # ``tools.matching.score.count_unscored`` — jobs the user has
+                # not decided on and nothing has scored.
+                #
+                # It used to be ``counts["pending"]``, which meant three
+                # different things depending on which branch produced it
+                # (jobs newly persisted / jobs this run attempted / jobs the
+                # batch reserved), all of them grant-bounded except the first,
+                # while the Profile card labelled it "waiting to be scored".
+                # A find-only run on a 9,219-job backlog advertised 60.
+                #
+                # What a priced click actually covers is ``min(this, the
+                # grant)``; the grant is the estimate's job, not this one.
+                "unscored_backlog": await _backlog(user_id),
                 "scored": counts["scored"],
                 "discarded": counts["discarded"],
                 "failed": counts["failed"],
@@ -722,7 +803,23 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
             )
 
 
-def enqueue_cycle(kind: str, user_id: str, *, trigger: str) -> bool:
+#: The find-only discovery task's own worker route. **Not a field on the
+#: existing task, and that is the whole design.**
+#:
+#: Cloud Tasks delivers to whichever hermes-worker revision is live when the
+#: task runs, which during a rollout is the *old* one. An old worker handed
+#: ``{"score": false}`` on ``/tasks/discovery`` would ignore the unknown field
+#: — pydantic drops extras — and score the backlog anyway: the guard would
+#: fail open, silently, on every deploy. An old worker handed this path 404s
+#: instead, Cloud Tasks retries with backoff, and the task lands once the new
+#: revision is serving. Nothing is spent in the window.
+#:
+#: Collapsing this into a bool belongs to a later PR, after both revisions are
+#: past. Please don't "simplify" it before then.
+SCAN_TASK_PATH = "/tasks/discovery/scan"
+
+
+def enqueue_cycle(kind: str, user_id: str, *, trigger: str, score: bool = True) -> bool:
     """Push one cycle onto the discovery queue. Returns False when deduped.
 
     The queue half of :func:`dispatch_cycle`, split out because it is the half
@@ -734,17 +831,27 @@ def enqueue_cycle(kind: str, user_id: str, *, trigger: str) -> bool:
     Hour-granular ids for scheduled work — one per user per hour no matter how
     many triggers race — and minute-granular ids for manual runs, so a
     double-click dedupes but a deliberate re-run a minute later doesn't.
+
+    ``score=False`` routes to :data:`SCAN_TASK_PATH` and takes its own slice of
+    the id namespace: a find-only run and a scored run in the same minute are
+    different asks, and deduping the second into the first would drop exactly
+    the click the user paid attention to.
     """
     grain = "%Y%m%d%H%M" if trigger == "manual" else "%Y%m%d%H"
+    scan = kind == "discovery" and not score
+    path = SCAN_TASK_PATH if scan else f"/tasks/{kind}"
+    verb = f"{kind}-scan" if scan else kind
     return queues.enqueue(
         "discovery",
-        f"/tasks/{kind}",
+        path,
         {"user_id": user_id, "trigger": trigger},
-        task_id=f"{trigger}-{kind}-{user_id}-{_now().strftime(grain)}",
+        task_id=f"{trigger}-{verb}-{user_id}-{_now().strftime(grain)}",
     )
 
 
-async def dispatch_cycle(kind: str, user_id: str, *, trigger: str) -> bool:
+async def dispatch_cycle(
+    kind: str, user_id: str, *, trigger: str, score: bool = True
+) -> bool:
     """Run a discovery/sweep cycle — on the worker via queue when enabled.
 
     With QUEUE_MODE on, the cycle becomes a named Cloud Tasks task pushed to
@@ -756,9 +863,14 @@ async def dispatch_cycle(kind: str, user_id: str, *, trigger: str) -> bool:
     if queues.enabled():
         # Off the event loop: the enqueue is a blocking gRPC call, and this
         # coroutine runs on a worker serving other tasks concurrently.
-        return await asyncio.to_thread(enqueue_cycle, kind, user_id, trigger=trigger)
-    cycle = run_discovery_cycle if kind == "discovery" else run_sweep_cycle
-    await cycle(user_id, trigger=trigger)
+        return await asyncio.to_thread(
+            enqueue_cycle, kind, user_id, trigger=trigger, score=score
+        )
+    if kind == "discovery":
+        await run_discovery_cycle(user_id, trigger=trigger, score=score)
+    else:
+        # The sweep buys no LLM calls, so it has no scoring leg to separate.
+        await run_sweep_cycle(user_id, trigger=trigger)
     return True
 
 
@@ -882,9 +994,28 @@ def save_discovery_settings(
 
 @router.post("/settings/discovery/run")
 async def run_discovery_now(
-    background_tasks: BackgroundTasks, user_id: str = Depends(verify_user)
+    background_tasks: BackgroundTasks,
+    body: SpendConfirm | None = None,
+    user_id: str = Depends(verify_user),
 ) -> dict:
-    """Explicit user action: run discovery + scoring immediately.
+    """Explicit user action: find new jobs now — and score them only if asked.
+
+    **This route is the 2026-09-26 incident.** It used to mean "find *and*
+    score", and under QUEUE_MODE that meant a Vertex batch was submitted the
+    moment the backlog cleared ``BATCH_MIN_PENDING`` (50, which a fresh
+    account always clears). No estimate, no confirmation. The click could not
+    not spend.
+
+    Now the default verb is the free one. Without ``confirm`` the cycle runs
+    with ``score=False`` and the response says ``scored: false``; the card
+    then quotes the scoring step and takes a second, deliberate click. With a
+    valid token — minted by ``POST /jobs/score``'s 402, or by this route's own
+    — the cycle scores in one go, consented.
+
+    A ``confirm`` that is present but **invalid** answers 402 rather than
+    quietly downgrading to find-only: the user asked for the paid thing, and
+    silently doing something else is how a guard becomes a surprise in the
+    other direction.
 
     ``mode`` reports where the work actually went — "queued" (Cloud Tasks →
     hermes-worker) or "in_process" (a background task on this instance, which
@@ -892,20 +1023,33 @@ async def run_discovery_now(
     deployment's QUEUE_MODE is what you think it is.
 
     Refuses outright from a local process — see :func:`live_runs_refused`. The
-    check is the *first* thing here, ahead of the QUEUE_MODE branch, because
-    both arms of it spend the same money: one on this instance, one on the
-    worker.
+    check is the *first* thing here, ahead of both the consent seam and the
+    QUEUE_MODE branch, because every arm of it spends the same money.
     """
     if live_runs_refused():
         log.warning("discovery.run_now_refused", user_id=user_id)
         raise HTTPException(status_code=403, detail=LIVE_RUN_REFUSED)
-    log.info("discovery.run_now", user_id=user_id)
+
+    score = False
+    if body is not None and body.confirm:
+        db = spend_client()
+        try:
+            await spend.consume(db, user_id, spend.DISCOVERY_SCAN, body.confirm)
+        except spend.ConsentRequired:
+            raise await spend_402(db, user_id, spend.DISCOVERY_SCAN) from None
+        score = True
+
+    log.info("discovery.run_now", user_id=user_id, scored=score)
     if queues.enabled():
-        queued = await dispatch_cycle("discovery", user_id, trigger="manual")
-        return {"ok": True, "mode": "queued", "deduped": not queued}
+        queued = await dispatch_cycle(
+            "discovery", user_id, trigger="manual", score=score
+        )
+        return {"ok": True, "mode": "queued", "deduped": not queued, "scored": score}
     # No queue infra: run in-process, after the response goes out.
-    background_tasks.add_task(run_discovery_cycle, user_id, trigger="manual")
-    return {"ok": True, "mode": "in_process"}
+    background_tasks.add_task(
+        run_discovery_cycle, user_id, trigger="manual", score=score
+    )
+    return {"ok": True, "mode": "in_process", "scored": score}
 
 
 @router.post("/settings/discovery/sweep")

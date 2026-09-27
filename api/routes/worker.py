@@ -84,6 +84,27 @@ async def task_discovery(body: CycleTask) -> dict:
     return {"ok": True}
 
 
+@router.post("/discovery/scan")
+async def task_discovery_scan(body: CycleTask) -> dict:
+    """Find-only discovery cycle: fetch -> filter -> persist. **No scoring.**
+
+    **Its own route rather than a field on ``/tasks/discovery``, and that is
+    load-bearing.** Cloud Tasks delivers to whichever worker revision is live
+    when the task runs, which during a rollout is the old one. Given a
+    ``{"score": false}`` field it did not know about, an old worker would drop
+    it (pydantic ignores extras) and score the backlog anyway — the guard
+    would fail open, silently, on every deploy. Given *this path*, an old
+    worker 404s, Cloud Tasks retries with backoff, and the task lands when the
+    new revision is serving. Nothing is spent in the window.
+
+    Collapsing this back into a bool is a later PR, once both revisions are
+    past. See ``api.routes.discovery.SCAN_TASK_PATH``.
+    """
+    _require_worker()
+    await run_discovery_cycle(body.user_id, trigger=body.trigger, score=False)
+    return {"ok": True}
+
+
 @router.post("/sweep")
 async def task_sweep(body: CycleTask) -> dict:
     """Liveness sweep: dismiss postings the ATS took down."""
@@ -123,6 +144,52 @@ async def task_score(body: ScoreTask) -> dict:
                 run_id,
                 runner="score_task",
                 started_at=started_at,
+                jobs={
+                    "pending": counts.get("pending", 0),
+                    "scored": counts.get("scored", 0),
+                    "discarded": counts.get("discarded", 0),
+                    "failed": counts.get("failed", 0),
+                },
+            )
+    return {"ok": True, **counts}
+
+
+@router.post("/score/backlog")
+async def task_score_backlog(body: ScoreTask) -> dict:
+    """The user's "score what you found" click, executed.
+
+    **Goes through ``score_or_start_run``, not straight to the online
+    scorer**, and that is the whole reason this route exists rather than
+    reusing ``/tasks/score``. That seam is what routes a backlog over
+    ``BATCH_MIN_PENDING`` to a half-price Vertex batch. Before the spend
+    safeguards landed, the same intent — the user asking for their backlog to
+    be scored — went through it; pointing the new button at ``/tasks/score``
+    instead would have quietly doubled the price of the exact workflow this
+    PR replaced, and left the batch-rate floor of every quote unreachable.
+
+    ``cycle_id=None`` for the reason ``/tasks/score`` gives: measure under
+    this run, spend out of the window discovery opened. A button that opened
+    a fresh window would make "200 per cycle" resettable on demand.
+
+    Its own path for the same rollout-skew reason as
+    ``/tasks/discovery/scan``: an old worker revision 404s it and Cloud Tasks
+    retries, rather than serving it with the wrong semantics.
+    """
+    _require_worker()
+    with run_context("score_backlog", user_id=body.user_id) as run_id:
+        started_at = datetime.now(UTC).isoformat()
+        counts: dict = {}
+        try:
+            counts = await batch_runs.score_or_start_run(body.user_id, cycle_id=None)
+        finally:
+            await persist_run_cost(
+                firestore.AsyncClient,
+                body.user_id,
+                run_id,
+                runner="score_backlog",
+                trigger="manual",
+                started_at=started_at,
+                batch_run=counts.get("batch_run"),
                 jobs={
                     "pending": counts.get("pending", 0),
                     "scored": counts.get("scored", 0),

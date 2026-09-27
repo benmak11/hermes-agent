@@ -159,6 +159,22 @@ export type DiscoveryState = {
     duration_ms?: number;
     run_id?: string;
     trigger?: string;
+    /**
+     * The unscored backlog after this cycle: jobs the user has not decided on
+     * that nothing has scored. **One meaning, from one definition**
+     * (`tools.matching.score.count_unscored`), reported identically by every
+     * branch of the cycle. Absent when it could not be counted — never 0 as
+     * a stand-in, which would claim nothing is waiting.
+     *
+     * It is *not* what a scoring click covers: that is `min(this, the
+     * grant)`, and the grant is the 402 estimate's job. The predecessor field
+     * (`pending`) meant three different things depending on branch, and the
+     * card labelled it as a fourth.
+     */
+    unscored_backlog?: number;
+    /** Whether this cycle was allowed to score at all. False on a find-only
+     *  manual run, which is what tells "0 scored" apart from a failure. */
+    scored_leg?: boolean;
     /** Scoring budget: what this cycle was granted, and what is left after it.
      *  Absent on runs taken before the cap existed, or run with --ignore-budget. */
     budget_granted?: number;
@@ -181,6 +197,36 @@ export type DiscoverySettingsResponse = {
   state: DiscoveryState;
   next_discovery_at?: string | null;
   next_sweep_at?: string | null;
+};
+
+/**
+ * A quote for a paid action, as the 402 body carries it. Always a range with
+ * its provenance and the cap that bounds it — never a single figure: the
+ * measured per-job rate moved ~2.2x once with no change on our side.
+ */
+export type SpendEstimate = {
+  action: string;
+  units: number;
+  unit: string;
+  usd_low: number;
+  usd_high: number;
+  rate_usd: number;
+  rate_source: string;
+  rate_sample: number;
+  caps: {
+    per_cycle: number;
+    per_day: number;
+    remaining_cycle: number;
+    remaining_day: number;
+  };
+};
+
+/** The `detail` of a 402: what it would cost, and the token that agrees to it. */
+export type SpendConfirmation = {
+  needs_confirmation: true;
+  action: string;
+  estimate: SpendEstimate;
+  confirm_token: string;
 };
 
 export type Decision = "approved" | "rejected" | "starred";
