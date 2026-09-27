@@ -42,7 +42,7 @@ from obs.logging import bind_run_context
 from tools.matching import batch_runs
 from tools.matching.batch import batch_score_pending_jobs
 from tools.matching.score import score_pending_jobs
-from tools.run_costs import persist_run_cost
+from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 
 load_dotenv()
 
@@ -173,9 +173,26 @@ async def main() -> None:
     args = parser.parse_args()
     run_id = bind_run_context("matching", user_id=args.user_id)
     started_at = datetime.now(UTC).isoformat()
+    # ``running`` until a leg below decides. A CLI run killed with Ctrl-C or
+    # SIGKILL leaves the doc open, and the activity contract ages it into
+    # ``stalled`` rather than reporting nothing at all.
+    ledger_state = RUNNING
+    await open_run(
+        firestore.AsyncClient,
+        args.user_id,
+        run_id,
+        runner="matching",
+        trigger="cli",
+        started_at=started_at,
+    )
 
     try:
         await _score(args)
+        ledger_state = DONE
+    except Exception:
+        # Re-raised untouched; this clause only records the outcome.
+        ledger_state = FAILED
+        raise
     finally:
         # In a finally: a run killed mid-scoring has still paid for every
         # call it got through, and that spend lives only in this process
@@ -185,7 +202,7 @@ async def main() -> None:
             args.user_id,
             run_id,
             runner="matching",
-            started_at=started_at,
+            state=ledger_state,
         )
 
 

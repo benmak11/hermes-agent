@@ -2,6 +2,8 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Shared fixtures for the unit suite."""
 
+import sys
+
 import pytest
 from google.cloud import firestore
 
@@ -13,7 +15,7 @@ import api.routes.discovery as routes_discovery
 import api.routes.jobs as routes_jobs
 import api.routes.journeys as routes_journeys
 import api.routes.profile as routes_profile
-from tools import genai_client
+from tools import genai_client, run_costs
 from tools.matching import budget
 
 
@@ -150,3 +152,65 @@ def no_production_firestore(monkeypatch, request):
     # (``spend_client``). Same leak shape, and this one is built as soon as
     # anybody touches a paid route rather than sitting unused behind a flag.
     monkeypatch.setattr(api_deps, "_spend_db", None, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def run_ledger_opens(monkeypatch):
+    """Neuter (and record) the run ledger's ``open_run`` write, everywhere.
+
+    ``open_run`` is the liveness half of the run ledger: it writes
+    ``state: "running"`` the moment a pipeline starts, and it resolves its
+    Firestore client exactly the way ``persist_run_cost`` does — which means it
+    is a second way for the leak ``no_production_firestore`` exists to catch to
+    reach the live project, from *every* pipeline at once. Fifteen tests
+    already patch ``persist_run_cost`` by hand; patching its twin fifteen more
+    times is how one gets missed.
+
+    Replaced with a **recorder**, not a no-op: a fixture that silently disables
+    the thing under test is how this project has repeatedly ended up with tests
+    that cannot fail. Ask for this fixture to assert on what a pipeline opened,
+    or override it with ``monkeypatch.setattr(<module>, "open_run", ...)`` in a
+    test that needs its own seam — the later patch wins.
+    """
+    opened: list[dict] = []
+
+    async def fake_open_run(
+        db, user_id, run_id, *, runner, trigger=None, started_at=None
+    ):
+        opened.append(
+            {
+                "user_id": user_id,
+                "run_id": run_id,
+                "runner": runner,
+                "trigger": trigger,
+                "started_at": started_at,
+            }
+        )
+
+    # By identity against the real function, over the modules already imported:
+    # every call site does ``from tools.run_costs import open_run``, so the name
+    # lives in the caller's namespace and patching the source module would miss
+    # all of them.
+    #
+    # ``real`` is bound **before** the loop on purpose: reading
+    # ``run_costs.open_run`` inside it made ``tools.run_costs`` — whichever
+    # position it happens to hold in ``sys.modules`` — the last module patched,
+    # because the comparison then matched the fake from that point on. The
+    # fixture "passed" while patching exactly one module, and every pipeline
+    # still called the real write.
+    #
+    # ``tools.run_costs`` itself is deliberately left alone: no call site reaches
+    # ``open_run`` by qualified name, and leaving the definition intact is what
+    # lets ``test_run_costs.py`` exercise the real function against a fake client.
+    real = run_costs.open_run
+    patched = []
+    for module in list(sys.modules.values()):
+        if module is run_costs:
+            continue
+        if getattr(module, "open_run", None) is real:
+            monkeypatch.setattr(module, "open_run", fake_open_run)
+            patched.append(module.__name__)
+    # A guard on the guard: the pipelines are what this has to cover, and a
+    # rename or a moved import would otherwise silently reduce it to nothing.
+    assert "api.routes.discovery" in patched, patched
+    return opened

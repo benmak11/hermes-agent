@@ -36,7 +36,7 @@ from tools.applications import state
 from tools.matching import batch_runs
 from tools.matching.score import score_pending_jobs
 from tools.queues import worker_mode
-from tools.run_costs import persist_run_cost
+from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 
 log = get_logger("api.worker")
 
@@ -133,17 +133,32 @@ async def task_score(body: ScoreTask) -> dict:
     with run_context("score_task", user_id=body.user_id) as run_id:
         started_at = datetime.now(UTC).isoformat()
         counts: dict = {}
+        # ``running`` until a leg decides: a task Cloud Run kills mid-scoring
+        # banks ``running`` and the activity contract ages it into ``stalled``.
+        ledger_state = RUNNING
+        await open_run(
+            firestore.AsyncClient,
+            body.user_id,
+            run_id,
+            runner="score_task",
+            trigger="task",
+            started_at=started_at,
+        )
         try:
             counts = await score_pending_jobs(
                 body.user_id, limit=body.limit, cycle_id=None
             )
+            ledger_state = DONE
+        except Exception:
+            ledger_state = FAILED
+            raise
         finally:
             await persist_run_cost(
                 firestore.AsyncClient,
                 body.user_id,
                 run_id,
                 runner="score_task",
-                started_at=started_at,
+                state=ledger_state,
                 jobs={
                     "pending": counts.get("pending", 0),
                     "scored": counts.get("scored", 0),
@@ -179,8 +194,25 @@ async def task_score_backlog(body: ScoreTask) -> dict:
     with run_context("score_backlog", user_id=body.user_id) as run_id:
         started_at = datetime.now(UTC).isoformat()
         counts: dict = {}
+        ledger_state = RUNNING
+        await open_run(
+            firestore.AsyncClient,
+            body.user_id,
+            run_id,
+            runner="score_backlog",
+            trigger="manual",
+            started_at=started_at,
+        )
         try:
             counts = await batch_runs.score_or_start_run(body.user_id, cycle_id=None)
+            # A backlog that went to a Vertex batch is **not** done: the worker's
+            # resume tick closes this doc when it ingests the results, under this
+            # same run_id. Closing it here would report a finished run while
+            # Google still holds the work.
+            ledger_state = RUNNING if counts.get("batch_run") else DONE
+        except Exception:
+            ledger_state = FAILED
+            raise
         finally:
             await persist_run_cost(
                 firestore.AsyncClient,
@@ -188,7 +220,7 @@ async def task_score_backlog(body: ScoreTask) -> dict:
                 run_id,
                 runner="score_backlog",
                 trigger="manual",
-                started_at=started_at,
+                state=ledger_state,
                 batch_run=counts.get("batch_run"),
                 jobs={
                     "pending": counts.get("pending", 0),
@@ -215,17 +247,32 @@ async def task_batch_start(body: ScoreTask) -> dict:
     with run_context("batch_start", user_id=body.user_id) as run_id:
         started_at = datetime.now(UTC).isoformat()
         result: dict = {}
+        ledger_state = RUNNING
+        await open_run(
+            firestore.AsyncClient,
+            body.user_id,
+            run_id,
+            runner="batch_start",
+            trigger="task",
+            started_at=started_at,
+        )
         try:
             result = await batch_runs.start(
                 body.user_id, limit=body.limit, cycle_id=None
             )
+            # Submitting a batch is the *beginning* of the work, not the end —
+            # the resume tick that ingests it closes this doc.
+            ledger_state = RUNNING if result.get("run") else DONE
+        except Exception:
+            ledger_state = FAILED
+            raise
         finally:
             await persist_run_cost(
                 firestore.AsyncClient,
                 body.user_id,
                 run_id,
                 runner="batch_start",
-                started_at=started_at,
+                state=ledger_state,
                 batch_run=result.get("run"),
             )
     return {"ok": True, **result}

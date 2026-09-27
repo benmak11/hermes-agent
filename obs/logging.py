@@ -273,8 +273,23 @@ def log_agent_end(
     every run, not just that something with this run_id eventually stopped.
     ``**result`` carries whatever summary is useful for that agent (counts,
     resume_uri, error, ...).
+
+    **A ``duration_ms`` in ``result`` is renamed, not passed through.** The
+    sweep's counts dict carries its own ``duration_ms`` (``tools.ats.sweep``
+    times its board fetches), and splatting it here collided with the keyword
+    below — ``TypeError: got multiple values for keyword argument
+    'duration_ms'`` — raised *after* the sweep's Firestore success write, so
+    the caller's ``except`` logged ``sweep.failed`` and released the slot on a
+    run that had done its whole job. Three weeks of production logs (13
+    sweeps, 13 ``outcome=failed``, zero completed) were that one keyword.
+    Fixed here rather than at the call site so no future caller can
+    reintroduce it: whatever the caller measured lands as
+    ``step_duration_ms``, beside this function's own wall-clock figure.
     """
     duration_ms = round((time.perf_counter() - started) * 1000, 1)
+    step_duration_ms = result.pop("duration_ms", None)
+    if step_duration_ms is not None:
+        result["step_duration_ms"] = step_duration_ms
     logger.info(
         "agent.finished",
         agent=agent,

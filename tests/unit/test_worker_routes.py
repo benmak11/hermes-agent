@@ -1720,6 +1720,7 @@ def test_dry_run_is_worker_only():
         f"api.routes.{name}"
         for name in (
             "account",
+            "activity",
             "applications",
             "companies",
             "discovery",
