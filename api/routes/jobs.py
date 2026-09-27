@@ -23,7 +23,7 @@ from tools import queues, spend
 from tools.applications import state as app_state
 from tools.ats.validate import check_posting
 from tools.matching.score import score_pending_jobs
-from tools.run_costs import persist_run_cost
+from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 from tools.spend.estimate import Estimate
 
 router = APIRouter(tags=["jobs"])
@@ -120,8 +120,26 @@ async def run_score_backlog(user_id: str) -> None:
     with run_context("score_backlog", user_id=user_id) as run_id:
         started_at = datetime.now(UTC).isoformat()
         counts: dict = {}
+        # ``running`` until a leg below decides: a task killed mid-scoring banks
+        # ``running`` and the activity contract ages it into ``stalled``, which
+        # beats the old behaviour of leaving no document at all.
+        ledger_state = RUNNING
+        await open_run(
+            firestore.AsyncClient,
+            user_id,
+            run_id,
+            runner="score_backlog",
+            trigger="manual",
+            started_at=started_at,
+        )
         try:
             counts = await score_pending_jobs(user_id, cycle_id=None)
+            ledger_state = DONE
+        except Exception:
+            # Re-raised untouched — the only reason this clause exists is to
+            # record the outcome on the ledger before the ``finally`` closes it.
+            ledger_state = FAILED
+            raise
         finally:
             await persist_run_cost(
                 firestore.AsyncClient,
@@ -129,7 +147,7 @@ async def run_score_backlog(user_id: str) -> None:
                 run_id,
                 runner="score_backlog",
                 trigger="manual",
-                started_at=started_at,
+                state=ledger_state,
                 jobs={
                     "pending": counts.get("pending", 0),
                     "scored": counts.get("scored", 0),

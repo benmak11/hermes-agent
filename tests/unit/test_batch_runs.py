@@ -732,6 +732,10 @@ def test_resume_prices_the_batch_under_the_run_that_ordered_it(harness, monkeypa
             "cycle-1",
             {
                 "batch_run": "r1",
+                # The score leg drove the batch_runs doc to ``done``, so the
+                # originating cycle's ledger doc closes here — not when the
+                # cycle itself returned, which was hours ago.
+                "state": "done",
                 "jobs": {
                     "scored": 1,
                     "discarded": 0,
@@ -799,8 +803,11 @@ def test_resume_banks_cost_when_the_ingest_dies_after_pricing(harness, monkeypat
     assert store["r1"]["state"] == "running"  # left claimed for the retry
     # No ``jobs``: the leg never returned its counts, so the money is banked
     # and the outcome breakdown is simply absent rather than guessed at.
+    # ``state`` stays ``running``: the batch_runs doc is still ``running`` (left
+    # claimed for the retry above), so the originating run is not over and its
+    # ledger doc must not claim to be.
     assert harness.cost_flushes == [
-        ("u1", "cycle-1", {"batch_run": "r1", "jobs": None})
+        ("u1", "cycle-1", {"batch_run": "r1", "state": "running", "jobs": None})
     ]
     # The point of the test: real spend was banked, not an empty flush.
     banked = harness.banked[0]

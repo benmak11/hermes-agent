@@ -510,7 +510,12 @@ def test_discovery_cycle_flushes_cost_and_reports_it_in_metrics(monkeypatch):
     user_id, _run_id, meta = flushes[0]
     assert user_id == "u1"
     assert meta["runner"] == "auto_discovery" and meta["trigger"] == "manual"
-    assert meta["started_at"]
+    assert meta["state"] == "done"
+    # **The close does not re-send ``started_at``.** ``open_run`` wrote it when
+    # the cycle began; a close that sent it again would, on the call sites that
+    # have no value to send (the batch ingest, hours later), land a ``None``
+    # and blank the only record of when the run started.
+    assert "started_at" not in meta
     # Key names are the ledger's contract; `pending`, not `reserved`.
     assert meta["jobs"] == {
         "pending": 8,
@@ -625,3 +630,197 @@ def test_tombstone_run_id_is_explicit_not_ambient():
         )
     assert backfilled["scored_run_id"] is None
     assert carried["scored_run_id"] == "the-run-that-paid"
+
+
+# ------------------------------------------------- the ledger as a liveness record
+#
+# ``users/{uid}/runs/*`` used to be created only by ``persist_run_cost``'s
+# ``finally``, so an in-flight run had **no document** and a run killed by
+# CancelledError or SIGKILL never got one — 67 live docs, every one already
+# closed with both timestamps. ``open_run`` writes ``state: "running"`` up
+# front; the close carries the caller's own outcome. That is what makes "is
+# anything happening?" answerable from the server instead of from client state.
+
+
+class _LedgerDoc:
+    """One ``runs/{run_id}`` document, with real ``set(merge=True)`` semantics."""
+
+    def __init__(self, store: dict, doc_id: str):
+        self._store = store
+        self.id = doc_id
+
+    async def set(self, doc: dict, merge: bool = False) -> None:
+        if merge:
+            # Firestore's merge writes only the keys present; it never blanks a
+            # field the write omits. A close that *does* send ``started_at:
+            # None`` therefore blanks it, which is the thing the test below
+            # pins.
+            self._store.setdefault(self.id, {}).update(doc)
+        else:
+            self._store[self.id] = dict(doc)
+
+
+class _LedgerCollection:
+    def __init__(self, store: dict):
+        self._store = store
+
+    def document(self, doc_id: str) -> _LedgerDoc:
+        return _LedgerDoc(self._store, doc_id)
+
+
+class _LedgerUser:
+    def __init__(self, store: dict, uid: str, user_id: str):
+        self._store = store
+        assert uid == user_id, f"ledger written under {uid}, not {user_id}"
+
+    def collection(self, name: str) -> _LedgerCollection:
+        assert name == run_costs.COLLECTION, name
+        return _LedgerCollection(self._store)
+
+
+class _LedgerDB:
+    """An async Firestore just deep enough for ``users/{uid}/runs/{run_id}``.
+
+    It honours the user id it is handed rather than ignoring it — a fake that
+    drops its arguments answers a different question than the one asked, which
+    this suite has been burned by twice.
+    """
+
+    def __init__(self, user_id: str = "u1"):
+        self.docs: dict[str, dict] = {}
+        self._user_id = user_id
+
+    def collection(self, name: str):
+        assert name == "users", name
+        return SimpleNamespace(
+            document=lambda uid: _LedgerUser(self.docs, uid, self._user_id)
+        )
+
+
+def test_an_open_run_has_a_running_doc_before_it_ends(monkeypatch):
+    """The whole point: the record exists *while* the work is happening."""
+    import api.routes.jobs as jobs
+
+    db = _LedgerDB()
+    seen_mid_flight: list[dict] = []
+
+    async def fake_score(user_id, *, cycle_id=None):
+        # Mid-run: exactly the moment ``GET /activity`` has to be able to say
+        # "scoring is running" from a server-side record alone.
+        seen_mid_flight.append(dict(next(iter(db.docs.values()), {})))
+        return {"pending": 3, "scored": 3, "discarded": 0, "failed": 0}
+
+    monkeypatch.setattr(jobs, "score_pending_jobs", fake_score)
+    # The real ledger writes, against the fake client — the conftest recorder
+    # is deliberately overridden here, because this test is *about* open_run.
+    monkeypatch.setattr(jobs, "open_run", run_costs.open_run)
+    monkeypatch.setattr(jobs, "persist_run_cost", run_costs.persist_run_cost)
+    monkeypatch.setattr(jobs.firestore, "AsyncClient", lambda: db)
+
+    asyncio.run(jobs.run_score_backlog("u1"))
+
+    assert len(seen_mid_flight) == 1
+    mid = seen_mid_flight[0]
+    assert mid["state"] == run_costs.RUNNING
+    assert mid["runner"] == "score_backlog"
+    assert mid["started_at"]
+    assert "ended_at" not in mid  # not closed yet — that is the whole claim
+    # And it closes.
+    closed = next(iter(db.docs.values()))
+    assert closed["state"] == run_costs.DONE
+    assert closed["ended_at"]
+
+
+def test_closing_sets_state_and_never_blanks_started_at(monkeypatch):
+    """The batch ingest closes a run hours later, holding no ``started_at``."""
+    db = _LedgerDB()
+    asyncio.run(
+        run_costs.open_run(
+            db,
+            "u1",
+            "r1",
+            runner="auto_discovery",
+            trigger="cron",
+            started_at="2026-09-27T09:00:00+00:00",
+        )
+    )
+    assert db.docs["r1"]["started_at"] == "2026-09-27T09:00:00+00:00"
+
+    # The ingest's shape: no started_at, no trigger, just the outcome.
+    asyncio.run(run_costs.persist_run_cost(db, "u1", "r1", state=run_costs.DONE))
+
+    doc = db.docs["r1"]
+    assert doc["state"] == run_costs.DONE
+    # Still the opener's value. A close that wrote ``started_at`` unconditionally
+    # would have merged a ``None`` over it and destroyed the one record of when
+    # this run began — and with it every honest elapsed time the UI can show.
+    assert doc["started_at"] == "2026-09-27T09:00:00+00:00"
+
+
+def test_a_run_still_outstanding_closes_as_running(monkeypatch):
+    """A cycle that handed its scoring to Vertex is not finished."""
+    db = _LedgerDB()
+    asyncio.run(
+        run_costs.persist_run_cost(
+            db, "u1", "r1", state=run_costs.RUNNING, batch_run="20260927-x"
+        )
+    )
+    assert db.docs["r1"]["state"] == run_costs.RUNNING
+
+
+def test_state_is_a_plain_field_never_an_increment():
+    """``firestore.Increment("done")`` raises — so ``state`` must never go
+    through ``_increments``, i.e. must never be a member of ``jobs``/``llm``."""
+    db = _FakeDB()
+    _flush(db, runner="auto_discovery", state="done", jobs={"scored": 1})
+
+    doc = db.written["doc"]
+    assert doc["state"] == "done"
+    assert not isinstance(doc["state"], Increment)
+    # The counts beside it still are, so this is not the increments breaking.
+    assert isinstance(doc["jobs"]["scored"], Increment)
+    assert isinstance(doc["llm"]["calls"], Increment)
+    # And the reason it can never be one: the transform refuses non-numerics.
+    with pytest.raises(ValueError):
+        Increment("done")
+
+
+# ------------------------------------------------------------- derived staleness
+
+
+def _open_doc(minutes_ago: float, *, now: datetime) -> dict:
+    return {
+        "state": run_costs.RUNNING,
+        "runner": "auto_discovery",
+        "started_at": (now - timedelta(minutes=minutes_ago)).isoformat(),
+    }
+
+
+def test_an_open_doc_past_the_ceiling_reads_stalled():
+    now = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
+    # 1860s = the dispatch deadline plus the lease grace. Cloud Tasks has
+    # abandoned the dispatch by then, so nothing can still be running.
+    assert run_costs.STALE_AFTER == timedelta(seconds=1860)
+    assert not run_costs.run_is_stalled(_open_doc(5, now=now), now=now)
+    assert not run_costs.run_is_stalled(_open_doc(30, now=now), now=now)
+    assert run_costs.run_is_stalled(_open_doc(31, now=now), now=now)
+    assert run_costs.run_is_stalled(_open_doc(60 * 24, now=now), now=now)
+
+
+def test_a_closed_doc_is_never_stalled():
+    now = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
+    for state in (run_costs.DONE, run_costs.FAILED):
+        doc = _open_doc(60 * 24, now=now) | {"state": state}
+        assert not run_costs.run_is_stalled(doc, now=now)
+    # Legacy docs (the 67 live ones) carry no ``state`` at all: closed, by
+    # definition — they only exist because something closed them.
+    assert not run_costs.run_is_stalled({"runner": "matching"}, now=now)
+
+
+def test_an_open_doc_with_no_readable_start_is_stalled():
+    # It cannot be aged, and "it is running" is the dishonest guess.
+    now = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
+    assert run_costs.run_is_stalled({"state": run_costs.RUNNING}, now=now)
+    assert run_costs.run_is_stalled(
+        {"state": run_costs.RUNNING, "started_at": "not a date"}, now=now
+    )

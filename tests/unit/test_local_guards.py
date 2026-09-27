@@ -443,3 +443,66 @@ def test_every_module_that_can_bill_google_is_registered():
         "remove the entry in BILLING_CALL_SITES above, and say in the PR "
         "which consent seam the call sits behind."
     )
+
+
+# --------------------------------------------------------------------------
+# /activity is side-effect free, and that is load-bearing
+# --------------------------------------------------------------------------
+
+
+def test_the_activity_route_can_never_schedule_background_work():
+    """A status endpoint is the most-polled thing in the app; it must not spend.
+
+    ``GET /jobs/pending`` and ``GET /settings/discovery`` both take a
+    ``BackgroundTasks`` and ``add_task(tick_user, …)``. Under QUEUE_MODE that
+    tick dispatches a discovery cycle, which chains unconditionally into
+    scoring, which on a backlog over ``BATCH_MIN_PENDING`` submits a **paid**
+    Vertex batch. That is the 2026-09-26 incident's mechanism, still live on
+    those two routes by decision rather than oversight.
+
+    ``/activity`` is polled harder than either, so it may not have the same
+    shape. Pinned on the signature rather than by exercising a path: the only
+    way FastAPI hands a route a scheduler is through that parameter, so its
+    absence is the property itself, and no fake can accidentally satisfy it.
+    """
+    import inspect
+
+    import api.routes.activity as activity
+
+    sig = inspect.signature(activity.get_activity)
+    annotations = {str(p.annotation) for p in sig.parameters.values()}
+    assert not any("BackgroundTasks" in a for a in annotations), sig
+    assert "background_tasks" not in sig.parameters
+
+    # And nothing in the module reaches a scheduler or a write by another name.
+    source = Path(activity.__file__).read_text()
+    tree = ast.parse(source)
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    forbidden = called & {"add_task", "set", "update", "delete", "create_task"}
+    assert not forbidden, f"/activity is supposed to be read-only: {forbidden}"
+
+    # By identifier, not by substring: the module *documents* why it must not
+    # tick, so the words appear in its docstring. Names and imports are what
+    # would make it actually possible.
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom | ast.Import)
+        for alias in node.names
+    }
+    assert "tick_user" not in names | imported
+    assert "BackgroundTasks" not in names | imported
+
+
+def test_the_activity_route_is_authenticated_like_every_other_read():
+    import inspect
+
+    import api.routes.activity as activity
+
+    default = inspect.signature(activity.get_activity).parameters["user_id"].default
+    assert getattr(default, "dependency", None) is verify_user

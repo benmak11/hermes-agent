@@ -54,7 +54,7 @@ from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
 from tools.matching import batch_runs
 from tools.matching.score import count_unscored, score_pending_jobs
-from tools.run_costs import persist_run_cost
+from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 
 log = get_logger("api.discovery")
 
@@ -592,9 +592,25 @@ async def run_discovery_cycle(
             log, "discovery", trigger=trigger, user_id=user_id
         )
         counts: dict = {}
+        # ``running`` until some leg below decides otherwise. A cycle killed by
+        # CancelledError or SIGKILL reaches neither the success nor the failure
+        # branch, so it banks ``running`` and the activity contract derives
+        # ``stalled`` from its age — which is what it is.
+        ledger_state = RUNNING
         # Before any work: the tick's claim has been paying for queue wait, and
         # from here the TTL has to cover the run.
         await asyncio.to_thread(_extend_slot, user_id, "discovery", trigger, began)
+        # The liveness record, before the first fetch: until this existed an
+        # in-flight cycle had no document at all, so "is discovery running?"
+        # was unanswerable from the server and the UI guessed.
+        await open_run(
+            _client,
+            user_id,
+            run_id,
+            runner="auto_discovery",
+            trigger=trigger,
+            started_at=started_at,
+        )
         try:
             summary = await run_discovery(user_id)
             # Free title pre-filter: confidently out-of-family jobs never get
@@ -685,6 +701,12 @@ async def run_discovery_cycle(
                 },
                 merge=True,
             )
+            # **A cycle that handed its scoring to a Vertex batch is not over.**
+            # The results land when the worker's resume ticks ingest them, under
+            # this same run_id, and that ingest is what closes the doc — so
+            # closing it here would advertise a finished run while Google still
+            # holds the work.
+            ledger_state = RUNNING if counts.get("batch_run") else DONE
             # The one line to watch per auto search: how the run performed.
             log.info("auto_discovery.metrics", **metrics)
             log_agent_end(
@@ -697,6 +719,7 @@ async def run_discovery_cycle(
                 batch_run=counts.get("batch_run"),
             )
         except Exception:
+            ledger_state = FAILED
             log.exception("auto_discovery.failed")
             log_agent_end(log, "discovery", agent_started, outcome="failed")
             # A run that fails *loudly* is over, and it wrote no
@@ -732,7 +755,9 @@ async def run_discovery_cycle(
                 run_id,
                 runner="auto_discovery",
                 trigger=trigger,
-                started_at=started_at,
+                # ``started_at`` is not re-sent: ``open_run`` wrote it, and the
+                # close must not move it.
+                state=ledger_state,
                 batch_run=counts.get("batch_run"),
                 jobs={
                     "pending": counts.get("pending", 0),
@@ -769,7 +794,16 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
         began = _now()
         started_at = began.isoformat()
         started = log_agent_start(log, "sweep", trigger=trigger, user_id=user_id)
+        ledger_state = RUNNING
         await asyncio.to_thread(_extend_slot, user_id, "sweep", trigger, began)
+        await open_run(
+            _client,
+            user_id,
+            run_id,
+            runner="liveness_sweep",
+            trigger=trigger,
+            started_at=started_at,
+        )
         try:
             counts = await sweep_postings(user_id)
             await asyncio.to_thread(
@@ -785,8 +819,10 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
                 },
                 merge=True,
             )
+            ledger_state = DONE
             log_agent_end(log, "sweep", started, outcome="completed", **counts)
         except Exception:
+            ledger_state = FAILED
             log.exception("sweep.failed")
             log_agent_end(log, "sweep", started, outcome="failed")
             await asyncio.to_thread(_release_slot, user_id, "sweep", trigger, began)
@@ -799,7 +835,7 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
                 run_id,
                 runner="liveness_sweep",
                 trigger=trigger,
-                started_at=started_at,
+                state=ledger_state,
             )
 
 

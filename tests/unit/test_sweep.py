@@ -303,3 +303,120 @@ async def test_the_sweep_lends_its_board_fetches_one_pooled_client(monkeypatch):
     assert len(set(map(id, seen))) == 1, "fetches did not share one client"
     # And the scope is released when the sweep returns.
     assert _http._client.get() is None
+
+
+# --------------------------------------------------------------------------
+# run_sweep_cycle's outcome logging
+#
+# The sweep's counts dict carries its own ``duration_ms``, and
+# ``log_agent_end`` has a ``duration_ms`` keyword of its own. Splatting the
+# counts collided with it and raised *after* the Firestore success write, so
+# every successful sweep was logged as ``sweep.failed`` and handed its slot
+# back. 13 production sweeps in 7 days, 13 ``outcome=failed``, zero completed.
+# --------------------------------------------------------------------------
+
+
+class _RecordingLogger:
+    """Records every structlog call instead of emitting it."""
+
+    def __init__(self):
+        self.events: list[tuple[str, str, dict]] = []
+
+    def _record(self, level):
+        def call(event, **kw):
+            self.events.append((level, event, kw))
+
+        return call
+
+    def __getattr__(self, level):
+        return self._record(level)
+
+    def bind(self, **kw):
+        return self
+
+    def names(self) -> list[str]:
+        return [event for _, event, _ in self.events]
+
+    def one(self, event: str) -> dict:
+        matches = [kw for _, name, kw in self.events if name == event]
+        assert len(matches) == 1, f"{event}: {len(matches)} of {self.names()}"
+        return matches[0]
+
+
+@pytest.fixture
+def swept_cycle(monkeypatch):
+    """``run_sweep_cycle`` with every external seam stubbed; returns the log."""
+    import api.routes.discovery as discovery
+
+    def build(counts: dict):
+        recorder = _RecordingLogger()
+        monkeypatch.setattr(discovery, "log", recorder)
+        monkeypatch.setattr(discovery, "live_runs_refused", lambda: False)
+
+        async def not_deleted(user_id):
+            return False
+
+        async def fake_sweep(user_id):
+            return dict(counts)
+
+        async def noop_persist(*a, **kw):
+            return None
+
+        async def noop_open(*a, **kw):
+            return None
+
+        monkeypatch.setattr(discovery, "_account_deleted", not_deleted)
+        monkeypatch.setattr(discovery, "sweep_postings", fake_sweep)
+        monkeypatch.setattr(discovery, "persist_run_cost", noop_persist)
+        monkeypatch.setattr(discovery, "open_run", noop_open)
+        monkeypatch.setattr(discovery, "_extend_slot", lambda *a, **kw: True)
+        monkeypatch.setattr(discovery, "_release_slot", lambda *a, **kw: True)
+        monkeypatch.setattr(discovery, "_user_ref", lambda uid: _UserDoc())
+        return recorder
+
+    return build
+
+
+class _UserDoc:
+    """Captures the sweep's one ``set(..., merge=True)`` success write."""
+
+    def __init__(self):
+        self.written: dict = {}
+
+    def set(self, doc, merge=False):
+        self.written = doc
+
+
+@pytest.mark.asyncio
+async def test_a_successful_sweep_logs_completed_not_failed(swept_cycle) -> None:
+    import api.routes.discovery as discovery
+
+    log = swept_cycle(
+        {"checked": 3, "removed": 1, "boards_failed": 0, "duration_ms": 415}
+    )
+    await discovery.run_sweep_cycle("u1", trigger="cron")
+
+    assert "sweep.failed" not in log.names()
+    finished = log.one("agent.finished")
+    assert finished["agent"] == "sweep"
+    assert finished["outcome"] == "completed"
+    # The counts still reach the log — and the sweep's own figure keeps its
+    # value under a name that cannot collide with the wall-clock one.
+    assert finished["checked"] == 3
+    assert finished["removed"] == 1
+    assert finished["step_duration_ms"] == 415
+    assert isinstance(finished["duration_ms"], float)
+
+
+@pytest.mark.asyncio
+async def test_log_agent_end_tolerates_counts_without_a_duration(swept_cycle) -> None:
+    # The rename must not invent a key: a caller with no duration of its own
+    # logs no ``step_duration_ms`` at all rather than a fabricated null.
+    import api.routes.discovery as discovery
+
+    log = swept_cycle({"checked": 0, "removed": 0, "boards_failed": 0})
+    await discovery.run_sweep_cycle("u1", trigger="cron")
+
+    finished = log.one("agent.finished")
+    assert finished["outcome"] == "completed"
+    assert "step_duration_ms" not in finished

@@ -23,6 +23,7 @@ from api.app_utils.telemetry import setup_cloud_otel, setup_telemetry
 from api.app_utils.typing import Feedback
 from api.deps import dev_mode, verify_user
 from api.routes import account as account_routes
+from api.routes import activity as activity_routes
 from api.routes import applications as applications_routes
 from api.routes import companies as companies_routes
 from api.routes import discovery as discovery_routes
@@ -96,6 +97,9 @@ app.include_router(profile_routes.router)
 app.include_router(journeys_routes.router)
 app.include_router(discovery_routes.router)
 app.include_router(account_routes.router)
+# Read-only liveness contract. Registered like any other authenticated route;
+# it takes no BackgroundTasks and schedules nothing (see api/routes/activity.py).
+app.include_router(activity_routes.router)
 # /tasks/* handlers; they 404 unless this deployment sets WORKER_MODE=1.
 app.include_router(worker_routes.router)
 

@@ -57,7 +57,7 @@ from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import queues
 from tools.applications import reaper, state
 from tools.ats.validate import check_posting
-from tools.run_costs import persist_run_cost
+from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 from tools.submitters import SUBMIT_CLICKED
 from tools.submitters.router import submit_application
 from tools.submitters.storage import download_resume, upload_screenshot
@@ -186,6 +186,15 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
     with run_context("tailoring", user_id=user_id, job_id=job_id) as run_id:
         started_at = _now()
         started = log_agent_start(task_log, "tailoring")
+        ledger_state = RUNNING
+        await open_run(
+            _client,
+            user_id,
+            run_id,
+            runner="tailoring",
+            trigger="approved",
+            started_at=started_at,
+        )
         try:
             # Claim before any paid work. Two schedulings of this task (approve
             # then regenerate, or a retry) can't both spend an LLM run on the
@@ -204,6 +213,10 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 lease=state.lease_for("tailoring", owner=state.new_owner()),
             ):
                 task_log.info("tailoring.not_claimed")
+                # Over, not outstanding: another run owns the work. Every exit
+                # from this block closes the ledger doc, or a run that declined
+                # to do anything would age into ``stalled``.
+                ledger_state = DONE
                 log_agent_end(task_log, "tailoring", started, outcome="not_claimed")
                 return
 
@@ -225,6 +238,7 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             if await _dismiss_if_posting_removed(
                 user_ref, app_ref, job, task_log, allowed_from={"tailoring"}
             ):
+                ledger_state = DONE
                 log_agent_end(task_log, "tailoring", started, outcome="posting_removed")
                 return
 
@@ -241,6 +255,7 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 # writing to one that survived would only resurrect state the
                 # user asked us to drop. It expires on the IN_PROGRESS clock.
                 task_log.info("tailoring.discarded", decision=decision)
+                ledger_state = DONE
                 log_agent_end(
                     task_log,
                     "tailoring",
@@ -302,6 +317,7 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             ):
                 task_log.info("tailoring.result_not_published")
             task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
+            ledger_state = DONE
             log_agent_end(
                 task_log,
                 "tailoring",
@@ -310,8 +326,10 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 resume_uri=app.resume_variant_uri,
             )
         except Exception as e:  # persist failure for the UI, surface in timeline
+            ledger_state = FAILED
             task_log.exception("tailoring.failed")
             if not (await asyncio.to_thread(app_ref.get)).exists:
+                ledger_state = DONE
                 log_agent_end(task_log, "tailoring", started, outcome="discarded")
                 return  # discarded by a revert while we ran — don't resurrect
             # Same precondition as the publish above, and the case it guards is
@@ -346,7 +364,7 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 run_id,
                 runner="tailoring",
                 job_id=job_id,
-                started_at=started_at,
+                state=ledger_state,
             )
 
 
@@ -650,8 +668,12 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
 
     # run_id context so the submitter's own log lines (tools.submitters, the
     # Playwright steps) stitch to this submission in Cloud Logging.
-    with run_context("submission", user_id=user_id, app_id=app_id, job_id=job_id):
+    with run_context(
+        "submission", user_id=user_id, app_id=app_id, job_id=job_id
+    ) as run_id:
+        run_started_at = _now()
         started = log_agent_start(task_log, "submission", source=app.get("job_source"))
+        ledger_state = RUNNING
 
         # The delivery claim, before any browser opens. The status can't take
         # it: ``POST /applications/{id}/submit`` already claimed the work by
@@ -679,6 +701,24 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                 return False
             task_log = task_log.bind(lease_owner=owner)
         try:
+            # Submission buys no LLM calls, so this normally banks a $0 ledger
+            # doc — and that is the point: the doc is the *liveness* record, and
+            # a submission is the one leg of the funnel with no other
+            # server-side signal that a browser is currently driving a real
+            # employer's form. The run ledger held no submission docs at all
+            # before this.
+            #
+            # Inside the ``try``, not above the claim: nothing new may sit
+            # between the claim and this block (see the claim's comment), and a
+            # run that *lost* the claim did no work and should leave no record.
+            await open_run(
+                _client,
+                user_id,
+                run_id,
+                runner="submission",
+                trigger="dry_run" if dry_run else "submit",
+                started_at=run_started_at,
+            )
             if owner is not None:
                 # Re-read now the claim has landed. ``try_claim_lease`` retries
                 # against a *fresh* snapshot, so it can succeed on a document one
@@ -701,6 +741,7 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
             if await _dismiss_if_posting_removed(
                 user_ref, ref, job, task_log, allowed_from=owned
             ):
+                ledger_state = DONE
                 log_agent_end(
                     task_log, "submission", started, outcome="posting_removed"
                 )
@@ -739,6 +780,7 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                 error=result.get("error"),
                 screenshots=len(shots),
             )
+            ledger_state = DONE if result.get("success") else FAILED
             log_agent_end(
                 task_log,
                 "submission",
@@ -816,6 +858,7 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                     screenshot_uris=[s["uri"] for s in shots],
                 )
         except Exception as e:  # record failure for the UI
+            ledger_state = FAILED
             task_log.exception("submission.failed")
             if dry_run:
                 # Same rule as the success path: a dry run writes no status.
@@ -846,6 +889,18 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                 task_log, "submission", started, outcome="failed", error=str(e)[:300]
             )
         finally:
+            # The ledger close, first: it is the only server-side record that
+            # this submission ran at all, and everything below it can take a
+            # Firestore round trip and raise.
+            await persist_run_cost(
+                _client,
+                user_id,
+                run_id,
+                runner="submission",
+                job_id=job_id,
+                app_id=app_id,
+                state=ledger_state,
+            )
             # Hand the lease back — but only once the document has an outcome.
             #
             # Normally there is nothing to do: every terminal transition carries

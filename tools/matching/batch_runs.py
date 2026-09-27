@@ -90,7 +90,7 @@ from tools.matching.score import (
     score_pending_jobs,
     unbudgeted_limit,
 )
-from tools.run_costs import persist_run_cost
+from tools.run_costs import DONE, FAILED, RUNNING, persist_run_cost
 
 log = get_logger("tools.matching")
 
@@ -657,6 +657,36 @@ async def _ingest_score(db, run_ref, run: dict) -> dict[str, int]:
     return _leg_delta(before, counts)
 
 
+async def _ledger_state(run_ref, run_tag: str) -> str:
+    """The originating run's ledger state, read back off the ``batch_runs`` doc.
+
+    **The origin run closes when the batch does, not when a leg does.** The
+    cycle (or ``/tasks/batch/start``) that submitted this batch left its ledger
+    doc open, because the work was with Google; the ingest that drives the
+    ``batch_runs`` doc terminal is what closes it. A parse leg that has just
+    submitted the score batch therefore keeps it ``running``.
+
+    Read back rather than inferred from the leg name, because a parse leg with
+    nothing left to score completes the *whole* run (``_submit_score_stage``
+    writes ``done`` and submits nothing) — inferring would leave that run's
+    ledger doc open forever, to be aged into ``stalled``.
+
+    Falls back to ``running`` if the read fails: it is the state the doc already
+    holds, so the fallback changes nothing, and it must never cost the flush
+    this feeds — that one is money.
+    """
+    try:
+        state = ((await run_ref.get()).to_dict() or {}).get("state")
+    except Exception:
+        log.exception("batch_runs.state_reread_failed", run=run_tag)
+        return RUNNING
+    if state == "done":
+        return DONE
+    if state == "failed":
+        return FAILED
+    return RUNNING
+
+
 async def resume(
     *,
     user_id: str | None = None,
@@ -789,6 +819,7 @@ async def resume(
                                 run["user_id"],
                                 origin,
                                 batch_run=snap.id,
+                                state=await _ledger_state(run_ref, snap.id),
                                 jobs=leg_counts,
                             )
                             await run_ref.update(

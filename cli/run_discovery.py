@@ -15,7 +15,7 @@ from google.cloud import firestore
 from obs.logging import bind_run_context
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
-from tools.run_costs import persist_run_cost
+from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 
 # Load GOOGLE_CLOUD_PROJECT (and friends) so the Firestore client targets the
 # right project.
@@ -28,6 +28,18 @@ async def main() -> None:
     args = parser.parse_args()
     run_id = bind_run_context("discovery", user_id=args.user_id)
     started_at = datetime.now(UTC).isoformat()
+    # ``running`` until a leg below decides. A CLI run killed with Ctrl-C or
+    # SIGKILL leaves the doc open, and the activity contract ages it into
+    # ``stalled`` rather than reporting nothing at all.
+    ledger_state = RUNNING
+    await open_run(
+        firestore.AsyncClient,
+        args.user_id,
+        run_id,
+        runner="discovery",
+        trigger="cli",
+        started_at=started_at,
+    )
 
     try:
         print("→ Running discovery...")
@@ -52,6 +64,11 @@ async def main() -> None:
 
         new = await persist_new_jobs(jobs)
         print(f"✓ {new} new jobs added to Firestore")
+        ledger_state = DONE
+    except Exception:
+        # Re-raised untouched; this clause only records the outcome.
+        ledger_state = FAILED
+        raise
     finally:
         # In a finally: a run that dies partway through still spent whatever
         # it spent, and that only reaches the ledger from here.
@@ -60,7 +77,7 @@ async def main() -> None:
             args.user_id,
             run_id,
             runner="discovery",
-            started_at=started_at,
+            state=ledger_state,
         )
 
 

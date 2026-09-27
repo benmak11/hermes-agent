@@ -35,7 +35,7 @@ from models.profile import MasterProfile
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import queues
 from tools.profile.extract import extract_profile, read_resume_text
-from tools.run_costs import persist_run_cost
+from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 
 log = get_logger("api.profile")
 
@@ -141,8 +141,18 @@ async def extract(
                 source=source,
                 chars=len(resume_text),
             )
+            ledger_state = RUNNING
+            await open_run(
+                _client,
+                user_id,
+                run_id,
+                runner="profile_extract",
+                trigger=source,
+                started_at=started_at,
+            )
             try:
                 profile = await asyncio.to_thread(extract_profile, resume_text, user_id)
+                ledger_state = DONE
                 log_agent_end(
                     log,
                     "profile_extract",
@@ -150,6 +160,11 @@ async def extract(
                     outcome="completed",
                     roles=len(profile.experience),
                 )
+            except Exception:
+                # Re-raised untouched (the outer handler turns it into a 422);
+                # this clause exists only to record the outcome on the ledger.
+                ledger_state = FAILED
+                raise
             finally:
                 # The first paid call a new user ever triggers, and it binds a
                 # run_id — flush it here or its cost sits in the API process
@@ -161,7 +176,7 @@ async def extract(
                     run_id,
                     runner="profile_extract",
                     trigger=source,
-                    started_at=started_at,
+                    state=ledger_state,
                 )
     except Exception as e:  # extraction/validation failure → 422 for the UI
         log.exception("profile.extract.failed", chars=len(resume_text))
