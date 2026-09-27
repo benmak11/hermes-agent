@@ -187,6 +187,13 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
         started_at = _now()
         started = log_agent_start(task_log, "tailoring")
         ledger_state = RUNNING
+        # Only set when this run's result is the one published. A run that
+        # spent money but produced no application (discarded mid-run, lost
+        # the publish swap to an overlapping run, or raised after
+        # generate_objective succeeded) must not count as a tailored job —
+        # see tools.tailoring.rates' observed_rate docstring for why a
+        # denominator has to mean "actually produced," not "attempted."
+        tailored = 0
         await open_run(
             _client,
             user_id,
@@ -308,13 +315,19 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             # lapsed, and run B claims it — so without this, run A finishing
             # late would publish *its* result over run B's live ``tailoring``
             # document and clear B's lease with it.
-            if not await _transition(
+            if await _transition(
                 app_ref,
                 "ready_for_review",
                 lease=state.CLEAR_LEASE,
                 extra={reaper.ATTEMPTS_FIELD: firestore.DELETE_FIELD},
                 allowed_from={"tailoring"},
             ):
+                # Counted only by the run whose result is the one published.
+                # When the reaper has started an overlapping run B, this run
+                # (A) loses the swap and B publishes: both spent, one
+                # application exists, so only B may bank it.
+                tailored = 1
+            else:
                 task_log.info("tailoring.result_not_published")
             task_log.info("tailoring.done", resume_uri=app.resume_variant_uri)
             ledger_state = DONE
@@ -358,6 +371,13 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             # Tailoring is the second-most expensive per-user action, and it
             # binds a run_id — so without this flush its spend accumulates in
             # the API process and is never banked or released.
+            #
+            # jobs={"tailored": ...} only when the run actually produced one
+            # (see the ``tailored`` comment above) — an empty/zero count is
+            # omitted rather than sent as an Increment(0), the same "None
+            # values are dropped" convention persist_run_cost already applies
+            # to its meta kwargs, so a not_claimed/discarded/failed run's
+            # ledger doc carries real spend with no misleading zero count.
             await persist_run_cost(
                 _client,
                 user_id,
@@ -365,6 +385,7 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
                 runner="tailoring",
                 job_id=job_id,
                 state=ledger_state,
+                jobs={"tailored": tailored} if tailored else None,
             )
 
 
