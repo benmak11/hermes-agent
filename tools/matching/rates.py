@@ -109,14 +109,16 @@ class Rate:
         return self.source == SOURCE_OBSERVED
 
 
-#: The fallback, as a :class:`Rate`.
+#: The blended constant as a :class:`Rate` — cost per job *attempted*. Kept
+#: as :func:`committed_usd`'s default (a batch-leg ops reconciliation figure);
+#: :func:`observed_rate` no longer falls back to it.
 MEASURED = Rate(MEASURED_COST_PER_JOB_USD, SOURCE_MEASURED, 0)
 
-#: The fallback for "cost of one delivered match" specifically — see
-#: :data:`MEASURED_RATED_JOB_USD`. A real account's own :func:`observed_rate`
-#: needs no equivalent swap: it already divides by ``jobs.scored``, which
-#: already excludes both kinds of free/discarded rejects, so it answers this
-#: same question correctly the moment an account has enough history.
+#: What :func:`observed_rate` falls back to: cost per rated job, see
+#: :data:`MEASURED_RATED_JOB_USD`. Under the 3-slot caps a slot is, in
+#: practice, a rated job, so this is the unit a quote's ``units`` counts — and
+#: it is the closer of the two constants to what a real account's own observed
+#: rate measures (spend over ``jobs.scored``, free rejects excluded).
 MEASURED_RATED = Rate(MEASURED_RATED_JOB_USD, SOURCE_MEASURED_RATED, 0)
 
 
@@ -124,8 +126,15 @@ async def observed_rate(db, user_id: str, *, min_jobs: int = 100) -> Rate:
     """This user's own $/job over their most recent completed runs.
 
     ``sum(llm.cost_usd) / sum(jobs.scored)``, and below ``min_jobs`` scored in
-    total it declines and returns :data:`MEASURED` instead — a two-job run
-    divides by a number small enough to quote anything.
+    total it declines and returns :data:`MEASURED_RATED` instead — a two-job
+    run divides by a number small enough to quote anything.
+
+    The fallback is the *rated* constant, not the blended :data:`MEASURED`.
+    The blended figure averages in the free rejects of a 100-job run, and
+    since the 3-slot caps (``tools.matching.budget``) every slot goes to a
+    title-filtered job that mostly takes both legs — so quoting a fresh
+    account at the blended rate put the expected cost at the *top* of its
+    range and the remembered low end at half of it.
 
     **Docs with ``jobs.scored == 0`` are skipped, not counted as zero.** An
     ingest that raised banks the leg's spend without its outcome counts (see
@@ -160,7 +169,7 @@ async def observed_rate(db, user_id: str, *, min_jobs: int = 100) -> Rate:
             return Rate(cost / scored, SOURCE_OBSERVED, scored)
     except Exception:
         log.exception("rates.observed_failed", user_id=user_id)
-    return MEASURED
+    return MEASURED_RATED
 
 
 def committed_usd(

@@ -97,6 +97,20 @@ describe("rateProvenance", () => {
     // "trust us" is not one the user can check.
     expect(rateProvenance("measured_2026_08_23", 0, 0.0098)).toContain("2026-08-23");
   });
+
+  it("finds the date in a fallback source that names more than the date", () => {
+    // The per-rated-job fallback is "measured_rated_2026_08_23". Stripping a
+    // fixed "measured_" prefix rendered "rated-2026-08-23" as the date.
+    const text = rateProvenance("measured_rated_2026_08_23", 0, 0.0193);
+    expect(text).toContain("our 2026-08-23 measurement");
+    expect(text).not.toContain("rated-");
+  });
+
+  it("never shows an internal identifier when there is no date", () => {
+    expect(rateProvenance("estimated_no_ledger_yet", 0, 0.0016)).not.toContain(
+      "estimated_no_ledger_yet",
+    );
+  });
 });
 
 describe("zeroGrantReason", () => {

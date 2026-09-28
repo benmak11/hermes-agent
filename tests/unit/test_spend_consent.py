@@ -232,6 +232,24 @@ def test_yesterdays_counters_do_not_bind_today():
     assert day == 400
 
 
+def test_a_fresh_accounts_quote_does_not_start_below_what_rating_costs(db, monkeypatch):
+    """2026-09-28. Under the 3-slot caps every slot goes to a rated job
+    (parse + score, $0.0193), but a fresh account was quoted at the blended
+    per-attempt average ($0.0098): the range read $0.03-$0.06, with the
+    expected cost as its ceiling and the low end — the number people
+    remember — at half of it."""
+    monkeypatch.delenv("SCORING_BUDGET_PER_CYCLE", raising=False)
+    monkeypatch.delenv("SCORING_BUDGET_PER_DAY", raising=False)
+
+    quote = asyncio.run(estimate.build(db, "u1", estimate.DISCOVERY_SCAN))
+
+    expected = quote.units * rates.MEASURED_RATED_JOB_USD
+    assert 0 < quote.units < batch_runs.BATCH_MIN_PENDING  # online path, no discount
+    assert quote.rate_source == rates.SOURCE_MEASURED_RATED
+    assert quote.usd_low >= round(expected, 2)
+    assert quote.usd_high > expected
+
+
 def test_an_observed_rate_needs_enough_jobs_behind_it(db):
     """A two-job run divides by a number small enough to quote anything, so
     below the threshold the documented constant wins."""
@@ -241,7 +259,7 @@ def test_an_observed_rate_needs_enough_jobs_behind_it(db):
         "jobs": {"scored": 5},
     }
     thin = asyncio.run(rates.observed_rate(db, "u1"))
-    assert thin is rates.MEASURED
+    assert thin is rates.MEASURED_RATED
 
     db.store["users/u1/runs/r2"] = {
         "ended_at": "2026-09-02T00:00:00+00:00",

@@ -49,7 +49,11 @@ export function rateProvenance(source: string, sample: number, rate: number): st
   if (source === "your_last_runs") {
     return `based on your last ${sample.toLocaleString()} scored jobs (${per})`;
   }
-  const measured = source.replace(/^measured_/, "").replace(/_/g, "-");
+  // Match the date rather than strip a known prefix: fallback sources name more
+  // than the date ("measured_rated_2026_08_23"), and stripping "measured_"
+  // from that renders "rated-2026-08-23" to the user.
+  const date = source.match(/(\d{4})_(\d{2})_(\d{2})/);
+  const measured = date ? `${date[1]}-${date[2]}-${date[3]}` : "reference";
   return `no runs measured on your account yet — using our ${measured} measurement (${per})`;
 }
 
