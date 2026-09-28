@@ -22,16 +22,19 @@ from __future__ import annotations
 import ast
 import asyncio
 import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from firestore_fakes import _FakeDB as _AllowanceDB
 
 import api.deps as deps
 import api.routes.discovery as discovery
 from api.deps import verify_user
+from tools.discovery import budget as discovery_budget
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -116,11 +119,16 @@ def discovery_client(monkeypatch):
 
     monkeypatch.setattr(discovery, "run_discovery_cycle", fake_run_discovery_cycle)
     monkeypatch.setattr(discovery, "dispatch_cycle", fake_dispatch_cycle)
+    # The route reads (and, past the refusal, charges) the weekly search
+    # allowance. A real fake, not an unlimited stub: a run refused for being
+    # local must also leave that counter alone, and it can only be seen to.
+    allowance = _AllowanceDB()
+    monkeypatch.setattr(discovery, "_async_client", lambda: allowance)
 
     app = FastAPI()
     app.include_router(discovery.router)
     app.dependency_overrides[verify_user] = lambda: "u1"
-    return TestClient(app), started
+    return TestClient(app), started, allowance
 
 
 @pytest.mark.parametrize("queue_mode", ["0", "1"])
@@ -133,7 +141,7 @@ def test_a_local_process_cannot_start_a_live_discovery_run(
     ``TestClient`` runs ``background_tasks`` synchronously, which is what turned
     "schedule a crawl" into "run a crawl" on 2026-08-23.
     """
-    client, started = discovery_client
+    client, started, allowance = discovery_client
     monkeypatch.setenv("QUEUE_MODE", queue_mode)
     monkeypatch.setenv("AUTH_DEV_MODE", "1")
 
@@ -142,6 +150,9 @@ def test_a_local_process_cannot_start_a_live_discovery_run(
     assert resp.status_code == 403
     assert discovery.LIVE_RUN_OVERRIDE in resp.json()["detail"]
     assert started == []
+    # The refusal is ahead of the weekly allowance too, so a developer's
+    # refused click does not burn one of the user's searches.
+    assert allowance.store == {}
 
 
 @pytest.mark.parametrize("queue_mode", ["0", "1"])
@@ -149,10 +160,11 @@ def test_the_same_request_is_honoured_from_a_deployed_service(
     discovery_client, monkeypatch, queue_mode
 ):
     """Positive control: the guard is the dev bypass, not the endpoint."""
-    client, started = discovery_client
+    client, started, allowance = discovery_client
     monkeypatch.setenv("QUEUE_MODE", queue_mode)
 
     assert client.post("/settings/discovery/run").status_code == 200
+    assert allowance.budget_state["runs_this_week"] == 1
 
     where = "queued" if queue_mode == "1" else "in_process"
     # ``score`` is False: the unconfirmed manual click is the *free* verb
@@ -163,7 +175,7 @@ def test_the_same_request_is_honoured_from_a_deployed_service(
 
 
 def test_the_override_hands_a_developer_the_run_back(discovery_client, monkeypatch):
-    client, started = discovery_client
+    client, started, _allowance = discovery_client
     monkeypatch.setenv("AUTH_DEV_MODE", "1")
     monkeypatch.setenv(discovery.LIVE_RUN_OVERRIDE, "1")
 
@@ -175,7 +187,13 @@ def test_the_cycle_itself_refuses_before_it_touches_anything(monkeypatch):
     """The route is not the only way in: the opportunistic tick behind ``GET
     /settings/discovery``, ``cron_tick``'s fan-out and the onboarding kickoff
     all reach ``run_discovery_cycle`` directly. So the guard sits there too, and
-    ahead of the first Firestore write — a refused run costs nothing at all."""
+    ahead of every write the cycle makes — a refused run costs nothing.
+
+    The one thing it now does reach is the weekly-allowance **refund**: the
+    dispatch that sent this run charged a search, and a run refused before it
+    crawled anything hands that search back. A credit, not a cost — and only
+    for the triggers that were charged.
+    """
     monkeypatch.setenv("AUTH_DEV_MODE", "1")
 
     def explode(*args, **kwargs):
@@ -184,11 +202,19 @@ def test_the_cycle_itself_refuses_before_it_touches_anything(monkeypatch):
     async def explode_async(*args, **kwargs):
         raise AssertionError("a refused cycle must not crawl anything")
 
+    allowance = _AllowanceDB(
+        state={
+            "week": discovery_budget.week_key(datetime.now(UTC), "UTC"),
+            "runs_this_week": 3,
+        }
+    )
     monkeypatch.setattr(discovery, "_client", explode)
+    monkeypatch.setattr(discovery, "_async_client", lambda: allowance)
     monkeypatch.setattr(discovery, "_extend_slot", explode)
     monkeypatch.setattr(discovery, "run_discovery", explode_async)
 
     assert asyncio.run(discovery.run_discovery_cycle("u1", trigger="manual")) is None
+    assert allowance.budget_state["runs_this_week"] == 2
 
 
 def _no_firestore(*args, **kwargs):

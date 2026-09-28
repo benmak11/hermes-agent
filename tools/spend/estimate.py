@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
-from tools.matching import budget, rates
+from tools.matching import batch_runs, budget, rates
 
 #: "run discovery now, and score what it finds" — the manual button.
 DISCOVERY_SCAN = "discovery_scan"
@@ -122,10 +122,15 @@ def quote(
         raise ValueError(f"unknown spend action {action!r}; expected one of {ACTIONS}")
     limits = limits or budget.Limits.from_env()
     units = max(min(remaining_cycle, remaining_day), 0)
-    # Floor at the half-price batch path (what a backlog over BATCH_MIN_PENDING
-    # actually takes), ceiling at the observed rate drift. Online scoring at
-    # the plain rate sits inside the range, which is the point of having one.
-    low = units * rate.usd_per_job * rates.BATCH_MULTIPLIER
+    # Floor at the half-price batch path, ceiling at the observed rate drift —
+    # **but only where the batch path is reachable.** ``score_or_start_run``
+    # sends a run to Vertex batch only at ``BATCH_MIN_PENDING`` or more, and the
+    # grant is what it sees (the reservation is taken first), so under a small
+    # per-cycle cap every rating takes the online path at full price. Quoting
+    # the batch rate anyway advertises a price the product structurally cannot
+    # deliver, and the low end of a range is the number people remember.
+    floor = rates.BATCH_MULTIPLIER if units >= batch_runs.BATCH_MIN_PENDING else 1.0
+    low = units * rate.usd_per_job * floor
     high = units * rate.usd_per_job * rates.UNCERTAINTY
     return Estimate(
         action=action,

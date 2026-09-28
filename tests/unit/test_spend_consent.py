@@ -29,7 +29,7 @@ from fastapi.testclient import TestClient
 
 import api.deps as deps
 from api.deps import SpendConfirm, required, verify_user
-from tools.matching import budget, rates
+from tools.matching import batch_runs, budget, rates
 from tools.spend import consent, estimate
 
 # --------------------------------------------------------------------------
@@ -126,6 +126,44 @@ def test_the_quote_counts_the_budget_grant_and_not_the_backlog():
     # A range, never a figure, and both ends move with the units.
     assert 0 < quote.usd_low < quote.usd_high
     assert _estimate(units=50).usd_high < quote.usd_high
+
+
+def test_quote_floor_not_batch_rate_for_small_grant():
+    """**An honesty bug, not a rounding one.** Every quote used to be floored
+    at ``BATCH_MULTIPLIER`` — the half price a Vertex batch run pays. A batch
+    is only started at ``BATCH_MIN_PENDING`` (50) or more, and the grant is
+    what that threshold sees, so under a 3-slot cap the batch path is
+    unreachable and the low end of the range advertises a price the product
+    structurally cannot deliver.
+
+    Below the threshold the floor is the plain online rate. At or above it the
+    half-price floor is still right, and that half is asserted too — otherwise
+    this test would also pass against "never apply the multiplier", which
+    would be a different wrong answer.
+    """
+    small = estimate.quote(
+        estimate.SCORE_BACKLOG,
+        remaining_cycle=3,
+        remaining_day=3,
+        rate=rates.MEASURED,
+        limits=budget.Limits(per_cycle=3, per_day=3),
+    )
+    assert small.units == 3
+    assert small.usd_low == round(3 * rates.MEASURED.usd_per_job, 2)
+    assert small.usd_low > round(
+        3 * rates.MEASURED.usd_per_job * rates.BATCH_MULTIPLIER, 2
+    )
+
+    batchable = estimate.quote(
+        estimate.SCORE_BACKLOG,
+        remaining_cycle=batch_runs.BATCH_MIN_PENDING,
+        remaining_day=batch_runs.BATCH_MIN_PENDING,
+        rate=rates.MEASURED,
+        limits=budget.Limits(per_cycle=200, per_day=400),
+    )
+    assert batchable.usd_low == round(
+        batch_runs.BATCH_MIN_PENDING * rates.MEASURED.usd_per_job * 0.5, 2
+    )
 
 
 def test_the_quote_is_capped_by_whichever_limit_binds():

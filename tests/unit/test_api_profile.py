@@ -13,6 +13,7 @@ from datetime import date
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from firestore_fakes import FakeSyncTransaction
 
 import api.routes.profile as profile_mod
 from api.deps import verify_user
@@ -57,6 +58,12 @@ class _FakeSnap:
     def __init__(self, data: dict | None):
         self._data = data
 
+    @property
+    def exists(self) -> bool:
+        """The weekly-allowance charge declines to write to a document that
+        is not there, so this fake has to be able to say."""
+        return self._data is not None
+
     def to_dict(self):
         return self._data
 
@@ -66,7 +73,7 @@ class _FakeRef:
         self._store = store
         self._uid = uid
 
-    def get(self):
+    def get(self, transaction=None):
         return _FakeSnap(self._store.get(self._uid))
 
     def set(self, data, merge=False):
@@ -89,6 +96,11 @@ class _FakeClient:
     def collection(self, name):
         assert name == "users"
         return _FakeCollection(self._store)
+
+    def transaction(self):
+        """The kickoff charges the weekly search allowance inside a
+        transaction, so this store has to be able to serve one."""
+        return FakeSyncTransaction()
 
 
 @pytest.fixture

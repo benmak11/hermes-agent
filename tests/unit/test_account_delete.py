@@ -29,6 +29,10 @@ from types import SimpleNamespace
 import pytest
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.testclient import TestClient
+
+# The transaction-honouring user-doc fake the weekly-allowance tests use; the
+# local ``_FakeDB`` above is path-based and has no transaction protocol.
+from firestore_fakes import _FakeDB as _RefundDB
 from google.cloud import storage
 
 import api.routes.account as account
@@ -717,10 +721,18 @@ async def _explode_async(*args, **kwargs):
 
 @pytest.fixture
 def tombstoned(monkeypatch):
-    """Every seam past the refusal wired to fail, for both cycles."""
+    """Every seam past the refusal wired to fail, for both cycles.
+
+    The weekly-allowance refund is the one thing the refusal is *allowed* to
+    reach — a dispatch that never became work hands its search back — so it
+    gets a recorder rather than an explosion, and the test below asserts on
+    what it wrote.
+    """
     monkeypatch.setattr(
         discovery, "_user_ref", lambda uid: _ref({"deleted_at": DELETED_AT})
     )
+    refund_db = _RefundDB()
+    monkeypatch.setattr(discovery, "_async_client", lambda: refund_db)
     monkeypatch.setattr(discovery, "_extend_slot", _explode)
     monkeypatch.setattr(discovery, "_release_slot", _explode)
     monkeypatch.setattr(discovery, "run_discovery", _explode_async)
@@ -728,6 +740,7 @@ def tombstoned(monkeypatch):
     # In the cycle's ``finally``: reaching it would mean the refusal came too
     # late and a run context had already been opened.
     monkeypatch.setattr(discovery, "persist_run_cost", _explode_async)
+    return refund_db
 
 
 def test_a_deleted_account_gets_no_discovery_cycle(tombstoned):
@@ -736,6 +749,13 @@ def test_a_deleted_account_gets_no_discovery_cycle(tombstoned):
     ahead of every write, because the cycle's own success write is a
     ``set(..., merge=True)`` that would recreate the deleted document."""
     assert asyncio.run(discovery.run_discovery_cycle("u1", trigger="cron")) is None
+
+    # **And the refund it is allowed to take writes nothing either.** The
+    # dispatch charged a search against the weekly allowance, so a cycle that
+    # refuses before doing any work hands it back — but ``delete_account``
+    # removed the document, and a refund that wrote to it anyway would recreate
+    # ``users/{uid}`` *without* its ``deleted_at`` and resurrect the account.
+    assert tombstoned.store == {}
 
 
 def test_a_deleted_account_gets_no_sweep_cycle(tombstoned):
