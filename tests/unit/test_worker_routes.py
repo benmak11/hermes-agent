@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from firestore_fakes import _FakeDB as _AllowanceDB
 from google.api_core.exceptions import FailedPrecondition, NotFound
 from google.cloud import firestore
 from google.cloud.firestore_v1.transforms import ArrayUnion
@@ -2197,6 +2198,13 @@ def slot_world(monkeypatch):
     monkeypatch.setattr(discovery, "_user_ref", lambda uid: doc)
     monkeypatch.setattr(discovery, "dispatch_cycle", fake_dispatch)
     monkeypatch.setattr(discovery, "_last_tick_check", {})
+    # A tick that gets past the slot also charges the weekly search
+    # allowance; these tests are about the lease, so the allowance gets a
+    # working fake rather than an unlimited stub — a tick that ran out of
+    # searches would stop claiming, and that would quietly gut every
+    # assertion below.
+    allowance = _AllowanceDB()
+    monkeypatch.setattr(discovery, "_async_client", lambda: allowance)
 
     def freeze(at: datetime):
         monkeypatch.setattr(discovery, "_now", lambda: at)
@@ -2209,7 +2217,12 @@ def slot_world(monkeypatch):
         doc.set({"discovery_state": state}, merge=True)
 
     return SimpleNamespace(
-        doc=doc, dispatched=dispatched, tick=tick, freeze=freeze, seed=seed
+        doc=doc,
+        dispatched=dispatched,
+        tick=tick,
+        freeze=freeze,
+        seed=seed,
+        allowance=allowance,
     )
 
 

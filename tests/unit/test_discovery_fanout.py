@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 
+from firestore_fakes import _FakeDB as _AllowanceDB
 from test_company_prefs import _FakeDB
 
 import tools.discovery.pipeline as discovery
@@ -278,8 +279,16 @@ def test_the_cron_tick_still_scores(monkeypatch):
         ),
     )
     monkeypatch.setattr(routes_discovery, "_claim_slot", lambda *a, **kw: True)
+    # The tick charges a search against the weekly allowance between the claim
+    # and the dispatch. A working fake, not an unlimited stub: if the cap
+    # refused, the tick would dispatch nothing and this test would pass by
+    # asserting on a run that never happened.
+    allowance = _AllowanceDB()
+    monkeypatch.setattr(routes_discovery, "_async_client", lambda: allowance)
 
     asyncio.run(routes_discovery.tick_user("u1", force_check=True))
+
+    assert allowance.budget_state["runs_this_week"] == 1
 
     assert scoring == ["online"], "the unattended loop stopped scoring"
     assert written[0]["discovery_state"]["last_discovery"]["scored_leg"] is True

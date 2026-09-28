@@ -50,6 +50,7 @@ from tools import allowlist, queues, spend
 from tools.account.delete import is_deleted
 from tools.applications import reaper
 from tools.ats.sweep import sweep_postings
+from tools.discovery import budget as discovery_budget
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
 from tools.matching import batch_runs
@@ -123,6 +124,22 @@ _OPPORTUNISTIC_TRIGGER = "opportunistic"
 #: :func:`dispatch_cycle` and take no slot at all, so a failing one of those
 #: must not release a *scheduled* run's lease out from under it.
 SLOT_TRIGGERS = frozenset({_CRON_TRIGGER, _OPPORTUNISTIC_TRIGGER})
+
+_MANUAL_TRIGGER = "manual"
+_ONBOARDING_TRIGGER = "onboarding"
+
+#: The triggers whose dispatch **charged a run against the weekly allowance**,
+#: and therefore the only ones a pre-work refusal inside the cycle may refund.
+#: Every other trigger (a CLI ``scheduled`` run, a worker replaying something
+#: by hand) never took a run, and crediting one back for it would hand out an
+#: allowance nobody spent — the one direction a cap must not fail in.
+#:
+#: The charge itself lives at the three *dispatch* sites — :func:`tick_user`
+#: once its ``_claim_slot`` has won, :func:`run_discovery_now`, and the
+#: onboarding kickoff in ``api.routes.profile`` — and deliberately **not** in
+#: the worker's ``/tasks/discovery*`` handlers, where a Cloud Tasks redelivery
+#: would charge a second time for one user-visible search.
+CHARGED_TRIGGERS = SLOT_TRIGGERS | {_MANUAL_TRIGGER, _ONBOARDING_TRIGGER}
 
 #: The one way to run the real pipeline from a developer's machine anyway.
 #: Deliberately a second, explicit variable rather than "unset AUTH_DEV_MODE":
@@ -523,6 +540,69 @@ def _release_slot(user_id: str, kind: str, trigger: str, began: datetime) -> boo
     return False
 
 
+def _allowance_left(user_id: str, doc: dict) -> bool:
+    """Has this user a search left this week? A **screen**, on a document the
+    caller already holds — no read, no write, no counter moved.
+
+    Ordered ahead of :func:`_claim_slot` for the reason the interval check
+    already is (see that function): a capped user must cost nothing at all,
+    and a lease taken and then handed back is two writes plus a window in
+    which a second tick sees the slot as busy. The reservation that actually
+    binds is taken after the claim wins.
+    """
+    left = discovery_budget.remaining(doc.get(discovery_budget.FIELD))
+    # ``None`` is the kill switch, not "zero left": with the cap off every
+    # tick passes the screen. Checked explicitly because ``None > 0`` is a
+    # TypeError and ``not None`` would read as capped — the wrong direction.
+    if left is None or left > 0:
+        return True
+    log.info("tick.discovery_capped", user_id=user_id)
+    return False
+
+
+def _cap_429(runs_this_week: int, limits: discovery_budget.Limits) -> HTTPException:
+    """The weekly-cap refusal.
+
+    **429, never 402.** 402 already means "confirm the spend" to this client
+    (``api.deps.spend_402``), and it hands back a token that makes the action
+    go through. A cap is not a price: there is no token, and the only thing
+    that changes the answer is time.
+    """
+    return HTTPException(
+        status_code=429,
+        detail={
+            "reason": "discovery_cap",
+            "runs_this_week": runs_this_week,
+            "per_week": limits.per_week,
+            # An ISO *instant*. The client renders it; a server that formatted
+            # a local time would have to know the viewer's timezone.
+            "resets_at": discovery_budget.resets_at(_now(), discovery_budget.UTC_TZ),
+        },
+    )
+
+
+async def _refund_run(user_id: str, trigger: str, *, week: str | None = None) -> None:
+    """Hand back a charged run that never became work. Never raises.
+
+    Only for **pre-work** outcomes — a queue dedupe, a refused live run, a
+    deleted account. A crawl that ran and then failed keeps its charge: the
+    next scheduled tick is the retry, and 14/week is itself the retry bound.
+
+    ``week`` defaults to the current key rather than the reservation's, because
+    the cycle-side callers run on the worker with nothing but a user id. That
+    is the right semantic either way: ``apply_release`` credits a counter only
+    while it still describes the window the run was taken from.
+    """
+    if trigger not in CHARGED_TRIGGERS:
+        return
+    await discovery_budget.release(
+        _async_client(),
+        user_id,
+        1,
+        week=week or discovery_budget.week_key(_now(), discovery_budget.UTC_TZ),
+    )
+
+
 async def _backlog(user_id: str) -> int | None:
     """The unscored backlog, or ``None`` when it could not be counted.
 
@@ -578,9 +658,15 @@ async def run_discovery_cycle(
     """
     if live_runs_refused():
         log.warning("discovery.cycle_refused", user_id=user_id, trigger=trigger)
+        await _refund_run(user_id, trigger)
         return
     if await _account_deleted(user_id):
         log.warning("discovery.cycle_account_deleted", user_id=user_id, trigger=trigger)
+        # Safe against the resurrection hazard this guard exists for: the
+        # refund is a read-modify-write that declines when there is no counter
+        # to credit, and a deleted account's document is gone with it. See
+        # ``tools.discovery.budget.apply_release``.
+        await _refund_run(user_id, trigger)
         return
     with run_context(
         "auto_discovery", user_id=user_id, trigger=trigger, scored=score
@@ -957,14 +1043,50 @@ async def tick_user(
             now,
             lease=state.get("discovery_lease"),
         )
+        and _allowance_left(user_id, doc)
         and await asyncio.to_thread(
             _claim_slot, user_id, "discovery", settings.discovery_interval_hours, now
         )
     ):
-        # Logged after the claim, not before it: this line means a cycle was
-        # dispatched, and a tick that loses the swap dispatches nothing.
-        log.info("tick.discovery_due", user_id=user_id, trigger=trigger)
-        await dispatch_cycle("discovery", user_id, trigger=trigger)
+        # **Charged here, once the claim has won.** The screen above runs on a
+        # document that may be seconds old; this is the transaction that
+        # actually binds, and it is on the dispatch side so a redelivery of the
+        # queued task cannot charge a second time.
+        reservation = await discovery_budget.reserve(_async_client(), user_id)
+        if reservation.granted <= 0:
+            # Lost the race between the screen and the reservation. Give the
+            # lease straight back — holding it would keep the next tick off a
+            # slot this one is not going to use.
+            await asyncio.to_thread(_release_slot, user_id, "discovery", trigger, now)
+        else:
+            # Logged after the claim, not before it: this line means a cycle was
+            # dispatched, and a tick that loses the swap dispatches nothing.
+            log.info("tick.discovery_due", user_id=user_id, trigger=trigger)
+            try:
+                dispatched = await dispatch_cycle("discovery", user_id, trigger=trigger)
+            except Exception:
+                # **A charge whose dispatch never happened, which is the one
+                # way this cap could take a transient outage and make it last
+                # a week.** ``queues.enqueue`` raises on a Cloud Tasks 503, a
+                # missing IAM binding, an unset WORKER_URL/TASKS_SA_EMAIL —
+                # and ``cron_tick`` swallows the raise as one failed user. Left
+                # unrefunded, fourteen hourly ticks would spend the whole
+                # allowance on zero searches and then screen the user out for
+                # the rest of the calendar week, with the outage long fixed.
+                #
+                # Only where the dispatch really is *just* an enqueue. With no
+                # queue, ``dispatch_cycle`` **is** the cycle: a raise there is a
+                # crawl that ran and then failed, which keeps its charge (and
+                # releases its own lease in ``run_discovery_cycle``).
+                if queues.enabled():
+                    await _refund_run(user_id, trigger, week=reservation.week_key)
+                    await asyncio.to_thread(
+                        _release_slot, user_id, "discovery", trigger, now
+                    )
+                raise
+            if not dispatched:
+                # Deduped by the queue: no crawl will happen under this charge.
+                await _refund_run(user_id, trigger, week=reservation.week_key)
 
     if (
         settings.liveness_sweep
@@ -1061,10 +1183,28 @@ async def run_discovery_now(
     Refuses outright from a local process — see :func:`live_runs_refused`. The
     check is the *first* thing here, ahead of both the consent seam and the
     QUEUE_MODE branch, because every arm of it spends the same money.
+
+    **And it answers 429 once the week's searches are gone** (``reason:
+    "discovery_cap"``, with ``runs_this_week``, ``per_week`` and an ISO
+    ``resets_at``). Not 402: see :func:`_cap_429`.
     """
     if live_runs_refused():
         log.warning("discovery.run_now_refused", user_id=user_id)
         raise HTTPException(status_code=403, detail=LIVE_RUN_REFUSED)
+
+    # **The cap is screened before the consent seam, and it gates the free verb
+    # too.** Finding jobs costs no money but it does cost a search, so a capped
+    # user gets 429 whether or not they brought a token — and screening first
+    # means a 429 never burns a confirmation the user would have to mint again.
+    adb = _async_client()
+    limits = discovery_budget.Limits.from_env()
+    snap = await adb.collection("users").document(user_id).get()
+    state = (snap.to_dict() or {}).get(discovery_budget.FIELD) or {}
+    left = discovery_budget.remaining(state, limits=limits)
+    # ``None`` means the cap is off — never 429 in that case.
+    if left is not None and left <= 0:
+        log.info("discovery.run_now_capped", user_id=user_id)
+        raise _cap_429(discovery_budget.used(state), limits)
 
     score = False
     if body is not None and body.confirm:
@@ -1075,11 +1215,33 @@ async def run_discovery_now(
             raise await spend_402(db, user_id, spend.DISCOVERY_SCAN) from None
         score = True
 
+    # The reservation that binds, taken after consent and **before** anything
+    # is dispatched: a run that is going to be refused must not have been
+    # started first. It can still come back empty — two clicks can race for the
+    # last run of the week — and that is the same 429.
+    reservation = await discovery_budget.reserve(adb, user_id, limits=limits)
+    if reservation.granted <= 0:
+        log.info("discovery.run_now_capped", user_id=user_id)
+        raise _cap_429(limits.per_week, limits)
+
     log.info("discovery.run_now", user_id=user_id, scored=score)
     if queues.enabled():
-        queued = await dispatch_cycle(
-            "discovery", user_id, trigger="manual", score=score
-        )
+        try:
+            queued = await dispatch_cycle(
+                "discovery", user_id, trigger="manual", score=score
+            )
+        except Exception:
+            # The enqueue failed — Cloud Tasks 503, a missing IAM binding, an
+            # unset WORKER_URL/TASKS_SA_EMAIL. The user gets a 500 and will
+            # click again, so the search they did not get must not be charged.
+            # (Only the queue branch: the in-process branch below defers the
+            # cycle to a background task and cannot fail here.)
+            await _refund_run(user_id, "manual", week=reservation.week_key)
+            raise
+        if not queued:
+            # A double-click the queue collapsed into the first task. No second
+            # crawl will run, so no second run is owed.
+            await _refund_run(user_id, "manual", week=reservation.week_key)
         return {"ok": True, "mode": "queued", "deduped": not queued, "scored": score}
     # No queue infra: run in-process, after the response goes out.
     background_tasks.add_task(

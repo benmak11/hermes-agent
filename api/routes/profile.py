@@ -34,6 +34,7 @@ from api.deps import verify_user
 from models.profile import MasterProfile
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import queues
+from tools.discovery import budget as discovery_budget
 from tools.profile.extract import extract_profile, read_resume_text
 from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 
@@ -241,6 +242,18 @@ def save_profile(
     if first_completion:
         from api.routes.discovery import dispatch_cycle, enqueue_cycle
 
+        # The third and last site that charges the weekly search allowance —
+        # charged here, at dispatch, never inside the cycle. Synchronous
+        # because this route is: see ``discovery_budget.reserve_sync``.
+        reservation = discovery_budget.reserve_sync(_client(), user_id)
+        if reservation.granted <= 0:
+            # A brand-new account cannot hit this; a re-completion after a
+            # failed enqueue can. Fail closed and say nothing alarming — the
+            # user has already had this week's searches, and the scheduled
+            # loop picks them up next week.
+            log.info("profile.onboarding_kickoff_capped", user_id=user_id)
+            return {"ok": True}
+
         log.info("profile.onboarding_discovery_kickoff", user_id=user_id)
         if queues.enabled():
             try:
@@ -252,12 +265,22 @@ def save_profile(
                 # it means the profile save failed. Give the flag back so the
                 # retry is a real retry, and tell the user something to retry.
                 _user_ref(user_id).set({"onboarding_complete": False}, merge=True)
+                # The retry re-fires the kickoff, so it must not pay twice.
+                discovery_budget.release_sync(
+                    _client(), user_id, 1, week=reservation.week_key
+                )
                 log.exception("profile.onboarding_kickoff_failed", user_id=user_id)
                 raise HTTPException(
                     status_code=503,
                     detail="profile saved, but the first search could not be "
                     "started — please save again",
                 ) from e
+            if not queued:
+                # Deduped: the queued task is the kickoff, and one search is
+                # one charge.
+                discovery_budget.release_sync(
+                    _client(), user_id, 1, week=reservation.week_key
+                )
             # Deduped means a kickoff for this user and hour is already queued,
             # which is the outcome we wanted; it is not a failure.
             log.info(

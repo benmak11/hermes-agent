@@ -37,21 +37,30 @@ State lives in one map on the user doc, ``users/{uid}.scoring_budget``::
     updated_at: iso
 
 Env contract (same shape as ``tools.queues``):
-- ``SCORING_BUDGET_PER_CYCLE`` — slots one cycle may score (default 200).
-- ``SCORING_BUDGET_PER_DAY`` — slots one user may score per UTC day (400).
+- ``SCORING_BUDGET_PER_CYCLE`` — slots one cycle may score (default 3).
+- ``SCORING_BUDGET_PER_DAY`` — slots one user may score per UTC day (3).
 
-**The defaults are calibrated against a real measurement, not an estimate.** On
-2026-08-23 one capped 100-job run through the Phase 1A ledger (run
-``37338813872b4197a860e49d380c2813``) cost **$0.979287 — $0.0098/job**, split
-$0.00279 per Flash parse and $0.01649 per cached Pro score. That is ~2.2x the
-~$0.004/job figure measured in July, because both models now emit billed
-thinking tokens (~510 per parse). At $0.0098/job, 200 slots is **~$1.96** and
-400/day is **~$3.92**, which is what keeps a fresh signup's first cycle under
-the $2 the viability criterion asks for. The earlier 300/1000 defaults would
-have been ~$2.94 and ~$9.79.
+**The defaults are calibrated against a real measurement, and the basis is a
+fully rated job.** On 2026-08-23 one capped 100-job run through the Phase 1A
+ledger (run ``37338813872b4197a860e49d380c2813``) cost $0.979287, split
+**$0.00279 per Flash parse and $0.01649 per cached Pro score**. The $0.0098/job
+that number averages to is an average over every job *attempted*, including the
+ones rejected locally for free — so it describes a population that no longer
+exists once only shortlisted jobs are rated. **Budget at $0.0193/job**: parse
+plus score, which is what every rated job now takes.
 
-Re-measure before trusting these: the rate has moved once already, and it moved
-under us without any code change on our side.
+At $0.0193/job, 3 a day is **~$0.058/day, ~$1.74/month** per user at the
+ceiling — against ~$117.60/month for the 400/day this replaced, and still
+~$3.82/month if the rate moves 2.2x again, which it has done once already
+without any code change on our side. The per-cycle cap stops mattering at this
+size and is held equal to the daily one so a fresh signup's first cycle is 3
+good matches rather than 200 average ones.
+
+**Changing these defaults does not change a running service.** ``_int_env``
+prefers the env value and ``SCORING_BUDGET_PER_CYCLE``/``_PER_DAY`` are
+hand-set on Cloud Run, represented in no terraform CI check — so the ops step
+is a separate, deliberate one. The default still has to be right: a service
+recreated from terraform silently restores whatever it says.
 
 Exceeding the budget is a normal outcome, not an error: the run scores what it
 was granted, logs ``matching.budget_capped`` at info, and the rest of the
@@ -74,8 +83,8 @@ log = get_logger("tools.matching")
 # The map on users/{uid} holding the counters below.
 FIELD = "scoring_budget"
 
-DEFAULT_PER_CYCLE = 200
-DEFAULT_PER_DAY = 400
+DEFAULT_PER_CYCLE = 3
+DEFAULT_PER_DAY = 3
 
 
 class _CycleDefault(Enum):

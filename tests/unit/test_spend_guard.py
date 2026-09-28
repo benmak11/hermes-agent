@@ -32,16 +32,19 @@ was before the spend-safeguards PR.** That failure is the incident.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from firestore_fakes import _FakeDB as _AllowanceDB
 
 import api.routes.discovery as discovery
 import api.routes.worker as worker
 from api.deps import verify_user
 from tools import queues, spend
+from tools.discovery import budget
 from tools.matching import batch_runs
 
 #: Comfortably over ``batch_runs.BATCH_MIN_PENDING`` (50), which is the
@@ -151,6 +154,11 @@ def app_client(monkeypatch):
     worker route the queue would push to."""
     monkeypatch.setenv("QUEUE_MODE", "1")
     monkeypatch.setenv("WORKER_MODE", "1")
+    # The weekly search allowance the route now charges. **One instance**, so
+    # the counter really carries across requests — a fresh store per call is
+    # exactly the unlimited stub this comment would otherwise be denying.
+    allowance = _AllowanceDB()
+    monkeypatch.setattr(discovery, "_async_client", lambda: allowance)
     app = FastAPI()
     app.include_router(discovery.router)
     app.include_router(worker.router)
@@ -208,12 +216,15 @@ def run_now(monkeypatch):
         return True
 
     monkeypatch.setattr(discovery, "dispatch_cycle", fake_dispatch_cycle)
+    # One instance, so a test can spend the week and the next request sees it.
+    allowance = _AllowanceDB()
+    monkeypatch.setattr(discovery, "_async_client", lambda: allowance)
     monkeypatch.setenv("QUEUE_MODE", "1")
 
     app = FastAPI()
     app.include_router(discovery.router)
     app.dependency_overrides[verify_user] = lambda: "u1"
-    return TestClient(app), db, dispatched
+    return TestClient(app), db, dispatched, allowance
 
 
 def _mint(db, action):
@@ -228,7 +239,7 @@ def _mint(db, action):
 
 
 def test_a_run_now_with_no_token_finds_without_spending(run_now):
-    client, _db, dispatched = run_now
+    client, _db, dispatched, _allowance = run_now
 
     resp = client.post("/settings/discovery/run", json={})
 
@@ -239,7 +250,7 @@ def test_a_run_now_with_no_token_finds_without_spending(run_now):
 def test_a_run_now_with_a_valid_token_scores_in_one_go(run_now):
     """The positive control the guard needs to be a guard and not an off
     switch: a real token really does buy the paid verb."""
-    client, db, dispatched = run_now
+    client, db, dispatched, _allowance = run_now
     token = _mint(db, spend.DISCOVERY_SCAN)
 
     resp = client.post("/settings/discovery/run", json={"confirm": token})
@@ -259,7 +270,7 @@ def test_an_invalid_token_on_run_now_answers_402_and_spends_nothing(run_now):
     of surprise in the other direction — they would be left believing their
     jobs were scored.
     """
-    client, _db, dispatched = run_now
+    client, _db, dispatched, _allowance = run_now
 
     for bogus in ("yes", "true", "deadbeef", "x" * 32):
         resp = client.post("/settings/discovery/run", json={"confirm": bogus})
@@ -275,7 +286,7 @@ def test_an_invalid_token_on_run_now_answers_402_and_spends_nothing(run_now):
 
 
 def test_the_402_from_run_now_hands_back_a_token_that_works(run_now):
-    client, _db, dispatched = run_now
+    client, _db, dispatched, _allowance = run_now
     token = client.post("/settings/discovery/run", json={"confirm": "no"}).json()[
         "detail"
     ]["confirm_token"]
@@ -291,7 +302,7 @@ def test_a_score_backlog_token_does_not_authorise_a_discovery_scan(run_now):
     is not a yes to "crawl 198 boards and then score whatever turns up" —
     different work, different money, and the estimate the user saw was
     attached to the other one."""
-    client, db, dispatched = run_now
+    client, db, dispatched, _allowance = run_now
     token = _mint(db, spend.SCORE_BACKLOG)
 
     resp = client.post("/settings/discovery/run", json={"confirm": token})
@@ -309,7 +320,7 @@ def test_a_score_backlog_token_does_not_authorise_a_discovery_scan(run_now):
 
 
 def test_a_replayed_run_now_token_does_not_buy_a_second_batch(run_now):
-    client, db, dispatched = run_now
+    client, db, dispatched, _allowance = run_now
     token = _mint(db, spend.DISCOVERY_SCAN)
     assert (
         client.post("/settings/discovery/run", json={"confirm": token}).status_code
@@ -320,3 +331,35 @@ def test_a_replayed_run_now_token_does_not_buy_a_second_batch(run_now):
 
     assert again.status_code == 402
     assert [d["score"] for d in dispatched] == [True]
+
+
+def test_a_capped_run_now_answers_429_without_burning_the_token(run_now):
+    """**The weekly cap must not eat a consent token**, which is why the cap
+    is screened *before* the seam rather than only by the reservation after it.
+
+    This is the shape the spend PR already fixed once in the other direction —
+    a 403 raised inside the handler body, after FastAPI had consumed and
+    deleted the token, so the developer had to confirm again to be refused
+    again. A cap is a worse place for it: the answer does not change until
+    next week, so the user would mint and burn a token per attempt for days.
+
+    Without the pre-seam screen the reservation still produces a 429 and the
+    whole suite stays green — the refusal is right and the token is gone. Only
+    the surviving consent document tells the two apart.
+    """
+    client, db, dispatched, allowance = run_now
+    token = _mint(db, spend.DISCOVERY_SCAN)
+    consent_path = f"users/u1/spend_consents/{token}"
+    assert consent_path in db.store
+    allowance.store[budget.FIELD] = {
+        "week": budget.week_key(datetime.now(UTC), "UTC"),
+        "runs_this_week": budget.Limits.from_env().per_week,
+    }
+
+    resp = client.post("/settings/discovery/run", json={"confirm": token})
+
+    assert resp.status_code == 429, resp.text
+    assert resp.json()["detail"]["reason"] == "discovery_cap"
+    assert dispatched == []
+    # Still there, and still spendable next week.
+    assert consent_path in db.store

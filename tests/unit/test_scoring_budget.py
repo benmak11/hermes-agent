@@ -255,15 +255,43 @@ def test_summary_of_an_unbudgeted_run_is_empty():
 # --------------------------------------------------------------- Limits.from_env
 
 
-def test_limits_default_to_the_documented_numbers(monkeypatch):
+def test_default_limits_are_three(monkeypatch):
+    """3 a day, at the $0.0193 a *fully rated* job costs: ~$1.74/month per
+    user at the ceiling, against ~$117.60 for the 400/day this replaced.
+
+    The number is asserted literally on purpose. It is the whole cost model,
+    it is not derivable from anything else in the repo, and the env values
+    hand-set on Cloud Run silently win over it — so if this default drifts,
+    nothing else in the suite notices.
+    """
     monkeypatch.delenv("SCORING_BUDGET_PER_CYCLE", raising=False)
     monkeypatch.delenv("SCORING_BUDGET_PER_DAY", raising=False)
-    # Calibrated against the $0.0098/job measured 2026-08-23: 200 slots is
-    # ~$1.96, which is what holds a first cycle under the $2 criterion.
     assert Limits.from_env() == Limits(
         per_cycle=budget.DEFAULT_PER_CYCLE, per_day=budget.DEFAULT_PER_DAY
     )
-    assert (budget.DEFAULT_PER_CYCLE, budget.DEFAULT_PER_DAY) == (200, 400)
+    assert (budget.DEFAULT_PER_CYCLE, budget.DEFAULT_PER_DAY) == (3, 3)
+
+
+def test_cap_drop_mid_day_grants_zero(monkeypatch):
+    """The day the cap goes 400 -> 3, live users are mid-day at 246 scored.
+
+    ``per_day - day_used`` is -243 there, and a negative remainder that reached
+    ``min()`` would grant a *negative* number of slots — which is worse than
+    uncapped, because a limit of -243 passed down as a query bound is not a
+    number anything downstream is ready for. The floor is what makes the
+    over-spent day simply grant nothing.
+    """
+    monkeypatch.delenv("SCORING_BUDGET_PER_CYCLE", raising=False)
+    monkeypatch.delenv("SCORING_BUDGET_PER_DAY", raising=False)
+    spent = _state(jobs_scored_today=246, jobs_scored_this_cycle=246)
+
+    new_state, res = _reserve(spent, 3, limits=Limits.from_env())
+
+    assert res.granted == 0 and res.capped is True
+    assert res.remaining_day == 0 and res.remaining_cycle == 0
+    # And nothing moved: the run scores nothing rather than crashing or
+    # un-spending the day.
+    assert new_state["jobs_scored_today"] == 246
 
 
 def test_limits_read_the_env(monkeypatch):
