@@ -73,18 +73,11 @@ async def observed(db, user_id: str) -> FunnelRate:
 
     Two independent reads (each already degrades to its own fallback on a
     thin sample or a Firestore hiccup — see both modules' ``observed_rate``),
-    so this never raises either.
-
-    ``matching_rates.observed_rate``'s own fallback
-    (:data:`~tools.matching.rates.MEASURED`) is the blended average over every
-    job a run *attempted*, free rejects included — so a fresh account with no
-    history yet gets :data:`~tools.matching.rates.MEASURED_RATED` here
-    instead, the fallback priced per rated job. A real account's observed
-    rate already divides by ``jobs.scored`` and needs no swap.
+    so this never raises either. A fresh account's match leg is
+    :data:`~tools.matching.rates.MEASURED_RATED` — priced per rated job, not
+    the blended per-attempt average.
     """
     match = await matching_rates.observed_rate(db, user_id)
-    if match is matching_rates.MEASURED:
-        match = matching_rates.MEASURED_RATED
     tailor = await tailoring_rates.observed_rate(db, user_id)
     return FunnelRate(
         match=match,
