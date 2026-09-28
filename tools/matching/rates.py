@@ -67,10 +67,26 @@ UNCERTAINTY = 2.0
 PARSE_SHARE = 0.13
 SCORE_SHARE = 1.0 - PARSE_SHARE
 
+#: The same 2026-08-23 measurement's per-leg unit costs, named rather than
+#: left inside the comment above. **Not the same number as**
+#: :data:`MEASURED_COST_PER_JOB_USD`: that constant is total run cost over
+#: every job the run *attempted* (100), many of which hit jd_cache (skip
+#: parse) or were rejected free by the family/geo filter (skip score). These
+#: two are cost *per occurrence* of each leg, and their sum is the cost of
+#: taking one job all the way to a rated match. Since the 3-slot caps (see
+#: ``tools.matching.budget``), slots go to title-filtered jobs that mostly
+#: take both legs, so this sum — not the blended average — is the basis the
+#: budget prices against. Using the average understates a rated job by
+#: roughly 2x.
+MEASURED_PARSE_USD = 0.00279
+MEASURED_SCORE_USD = 0.01649
+MEASURED_RATED_JOB_USD = round(MEASURED_PARSE_USD + MEASURED_SCORE_USD, 6)
+
 #: Where a rate came from. ``observed`` is the user's own ledger; the constant
 #: names its measurement date so the UI string can't outlive the number.
 SOURCE_OBSERVED = "your_last_runs"
 SOURCE_MEASURED = f"measured_{MEASURED_AT.replace('-', '_')}"
+SOURCE_MEASURED_RATED = f"measured_rated_{MEASURED_AT.replace('-', '_')}"
 
 #: Ledger docs to read when deriving an observed rate. Recent runs only: the
 #: rate moves with prompt and model changes, and averaging over a year of them
@@ -95,6 +111,13 @@ class Rate:
 
 #: The fallback, as a :class:`Rate`.
 MEASURED = Rate(MEASURED_COST_PER_JOB_USD, SOURCE_MEASURED, 0)
+
+#: The fallback for "cost of one delivered match" specifically — see
+#: :data:`MEASURED_RATED_JOB_USD`. A real account's own :func:`observed_rate`
+#: needs no equivalent swap: it already divides by ``jobs.scored``, which
+#: already excludes both kinds of free/discarded rejects, so it answers this
+#: same question correctly the moment an account has enough history.
+MEASURED_RATED = Rate(MEASURED_RATED_JOB_USD, SOURCE_MEASURED_RATED, 0)
 
 
 async def observed_rate(db, user_id: str, *, min_jobs: int = 100) -> Rate:
