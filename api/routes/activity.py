@@ -33,6 +33,13 @@ parameter, schedules nothing, and writes nothing;
 property cannot be lost by an edit. Moving ``tick_user`` off those two routes is
 a separate change.
 
+The response also carries an ``allowance`` block — the two caps (searches per
+week, ratings per day) with what is left of each and **two independent reset
+instants**. It is read off the same ``users/{uid}`` document the rest of the
+route already fetched, so it costs no extra read, and it is computed from the
+budget modules' own pure functions so a display can never promise something
+the next reservation would refuse. See :func:`_allowance`.
+
 Known limits, stated rather than papered over:
 
 - A discovery or sweep cycle that **failed** is not visible here. Its outcome
@@ -59,7 +66,9 @@ from api.routes.discovery import _lease_at, _lease_held, _next_iso, _parse_ts
 from models.settings import DiscoverySettings
 from obs.logging import get_logger
 from tools.applications import state as app_state
+from tools.discovery import budget as discovery_budget
 from tools.matching import batch_runs
+from tools.matching import budget as matching_budget
 from tools.run_costs import COLLECTION as RUNS_COLLECTION
 from tools.run_costs import RUNNING as LEDGER_RUNNING
 from tools.run_costs import run_is_stalled
@@ -167,6 +176,86 @@ def _item(
         "done": done,
         "total": total,
         "detail": detail or {},
+    }
+
+
+def _allowance(user_doc: dict, now: datetime) -> dict:
+    """What is left of the two caps, and when each one rolls.
+
+    Read off the ``users/{uid}`` document the route has already fetched, so
+    this block costs **zero extra reads** and, like everything else here,
+    writes nothing.
+
+    Two things this gets right on purpose:
+
+    - **``limit``/``remaining`` are ``None``, never ``0``, when a cap is off.**
+      "Unlimited" is not a quantity, and a ``0`` renders as "no searches left"
+      — the opposite of the truth. This mirrors
+      ``discovery_budget.Reservation.remaining_week`` and the ``int | None``
+      that ``discovery_budget.remaining`` already returns for exactly this
+      reason. The scoring cap has no kill switch (``SCORING_BUDGET_PER_DAY=0``
+      means *no ratings*, not *no cap*), so ``ratings.limit`` is always a
+      number today; it is typed alongside the other one so a client cannot
+      grow a dependence on that staying true.
+    - **Two independent ``resets_at``.** Searches roll next Monday 00:00 UTC,
+      ratings next UTC midnight. They coincide only on a Sunday, and one
+      shared field could not express both.
+
+    **``ratings.remaining`` is what the next reservation would actually
+    grant**, which is ``min(remaining_day, remaining_cycle)`` and not the
+    daily figure alone. The per-cycle counter has **no time rollover** — only
+    a new ``cycle_id`` clears it — and every ad-hoc scorer (``POST
+    /jobs/score`` and the worker tasks) reserves with ``cycle_id=None``,
+    i.e. against the window that is already open. So a user who rated out
+    this search's window and then crossed midnight has a full *daily*
+    allowance and a grant of zero, and with ``auto_discovery`` off there is
+    no cycle coming to open a new window. Reporting the daily remainder there
+    promises three ratings and delivers none.
+
+    ``remaining_cycle`` is carried alongside it so a surface can say **which**
+    window binds: when it is the cycle, the ``resets_at`` instant is not the
+    answer and waiting for it will not help — only a new search will.
+
+    Both figures come from ``apply_reservation(..., wanted=0)`` — the pure
+    function, on a discarded copy of the state — rather than a second
+    implementation of its rollover rules. Asking for nothing grants nothing,
+    so nothing is debited and nothing is written, and a display can never
+    promise something the next reservation would refuse.
+
+    ``used`` on both blocks is the **stored counter**, read through each
+    module's ``used()``, never ``limit - remaining``: that derivation clamps
+    at the cap, so an account holding 46 rated jobs under #92's new limit of
+    3 would read "3 of 3" instead of the truth.
+    """
+    search_limits = discovery_budget.Limits.from_env()
+    search_state = user_doc.get(discovery_budget.FIELD)
+    tz = discovery_budget.UTC_TZ
+
+    rating_limits = matching_budget.Limits.from_env()
+    rating_state = user_doc.get(matching_budget.FIELD)
+    _discarded, rated = matching_budget.apply_reservation(
+        rating_state,
+        0,
+        now=now,
+        cycle_id=None,
+        limits=rating_limits,
+    )
+    return {
+        "searches": {
+            "used": discovery_budget.used(search_state, now=now, tz=tz),
+            "limit": search_limits.per_week if search_limits.enforced else None,
+            "remaining": discovery_budget.remaining(
+                search_state, now=now, tz=tz, limits=search_limits
+            ),
+            "resets_at": discovery_budget.resets_at(now, tz),
+        },
+        "ratings": {
+            "used": matching_budget.used(rating_state, now=now),
+            "limit": rating_limits.per_day,
+            "remaining": min(rated.remaining_day, rated.remaining_cycle),
+            "remaining_cycle": rated.remaining_cycle,
+            "resets_at": matching_budget.resets_at(now),
+        },
     }
 
 
@@ -636,6 +725,7 @@ async def get_activity(user_id: str = Depends(verify_user)) -> dict:
         "polled_at": now.isoformat(),
         "next_tick_at": _next_hour(now),
         "items": items,
+        "allowance": _allowance(user_doc, now),
         # Money already owed Google that the ledger has not priced yet. Never
         # summed with actual spend in code — the two mean different things and a
         # UI that wants both shows two lines.

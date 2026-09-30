@@ -10,7 +10,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
-  clearFirstRun,
   loadStats,
   paceMinutes,
   reconcileStats,
@@ -19,13 +18,14 @@ import {
   reviewedCount,
   saveMinScore,
   saveStats,
-  useFirstRun,
   useMinScore,
   useSessionStats,
   type SessionStats,
 } from "@/lib/session";
+import { pollMs, type ActivityResponse } from "@/lib/activity";
 import type { DecideValue, Decision, Job, ProfileResponse } from "@/lib/types";
 import { barColor, initial, recPill, scoreColor } from "@/lib/ui";
+import { ActivityPanel } from "@/components/activity/ActivityPanel";
 import { TopNav } from "@/components/TopNav";
 import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
 import { Pill } from "@/components/warm/Pill";
@@ -58,7 +58,6 @@ export default function VettingPage() {
   // Storage-backed values (hydration-safe external stores).
   const minScore = useMinScore();
   const stats = useSessionStats(uid);
-  const firstRun = useFirstRun();
   const [pending, setPending] = useState<PendingCommit | null>(null);
   const commitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingRef = useRef<PendingCommit | null>(null);
@@ -79,6 +78,23 @@ export default function VettingPage() {
     if (needsOnboarding) router.push("/onboarding");
   }, [needsOnboarding, router]);
 
+  // What the server says is actually happening. The one source of both the
+  // activity panel and the poll cadence below.
+  const { data: activity } = useQuery({
+    queryKey: ["activity"],
+    queryFn: () => apiFetch<ActivityResponse>("/activity"),
+    enabled: !!user && profileData?.profile != null,
+    refetchInterval: (query) => pollMs(query.state.data?.items ?? []),
+  });
+
+  // **Not a constant, and not a localStorage flag.** The old cadence was
+  // `firstRun ? 5000 : 30000`: five seconds for five minutes after onboarding
+  // whether or not anything was running, and thirty seconds forever after
+  // whether or not anything was. `pollMs` asks what can actually change —
+  // seconds while a claim is live, a minute while a Vertex batch is with
+  // Google, and no polling at all when nothing can change without the user.
+  const poll = pollMs(activity?.items ?? []);
+
   const queryKey = ["pending", minScore] as const;
 
   const { data, isLoading, error } = useQuery({
@@ -86,9 +102,9 @@ export default function VettingPage() {
     queryFn: () =>
       apiFetch<PendingResponse>(`/jobs/pending?min_score=${minScore}`),
     enabled: !!user && profileData?.profile != null,
-    // Matches stream in as agents write them — poll faster while discovery is
-    // fresh after onboarding, gently otherwise.
-    refetchInterval: firstRun ? 5000 : 30000,
+    // Matches stream in as agents write them — so re-ask exactly while
+    // something is writing them.
+    refetchInterval: poll,
   });
 
   const decide = useMutation({
@@ -208,11 +224,6 @@ export default function VettingPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, [act, undo]);
 
-  // The first-run treatment retires once the queue is real and being worked.
-  useEffect(() => {
-    if (firstRun && reviewedCount(stats) >= 3) clearFirstRun();
-  }, [firstRun, stats]);
-
   // Counts live in localStorage and survive a server-side wipe, which would
   // otherwise leave the header reporting a review session for jobs that no
   // longer exist. Runs before the counts are read below.
@@ -245,7 +256,6 @@ export default function VettingPage() {
             <SessionProgress reviewed={reviewed} total={total} />
           ) : undefined
         }
-        pill={firstRun ? <DiscoveryPill /> : undefined}
       />
       <main className="mx-auto w-full max-w-[920px] flex-1 px-7 py-7">
         <div className="mb-6 flex items-start justify-between gap-5">
@@ -255,33 +265,22 @@ export default function VettingPage() {
                 className="text-[28px] font-normal leading-[1.15]"
                 style={{ fontFamily: SERIF, color: "var(--ink)" }}
               >
-                {firstRun ? "Your first matches" : "Jobs to review"}
+                Jobs to review
               </h1>
-              {!firstRun && (
-                <span
-                  className="inline-flex h-[22px] min-w-6 items-center justify-center rounded-full px-[7px] text-[12px] font-bold"
-                  style={{ background: "var(--ink)", color: "#fff9f2" }}
-                >
-                  {jobs.length}
-                </span>
-              )}
-            </div>
-            {firstRun ? (
-              <div className="mt-2 text-[13px]" style={{ color: "var(--ink-4)" }}>
-                <span style={{ color: "var(--sage)", fontWeight: 700 }}>
-                  {jobs.length} {jobs.length === 1 ? "match" : "matches"}
-                </span>{" "}
-                so far — start reviewing, more will appear below
-              </div>
-            ) : (
-              <div
-                className="mt-2 flex items-center gap-1.5 text-[12px]"
-                style={{ color: "var(--ink-4)" }}
+              <span
+                className="inline-flex h-[22px] min-w-6 items-center justify-center rounded-full px-[7px] text-[12px] font-bold"
+                style={{ background: "var(--ink)", color: "#fff9f2" }}
               >
-                <Kbd>a</Kbd> approve <Kbd>s</Kbd> skip <Kbd>r</Kbd> star{" "}
-                <Kbd>z</Kbd> undo
-              </div>
-            )}
+                {jobs.length}
+              </span>
+            </div>
+            <div
+              className="mt-2 flex items-center gap-1.5 text-[12px]"
+              style={{ color: "var(--ink-4)" }}
+            >
+              <Kbd>a</Kbd> approve <Kbd>s</Kbd> skip <Kbd>r</Kbd> star{" "}
+              <Kbd>z</Kbd> undo
+            </div>
           </div>
 
           <label
@@ -311,13 +310,24 @@ export default function VettingPage() {
           </label>
         </div>
 
+        {activity && (
+          <div className="mb-5">
+            {/* The server's own clock reading, not this browser's: every
+                elapsed time in the panel is then measured against the same
+                instant the states were, and the render stays pure. It
+                advances on each poll, which is exactly when anything it
+                describes can have changed. */}
+            <ActivityPanel data={activity} now={Date.parse(activity.polled_at)} />
+          </div>
+        )}
+
         {isLoading && <LoadingSkeleton />}
         {error && (
           <p className="text-[13.5px]" style={{ color: "var(--brick)" }}>
             Failed to load: {String(error)}
           </p>
         )}
-        {!isLoading && jobs.length === 0 && !firstRun && (
+        {!isLoading && jobs.length === 0 && (
           <EmptyState
             minScore={minScore}
             pendingTotal={data?.pending_total ?? null}
@@ -336,8 +346,6 @@ export default function VettingPage() {
             />
           ))}
         </div>
-
-        {firstRun && !isLoading && <ScoringCard />}
 
         {reviewed > 0 && (
           <div
@@ -397,62 +405,6 @@ function SessionProgress({
       <span className="text-[12.5px] font-semibold" style={{ color: "var(--ink-3)" }}>
         {reviewed} of {total} reviewed
       </span>
-    </div>
-  );
-}
-
-function DiscoveryPill() {
-  return (
-    <span
-      className="inline-flex items-center gap-2 rounded-full border px-[14px] py-[7px] text-[12px] font-bold"
-      style={{
-        background: "var(--honey-tint)",
-        borderColor: "#f4dfb4",
-        color: "#9a6216",
-      }}
-    >
-      <span
-        className="inline-block h-[11px] w-[11px] rounded-full border-2"
-        style={{
-          borderColor: "#9a6216",
-          borderTopColor: "transparent",
-          animation: "hspin 0.8s linear infinite",
-        }}
-      />
-      discovery running
-    </span>
-  );
-}
-
-/** Dashed placeholder for a match still being scored (mock 06). */
-function ScoringCard() {
-  return (
-    <div
-      className="mt-4 rounded-[18px] px-[22px] py-5"
-      style={{
-        border: "1px dashed #d9c4a8",
-        background: "rgba(255,252,248,0.6)",
-      }}
-    >
-      <div className="flex items-center gap-[11px]">
-        <div
-          className="h-[34px] w-[34px] rounded-lg h-pulse"
-          style={{ background: "#f0e3d3" }}
-        />
-        <div className="flex-1">
-          <div
-            className="h-[13px] w-[220px] rounded h-pulse"
-            style={{ background: "#f0e3d3" }}
-          />
-          <div
-            className="mt-[7px] h-[11px] w-[110px] rounded h-pulse"
-            style={{ background: "#f6ede1" }}
-          />
-        </div>
-        <span className="text-[11.5px] font-semibold" style={{ color: "#a3927f" }}>
-          scoring…
-        </span>
-      </div>
     </div>
   );
 }
