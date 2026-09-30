@@ -794,3 +794,77 @@ def test_batch_run_start_refunds_when_it_does_not_start(budgeted, monkeypatch):
 
     assert result["started"] is False
     assert budgeted.budget_state["jobs_scored_this_cycle"] == 0
+
+
+# --------------------------------------------------------------------------
+# resets_at — the daily window's rolling instant, for display only
+# --------------------------------------------------------------------------
+
+
+def test_resets_at_is_the_instant_the_day_key_changes():
+    """Not "tomorrow at some point": the exact boundary ``apply_reservation``
+    keys off, so what a screen promises and what the next reservation does
+    cannot drift apart."""
+    now = datetime(2026, 9, 30, 23, 59, 59, tzinfo=UTC)
+    assert budget.resets_at(now) == "2026-10-01T00:00:00+00:00"
+
+    # One second later the key has rolled, and so has the promise.
+    rolled = now + timedelta(seconds=1)
+    assert rolled.date().isoformat() == "2026-10-01"
+    assert budget.resets_at(rolled) == "2026-10-02T00:00:00+00:00"
+
+
+def test_resets_at_crosses_a_month_and_a_year_boundary():
+    assert budget.resets_at(datetime(2026, 12, 31, 8, 0, tzinfo=UTC)) == (
+        "2027-01-01T00:00:00+00:00"
+    )
+
+
+def test_resets_at_is_not_the_weekly_instant():
+    """The one mutation that matters: pointing ratings at the search window.
+
+    They coincide on a Sunday and disagree the other six days, so a surface
+    that shares one field is wrong most of the week.
+    """
+    from tools.discovery import budget as discovery_budget
+
+    wednesday = datetime(2026, 9, 30, 12, 30, tzinfo=UTC)
+    assert budget.resets_at(wednesday) != discovery_budget.resets_at(wednesday, "UTC")
+
+
+def test_a_zero_wanted_reservation_grants_and_debits_nothing():
+    """How a read-only surface asks "what is left?" without paying for it.
+
+    ``/activity``'s allowance block draws its rating figures this way rather
+    than reimplementing the lazy day rollover, so the two can never disagree.
+    """
+    now = datetime(2026, 9, 27, 12, 30, tzinfo=UTC)
+    state = {"day": "2026-09-27", "jobs_scored_today": 2, "cycle_id": "c1"}
+    new_state, res = budget.apply_reservation(
+        dict(state), 0, now=now, cycle_id=None, limits=budget.Limits(3, 3)
+    )
+
+    assert res.granted == 0
+    assert res.remaining_day == 1
+    assert new_state["jobs_scored_today"] == 2
+    assert new_state["cycle_id"] == "c1"
+
+
+def test_used_reports_the_stored_counter_and_rolls_with_the_day():
+    """The read-only twin of the day counter, and the reason it exists: it
+    must not be derived from the cap."""
+    now = datetime(2026, 9, 27, 12, 30, tzinfo=UTC)
+    assert budget.used({"day": "2026-09-27", "jobs_scored_today": 46}, now=now) == 46
+    # Yesterday's counter is a spent window, not spent quota.
+    assert budget.used({"day": "2026-09-26", "jobs_scored_today": 46}, now=now) == 0
+    assert budget.used(None, now=now) == 0
+    # A hand-edited doc cannot grant more, or crash a status page.
+    assert budget.used({"day": "2026-09-27", "jobs_scored_today": -9}, now=now) == 0
+    assert budget.used({"day": "2026-09-27", "jobs_scored_today": "lots"}, now=now) == 0
+
+
+def test_used_is_not_clamped_to_the_limit():
+    """#92 cut the cap 400 -> 3 mid-day. What was already rated stays true."""
+    now = datetime(2026, 9, 27, 12, 30, tzinfo=UTC)
+    state = {"day": "2026-09-27", "jobs_scored_today": 46}
+    assert budget.used(state, now=now) > budget.Limits(3, 3).per_day

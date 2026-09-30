@@ -57,10 +57,59 @@ export type ActivityItem = {
   detail: Record<string, unknown>;
 };
 
+/**
+ * One cap's state: how much of it is spent, and when it rolls.
+ *
+ * `limit` and `remaining` are `null` — **not `0`** — when that cap is off.
+ * "Unlimited" is not a quantity, and a `0` here renders as "no searches left"
+ * when the truth is "no limit". That is the search cap's case:
+ * `DISCOVERY_RUNS_PER_WEEK=0` is a kill switch, and
+ * `tools/discovery/budget.py`'s `remaining() -> int | None` says so in its
+ * own type. The rating cap has **no kill switch today** —
+ * `SCORING_BUDGET_PER_DAY=0` means *no ratings*, not *no cap*, and renders
+ * honestly as "0 of 0" — so `ratings.limit` is always a number in practice.
+ * It is typed nullable anyway so no consumer hard-codes an assumption that a
+ * future kill switch would break.
+ */
+export type AllowanceBlock = {
+  used: number;
+  limit: number | null;
+  remaining: number | null;
+  /** ISO instant. The server never formats a local time; `resetsLine` does. */
+  resets_at: string;
+};
+
+/**
+ * The two caps, with **two independent reset instants**.
+ *
+ * Searches roll next Monday 00:00 UTC, ratings next UTC midnight. They
+ * coincide one day in seven and differ the other six, so a surface that shows
+ * both has to show both — one shared "resets at" would be wrong most of the
+ * week.
+ */
+/**
+ * Ratings carry a second window the clock never clears.
+ *
+ * `remaining` is what the next reservation would actually grant, i.e. the
+ * smaller of the daily and per-search remainders. `remaining_cycle` is the
+ * per-search one on its own, and it is here for one reason: when *it* is what
+ * binds, `resets_at` is not the answer. A new UTC day does not open a new
+ * search window — only a new search does — so a screen that showed the reset
+ * time there would be telling the user to wait for something that will not
+ * help them.
+ */
+export type RatingsAllowance = AllowanceBlock & { remaining_cycle: number };
+
+export type Allowance = {
+  searches: AllowanceBlock;
+  ratings: RatingsAllowance;
+};
+
 export type ActivityResponse = {
   polled_at: string;
   next_tick_at: string;
   items: ActivityItem[];
+  allowance: Allowance;
   committed: { usd_low: number; usd_high: number; runs: number };
 };
 
@@ -248,9 +297,60 @@ export function activityView(item: ActivityItem, now: number): ActivityView {
   }
 }
 
+/**
+ * "9 of 14 searches this week", or the honest uncapped form.
+ *
+ * The uncapped branch says what is *known* (how many ran) and refuses to
+ * invent a denominator, which is the same rule `activityView` applies to a
+ * progress bar.
+ */
+export function allowanceLabel(
+  block: AllowanceBlock,
+  noun: string,
+  window: string,
+): string {
+  return block.limit === null
+    ? `${block.used} ${noun} ${window} \u00b7 no limit`
+    : `${block.used} of ${block.limit} ${noun} ${window}`;
+}
+
+/**
+ * "resets at 01:00" / "resets Mon 01:00" — the viewer's own clock.
+ *
+ * A weekly window is days away, so an hour alone would be ambiguous; a nightly
+ * one is not, so a weekday on it would be noise. The instant itself comes from
+ * the server and is never re-derived here.
+ */
+export function resetsLine(iso: string, now: number): string {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return "";
+  const within24h = at.getTime() - now < 24 * 3600 * 1000;
+  const day = within24h
+    ? ""
+    : `${at.toLocaleDateString([], { weekday: "short" })} `;
+  return `resets ${within24h ? "at " : ""}${day}${hhmm(iso)}`;
+}
+
+/**
+ * What to say under the ratings figure: the reset instant, or the truth that
+ * the reset will not help.
+ *
+ * The per-search window binds when it is empty while the day still has room.
+ * `used < limit` is that test, and it is why `used` has to be the real stored
+ * counter rather than `limit - remaining`.
+ */
+export function ratingsResetLine(block: RatingsAllowance, now: number): string {
+  const dayHasRoom = block.limit === null || block.used < block.limit;
+  if (block.remaining === 0 && block.remaining_cycle === 0 && dayHasRoom) {
+    return "used up for this search \u00b7 a new search frees more";
+  }
+  return resetsLine(block.resets_at, now);
+}
+
 /** Poll cadences, by what can actually change. */
 export const POLL_ACTIVE_MS = 3000;
 export const POLL_EXTERNAL_MS = 60000;
+export const POLL_SCHEDULED_MS = 60000;
 
 /**
  * How often to re-ask `/activity`, or `false` for "don't".
@@ -262,10 +362,26 @@ export const POLL_EXTERNAL_MS = 60000;
  * - a live claim can change in seconds;
  * - a Vertex batch cannot change faster than the hourly resume tick, so polling
  *   it every three seconds is 1,200 pointless requests an hour;
+ * - a leg that is **scheduled** will start on its own, with nobody touching
+ *   the page. Its start is a real event on a clock we do not own, so a minute
+ *   is the cadence: fast enough that a 13:00 cron shows up as work by 13:01,
+ *   slow enough to be 60 requests an hour rather than 1,200. Without this the
+ *   screen sits at "next at 13:00" through 13:00, 13:30 and 14:00 — honest,
+ *   but staler than the hard-coded 30s interval this function replaced, and
+ *   that would be a freshness regression inherited by accident.
  * - nothing else can change without the user doing something, and a user action
  *   invalidates the query anyway. So: no polling at all. `false` rather than a
  *   long interval, because "we are still checking" is itself an implied claim
  *   that something might be happening.
+ *
+ * `idle_scheduled` **with a real `next_at`** is the only idle state that polls.
+ * `idle_unscheduled`, `never_started`, `finished`, `failed` and `stalled` all
+ * mean nothing is coming, and polling them would be that implied claim.
+ *
+ * Deliberately not conditioned on how far away `next_at` is: a distance test
+ * cannot re-evaluate itself. Returning `false` stops the timer, so a schedule
+ * four hours out would never come back into range on its own, and the screen
+ * that most needs the eventual refetch is the one that would never get it.
  */
 export function pollMs(items: ActivityItem[]): number | false {
   let interval: number | false = false;
@@ -274,6 +390,9 @@ export function pollMs(items: ActivityItem[]): number | false {
       return POLL_ACTIVE_MS; // nothing polls faster; no need to look further
     }
     if (item.state === "waiting_external") interval = POLL_EXTERNAL_MS;
+    else if (item.state === "idle_scheduled" && item.next_at && interval === false) {
+      interval = POLL_SCHEDULED_MS;
+    }
   }
   return interval;
 }

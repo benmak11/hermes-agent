@@ -344,3 +344,55 @@ body {
 .wm-chip.wm-chip-on:hover {
   border-color: var(--terracotta);
 }
+
+/* Activity panel (progress UI). **Motion is a claim that work is happening**,
+   so there are exactly two animated classes here and both are reachable only
+   from `visual: "shimmer"` / `"spinner"` — i.e. only from a `running` or
+   `queued` record. `quiet` markers (waiting_external, failed, stalled) and
+   idle rows get a still glyph and no rule below.
+
+   Guarded by prefers-reduced-motion with a static fallback: outside the query
+   the shimmer is a plain track and the spinner a plain ring, both still
+   legible. Same contract as the other .wm-*: these properties are never also
+   set inline, because inline beats the class and would kill the guard. */
+.wm-act-shimmer {
+  background: linear-gradient(
+    90deg,
+    #f0e3d3 0%,
+    #e4d2bb 40%,
+    #f0e3d3 80%
+  );
+  background-size: 250% 100%;
+}
+.wm-act-spin {
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+}
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes wmactshimmer {
+    to {
+      background-position: -250% 0;
+    }
+  }
+  .wm-act-shimmer {
+    animation: wmactshimmer 1.5s linear infinite;
+  }
+  .wm-act-spin {
+    animation: hspin 0.8s linear infinite;
+  }
+}
+.wm-act-bar {
+  background: var(--terracotta);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .wm-act-bar {
+    background: linear-gradient(
+      90deg,
+      var(--terracotta) 0%,
+      #d0724c 45%,
+      var(--terracotta) 90%
+    );
+    background-size: 250% 100%;
+    animation: wmactshimmer 1.9s linear infinite;
+  }
+}

@@ -3,9 +3,13 @@ import {
   ACTIVITY_LABELS,
   POLL_ACTIVE_MS,
   POLL_EXTERNAL_MS,
+  POLL_SCHEDULED_MS,
   activityView,
+  allowanceLabel,
   elapsedSince,
   pollMs,
+  ratingsResetLine,
+  resetsLine,
   type ActivityItem,
   type ActivityKind,
   type ActivityState,
@@ -209,7 +213,24 @@ describe("pollMs", () => {
     expect(pollMs([item("waiting_external")])).toBe(POLL_EXTERNAL_MS);
   });
 
-  it("is false for every terminal and idle state", () => {
+  it("polls slowly for a leg that will start on its own", () => {
+    // The cron fires at 13:00 with nobody touching the page. Without this the
+    // screen sits at "next at 13:00" through 13:00 and 14:00 — honest, but
+    // staler than the hard-coded 30s interval pollMs replaced.
+    expect(
+      pollMs([item("idle_scheduled", { next_at: "2026-09-27T13:00:00Z" })]),
+    ).toBe(POLL_SCHEDULED_MS);
+  });
+
+  it("does not poll a 'scheduled' leg with no actual time on it", () => {
+    // No `next_at` is no schedule, whatever the state is called.
+    expect(pollMs([item("idle_scheduled", { next_at: null })])).toBe(false);
+  });
+
+  it("is false for every terminal and idle state with nothing scheduled", () => {
+    // `item()` leaves `next_at` null, so `idle_scheduled` is in this list on
+    // the strength of having no time on it — the case above covers the one
+    // that does.
     for (const state of [
       "never_started",
       "idle_scheduled",
@@ -231,5 +252,93 @@ describe("pollMs", () => {
       POLL_EXTERNAL_MS,
     );
     expect(pollMs([item("finished"), item("idle_scheduled")])).toBe(false);
+    // A live claim still beats a schedule, and a schedule beats nothing.
+    expect(
+      pollMs([
+        item("idle_scheduled", { next_at: "2026-09-27T13:00:00Z" }),
+        item("running"),
+      ]),
+    ).toBe(POLL_ACTIVE_MS);
+    expect(
+      pollMs([
+        item("finished"),
+        item("idle_scheduled", { next_at: "2026-09-27T13:00:00Z" }),
+      ]),
+    ).toBe(POLL_SCHEDULED_MS);
+  });
+});
+
+describe("allowanceLabel", () => {
+  const capped = {
+    used: 9,
+    limit: 14,
+    remaining: 5,
+    resets_at: "2026-10-05T00:00:00+00:00",
+  };
+
+  it("reads as N of M over the window", () => {
+    expect(allowanceLabel(capped, "searches", "this week")).toBe(
+      "9 of 14 searches this week",
+    );
+  });
+
+  it("never invents a denominator when the cap is off", () => {
+    const off = { ...capped, limit: null, remaining: null };
+    const line = allowanceLabel(off, "searches", "this week");
+    expect(line).toContain("no limit");
+    expect(line).not.toContain("of");
+    // The failure mode this exists to stop: `null` coerced to a number.
+    expect(line).not.toContain("0");
+    expect(line).not.toContain("null");
+  });
+});
+
+describe("resetsLine", () => {
+  const now = Date.parse("2026-09-27T12:30:00Z");
+
+  it("drops the weekday for a reset inside the next 24 hours", () => {
+    expect(resetsLine("2026-09-28T00:00:00+00:00", now)).toMatch(
+      /^resets at \d?\d:\d\d/,
+    );
+  });
+
+  it("keeps it for one that is days out", () => {
+    const line = resetsLine("2026-10-05T00:00:00+00:00", now);
+    expect(line).toMatch(/^resets \S+ \d?\d:\d\d/);
+    expect(line).not.toContain("resets at");
+  });
+
+  it("says nothing rather than NaN for an unparseable instant", () => {
+    expect(resetsLine("not-a-date", now)).toBe("");
+  });
+});
+
+describe("ratingsResetLine", () => {
+  const now = Date.parse("2026-09-29T12:00:00Z");
+  const base = {
+    used: 0,
+    limit: 3,
+    remaining: 0,
+    remaining_cycle: 0,
+    resets_at: "2026-09-30T00:00:00+00:00",
+  };
+
+  it("does not offer a reset that would not help", () => {
+    // The day rolled, so the daily counter is empty; this search's window is
+    // not, and no clock clears it. Midnight refills nothing here.
+    const line = ratingsResetLine(base, now);
+    expect(line).toContain("a new search frees more");
+    expect(line).not.toContain("resets");
+  });
+
+  it("offers the reset when the day is what is actually spent", () => {
+    expect(ratingsResetLine({ ...base, used: 3 }, now)).toMatch(/^resets/);
+  });
+
+  it("offers the reset whenever anything is still grantable", () => {
+    expect(ratingsResetLine({ ...base, remaining: 1, remaining_cycle: 1 }, now))
+      .toMatch(/^resets/);
+    expect(ratingsResetLine({ ...base, remaining_cycle: 3, used: 3 }, now))
+      .toMatch(/^resets/);
   });
 });

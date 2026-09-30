@@ -20,6 +20,7 @@ a different question than the one asked, and this suite has shipped that twice.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -28,7 +29,9 @@ from fastapi.testclient import TestClient
 
 import api.routes.activity as activity
 from api.deps import verify_user
+from tools.discovery.budget import week_key as _dw_key
 from tools.matching import batch_runs
+from tools.matching import budget as matching_budget
 
 NOW = datetime(2026, 9, 27, 12, 30, 0, tzinfo=UTC)
 NEXT_HOUR = "2026-09-27T13:00:00+00:00"
@@ -96,6 +99,19 @@ class _Doc:
 
     async def get(self):
         return _Snap(self.id, self._docs.get(self.id) or {})
+
+    def set(self, data: dict, merge: bool = False) -> None:
+        """Writes really land in the store.
+
+        ``/activity`` must write nothing, and a fake that quietly swallowed a
+        ``set`` would make ``test_allowance_never_debits_anything`` assert
+        nothing at all — the second-commonest way a test in this repo has
+        turned out to be unfalsifiable. ``test_the_fake_firestore_actually_
+        writes`` pins it.
+        """
+        current = dict(self._docs.get(self.id) or {}) if merge else {}
+        current.update(data)
+        self._docs[self.id] = current
 
     def collection(self, name: str):
         sub = self._docs.setdefault(f"__sub__{self.id}", {})
@@ -171,6 +187,15 @@ def test_the_fake_firestore_actually_filters(client):
 # --------------------------------------------------------------------------
 # The state the product keeps getting wrong
 # --------------------------------------------------------------------------
+
+
+def test_the_fake_firestore_actually_writes(client):
+    """The other half of the fake's guard: a ``set`` is not a no-op."""
+    _cl, db = client(user={"a": 1})
+    db.collection("users").document("u1").set({"b": 2}, merge=True)
+    assert db.users["u1"] == {"a": 1, "b": 2}
+    db.collection("users").document("u1").set({"c": 3})
+    assert db.users["u1"] == {"c": 3}
 
 
 def test_an_unscored_backlog_with_auto_discovery_off_is_idle_unscheduled(client):
@@ -587,3 +612,242 @@ def test_a_recorded_tag_whose_document_is_gone_stays_never_started(client):
     assert _items(cl.get("/activity").json())["batch_scoring"]["state"] == (
         "never_started"
     )
+
+
+# --------------------------------------------------------------------------
+# The allowance block — what is left of each cap, and when it rolls
+# --------------------------------------------------------------------------
+
+WEDNESDAY = datetime(2026, 9, 30, 12, 30, 0, tzinfo=UTC)
+
+
+def _week_key(now: datetime) -> str:
+    return _dw_key(now, "UTC")
+
+
+def _allowance(cl) -> dict:
+    return cl.get("/activity").json()["allowance"]
+
+
+def test_allowance_reports_two_independent_resets(client, monkeypatch):
+    """Searches roll weekly, ratings nightly. **Different instants.**
+
+    A single shared ``resets_at`` cannot express both, and the cheap way to
+    get this wrong is to point ratings at ``discovery_budget.resets_at`` —
+    which is right one day in seven and wrong the other six.
+    """
+    cl, _ = client()
+    monkeypatch.setattr(activity, "_now", lambda: WEDNESDAY)
+    allowance = _allowance(cl)
+
+    # Wednesday: next Monday 00:00 UTC vs the coming UTC midnight.
+    assert allowance["searches"]["resets_at"] == "2026-10-05T00:00:00+00:00"
+    assert allowance["ratings"]["resets_at"] == "2026-10-01T00:00:00+00:00"
+    assert allowance["searches"]["resets_at"] != allowance["ratings"]["resets_at"]
+
+    # And on a Sunday the two genuinely coincide — which is why the assertion
+    # above has to be made on a day that isn't one. ``NOW`` is a Sunday.
+    monkeypatch.setattr(activity, "_now", lambda: NOW)
+    sunday = _allowance(cl)
+    assert sunday["searches"]["resets_at"] == "2026-09-28T00:00:00+00:00"
+    assert sunday["ratings"]["resets_at"] == sunday["searches"]["resets_at"]
+
+
+def test_allowance_is_null_when_a_cap_is_off(client, monkeypatch):
+    """``DISCOVERY_RUNS_PER_WEEK=0`` is the kill switch, not a cap of zero.
+
+    ``0`` here would render as "no searches left" when the truth is "no
+    limit" — the same reason ``Reservation.remaining_week`` is ``int | None``.
+    """
+    monkeypatch.setenv("DISCOVERY_RUNS_PER_WEEK", "0")
+    cl, _ = client(
+        user={
+            "discovery_budget": {
+                "week": _week_key(NOW),
+                "runs_this_week": 9,
+            }
+        }
+    )
+    searches = _allowance(cl)["searches"]
+
+    assert searches["limit"] is None
+    assert searches["remaining"] is None
+    # Used is still a real count — what has happened is knowable either way.
+    assert searches["used"] == 9
+
+
+def test_allowance_counts_the_current_window_only(client, monkeypatch):
+    """Both counters roll lazily, and the display must roll with them."""
+    monkeypatch.setenv("DISCOVERY_RUNS_PER_WEEK", "14")
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "3")
+    monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "3")
+    cl, _ = client(
+        user={
+            "discovery_budget": {"week": _week_key(NOW), "runs_this_week": 9},
+            "scoring_budget": {"day": NOW.date().isoformat(), "jobs_scored_today": 2},
+        }
+    )
+    allowance = _allowance(cl)
+    assert allowance["searches"] == {
+        "used": 9,
+        "limit": 14,
+        "remaining": 5,
+        "resets_at": "2026-09-28T00:00:00+00:00",
+    }
+    assert allowance["ratings"] == {
+        "used": 2,
+        "limit": 3,
+        "remaining": 1,
+        "remaining_cycle": 3,
+        "resets_at": "2026-09-28T00:00:00+00:00",
+    }
+
+    # Last week's and yesterday's counters are spent windows, not spent quota.
+    stale, _ = client(
+        user={
+            "discovery_budget": {"week": "2026-W01", "runs_this_week": 14},
+            "scoring_budget": {"day": "2026-01-01", "jobs_scored_today": 3},
+        }
+    )
+    allowance = _allowance(stale)
+    assert allowance["searches"]["used"] == 0
+    assert allowance["searches"]["remaining"] == 14
+    assert allowance["ratings"]["used"] == 0
+    assert allowance["ratings"]["remaining"] == 3
+
+
+def test_allowance_never_debits_anything(client, monkeypatch):
+    """Looking must not cost. Polling this endpoint cannot burn a search."""
+    monkeypatch.setenv("DISCOVERY_RUNS_PER_WEEK", "14")
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "3")
+    user = {
+        "discovery_budget": {"week": _week_key(NOW), "runs_this_week": 9},
+        "scoring_budget": {"day": NOW.date().isoformat(), "jobs_scored_today": 2},
+    }
+    cl, db = client(user=user)
+    before = deepcopy(db.users["u1"])
+
+    first = _allowance(cl)
+    for _ in range(5):
+        assert _allowance(cl) == first
+
+    # Not just "the numbers didn't move": the stored document is untouched.
+    # The fake honours ``set``, so a debit written back would show up here.
+    assert db.users["u1"] == before
+
+
+def test_allowance_is_whole_even_for_a_user_with_no_budget_state(client):
+    """A fresh account has neither map. It has its full allowance, not zero."""
+    cl, _ = client(user={})
+    allowance = _allowance(cl)
+    for block in ("searches", "ratings"):
+        assert allowance[block]["used"] == 0
+        assert allowance[block]["resets_at"].endswith("+00:00")
+    assert allowance["searches"]["remaining"] == allowance["searches"]["limit"]
+    assert allowance["ratings"]["remaining"] == allowance["ratings"]["limit"]
+
+
+def test_allowance_reports_the_grant_the_next_reservation_would_make(
+    client, monkeypatch
+):
+    """The cycle window binds too, and **no clock clears it**.
+
+    The reviewer's case, verbatim: this search's window is rated out, the UTC
+    day has since rolled, and ``auto_discovery`` is off so nothing will open a
+    new cycle. The daily counter says three are free; an ad-hoc score task
+    asking right now would be granted **zero**. Reporting the daily figure
+    here promises ratings the very next reservation refuses.
+    """
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "3")
+    monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "3")
+    monkeypatch.setattr(
+        activity, "_now", lambda: datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+    )
+    cl, _ = client(
+        user={
+            "discovery_settings": {"auto_discovery": False},
+            "scoring_budget": {
+                "day": "2026-09-28",
+                "jobs_scored_today": 3,
+                "cycle_id": "c1",
+                "jobs_scored_this_cycle": 3,
+            },
+        }
+    )
+    ratings = _allowance(cl)["ratings"]
+
+    # The day genuinely rolled — nothing has been rated today.
+    assert ratings["used"] == 0
+    assert ratings["limit"] == 3
+    # But the open cycle is spent, so that is what a request would get.
+    assert ratings["remaining"] == 0
+    # And the block says *which* window is binding, because the reset instant
+    # above is not the answer: only a new search opens a new cycle.
+    assert ratings["remaining_cycle"] == 0
+
+    # Exactly what a real reservation would grant, asked the same way every
+    # ad-hoc scorer asks (``cycle_id=None`` — draw on the open window).
+    _state, res = matching_budget.apply_reservation(
+        {
+            "day": "2026-09-28",
+            "jobs_scored_today": 3,
+            "cycle_id": "c1",
+            "jobs_scored_this_cycle": 3,
+        },
+        3,
+        now=datetime(2026, 9, 29, 12, 0, tzinfo=UTC),
+        cycle_id=None,
+        limits=matching_budget.Limits(3, 3),
+    )
+    assert res.granted == ratings["remaining"] == 0
+
+
+def test_allowance_remaining_is_the_day_when_the_day_is_what_binds(client, monkeypatch):
+    """The mirror case, so the fix cannot be "always report zero"."""
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "3")
+    monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "3")
+    cl, _ = client(
+        user={
+            "scoring_budget": {
+                "day": NOW.date().isoformat(),
+                "jobs_scored_today": 2,
+                "cycle_id": "c1",
+                "jobs_scored_this_cycle": 0,
+            }
+        }
+    )
+    ratings = _allowance(cl)["ratings"]
+    assert ratings["used"] == 2
+    assert ratings["remaining"] == 1  # the day, not the cycle's untouched 3
+    assert ratings["remaining_cycle"] == 3
+
+
+def test_allowance_reports_ratings_actually_used_not_the_cap(client, monkeypatch):
+    """#92 cut the daily cap 400 -> 3 **mid-day**. An account holding 46 rated
+    jobs under the old cap must read 46, not the new limit.
+
+    ``limit - remaining`` clamps, and clamping here understates what was
+    spent, which is the direction this whole program exists to stop.
+    """
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "3")
+    monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "3")
+    cl, _ = client(
+        user={
+            "scoring_budget": {
+                "day": NOW.date().isoformat(),
+                "jobs_scored_today": 46,
+                "jobs_scored_this_cycle": 46,
+            }
+        }
+    )
+    ratings = _allowance(cl)["ratings"]
+    assert ratings["used"] == 46
+    assert ratings["limit"] == 3
+    assert ratings["remaining"] == 0
+    # And searches read the same way — the real counter, over the cap.
+    over, _ = client(
+        user={"discovery_budget": {"week": _week_key(NOW), "runs_this_week": 40}}
+    )
+    searches = _allowance(over)["searches"]
+    assert searches["used"] == 40
+    assert searches["remaining"] == 0

@@ -148,24 +148,9 @@ export function saveMinScore(v: number): void {
   writeStored("local", MIN_SCORE_KEY, String(v));
 }
 
-// ---- First-run flag (set after onboarding; drives the mock-06 states) ----
-
-const FIRST_RUN_KEY = "hermes:firstRun";
-const FIRST_RUN_TTL = 5 * 60_000;
-
-export function markFirstRun(): void {
-  writeStored("session", FIRST_RUN_KEY, String(Date.now()));
-}
-
-export function clearFirstRun(): void {
-  writeStored("session", FIRST_RUN_KEY, null);
-}
-
-function parseFirstRun(raw: string | null): boolean {
-  const at = Number(raw);
-  return raw !== null && Number.isFinite(at) && Date.now() - at < FIRST_RUN_TTL;
-}
-
-export function useFirstRun(): boolean {
-  return useStored("session", FIRST_RUN_KEY, parseFirstRun, false);
-}
+// The first-run flag ("hermes:firstRun", a 5-minute session marker written at
+// the end of onboarding) lived here. It drove `DiscoveryPill` and
+// `ScoringCard` on /app, both of which asserted that work was happening on
+// the strength of it and had no way of knowing. Those are gone, the panel
+// renders `GET /activity` instead, and nothing reads a clock to decide what
+// the backend is doing. Deleted rather than left as dead exports.

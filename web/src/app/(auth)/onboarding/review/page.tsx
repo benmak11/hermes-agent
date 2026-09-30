@@ -10,7 +10,6 @@ import { useEffect, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { APP_HOME } from "@/lib/nav";
-import { markFirstRun } from "@/lib/session";
 import type { Profile, ProfileResponse } from "@/lib/types";
 import { initial, resolveUserAvatar } from "@/lib/ui";
 import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
@@ -72,10 +71,7 @@ export default function OnboardingReviewPage() {
   const save = useMutation({
     mutationFn: (profile: Profile) =>
       apiFetch("/profile", { method: "PUT", body: JSON.stringify(profile) }),
-    onSuccess: () => {
-      markFirstRun();
-      setSaved(true);
-    },
+    onSuccess: () => setSaved(true),
   });
 
   // After the celebratory "Profile saved" beat, drop the user into the queue.

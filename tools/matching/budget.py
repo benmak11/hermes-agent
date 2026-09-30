@@ -71,7 +71,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from enum import Enum
 
 from google.cloud import firestore
@@ -245,6 +245,53 @@ def apply_release(
         return None
     refunded["updated_at"] = now.isoformat()
     return refunded
+
+
+def used(state: dict | None, *, now: datetime) -> int:
+    """Jobs rated on the UTC day ``now`` falls in. Pure, and read-only.
+
+    The read-only twin of the day counter inside :func:`apply_reservation`,
+    and the exact shape ``tools.discovery.budget.used`` already has. A stored
+    counter from a *previous* day reads as zero here, which is the same lazy
+    rollover the next reservation will apply.
+
+    **It reports the counter, not the cap.** Deriving it as
+    ``per_day - remaining`` clamps at the limit, which is a lie in one real
+    situation: ``SCORING_BUDGET_PER_DAY`` was cut from 400 to 3 in #92, so an
+    account that had rated 46 jobs when the new value took effect would read
+    "3 of 3" instead of "46 of 3". What happened is knowable, and a surface
+    that rounds it down to the cap is understating spend — the direction this
+    program exists to stop.
+    """
+    state = dict(state or {})
+    if state.get("day") != now.date().isoformat():
+        return 0
+    return _count(state, "jobs_scored_today")
+
+
+def resets_at(now: datetime) -> str:
+    """When ``jobs_scored_today`` rolls, as an **ISO instant** in UTC.
+
+    The daily counter's window is keyed by ``now.date()`` in
+    :func:`apply_reservation`, so the instant it rolls is midnight at the start
+    of the *next* such date — derived from the same ``now`` rather than
+    assumed to be UTC midnight, so this can never disagree with the key the
+    next reservation will compute. Every caller passes an aware UTC ``now``
+    today, which makes that next UTC midnight.
+
+    Never a formatted local time: the client renders it, exactly as
+    ``tools.discovery.budget.resets_at`` does for the weekly window. Note the
+    two are **different instants** — searches roll on Monday, ratings nightly —
+    and a surface showing both must show both.
+
+    The *cycle* counter deliberately has no reset instant, because it has no
+    time-based rollover at all: only a new ``cycle_id`` clears it (see
+    :func:`apply_reservation`). Inventing a clock for it here would be the
+    fabricated-progress bug in a different hat.
+    """
+    tz = now.tzinfo or UTC
+    tomorrow = datetime.combine(now.date() + timedelta(days=1), time.min, tzinfo=tz)
+    return tomorrow.astimezone(UTC).isoformat()
 
 
 def summary(reservation: Reservation | None, *, drawn: int | None = None) -> dict:
