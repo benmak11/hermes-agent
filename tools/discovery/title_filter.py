@@ -17,10 +17,19 @@ rule below should be obvious for a human screener too.
 
 Dropped jobs get no tombstone: they are re-fetched and re-filtered next run,
 which is free.
+
+**The one-sided map.** The rules below were written for the families the user
+*wants*, so a replay of the live 8,882-job backlog drops nothing at all: 63%
+of it classifies as ``None`` and is kept. Precision-over-recall is the right
+contract, but a keyword map with holes in it degrades that contract into "keep
+everything". :data:`_WIDE_RULES` closes the measured holes, and ships behind
+``TITLE_FILTER_WIDE`` (default **off**, the ``GEO_GATE_ENFORCE`` precedent) so
+the rules can be measured by ``cli.title_replay`` before they act on anyone.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 
@@ -32,6 +41,11 @@ from models.profile import JobPreferences
 from obs.logging import get_logger
 
 log = get_logger("tools.discovery.title_filter")
+
+# Bumped whenever a rule changes, mirroring ``geo.GATE_VERSION``: a drop made
+# under one version of the map has to be resolvable against a later one.
+# Nothing stamps it yet — the filter writes no tombstones.
+TITLE_FILTER_VERSION = 1
 
 # Titles that straddle families (or read differently to different screeners).
 # These short-circuit to "unclassified" so Flash decides, never a keyword.
@@ -132,19 +146,216 @@ _RULES: list[tuple[str, re.Pattern]] = [
 ]
 
 
-def classify_title(title: str) -> str | None:
-    """Best-effort role family for a job title; None when not confident."""
+# The widened map, off by default. Every rule here closes a hole measured in
+# the live backlog.
+#
+# **What makes these rules safe is the ordering, not the wording.** They run
+# last, and only on titles _AMBIGUOUS and _RULES both had nothing to say
+# about, so widening can turn "kept because we don't know" into a drop but
+# can never overrule either. Do not read the phrases below as safe in
+# themselves: "user acquisition", "ad operations", "paid media", "customer
+# onboarding", "growth marketing" and "project management" all occur in real
+# engineering titles, and every one of them is neutralised by an earlier rule
+# matching first, not by the noun being unambiguous.
+#
+# So the test a new rule has to pass is not "does this phrase sound
+# out-of-family" — it is "is every title containing it already caught by
+# _AMBIGUOUS or _RULES, and is it still out-of-family when it isn't". Both
+# times that test was skipped the replay caught it: \bwarehouse\b against
+# *Data Warehouse Engineer*, and \bunderwriting\b against a *Machine Learning
+# Engineer, Capital Underwriting* that Pro scored 53. \bdriver\b (device
+# driver engineer) and \bscheduler\b were rejected the same way.
+#
+# The ordering was learned the same way. The first cut ran these rules first
+# and the replay caught it dropping eleven jobs the narrow map calls
+# engineering, among them *Staff Engineer - Customer Onboarding*.
+#
+# Left deliberately unclassified, and therefore kept: QA, security, web
+# developer, integration developer, solutions engineer, sales engineer, data
+# annotation, program manager, business analyst. They are engineering-adjacent
+# or genuinely ambiguous, and an unclassified title is kept while a
+# misclassified one is dropped and never seen again.
+_WIDE_RULES: list[tuple[str, re.Pattern]] = [
+    (
+        "marketing",
+        re.compile(
+            r"""
+            \bmarketing\s+(and\s+|&\s+)?
+                (sales|specialist|manager|associate|coordinator|assistant|
+                 executive|intern)\b |
+            \bppc\b |                                  # pay-per-click
+            \buser\s+acqui\w* |                        # …acquisition, and the
+                                                       # backlog's misspelling
+                                                       # of it
+            \b(paid|performance)\s+(media|search|social|acquisition)\b |
+            \bmedia\s+buyer\b |
+            \bplayable\s+ads?\b |
+            \b(ad|ads|advertising)\s+
+                (editor|creative|operations|ops|specialist|manager|buyer|
+                 trafficker)\b |
+            \bgrowth\s+(marketer|marketing|specialist|associate|coordinator)\b
+            """,
+            re.VERBOSE,
+        ),
+    ),
+    (
+        "sales",
+        re.compile(
+            r"""
+            \b(client|customer|revenue)\s+growth\s+(manager|lead|director)\b |
+            \baccount\s+(director|coordinator|specialist|associate|supervisor)\b |
+            \bterritory\s+(manager|representative)\b
+            """,
+            re.VERBOSE,
+        ),
+    ),
+    (
+        "customer-success",
+        re.compile(
+            r"""
+            \b(client|customer)\s+
+                (care|relations|advocate|onboarding|engagement)\b |
+            \bclient\s+success\b |
+            \b(call|contact)\s+cent(er|re)\b
+            """,
+            re.VERBOSE,
+        ),
+    ),
+    (
+        # No "program/project" family exists in the ParsedJD taxonomy, and
+        # delivery management sits closer to product than to operations.
+        # _AMBIGUOUS keeps *program* manager unclassified (it is often an
+        # engineering title); *project* manager is the one the backlog leaks.
+        "product",
+        re.compile(
+            r"""
+            # No "lead": *Engineering Project Lead* is an IC engineering
+            # title, while *Project Manager* is a delivery role in any
+            # industry.
+            \bproject\s+(manager|management|coordinator)\b |
+            \bscrum\s+master\b |
+            \bproduct\s+(analyst|specialist|operations)\b
+            """,
+            re.VERBOSE,
+        ),
+    ),
+    ("design", re.compile(r"\bart\s+director\b")),
+    (
+        "finance",
+        re.compile(
+            r"""
+            \baccounts\s+(payable|receivable)\b | \bbookkeep\w* |
+            # \bunderwriter\b only: "…- Underwriting" is a *domain*, and
+            # engineers are hired into it.
+            \bunderwriter\b | \bactuar(y|ial)\b |
+            \bcredit\s+analyst\b | \bcollections\s+specialist\b
+            """,
+            re.VERBOSE,
+        ),
+    ),
+    (
+        "people",
+        re.compile(
+            r"""
+            \bsourcer\b | \bstaffing\b | \bhris\b |
+            \bbenefits\s+(specialist|administrator|manager)\b |
+            \bcompensation\s+(analyst|manager|partner)\b
+            """,
+            re.VERBOSE,
+        ),
+    ),
+    (
+        "legal",
+        re.compile(
+            r"""
+            \bcontracts?\s+(manager|specialist|administrator)\b |
+            \blitigation\b | \bregulatory\s+affairs\b
+            """,
+            re.VERBOSE,
+        ),
+    ),
+    (
+        "operations",
+        re.compile(
+            r"""
+            \bdata\s+entry\b | \breceptionist\b | \bdispatcher?\b |
+            # Qualified, because *Data Warehouse Engineer* is engineering.
+            \bwarehouse\s+(associate|worker|clerk|operative|supervisor)\b |
+            \bcustodian\b | \bjanitor\w* | \bcourier\b |
+            \bvirtual\s+assistant\b |
+            \binventory\s+(clerk|specialist|manager|analyst)\b
+            """,
+            re.VERBOSE,
+        ),
+    ),
+]
+
+# Every outcome :func:`evaluate_title` can return. Only "drop" loses a job.
+OUTCOMES = ("no-filter", "target-title", "in-family", "unclassified", "drop")
+
+
+def wide_enabled() -> bool:
+    """Whether the widened out-of-family rules are switched on.
+
+    Off by default and read per call, exactly like
+    ``tools.matching.pipeline.geo_enforce_enabled``: the flag is hand-set
+    Cloud Run env, and a module-level constant would pin whatever the process
+    started with.
+    """
+    return os.getenv("TITLE_FILTER_WIDE", "").strip().lower() in {"1", "true", "on"}
+
+
+def classify_title(title: str, *, wide: bool | None = None) -> str | None:
+    """Best-effort role family for a job title; None when not confident.
+
+    ``wide`` overrides the ``TITLE_FILTER_WIDE`` env flag, which is what lets
+    ``cli.title_replay`` measure the candidate map without switching it on for
+    anybody. Leave it ``None`` in production code.
+    """
     t = title.lower()
     if _AMBIGUOUS.search(t):
+        # Not confident, so: kept. The wide rules do not get a second opinion
+        # here — _AMBIGUOUS is built out of the user's own target nouns, and
+        # letting the wide map resolve one of them is how *Machine Learning
+        # Engineer, Capital Underwriting* got dropped.
         return None
     for family, pattern in _RULES:
         if pattern.search(t):
             return family
+    if wide_enabled() if wide is None else wide:
+        # Reached only when neither the ambiguity guard nor the narrow map
+        # has anything to say, so the widening can add drops and can never
+        # move a job either of them already placed.
+        for family, pattern in _WIDE_RULES:
+            if pattern.search(t):
+                return family
     return None
 
 
+def evaluate_title(
+    title: str, preferences: JobPreferences | None, *, wide: bool | None = None
+) -> tuple[str, str | None]:
+    """``(outcome, family)`` for one title — the whole pre-filter decision.
+
+    Split out of :func:`prefilter_jobs` so the replay CLI measures the
+    function discovery actually runs, rather than a re-implementation of it
+    that can drift into flattering the map.
+    """
+    if preferences is None or not preferences.target_role_families:
+        return "no-filter", None
+    t = title.lower()
+    if any(w.lower() in t for w in preferences.target_titles):
+        return "target-title", None
+    family = classify_title(t, wide=wide)
+    if family is None:
+        return "unclassified", None
+    if family in {f.lower() for f in preferences.target_role_families}:
+        return "in-family", family
+    return "drop", family
+
+
 def prefilter_jobs(
-    jobs: list[Job], preferences: JobPreferences | None
+    jobs: list[Job], preferences: JobPreferences | None, *, wide: bool | None = None
 ) -> tuple[list[Job], Counter[str]]:
     """Split fetched jobs into (kept, dropped-count-by-family).
 
@@ -155,28 +366,27 @@ def prefilter_jobs(
     if preferences is None or not preferences.target_role_families:
         return jobs, Counter()
 
-    targets = {f.lower() for f in preferences.target_role_families}
-    wanted_titles = [t.lower() for t in preferences.target_titles]
-
     kept: list[Job] = []
     dropped: Counter[str] = Counter()
     for job in jobs:
-        title = job.title.lower()
-        if any(w in title for w in wanted_titles):
-            kept.append(job)
-            continue
-        family = classify_title(title)
-        if family is None or family in targets:
-            kept.append(job)
-        else:
+        outcome, family = evaluate_title(job.title, preferences, wide=wide)
+        if outcome == "drop" and family is not None:
             dropped[family] += 1
+        else:
+            kept.append(job)
 
     if dropped:
+        # ``wide`` and ``version`` are stamped because the moment the flag
+        # flips this line is the only production evidence of what the
+        # widening did, and a wide drop is otherwise indistinguishable from a
+        # narrow one. ``geo`` stamps GATE_VERSION for the same reason.
         log.info(
             "discovery.title_filtered",
             dropped=sum(dropped.values()),
             kept=len(kept),
             by_family=dict(dropped),
+            wide=wide_enabled() if wide is None else wide,
+            version=TITLE_FILTER_VERSION,
         )
     return kept, dropped
 
