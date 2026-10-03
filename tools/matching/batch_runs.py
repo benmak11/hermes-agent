@@ -88,6 +88,7 @@ from tools.matching.score import (
     persist_jd_parsed,
     persist_result,
     score_pending_jobs,
+    scored_with,
     unbudgeted_limit,
 )
 from tools.run_costs import DONE, FAILED, RUNNING, persist_run_cost
@@ -401,6 +402,32 @@ async def _persist_prefiltered(ref, job: Job, match, geo_gate: dict | None) -> s
     given, and it stays that dumb on purpose, so a keyword-only argument needs a
     shim rather than a smarter helper. Deliberately passes no ``profile``: see
     the note at the call site.
+
+    **Deliberately passes no ``provenance`` either, so these tombstones carry
+    no ``scored_with`` at all.** No scoring model was called: the match is a
+    ``pipeline.OUT_OF_FAMILY`` / ``GEO_INELIGIBLE`` sentinel at score 0 from a
+    free local rule, so ``match_model`` could only ever be ``None``. And the
+    parse is not attributable from here either — ``_submit_score_stage``
+    reaches this function from two entries and
+    ``load_profile_and_pending`` hands it documents, not history:
+
+    - from :func:`resume`'s score-submit path, the parse belongs to an earlier
+      leg in an earlier process, and nothing carries its model across;
+    - from :func:`_ingest_parse`, this *same* process did just parse those
+      jobs with ``BATCH_FLASH_MODEL`` — but that fact lives in the ingest
+      frame, not in the reloaded documents, and the shim cannot see it.
+
+    A record whose only non-null field is ``scored_at`` dates a write, not a
+    score, so the honest answer is no record. Absent rather than a dict of
+    nulls, matching ``geo_gate``'s rule in ``score.discard_tombstone``.
+
+    **Known cost, accepted here:** the same OUT_OF_FAMILY job scored through
+    ``batch.py`` gets ``parse_model: gemini-2.5-flash`` while this path gets
+    nothing. That is information loss, never a wrong attribution — the safe
+    direction. Closing it means threading the parse model through the
+    ``batch_runs`` document so a later leg can read it back, which is a
+    schema change on a live resumable-run record and belongs to its own task,
+    not to this one.
     """
     return await persist_result(ref, job, match, geo_gate=geo_gate)
 
@@ -639,8 +666,18 @@ async def _ingest_score(db, run_ref, run: dict) -> dict[str, int]:
     # tuples it is given at whatever persister it is given, and it stays that
     # dumb on purpose — ``_submit_score_stage`` hands it the same function with
     # no profile bound at all.
+    # ``BATCH_PRO_MODEL``, because that is the model whose output is being
+    # ingested right here — not ``PRO_MODEL``, even though they are currently
+    # the same string: these are two independently declared constants and the
+    # reason this task exists is that one of them can move without the other.
+    # ``parse_model`` is ``None`` on purpose: the parse leg ran in an earlier
+    # process and this stateless ingest reloads the parsed documents without
+    # any record of what produced them, so naming a model here would be a
+    # guess. One timestamp for the whole ingest is correct — it is one write
+    # pass, and ``scored_at`` dates the record, not each document.
+    provenance = scored_with(parse_model=None, match_model=BATCH_PRO_MODEL)
     for outcome in await _persist_all(
-        to_persist, partial(persist_result, profile=profile)
+        to_persist, partial(persist_result, profile=profile, provenance=provenance)
     ):
         counts[outcome] = counts.get(outcome, 0) + 1
 

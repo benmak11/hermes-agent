@@ -26,6 +26,9 @@ from obs.logging import current_run_id, get_logger
 from tools.matching import budget, geo, jd_cache
 from tools.matching.pipeline import (
     FLASH_MODEL,
+    MATCH_PROMPT_VERSION,
+    PARSE_PROMPT_VERSION,
+    PRO_MODEL,
     create_match_cache,
     delete_match_cache,
     geo_enforce_enabled,
@@ -378,6 +381,78 @@ def count_geo_gate(counts: dict, record: dict | None) -> None:
 EMPTY_GEO_COUNTS = {"geo_ineligible": 0, "geo_abstain": 0, "geo_skipped": 0}
 
 
+# ------------------------------------------------------- score attribution
+#
+# A score is only comparable to another score if you know what produced it.
+# Until this existed, nothing in Firestore recorded either half of that: the
+# prompts live in git but the documents carry no pointer at git, and
+# ``FLASH_MODEL`` is ``gemini-flash-latest`` — a *moving alias* that can start
+# serving a different model with no commit in this repo at all.
+#
+# The one rule that makes this record worth having: **stamp the leg that
+# actually ran in this call, never the constant that names the leg that
+# usually runs.** The batch path parses with ``batch.BATCH_FLASH_MODEL``
+# (``gemini-2.5-flash``), not ``FLASH_MODEL`` — batch prediction rejects
+# aliases, so they are genuinely different models — and a batch-scored job
+# stamped from the online constant records a lie that nothing downstream can
+# ever detect. Hence the models are threaded in from the caller and this
+# module never reaches for one itself.
+
+
+def scored_with(*, parse_model: str | None, match_model: str | None) -> dict:
+    """Provenance for one scoring outcome: what ran, under which prompts, when.
+
+    ``parse_model`` / ``match_model`` are the ids the **caller actually
+    called**, or ``None`` for a leg that did not run in this call. ``None`` is
+    load-bearing in both directions:
+
+    - ``match_model is None`` means **no scoring model ran** — the outcome came
+      from the free pre-filter (``pipeline.OUT_OF_FAMILY`` /
+      ``GEO_INELIGIBLE``), not from Pro. A consumer filtering for "jobs a model
+      scored" tests this key, not the presence of a score.
+    - ``parse_model is None`` means this call did not pay for a parse: the job
+      arrived already parsed (an earlier run, a batch parse leg, a ``jd_cache``
+      hit), and which model produced that parse is not knowable from here.
+      Guessing it from today's constant is exactly the lie this record exists
+      to prevent.
+
+    Each prompt version is stamped only beside the model it versions, for the
+    same reason: a ``parse_prompt_version`` next to a ``parse_model: None``
+    would be claiming to know which prompt produced a parse this call never
+    made.
+
+    **What the absence of the whole record proves is weaker than the above,
+    and says so here rather than in a consumer's head.** A document with no
+    ``scored_with`` is one of three things, and the key alone cannot separate
+    them:
+
+    1. nothing ran — ``batch_runs._persist_prefiltered``;
+    2. it was scored before this field existed;
+    3. a gap: some future writer forgot to thread the record through.
+
+    (1) is separately discriminable — those documents score exactly 0 and
+    carry a ``pipeline.OUT_OF_FAMILY`` / ``GEO_INELIGIBLE`` sentinel — so in
+    practice a consumer can get there, but by *joining on the score*, not by
+    reading this key. ``cli.purge_discarded`` used to be a fourth case and is
+    not: it carries the record over (``backfill_tombstone``), because a
+    Pro-scored job demoted by a threshold change would otherwise land in
+    ``discarded_jobs`` looking like case (1), which is the opposite of true.
+
+    ``scored_at`` is a **tz-aware** UTC instant. Naive timestamps from
+    ``utcnow()`` compare wrong against everything else written here (the job
+    doc's own ``scored_at``, ``discarded_at``, the decision log), and a
+    provenance record whose timestamps cannot be ordered against the data they
+    describe is not provenance.
+    """
+    return {
+        "parse_model": parse_model,
+        "match_model": match_model,
+        "parse_prompt_version": PARSE_PROMPT_VERSION if parse_model else None,
+        "match_prompt_version": MATCH_PROMPT_VERSION if match_model else None,
+        "scored_at": datetime.now(UTC).isoformat(),
+    }
+
+
 def restore_payload(job: Job) -> dict:
     """Everything needed to rebuild this ``Job`` from its tombstone, later.
 
@@ -414,6 +489,7 @@ def discard_tombstone(
     scored_run_id: str | None = None,
     geo_gate: dict | None = None,
     restore: dict | None = None,
+    provenance: dict | None = None,
 ) -> dict:
     """Minimal `discarded_jobs` record.
 
@@ -431,6 +507,17 @@ def discard_tombstone(
     geo gate issued under enforcement. Every other tombstone is a *Pro*
     decision: reversing it would need the Pro call re-run, not a stored copy of
     the job, so carrying the payload there would be pure weight.
+
+    ``provenance`` is :func:`scored_with`, landing under the ``scored_with``
+    key. It is explicit for the same reason the two above are — only the
+    caller knows which models it called — and absent rather than null when
+    there is nothing to say, matching ``geo_gate``'s rule: "we didn't look"
+    and "we looked and found nothing" have to stay distinguishable. Note a
+    backfill is **not** automatically a case of nothing to say:
+    ``cli.purge_discarded`` reads the record off the job doc it is demoting
+    and passes it here. Tombstones carry it as well as job docs
+    because ~71% of everything ever scored ends up here; a provenance record
+    that covers only the survivors cannot date the negatives.
     """
     stone = {
         "job_id": job.id,
@@ -469,6 +556,8 @@ def discard_tombstone(
         stone["geo_gate"] = geo_gate
     if restore is not None:
         stone["restore"] = restore
+    if provenance is not None:
+        stone["scored_with"] = provenance
     return stone
 
 
@@ -524,6 +613,7 @@ async def persist_result(
     *,
     profile: MasterProfile | None = None,
     geo_gate: dict | None = None,
+    provenance: dict | None = None,
 ) -> str:
     """Persist one scoring outcome; returns ``"discarded"`` or ``"scored"``.
 
@@ -544,6 +634,20 @@ async def persist_result(
     enforced skip is exactly a record with no Pro decision. Passing it here also
     keeps the record and the ``restore`` payload written by the same statement,
     so a tombstone can never come out carrying one and not the other.
+
+    ``provenance`` is :func:`scored_with` and lands under ``scored_with`` on
+    whichever document this call writes — job doc beside ``match`` and
+    ``geo_gate``, tombstone beside ``jd_parsed``. It is passed in rather than
+    built here because **this function does not know which models ran**: the
+    batch scorers use ``batch.BATCH_FLASH_MODEL`` / ``BATCH_PRO_MODEL`` and
+    the online one uses ``FLASH_MODEL`` / ``PRO_MODEL``, and the Flash ids are
+    not the same model. Building the record here off an imported constant
+    would stamp every batch-scored job with the online alias — a wrong
+    attribution that is indistinguishable from a right one forever after.
+
+    Absent, not null, when omitted, so a caller with nothing to attribute
+    keeps writing exactly the document it wrote before — and see
+    :func:`scored_with` for what that absence does and does not prove.
 
     This is the seam the recording hangs off rather than ``match_job`` because
     it is the *one* function all three scorers go through. Instrumenting the
@@ -568,6 +672,7 @@ async def persist_result(
                     scored_run_id=current_run_id(),
                     geo_gate=geo_gate,
                     restore=restore,
+                    provenance=provenance,
                 )
             )
         )
@@ -590,6 +695,8 @@ async def persist_result(
     }
     if geo_gate is not None:
         fields["geo_gate"] = geo_gate
+    if provenance is not None:
+        fields["scored_with"] = provenance
     if should_explore(job, match, geo_gate):
         # Written only when the job is actually sampled — never as ``False``.
         # At the default rate of 0 this branch never runs, so the job doc, and
@@ -755,6 +862,12 @@ async def _score_pending(
 
     async def _score(ref, job: Job) -> None:
         async with sem:
+            # The parse model *this call* paid for, or None when it did not:
+            # a job that arrived already parsed, or whose parse came free out
+            # of jd_cache, was produced by some earlier run under some other
+            # model, and this scorer cannot know which. See
+            # :func:`scored_with`.
+            parse_model: str | None = None
             try:
                 # Parse here (not inside match_job) so the result is durable
                 # before the Pro call gets a chance to fail. Cheapest source
@@ -763,6 +876,7 @@ async def _score_pending(
                     job.jd_parsed = await jd_cache.lookup(db, job.jd_raw)
                     if job.jd_parsed is None:
                         job.jd_parsed = await parse_jd(job)
+                        parse_model = FLASH_MODEL
                         await jd_cache.store(
                             db, job.jd_raw, job.jd_parsed, model=FLASH_MODEL
                         )
@@ -790,14 +904,38 @@ async def _score_pending(
                     else:
                         counts["geo_skipped"] += 1
                     outcome = await persist_result(
-                        ref, job, skipped, profile=profile, geo_gate=enforced
+                        ref,
+                        job,
+                        skipped,
+                        profile=profile,
+                        geo_gate=enforced,
+                        # No ``match_model``: the pre-filter is a free local
+                        # rule, and a record claiming Pro ran on a job Pro
+                        # never saw is the worst thing this field could do.
+                        # The parse leg is still attributed when this call is
+                        # what paid for it — the tombstone keeps that parse as
+                        # its only features (see ``discard_tombstone``), so
+                        # the prompt that produced them is worth knowing.
+                        provenance=scored_with(
+                            parse_model=parse_model, match_model=None
+                        )
+                        if parse_model
+                        else None,
                     )
                     counts[outcome] += 1
                     if on_result:
                         on_result(job, skipped, None)
                     return
                 match = await match_job(job, profile, cached_content=cache_name)
-                outcome = await persist_result(ref, job, match, profile=profile)
+                outcome = await persist_result(
+                    ref,
+                    job,
+                    match,
+                    profile=profile,
+                    provenance=scored_with(
+                        parse_model=parse_model, match_model=PRO_MODEL
+                    ),
+                )
                 counts[outcome] += 1
                 # Recomputed rather than handed back by persist_result: the
                 # gate is pure and costs microseconds, and one definition of

@@ -28,6 +28,35 @@ load_dotenv()
 log = get_logger("cli.purge_discarded")
 
 
+def backfill_tombstone(job: Job, match: JobMatch, doc: dict) -> dict:
+    """The tombstone for a job this purge is moving, carrying the doc's own
+    history rather than this run's.
+
+    Both fields come off the job document because **this purge spends
+    nothing**. It makes no model call and takes no budget reservation, so
+    anything it stamps from the ambient context describes the purge, not the
+    score.
+
+    - ``scored_run_id``: stamping this run's would misattribute the tombstone,
+      and tombstones are where most of a cycle's spend lands.
+    - ``scored_with``: the job was scored by a real model under a real prompt,
+      and the record of that is sitting right here in ``doc``. Dropping it
+      would be worse than never having had it: ``discard_tombstone`` treats an
+      absent ``scored_with`` as "no scoring model ran" (that is what
+      ``batch_runs._persist_prefiltered`` means by it), so a Pro-scored job
+      demoted by a threshold change would land in ``discarded_jobs`` asserting
+      the exact opposite of the truth. ``None`` for a job scored before the
+      field existed, which is the honest answer and the one the key already
+      has everywhere else.
+    """
+    return discard_tombstone(
+        job,
+        match,
+        scored_run_id=doc.get("scored_run_id"),
+        provenance=doc.get("scored_with"),
+    )
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--user-id", required=True)
@@ -61,13 +90,7 @@ async def main() -> None:
             await (
                 user_ref.collection("discarded_jobs")
                 .document(job.id)
-                .set(
-                    # Carry over the run that paid to score this job, if the
-                    # doc has one. This purge spends nothing, so stamping its
-                    # own run_id would misattribute the tombstone — and
-                    # tombstones are where most of a cycle's spend lands.
-                    discard_tombstone(job, match, scored_run_id=d.get("scored_run_id"))
-                )
+                .set(backfill_tombstone(job, match, d))
             )
             await snap.reference.delete()
         moved += 1

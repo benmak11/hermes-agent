@@ -206,6 +206,9 @@ def harness(monkeypatch, unlimited_budget):
         # (job_id, geo_gate): non-None only for a gate-enforced skip, which
         # carries its verdict explicitly instead of through the shadow path.
         persist_gates=[],
+        # (job_id, provenance): the ``scored_with`` record, which must name
+        # the BATCH models — the online constants are a different Flash.
+        persist_provenance=[],
         cache_hits={},  # lookup_many return value
         online_calls=[],
         cost_flushes=[],  # (user_id, run_id, meta) banked by persist_run_cost
@@ -235,10 +238,13 @@ def harness(monkeypatch, unlimited_budget):
     async def fake_persist_jd_parsed(ref, job):
         rec.jd_persisted.append(job.id)
 
-    async def fake_persist_result(ref, job, match, *, profile=None, geo_gate=None):
+    async def fake_persist_result(
+        ref, job, match, *, profile=None, geo_gate=None, provenance=None
+    ):
         rec.results.append((job.id, match.overall_score))
         rec.persist_profiles.append((job.id, profile))
         rec.persist_gates.append((job.id, geo_gate))
+        rec.persist_provenance.append((job.id, provenance))
         return "discarded" if match.overall_score <= 20 else "scored"
 
     monkeypatch.setattr(batch_runs, "submit_batch", fake_submit)

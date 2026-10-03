@@ -34,6 +34,7 @@ import api.routes.jobs as jobs_mod
 from api.deps import verify_user
 from models.job import Job
 from tools import decisions
+from tools.matching import score
 
 # --- fakes ------------------------------------------------------------------
 
@@ -270,8 +271,9 @@ def test_a_scored_jobs_snapshot_is_read_from_the_match_map(world, events):
         "overall_score": 78.5,
         "breakdown": {"skills": 30, "seniority": 20, "domain": 28.5},
         "recommendation": "apply",
-        # Task 3 writes the model and prompt versions; the key exists now so
-        # the documents have one shape across that change.
+        # No ``scored_with`` on this document: it was scored before that field
+        # existed. ``None`` is the honest answer, and the next two tests pin
+        # that it is not quietly replaced by today's constants.
         "scored_with": None,
     }
 
@@ -298,6 +300,44 @@ def test_the_snapshot_is_the_score_at_decision_time_not_after(world, events):
 
     assert events[0]["score_snapshot"]["overall_score"] == 78.5
     assert events[1]["score_snapshot"]["overall_score"] == 12.0
+
+
+def test_a_job_scored_before_this_pr_gets_a_null_scored_with(world, events):
+    """The whole point of the provenance record is that a score can be dated.
+    A job scored in October and decided in December carries no ``scored_with``
+    — and filling that in from the constants *at decision time* would date it
+    to December, asserting a comparability that is exactly backwards. ``None``
+    is a fact; a reconstruction is a fabrication that nothing downstream can
+    ever catch."""
+    client, _, _ = world(_job(match=dict(MATCH)))  # no ``scored_with`` key
+
+    client.post("/jobs/job1/decide", json={"decision": "approved"})
+
+    snap = events[0]["score_snapshot"]
+    assert snap is not None  # it *was* scored — that distinction is separate
+    assert snap["scored_with"] is None
+    # Not a record that merely looks empty, and not one built from the live
+    # constants either.
+    assert score.PRO_MODEL not in repr(snap)
+
+
+def test_a_newly_scored_job_carries_its_real_provenance(world, events):
+    """The other half: when the document does carry the record, the event must
+    carry it through verbatim — a snapshot that drops it leaves the label
+    store exactly as unattributable as it was before."""
+    provenance = score.scored_with(
+        parse_model="gemini-2.5-flash", match_model=score.PRO_MODEL
+    )
+    client, _, _ = world(_job(match=dict(MATCH), scored_with=provenance))
+
+    client.post("/jobs/job1/decide", json={"decision": "approved"})
+
+    assert events[0]["score_snapshot"]["scored_with"] == provenance
+    # Read off the document, not rebuilt: the batch Flash id survives, which
+    # it could not if this came from ``tools.llm_models``.
+    assert events[0]["score_snapshot"]["scored_with"]["parse_model"] == (
+        "gemini-2.5-flash"
+    )
 
 
 def test_score_snapshot_ignores_an_empty_match_map():
