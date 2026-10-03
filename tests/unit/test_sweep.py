@@ -124,6 +124,19 @@ class _Collection:
         return [_Snap(d) for d in self.docs.values()]
 
 
+class _Events:
+    """``users/{uid}/decisions``. Real, not a stub: ``log_decision`` swallows
+    every exception, so a fake that raised on ``add`` would leave the sweep's
+    event write unexercised and these tests green."""
+
+    def __init__(self):
+        self.written: list[dict] = []
+
+    def add(self, data):
+        self.written.append(dict(data))
+        return (None, None)
+
+
 class _UserRef:
     def __init__(self, collections):
         self._collections = collections
@@ -173,11 +186,13 @@ def _application(status: str) -> dict:
 def swept(monkeypatch):
     """sweep_postings over one approved job whose posting is gone."""
 
-    def build(app_status: str):
-        jobs = _Collection({"j1": _Doc("j1", _job_doc())})
+    def build(app_status: str, job: dict | None = None):
+        jobs = _Collection({"j1": _Doc("j1", job or _job_doc())})
         apps = _Collection({"app-j1": _Doc("app-j1", _application(app_status))})
-        db = _DB(_UserRef({"jobs": jobs, "applications": apps}))
+        events = _Events()
+        db = _DB(_UserRef({"jobs": jobs, "applications": apps, "decisions": events}))
         monkeypatch.setattr(sweep.firestore, "Client", lambda: db)
+        build.events = events
 
         # Board fetch succeeds but lists no jobs → the posting is gone.
         async def fake_fetch(platform, slug, url):
@@ -200,6 +215,46 @@ async def test_sweep_invalidates_a_pre_submission_application(swept):
     assert app["status"] == "posting_removed"
     assert [e["status"] for e in app["timeline"]] == ["tailoring", "posting_removed"]
     assert "liveness sweep" in app["timeline"][-1]["note"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_logs_its_dismissal_as_a_system_decision(swept):
+    """This sweep is the product's main writer of ``user_decision:
+    dismissed``. Without an event the decision log replays to ``approved`` for
+    a job the document calls ``dismissed``, and the two stores disagree
+    forever — the snapshot comes from the ``match`` map of the document read
+    before the dismissal, which the ``Job`` model does not carry."""
+    job = _job_doc()
+    job["match"] = {"overall_score": 64.0, "recommendation": "apply"}
+    jobs, _ = swept("ready_for_review", job)
+
+    await sweep.sweep_postings("u1")
+
+    assert jobs.docs["j1"].stored["user_decision"] == "dismissed"
+    (event,) = swept.events.written
+    assert event["job_id"] == "j1"
+    assert event["decision"] == "dismissed"
+    assert event["previous_decision"] == "approved"
+    assert event["actor"] == "system"
+    assert event["score_snapshot"]["overall_score"] == 64.0
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_that_dismisses_nothing_writes_no_event(swept, monkeypatch):
+    """The fail-open half: a board that still lists the posting dismisses
+    nothing, so there is no decision to record."""
+    jobs, _ = swept("ready_for_review")
+
+    async def still_listed(platform, slug, url):
+        return {"jobs": [{"id": "999"}]}
+
+    monkeypatch.setattr(sweep, "fetch_board_json", still_listed)
+
+    counts = await sweep.sweep_postings("u1")
+
+    assert counts["removed"] == 0
+    assert jobs.docs["j1"].stored["user_decision"] == "approved"
+    assert swept.events.written == []
 
 
 @pytest.mark.asyncio
