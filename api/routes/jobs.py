@@ -70,6 +70,18 @@ def list_pending_jobs(
     Both counts are free: this already streams every pending document and
     filters in Python, so they are tallies of a pass that was happening anyway,
     not extra queries.
+
+    Jobs carrying ``exploration`` (``tools.matching.score.should_explore``) are
+    returned alongside the ``min_score`` survivors even though they sit under
+    the threshold. That is a Python-side predicate on a stream this route was
+    already paying for — no second query, no extra read.
+
+    **The flag is stripped from the response.** A sampled job has to be
+    indistinguishable from a normally-surfaced one: the whole point of the
+    sample is an unbiased decision on a job the scorer rated low, and anything
+    the UI could branch on — a badge, a key, a different shape — tells the user
+    "this one doesn't really count" and destroys the label. Popped
+    unconditionally, so no response can leak it however the doc was written.
     """
     # Opportunistic scheduler tick (throttled in-process): opening the review
     # queue runs any due auto-discovery/sweep loop without external cron infra.
@@ -92,7 +104,8 @@ def list_pending_jobs(
         if not match:  # not scored yet
             continue
         scored_total += 1
-        if match.get("overall_score", 0) < min_score:
+        explored = bool(d.pop("exploration", False))
+        if match.get("overall_score", 0) < min_score and not explored:
             continue
         jobs.append({"id": snap.id, **d})
     jobs.sort(key=lambda j: j["match"]["overall_score"], reverse=True)
@@ -223,6 +236,14 @@ def list_decided_jobs(
 
     Scored jobs only, ranked high to low — same shape as /jobs/pending so the
     web app can reuse its card rendering.
+
+    ``exploration`` is stripped here for the same reason as on /jobs/pending,
+    and that shared renderer is half of why: two routes feeding one card with
+    different document shapes is how a key nobody meant to expose becomes
+    visible. The other half is that a decision on these shelves is **not
+    final** — starred/skipped cards offer restore and approve, so a user
+    re-deciding a restored job is making a fresh judgement, and a marker on
+    that card would bias it exactly as it would in the queue.
     """
     snaps = (
         _client()
@@ -237,6 +258,7 @@ def list_decided_jobs(
         d = snap.to_dict()
         if not d.get("match"):
             continue
+        d.pop("exploration", None)
         jobs.append({"id": snap.id, **d})
     jobs.sort(key=lambda j: j["match"]["overall_score"], reverse=True)
     return {"jobs": jobs}

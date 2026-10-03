@@ -9,6 +9,8 @@ CLI share one implementation.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import os
 import re
 import time
 from collections.abc import Callable
@@ -93,16 +95,159 @@ def should_discard(match: JobMatch) -> bool:
     return match.overall_score <= DISCARD_AT_OR_BELOW
 
 
+# ------------------------------------------------------- the exploration sample
+#
+# Every decision this product has ever collected was made on a job the current
+# scorer already liked: the queue hides everything under 60
+# (``api.routes.jobs.list_pending_jobs``'s default ``min_score``), so the
+# labels only ever cover the region the scorer put above its own bar. A model
+# trained on that is graded on its own prior — it can never be shown to be
+# wrong about a job it scored 40, because nobody was ever asked.
+#
+# The fix is the smallest one that works: deterministically surface a slice of
+# the hidden band so some labels come from outside the scorer's belief. It is
+# off by default and costs nothing when off.
+
+#: The score at and above which the queue already shows a job — the default
+#: ``min_score`` of ``api.routes.jobs.list_pending_jobs``, mirrored here
+#: because the route's default is the user-visible contract and this follows
+#: it, not the reverse. (Not imported from there: ``tools`` must not depend on
+#: ``api``. The band test asserts the two still agree.)
+#:
+#: Expressed as a strict upper bound rather than a top of 59 because
+#: ``overall_score`` is a **float** and the prompt weights five sub-scores at
+#: 0.30/0.25/0.20/0.15/0.10, so fractions are routine. A job at 59.35 is
+#: hidden by the route (``< 60``) and a band of "<= 59" would leave it out —
+#: a hole sitting exactly on the slice nearest the decision boundary, which is
+#: the most informative part of the band.
+QUEUE_DEFAULT_MIN_SCORE = 60
+
+
+def exploration_rate() -> float:
+    """``EXPLORATION_RATE`` as a fraction in [0, 1]; default ``0`` — off.
+
+    Default-off and env-gated, the same shape as ``GEO_GATE_ENFORCE``
+    (``pipeline.geo_enforce_enabled``). Unlike ``GEO_GATE_HOLDOUT``, whose
+    default is non-zero because a hold-out of zero destroys its measurement,
+    zero here is the *correct* shipped state: sampling changes what a user is
+    asked to review, so it waits for someone to decide to turn it on.
+
+    Anything unparseable or out of range falls back to zero rather than to a
+    guess — the failure mode of a typo must be "no sampling", never "every
+    hidden job surfaced".
+    """
+    raw = os.getenv("EXPLORATION_RATE", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("matching.exploration_rate_invalid", value=raw[:40])
+        return 0.0
+    if not 0.0 <= value <= 1.0:
+        log.warning("matching.exploration_rate_invalid", value=raw[:40])
+        return 0.0
+    return value
+
+
+def exploration_sample(job_id: str, rate: float) -> bool:
+    """Is this job id in the exploration sample, at ``rate``?
+
+    **SHA-256, never :func:`hash`.** Python salts ``hash(str)`` per process by
+    default, so the same job id answers differently in every worker and after
+    every cold start — the sample would reshuffle continuously while a local
+    test inside one process passed. The acceptance criterion is that sampled
+    jobs *stay* stable across runs, and only a stable digest gives that. Same
+    reasoning, same construction as ``pipeline.geo_holdout``.
+
+    The id is prefixed before hashing so this sample and the geo hold-out are
+    independent draws rather than the identical set of ids at equal rates —
+    two correlated samples would make the exploration labels a subset of the
+    hold-out population instead of a sample of the band.
+    """
+    if rate <= 0.0:
+        return False
+    if rate >= 1.0:
+        return True
+    digest = hashlib.sha256(b"exploration:" + job_id.encode()).digest()
+    return int.from_bytes(digest[:8], "big") / 2.0**64 < rate
+
+
+def should_explore(job: Job, match: JobMatch, geo_gate: dict | None) -> bool:
+    """Should this scored job be surfaced out of the hidden band?
+
+    Three conditions, all required.
+
+    **It is in the band.** Strictly above ``DISCARD_AT_OR_BELOW`` and strictly
+    below ``QUEUE_DEFAULT_MIN_SCORE`` — exactly what the queue hides. At or
+    below 20 the job is tombstoned and never reaches the queue; at 60 and above
+    it is already shown, and flagging those would be a no-op that still writes
+    a field. The bounds are strict inequalities on purpose: the score is a
+    float, so 59.35 is in the band and ``<= 59`` would miss it.
+
+    **It is not geo-ineligible.** The user cannot take those, so surfacing one
+    spends a decision on a rejection that says nothing about fit — it poisons
+    the labels rather than adding to them. The signal used is the ``geo_gate``
+    record's ``verdict``: it is the only one of the candidates that carries
+    information *in this band*.
+
+    - ``verdict == "ineligible"`` is the free gate's own judgement, measured at
+      0 false positives over 1,127 historical scores and again over 117 (see
+      ``tools.matching.geo``). It is the one reliable signal available here.
+    - ``pro_capped`` is defined as ``overall_score == 20`` and is therefore
+      *always false* inside 21-59. It carries exactly zero information at this
+      band and must not be read as "not capped, therefore eligible".
+    - ``pro_geo_flag`` / ``match.red_flags_hit`` are documented above as a
+      disambiguator and not a signal: the regex fires on ~1.5% of jobs Pro
+      *kept*. Gating on it would silently drop eligible jobs from the sample
+      and bias the very thing the sample exists to de-bias.
+
+    A missing ``geo_gate`` record (no profile passed, or no ``jd_parsed``) is
+    **not** treated as ineligible. The structural argument carries it: Rule 6
+    makes Pro cap a geographically ineligible role at exactly 20, which is
+    ``DISCARD_AT_OR_BELOW``, so a job that reached 21+ is one Pro already
+    judged eligible. The gate's verdict is an extra veto on top of Pro's
+    judgement, not a licence the job needs to earn.
+
+    **The id is in the sample**, deterministically — :func:`exploration_sample`.
+
+    **The flag is write-once, and there is no rollback.** Nothing clears
+    ``exploration`` once it is on a job doc. Setting ``EXPLORATION_RATE`` back
+    to 0 stops *new* jobs being sampled; it does not withdraw the ones already
+    flagged, which keep surfacing under the threshold until they are decided.
+    Lowering the rate likewise never shrinks the live sample. So "rate 0 means
+    nothing changed" is a statement about a deployment that has never had the
+    flag on, not about a rollback. Withdrawing a live sample today needs an
+    ad-hoc Firestore write over the user's ``jobs`` collection — there is no
+    CLI for it, deliberately noted here rather than discovered during an
+    incident.
+    """
+    if not DISCARD_AT_OR_BELOW < match.overall_score < QUEUE_DEFAULT_MIN_SCORE:
+        return False
+    if geo_gate is not None and geo_gate.get("verdict") == "ineligible":
+        return False
+    return exploration_sample(job.id, exploration_rate())
+
+
 # --------------------------------------------------------- geo gate, in shadow
 #
 # ``tools.matching.geo`` decides for free what Rule 6 of the scoring prompt
 # currently buys a Pro call to decide (69.4% of every Pro call ever made on the
 # main user came back capped at exactly 20 — geographically ineligible). The
-# replay against history proved the gate never *wrongly* rejects, but it cannot
-# prove what it would *save*: ``persist_result`` tombstones every capped score
-# out of the `jobs` collection and ``discard_tombstone`` carries no
-# ``jd_parsed``, so the gate has nothing to replay against exactly where its
-# upside lives. Live recording is the only way to measure it.
+# replay against history proved the gate never *wrongly* rejects, but it could
+# not prove what it would *save*: ``persist_result`` tombstones every capped
+# score out of the `jobs` collection, and ``discard_tombstone`` carried no
+# ``jd_parsed``, so the gate had nothing to replay against exactly where its
+# upside lives. Live recording was the only way to measure it.
+#
+# **That is no longer true going forward.** ``discard_tombstone`` now carries
+# ``jd_parsed`` (the negatives need features for reasons that have nothing to
+# do with this gate), so tombstones written from here on *are* replayable and
+# the gate's upside can be measured off them directly. Live recording stays —
+# it is the only thing that gives the Pro comparison, which a replay cannot
+# reconstruct — but the historical gap is now a gap in the *history*, not in
+# the mechanism. Note ``cli.geo_replay`` still prints the old claim to the
+# operator; correcting it belongs with the geo report, not here.
 #
 # So the gate runs on every scored job and its verdict is written down next to
 # what Pro said — and nothing else. It skips no call, changes no score, and
@@ -301,6 +446,18 @@ def discard_tombstone(
         # are the one place the money went that can't be traced. Same field
         # name as on the job docs — one query answers "what did this run buy?".
         "scored_run_id": scored_run_id,
+        # The negatives' only features. ~71% of everything ever scored lands
+        # here, and without the parse a tombstone records *that* a job was
+        # rejected and nothing about *what* was rejected — so no model can
+        # ever learn what a bad match looks like. Always present, ``None``
+        # when the Flash parse never happened (a geo-enforced skip, a
+        # backfill), because "no parse" and "field not written yet" have to
+        # stay distinguishable when these are counted.
+        #
+        # ``jd_raw`` deliberately stays out: it is the one heavy field, it is
+        # refetchable from ``url``, and ``restore`` already carries it on the
+        # only tombstones that need to be rebuildable.
+        "jd_parsed": (job.jd_parsed.model_dump(mode="json") if job.jd_parsed else None),
     }
     if geo_gate is not None:
         # The one field that earns a place in an otherwise minimal record: the
@@ -433,6 +590,12 @@ async def persist_result(
     }
     if geo_gate is not None:
         fields["geo_gate"] = geo_gate
+    if should_explore(job, match, geo_gate):
+        # Written only when the job is actually sampled — never as ``False``.
+        # At the default rate of 0 this branch never runs, so the job doc, and
+        # therefore ``/jobs/pending``'s payload, is byte-for-byte what it was
+        # before this field existed.
+        fields["exploration"] = True
     await ref.update(fields)
     return "scored"
 
