@@ -19,7 +19,7 @@ from api.routes.applications import application_id, dispatch_tailor
 from api.routes.discovery import refuse_live_runs, tick_user
 from models.job import Job
 from obs.logging import get_logger, run_context
-from tools import queues, spend
+from tools import decisions, queues, spend
 from tools.applications import state as app_state
 from tools.ats.validate import check_posting
 from tools.matching.score import score_pending_jobs
@@ -251,13 +251,8 @@ async def dismiss_skipped_if_posting_removed(user_id: str, job_id: str) -> None:
     dismisses. (Approvals are covered by the check at the top of tailoring.)
     """
     task_log = log.bind(user_id=user_id, job_id=job_id, task="skip_validation")
-    job_ref = (
-        _client()
-        .collection("users")
-        .document(user_id)
-        .collection("jobs")
-        .document(job_id)
-    )
+    user_ref = _client().collection("users").document(user_id)
+    job_ref = user_ref.collection("jobs").document(job_id)
     snap = job_ref.get()
     if not snap.exists:
         return
@@ -266,7 +261,10 @@ async def dismiss_skipped_if_posting_removed(user_id: str, job_id: str) -> None:
         return
     # The user may have restored or approved the job while we probed; the
     # approval path runs its own check, so only dismiss a still-skipped job.
-    if (job_ref.get().to_dict() or {}).get("user_decision") != "rejected":
+    # This re-read — not the one above — is the decision's "before" state: it
+    # is the newest thing we know when the dismissal lands.
+    current = job_ref.get().to_dict() or {}
+    if current.get("user_decision") != "rejected":
         task_log.info("job.posting_removed_but_redecided", url=job.url)
         return
     job_ref.update(
@@ -276,6 +274,16 @@ async def dismiss_skipped_if_posting_removed(user_id: str, job_id: str) -> None:
         }
     )
     task_log.info("job.posting_removed", url=job.url)
+    # Neither early return above reaches this: nothing decided, nothing to
+    # record. Only the write that actually changed `user_decision` is an event.
+    decisions.log_decision(
+        user_ref,
+        job_id=job_id,
+        decision="dismissed",
+        previous_decision=current.get("user_decision"),
+        job_doc=current,
+        actor="system",
+    )
 
 
 class Decision(BaseModel):
@@ -309,15 +317,46 @@ def decide(
     Skipping (``rejected``) schedules a posting-liveness check in the
     background — a posting that has already died is dismissed rather than
     shelved. (Approvals get the same check at the top of tailoring.)
+
+    Every decision also appends one event to ``users/{uid}/decisions`` (see
+    :mod:`tools.decisions`), because the job document only ever holds the
+    latest answer and an undo would otherwise erase the original choice.
     """
     user_ref = _client().collection("users").document(user_id)
+    job_ref = user_ref.collection("jobs").document(job_id)
+    # Read before the update: this is the only place the decision being
+    # replaced, and the score the user was looking at, still exist. A missing
+    # document is left to the update below to report — it is what already
+    # produced the 404, and a second source of truth for "does this job
+    # exist?" is a second thing to keep in step.
+    #
+    # Wrapped, because this read exists *only* to write a label. ``get`` can
+    # raise DeadlineExceeded / ServiceUnavailable / PermissionDenied when a
+    # read retry budget runs out, and before this task the path held no read
+    # at all — letting that 500 the request would leave the job un-approved
+    # with nothing dispatched, which is exactly the trade the event write
+    # itself refuses to make. An event with ``previous_decision: None`` is the
+    # documented inconvenience.
     try:
-        user_ref.collection("jobs").document(job_id).update(
-            {"user_decision": body.decision}
-        )
+        before = job_ref.get()
+        before_doc = before.to_dict() if before.exists else None
+    except Exception:
+        log.exception("job.decision_preread_failed", job_id=job_id)
+        before_doc = None
+    try:
+        job_ref.update({"user_decision": body.decision})
     except NotFound:
         raise HTTPException(status_code=404, detail="job not found") from None
     log.info("job.decided", job_id=job_id, decision=body.decision)
+    # After the update, never before: a 404 raised above changed nothing, so
+    # there is no decision to record.
+    decisions.log_decision(
+        user_ref,
+        job_id=job_id,
+        decision=body.decision,
+        previous_decision=(before_doc or {}).get("user_decision"),
+        job_doc=before_doc,
+    )
 
     if body.decision == "pending":
         app_ref = user_ref.collection("applications").document(application_id(job_id))

@@ -54,7 +54,7 @@ from api.deps import verify_user, verify_user_query
 from models.job import Job
 from models.profile import MasterProfile
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
-from tools import queues
+from tools import decisions, queues
 from tools.applications import reaper, state
 from tools.ats.validate import check_posting
 from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
@@ -121,7 +121,13 @@ async def _transition(ref, to: str, **kwargs) -> bool:
 
 
 async def _dismiss_if_posting_removed(
-    user_ref, app_ref, job: Job, task_log, *, allowed_from: Collection[str]
+    user_ref,
+    app_ref,
+    job: Job,
+    task_log,
+    *,
+    allowed_from: Collection[str],
+    job_doc: dict | None = None,
 ) -> bool:
     """Verify the posting is still live before spending work on it.
 
@@ -142,6 +148,11 @@ async def _dismiss_if_posting_removed(
     confirmation evidence for an application that really was sent. Same failure
     the liveness sweep documents in ``state.try_transition``; filtering before
     the swap is not a compare-and-swap.
+
+    ``job_doc`` is the caller's raw job document — the read that produced
+    ``job``, before this dismissal. It is passed rather than re-read because
+    the decision event's score snapshot lives under its ``match`` key, which
+    the ``Job`` model does not carry.
     """
     if await check_posting(job) != "removed":
         return False
@@ -149,6 +160,18 @@ async def _dismiss_if_posting_removed(
     await asyncio.to_thread(
         user_ref.collection("jobs").document(job.id).update,
         {"user_decision": "dismissed", "posting_removed_at": _now()},
+    )
+    # The system's own decision change, logged like the user's (see
+    # tools.decisions). ``to_thread`` because the helper drives the sync
+    # client, the way every other write on this path does.
+    await asyncio.to_thread(
+        decisions.log_decision,
+        user_ref,
+        job_id=job.id,
+        decision="dismissed",
+        previous_decision=(job_doc or {}).get("user_decision"),
+        job_doc=job_doc,
+        actor="system",
     )
     # The caller stops either way — the posting really is gone. A refused
     # transition means the document moved out from under us: either someone
@@ -243,7 +266,12 @@ async def run_tailoring(user_id: str, job_id: str) -> None:
             # ``tailoring`` while check_posting was on the wire, it is no longer
             # ours to park.
             if await _dismiss_if_posting_removed(
-                user_ref, app_ref, job, task_log, allowed_from={"tailoring"}
+                user_ref,
+                app_ref,
+                job,
+                task_log,
+                allowed_from={"tailoring"},
+                job_doc=job_doc.to_dict(),
             ):
                 ledger_state = DONE
                 log_agent_end(task_log, "tailoring", started, outcome="posting_removed")
@@ -760,7 +788,12 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
             # Last-line check: never drive a browser at a posting the ATS says
             # is gone. Fail-open — a flaky board proceeds and fails visibly.
             if await _dismiss_if_posting_removed(
-                user_ref, ref, job, task_log, allowed_from=owned
+                user_ref,
+                ref,
+                job,
+                task_log,
+                allowed_from=owned,
+                job_doc=job_snap.to_dict(),
             ):
                 ledger_state = DONE
                 log_agent_end(

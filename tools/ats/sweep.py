@@ -11,7 +11,10 @@ non-board sources) dismisses anything.
 Dismissal drops the job from the review queue and shelves
 (``user_decision: dismissed``); an approved job whose application hasn't been
 submitted yet also flips to the terminal ``posting_removed`` status so the
-tracking page stops serving it.
+tracking page stops serving it. Each dismissal also appends a decision event
+(``tools.decisions``, ``actor: "system"``): this sweep writes far more
+``dismissed`` decisions than any other path, and an event log missing them
+would replay to a final state that disagrees with the document.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from google.cloud import firestore
 
 from models.job import Job
 from obs.logging import get_logger
+from tools import decisions
 from tools.applications import state
 from tools.ats._http import board_client, fetch_board_json
 from tools.ats.ashby import BASE as ASHBY_BASE
@@ -72,6 +76,11 @@ async def sweep_postings(user_id: str) -> dict:
     jobs_ref = user_ref.collection("jobs")
 
     jobs: list[Job] = []
+    # The raw documents are kept beside the parsed ones because the decision
+    # event's score snapshot comes from the ``match`` map, which the ``Job``
+    # model does not carry. This is the read taken before the dismissal, so it
+    # is also where ``previous_decision`` comes from.
+    raw: dict[str, dict] = {}
     for snap in jobs_ref.stream():
         d = snap.to_dict()
         if d.get("user_decision") not in SWEEPABLE_DECISIONS:
@@ -80,6 +89,8 @@ async def sweep_postings(user_id: str) -> dict:
             jobs.append(Job.model_validate(d))
         except Exception:  # legacy/malformed doc — don't let it kill the sweep
             log.warning("sweep.job_unparseable", job_id=snap.id)
+        else:
+            raw[snap.id] = d
 
     boards: dict[tuple[str, str], list[Job]] = {}
     singles: list[Job] = []
@@ -144,6 +155,17 @@ async def sweep_postings(user_id: str) -> dict:
                 " — application dismissed (liveness sweep)"
             ),
             lease=state.CLEAR_LEASE,
+        )
+        # This sweep is the dominant writer of ``user_decision: dismissed``, so
+        # without this the event log would reconstruct a final state of
+        # ``rejected`` for a job the document calls ``dismissed``.
+        decisions.log_decision(
+            user_ref,
+            job_id=job.id,
+            decision="dismissed",
+            previous_decision=(raw.get(job.id) or {}).get("user_decision"),
+            job_doc=raw.get(job.id),
+            actor="system",
         )
         counts["removed"] += 1
         log.info(

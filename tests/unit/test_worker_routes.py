@@ -657,16 +657,33 @@ class _FakeCollection:
         return self._doc
 
 
+class _FakeEvents:
+    """``users/{uid}/decisions``. Present so the decision-event write is
+    *asserted* rather than absorbed: ``log_decision`` swallows every
+    exception, so a fake without ``add`` leaves these tests green while
+    exercising nothing (which is how this fake started out)."""
+
+    def __init__(self):
+        self.written: list[dict] = []
+
+    def add(self, data):
+        self.written.append(dict(data))
+        return (None, None)
+
+
 class _FakeUser:
-    """A user document with an ``applications`` and a ``jobs`` subcollection."""
+    """A user document with ``applications``, ``jobs`` and ``decisions``."""
 
     def __init__(self, app_doc: _FakeDoc, job_doc: _FakeDoc, profile: dict | None):
         self._app, self._job, self._profile = app_doc, job_doc, profile
+        self.decision_events = _FakeEvents()
 
     def get(self):
         return _FakeSnap("u1", self._profile, 1)
 
     def collection(self, name):
+        if name == "decisions":
+            return self.decision_events
         return _FakeCollection(self._app if name == "applications" else self._job)
 
 
@@ -838,9 +855,8 @@ def test_approving_a_job_dispatches_only_after_the_application_exists(
     monkeypatch.setenv("QUEUE_MODE", "1")
     app_doc = _FakeDoc(None)  # no Application yet
     job_doc = _FakeDoc({"id": "job1", "url": "https://x/y"}, "job1")
-    monkeypatch.setattr(
-        jobs, "_client", lambda: _FakeDb(_FakeUser(app_doc, job_doc, None))
-    )
+    user = _FakeUser(app_doc, job_doc, None)
+    monkeypatch.setattr(jobs, "_client", lambda: _FakeDb(user))
     api = FastAPI()
     api.include_router(jobs.router)
     api.dependency_overrides[verify_user] = lambda: "u1"
@@ -854,6 +870,10 @@ def test_approving_a_job_dispatches_only_after_the_application_exists(
     assert task_id.startswith("tailor-u1-job1-")
     # The document the task names is already there, already claimable.
     assert app_doc.data[state.STATUS_FIELD] == state.INITIAL
+    # And the approval was logged as a decision event, by the user.
+    assert [(e["decision"], e["actor"]) for e in user.decision_events.written] == [
+        ("approved", "user")
+    ]
 
 
 @pytest.fixture
@@ -1014,6 +1034,64 @@ def test_a_finished_tailoring_run_hands_its_lease_back(client, monkeypatch):
     assert state.try_claim_lease(doc, doc.get(), "submitting", owner="w") is True
 
 
+def test_a_dead_posting_found_before_tailoring_is_logged_as_a_decision(
+    client, monkeypatch
+):
+    """The pre-flight check's dismissal, which had no test at all.
+
+    It writes ``user_decision: dismissed`` onto the job document, which makes
+    it one of the system's own decision changes — and the snapshot has to come
+    from the ``match`` map of the document the caller already read, not from a
+    second read and not from the ``Job`` model (which does not carry it).
+    """
+    monkeypatch.setenv("WORKER_MODE", "1")
+    doc = _app_doc("queued")
+    job = _FakeDoc(
+        {
+            "id": "job1",
+            "url": "https://x/y",
+            "company": "Acme",
+            "title": "Staff Engineer",
+            "user_decision": "approved",
+            "match": {"overall_score": 71.0, "recommendation": "apply"},
+        },
+        "job1",
+    )
+    user = _FakeUser(doc, job, {})
+    monkeypatch.setattr(applications, "_client", lambda: _FakeDb(user))
+    monkeypatch.setattr(
+        applications, "MasterProfile", SimpleNamespace(model_validate=lambda d: d)
+    )
+    monkeypatch.setattr(
+        applications,
+        "Job",
+        SimpleNamespace(model_validate=lambda d: SimpleNamespace(**d)),
+    )
+
+    async def removed(job):
+        return "removed"
+
+    async def never(job, profile, upload=True):
+        raise AssertionError("a dead posting must not buy an LLM run")
+
+    async def fake_persist_run_cost(db, user_id, run_id, **meta):
+        pass
+
+    monkeypatch.setattr(applications, "check_posting", removed)
+    monkeypatch.setattr(applications, "tailor_application", never)
+    monkeypatch.setattr(applications, "persist_run_cost", fake_persist_run_cost)
+
+    client.post("/tasks/tailor", json={"user_id": "u1", "job_id": "job1"})
+
+    assert job.data["user_decision"] == "dismissed"
+    assert doc.data["status"] == "posting_removed"
+    (event,) = user.decision_events.written
+    assert event["decision"] == "dismissed"
+    assert event["previous_decision"] == "approved"
+    assert event["actor"] == "system"
+    assert event["score_snapshot"]["overall_score"] == 71.0
+
+
 @pytest.fixture
 def apply_world(monkeypatch):
     """The ``/tasks/apply`` handler over a fake document, with
@@ -1119,9 +1197,8 @@ def submission_world(monkeypatch):
     job = _FakeDoc(
         {"id": "job1", "url": "https://x/y", "user_decision": "approved"}, "job1"
     )
-    monkeypatch.setattr(
-        applications, "_client", lambda: _FakeDb(_FakeUser(doc, job, {}))
-    )
+    user = _FakeUser(doc, job, {})
+    monkeypatch.setattr(applications, "_client", lambda: _FakeDb(user))
     monkeypatch.setattr(
         applications, "MasterProfile", SimpleNamespace(model_validate=lambda d: d)
     )
@@ -1157,7 +1234,13 @@ def submission_world(monkeypatch):
 
     monkeypatch.setattr(applications, "check_posting", check_posting)
     monkeypatch.setattr(applications, "submit_application", submit_application)
-    return SimpleNamespace(doc=doc, job=job, hooks=hooks, submits=submits)
+    return SimpleNamespace(
+        doc=doc,
+        job=job,
+        hooks=hooks,
+        submits=submits,
+        decision_events=user.decision_events.written,
+    )
 
 
 def test_a_dry_run_never_records_a_submission(submission_world):
@@ -1254,6 +1337,18 @@ def test_an_uncontested_rehearsal_does_record_a_dead_posting(submission_world):
 
     assert submission_world.doc.data["status"] == "posting_removed"
     assert submission_world.job.data["user_decision"] == "dismissed"
+    # The dismissal is one of the system's own decision changes, and is logged
+    # as such — the job document only keeps the latest value.
+    assert submission_world.decision_events == [
+        {
+            "job_id": "job1",
+            "decision": "dismissed",
+            "previous_decision": "approved",
+            "decided_at": submission_world.decision_events[0]["decided_at"],
+            "actor": "system",
+            "score_snapshot": None,
+        }
+    ]
 
 
 # --------------------------------------------------------------------------
