@@ -94,9 +94,21 @@ def score_snapshot(job_doc: dict | None) -> dict | None:
     different facts, and a model trained on the second when the first is true
     is learning from noise.
 
-    ``scored_with`` (model + prompt versions) does not exist yet — it is
-    written by ML-readiness Task 3. The key is present and ``None`` so the
-    documents written before that task and after it have one shape.
+    ``scored_with`` (which models ran, under which prompt versions — see
+    ``tools.matching.score.scored_with``) is copied off the job document, and
+    is ``None`` for every job scored before that field existed. **Read off the
+    document, never reconstructed from today's constants**: a job scored in
+    October and decided in December would then be labelled with December's
+    model and prompt, which is precisely the false comparability this record
+    was added to prevent. Absent on the document and ``None`` here mean the
+    same thing — unattributable — and that is an honest answer where a
+    fabricated one is not.
+
+    Note the two ``None``s in this function are different facts and stay
+    distinguishable: no ``match`` at all returns ``None`` for the whole
+    snapshot ("never scored"), while a scored job with no provenance returns a
+    snapshot whose ``scored_with`` is ``None`` ("scored, by we don't know
+    what").
     """
     match = (job_doc or {}).get("match")
     if not match:
@@ -105,7 +117,11 @@ def score_snapshot(job_doc: dict | None) -> dict | None:
         "overall_score": match.get("overall_score"),
         "breakdown": match.get("breakdown"),
         "recommendation": match.get("recommendation"),
-        "scored_with": None,
+        # Top level, beside ``match`` — not inside it. ``score.persist_result``
+        # writes it as a sibling of ``match`` because it describes the act of
+        # scoring, not the score; reading it off ``match`` would return
+        # ``None`` for every job ever scored and nothing would ever say so.
+        "scored_with": (job_doc or {}).get("scored_with"),
     }
 
 

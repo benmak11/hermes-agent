@@ -62,6 +62,7 @@ from tools.matching.score import (
     load_profile_and_pending,
     persist_jd_parsed,
     persist_result,
+    scored_with,
     shadow_geo_gate,
     unbudgeted_limit,
 )
@@ -514,6 +515,10 @@ async def _batch_score(
             continue
         to_parse.setdefault(job.jd_raw, []).append(job)
     parsed_now: list[Job] = []
+    # Jobs whose parse THIS run paid a Flash batch for — not the jd_cache
+    # hits below, which came out of some earlier run under a model this one
+    # cannot name. Feeds ``scored_with`` at the persist step.
+    flash_parsed: set[str] = set()
     if to_parse:
         cached = await jd_cache.lookup_many(db, list(to_parse))
         for text, parsed in cached.items():
@@ -537,6 +542,12 @@ async def _batch_score(
         )
         for job in join_parse_responses(out_lines, to_parse):
             _fail(job, "parse_jd failed in batch")
+        flash_parsed.update(
+            job.id
+            for jobs in to_parse.values()
+            for job in jobs
+            if job.jd_parsed is not None
+        )
         parsed_now.extend(
             job
             for jobs in to_parse.values()
@@ -570,7 +581,12 @@ async def _batch_score(
     # tombstones through the same persistence path the online scorer uses. The
     # third tuple slot is the enforced geo record, ``None`` for everything the
     # gate did not reject — including every Pro result appended below.
-    to_persist: list[tuple[Job, JobMatch, dict | None]] = []
+    # The fourth slot is the model that produced the match — ``None`` for
+    # everything the free pre-filter decided, ``BATCH_PRO_MODEL`` for the Pro
+    # results appended below. It cannot be inferred at the persist step: an
+    # OUT_OF_FAMILY tombstone and a Pro result both arrive with ``enforced``
+    # set to ``None``.
+    to_persist: list[tuple[Job, JobMatch, dict | None, str | None]] = []
     to_score: list[Job] = []
     enforce_geo = geo_enforce_enabled()
     for _, job in pending:
@@ -581,7 +597,7 @@ async def _batch_score(
             enforced = enforced_geo_gate(decision)
             if enforced is not None:
                 counts["geo_skipped"] += 1
-            to_persist.append((job, m, enforced))
+            to_persist.append((job, m, enforced, None))
         else:
             to_score.append(job)
 
@@ -603,13 +619,27 @@ async def _batch_score(
         for job in failed:
             _fail(job, "scoring failed in batch")
         to_persist.extend(
-            (job, matches[job.id], None) for job in to_score if job.id in matches
+            (job, matches[job.id], None, BATCH_PRO_MODEL)
+            for job in to_score
+            if job.id in matches
         )
 
     sem = asyncio.Semaphore(_PERSIST_CONCURRENCY)
 
-    async def _persist(job: Job, match: JobMatch, enforced: dict | None) -> None:
+    async def _persist(
+        job: Job, match: JobMatch, enforced: dict | None, match_model: str | None
+    ) -> None:
         async with sem:
+            # The batch models, never the online constants: batch prediction
+            # rejects the ``gemini-flash-latest`` alias, so this path really
+            # does run a different Flash than ``score.score_pending_jobs``,
+            # and stamping ``FLASH_MODEL`` here would be unfalsifiable later.
+            parse_model = BATCH_FLASH_MODEL if job.id in flash_parsed else None
+            provenance = (
+                scored_with(parse_model=parse_model, match_model=match_model)
+                if (parse_model or match_model)
+                else None
+            )
             try:
                 # ``profile`` turns on geo shadow recording (see
                 # ``score.shadow_geo_gate``). The OUT_OF_FAMILY tombstones in
@@ -623,6 +653,7 @@ async def _batch_score(
                     match,
                     profile=profile,
                     geo_gate=enforced,
+                    provenance=provenance,
                 )
                 counts[outcome] += 1
                 count_geo_gate(counts, shadow_geo_gate(job, match, profile))

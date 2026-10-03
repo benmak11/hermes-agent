@@ -56,6 +56,20 @@ _MATCH_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MEDIUM
 # validation and surfaces as match.failed rather than a silent wrong score.
 _MATCH_MAX_OUTPUT_TOKENS = 4096
 
+#: Version of :data:`PARSE_JD_PROMPT`. **Bump this whenever that prompt
+#: changes**, in the same commit — a stale version is worse than no version at
+#: all, because it asserts that two parses are comparable when they are not.
+#: Stamped onto every parse this repo pays for (``score.scored_with``), so a
+#: later consumer can tell a feature extracted by today's prompt from one
+#: extracted by a different prompt that happened to fill the same schema.
+#: Integer, monotonic, no semantics beyond "different number, different
+#: prompt".
+#:
+#: **Not left to memory**: ``tests/unit/test_scored_with.py`` pins a digest of
+#: the prompt text per version, so editing the prompt without bumping this
+#: fails the suite, and bumping it without recording the new digest fails too.
+PARSE_PROMPT_VERSION = 1
+
 PARSE_JD_PROMPT = """Extract structured info from this job description.
 
 For role_family, classify into exactly one of: engineering, product, design, data,
@@ -86,6 +100,26 @@ For location, extract the job's geography from the posting and the location line
   'Remote - US', 'US remote', 'remote anywhere in the US', 'US-based remote'). Otherwise false.
   Do not infer this from the company being US-headquartered; require an explicit statement.
 """
+
+#: Version of **the whole scoring prompt**, which is assembled from more than
+#: one template: :data:`MATCH_CONTEXT_TEMPLATE` (the per-user static block,
+#: uploaded as Vertex cached content) plus :data:`MATCH_JOB_TEMPLATE` (the
+#: per-job block). One number covers both, deliberately — the model sees one
+#: concatenated prompt and a score is a function of all of it, so a version
+#: per template would describe a split that does not exist in the thing being
+#: versioned. **Bump this whenever either template changes**, and also when
+#: the scoring rules text inside ``MATCH_CONTEXT_TEMPLATE`` changes, which is
+#: the edit most likely to move every score while looking cosmetic.
+#:
+#: What it does *not* cover: the model id (recorded separately as
+#: ``match_model``), the candidate profile interpolated into the context block
+#: (per-user data, not prompt), and :func:`build_match_context`'s
+#: ``rejection_patterns`` / ``approval_patterns`` (per-user data again).
+#:
+#: Digest-pinned per version in ``tests/unit/test_scored_with.py``, over both
+#: templates concatenated — see :data:`PARSE_PROMPT_VERSION`.
+MATCH_PROMPT_VERSION = 1
+
 
 # The scoring prompt is split into a per-user static block and a per-job block
 # so the static block (profile JSON + geography + decision patterns + scoring

@@ -596,8 +596,10 @@ def test_resumable_batch_run_skips_and_records(monkeypatch, no_holdout):
     monkeypatch.setenv("GEO_GATE_ENFORCE", "1")
     persisted: list[tuple] = []
 
-    async def fake_persist_result(ref, job, match, *, profile=None, geo_gate=None):
-        persisted.append((job.id, match.overall_score, geo_gate))
+    async def fake_persist_result(
+        ref, job, match, *, profile=None, geo_gate=None, provenance=None
+    ):
+        persisted.append((job.id, match.overall_score, geo_gate, provenance))
         return "discarded"
 
     async def no_submit(**kw):
@@ -624,9 +626,11 @@ def test_resumable_batch_run_skips_and_records(monkeypatch, no_holdout):
 
     assert stage == "done"  # nothing left needing Pro
     assert counts["geo_skipped"] == 1 and counts["discarded"] == 1
-    job_id, overall, gate = persisted[0]
+    job_id, overall, gate, provenance = persisted[0]
     assert (job_id, overall) == ("j1", 0)
     assert gate["enforced"] is True and gate["rule"] == "country_mismatch"
+    # The free gate called no model; see ``batch_runs._persist_prefiltered``.
+    assert provenance is None
     assert updates[-1]["state"] == "done"
 
 
