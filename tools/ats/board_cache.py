@@ -2,19 +2,14 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Cross-user board cache: a board is fetched once per TTL, for everyone.
 
-Every user's discovery cycle walks the same ~198 boards independently. That is
-measured, not assumed: two users' cycles each fetched **13,083 jobs** with
-byte-identical per-platform splits (lever 5508, greenhouse 5163, ashby 2109,
-meta_jobs 203, google_jobs 100). The boards do not know who is asking, so the
-Nth user's crawl re-does the first user's work exactly.
+Every user's discovery cycle walks the same ~198 boards independently, and
+the boards do not know who is asking: two users' cycles were measured
+fetching 13,083 jobs each with byte-identical per-platform splits. This module
+removes that duplication the way :mod:`tools.matching.jd_cache` removed
+duplicated parses, storing content once keyed by what it is.
 
-This module removes that duplication the same way :mod:`tools.matching.jd_cache`
-removed duplicated parses: content that is identical for every user is stored
-once, keyed by what it is rather than by who wanted it.
-
-**GCS, not Firestore.** The unit stored here is a whole board's worth of
-normalized ``Job`` records — a Greenhouse board fetched with ``?content=true``
-is megabytes, well past Firestore's 1 MiB document limit.
+GCS, not Firestore: a Greenhouse board fetched with ``?content=true`` is
+megabytes, well past Firestore's 1 MiB document limit.
 
     gs://{resume_bucket}/board_cache/{platform}/{quoted-slug}.json
 
@@ -22,29 +17,23 @@ The ``board_cache/`` prefix is deliberately outside ``users/{uid}/``, which is
 the only prefix ``cli/reset_user.py`` deletes: wiping one user for a demo reset
 must not evict the cache every other user shares.
 
-**The payload is user-independent**, which is the whole premise. ``user_id`` and
+The payload is user-independent, which is the premise: ``user_id`` and
 ``discovered_at`` are dropped on the way in and re-stamped per user on the way
-out; every other ``Job`` field is a property of the posting (see
-``tests/unit/test_board_cache.py``, which pins that field by field).
+out, and ``tests/unit/test_board_cache.py`` pins the rest field by field.
 
-**``jd_raw`` must survive byte-for-byte.** ``tools.matching.jd_cache.jd_hash``
-is ``sha256(jd_raw.encode())`` with no normalization at all, so a single byte
-changed here misses the cache on all ~7,266 existing parses and this module
-would *cost* money instead of saving it. Nothing on this path touches the text:
-``html_to_text`` already ran inside the fetcher, before caching, and stays
-there. JSON is used because it is exactly round-tripping for ``str``.
+``jd_raw`` must survive byte-for-byte. ``jd_cache.jd_hash`` is
+``sha256(jd_raw.encode())`` with no normalization, so one changed byte misses
+the cache on every existing parse and this module costs money instead of
+saving it. Nothing here touches the text, and JSON is used because it
+round-trips ``str`` exactly.
 
-**Off by default.** ``BOARD_CACHE_TTL_SECONDS`` defaults to 0, which disables
-the cache entirely — no GCS client is built, no blob is read or written, and the
-fan-out behaves exactly as it did before this module existed. Ops flips the env
-var after a deploy proves it writes, the same way ``GEO_GATE_ENFORCE`` and
-``QUEUE_MODE`` shipped.
+Off by default: ``BOARD_CACHE_TTL_SECONDS`` defaults to 0, which builds no GCS
+client and reads or writes no blob.
 
-**No lock, no generation precondition.** Two cycles that miss the same board
-both fetch and both write. That is idempotent, and it is precisely what happens
-today with no cache at all. An ``if_generation_match`` would instead make the
-loser *raise*, converting a harmless race into an error to be mishandled. Every
-failure here — read or write — is swallowed: a cache that breaks a cycle is
+No lock and no generation precondition — two cycles that miss the same board
+both fetch and both write, which is idempotent and is what happens with no
+cache at all, where an ``if_generation_match`` would make the loser raise.
+Every failure, read or write, is swallowed: a cache that breaks a cycle is
 worse than no cache.
 """
 
@@ -81,11 +70,9 @@ PER_USER_FIELDS = ("user_id", "discovered_at")
 def ttl_seconds() -> int:
     """Cache lifetime in seconds. ``0`` (the default) disables the cache.
 
-    The floor on ``discovery_interval_hours`` is 6 (``models/settings.py``), so
-    any TTL up to 6h is invisible to a user's own cadence: their next scheduled
-    cycle is always past it. The one behaviour a TTL does change is a *manual*
-    ``POST /settings/discovery/run`` clicked twice inside the window — the
-    second click reads warm boards instead of re-crawling.
+    The floor on ``discovery_interval_hours`` is 6, so any TTL up to 6h is
+    invisible to a user's own cadence. The one behaviour it changes is a
+    manual ``POST /settings/discovery/run`` clicked twice inside the window.
     """
     raw = os.getenv("BOARD_CACHE_TTL_SECONDS", "").strip()
     if not raw:
@@ -105,11 +92,9 @@ def enabled() -> bool:
 def blob_path(platform: str, slug: str) -> str:
     """Object name for one board.
 
-    The slug is percent-quoted with nothing safe. For the ATS platforms it is a
-    company slug and quoting is a no-op, but ``google_jobs`` / ``meta_jobs``
-    reuse the slot as a *search query* (``"software engineer"``), and an
-    unquoted space or slash would either produce a surprising object name or
-    silently fold two different queries onto one blob.
+    The slug is percent-quoted with nothing safe: ``google_jobs`` and
+    ``meta_jobs`` reuse the slot as a search query, and an unquoted space or
+    slash would fold two different queries onto one blob.
     """
     return f"{PREFIX}/{platform}/{quote(slug, safe='')}.json"
 
@@ -120,13 +105,11 @@ _storage_client = None
 def _client():
     """Memoised GCS client, built on first use only.
 
-    Memoised because a cycle touches ~198 boards and every ``storage.Client()``
-    re-resolves Application Default Credentials — on Cloud Run, a metadata
-    server round trip each time. Safe to memoise (unlike the httpx client in
-    ``tools.ats._http``, whose pool binds to an event loop) because this client
-    is synchronous and only ever used inside ``asyncio.to_thread``. Tests call
-    :func:`reset_client` so a memo from an earlier test cannot outlive its
-    patch.
+    Memoised because a cycle touches ~198 boards and every
+    ``storage.Client()`` re-resolves ADC, a metadata round trip on Cloud Run.
+    Safe to memoise — unlike the httpx client in ``tools.ats._http``, whose
+    pool binds to an event loop — because this one is synchronous and only
+    used inside ``asyncio.to_thread``.
     """
     global _storage_client
     if _storage_client is None:
@@ -157,18 +140,17 @@ def strip_user(job: Job) -> dict:
 def _encode(platform: str, slug: str, jobs: list[Job]) -> bytes:
     """Serialize a board.
 
-    ``ensure_ascii`` is left at its default ``True`` on purpose. Board JSON is
-    parsed from the wire, and a ``\\ud800``-style escape in a posting yields a
-    Python string holding a lone surrogate — which ``str.encode("utf-8")``
-    refuses. Escaping non-ASCII sidesteps that entirely and still round-trips
-    the text exactly, which is the property ``jd_raw`` depends on.
+    ``ensure_ascii`` is left at its default ``True``: a ``\\ud800``-style
+    escape in a posting yields a lone surrogate that ``str.encode("utf-8")``
+    refuses, and escaping non-ASCII still round-trips the text exactly, which
+    is what ``jd_raw`` depends on.
     """
     payload = {
         "version": PAYLOAD_VERSION,
         "platform": platform,
         "slug": slug,
-        # Freshness travels *inside* the payload rather than being read off
-        # blob metadata. See the note in ``load_jobs``.
+        # Freshness travels inside the payload, not on blob metadata — see
+        # the note in ``load_jobs``.
         "fetched_at": datetime.now(UTC).isoformat(),
         "jobs": [strip_user(j) for j in jobs],
     }
@@ -178,9 +160,9 @@ def _encode(platform: str, slug: str, jobs: list[Job]) -> bytes:
 def _is_fresh(payload: dict, ttl: int) -> bool:
     """Is this payload's own timestamp inside the TTL?
 
-    A timestamp in the *future* is treated as a miss, not as maximally fresh:
-    that is corrupt or clock-skewed data, and the alternative reading would pin
-    a stale board in place indefinitely.
+    A future timestamp is treated as a miss rather than as maximally fresh:
+    it is corrupt or clock-skewed, and the other reading would pin a stale
+    board in place indefinitely.
     """
     raw = payload.get("fetched_at")
     if not isinstance(raw, str):
@@ -225,19 +207,14 @@ async def load_jobs(platform: str, slug: str, user_id: str) -> list[Job] | None:
     """A cached board re-stamped for ``user_id``, or ``None`` to go and fetch.
 
     ``None`` covers every reason not to use the cache — disabled, absent,
-    stale, corrupt, schema-drifted, or a GCS error. **This function never
-    raises**, which is what lets the caller treat a miss and a failure
-    identically and what keeps a broken bucket from breaking a cycle.
+    stale, corrupt, schema-drifted, or a GCS error — and this never raises, so
+    a broken bucket cannot break a cycle.
 
-    One ``download_as_bytes()``, and the freshness decision is made from those
-    same bytes. The tempting shape — ``exists()``, then ``reload()``, then
-    ``download_as_bytes()`` — is three round trips that check freshness against
-    metadata it then throws away and then downloads a *possibly different*
-    object. It is also not merely wasteful but wrong: ``download_as_bytes``
-    populates only the headers it can see, and ``updated`` is not among them
-    (``Blob._extract_headers_from_download`` sets etag/generation/hashes, never
-    ``updated``), so a post-download ``blob.updated`` is ``None`` and the
-    freshness check would silently never pass.
+    One ``download_as_bytes()``, with freshness decided from those same bytes.
+    Checking metadata first would be three round trips against a possibly
+    different object, and ``download_as_bytes`` does not populate
+    ``blob.updated``, so a post-download freshness check silently never
+    passes.
     """
     ttl = ttl_seconds()
     if ttl <= 0:
@@ -268,13 +245,11 @@ async def load_jobs(platform: str, slug: str, user_id: str) -> list[Job] | None:
 async def store_jobs(platform: str, slug: str, jobs: list[Job]) -> None:
     """Write a freshly fetched board back to the cache. Best effort, never raises.
 
-    **An empty board is never cached.** The fetchers cannot distinguish "this
-    board has no open roles" from "the fetch failed" — ``fetch_board_json``
-    absorbs a 404, a 429 that spent its retries, and a timeout alike, and every
-    one of them arrives here as ``[]``. Caching that would take a transient
-    board-side failure and hand it to every user for a whole TTL, which is the
-    one way this module could lose jobs. Re-probing an empty board costs an
-    HTTP call and no LLM spend, so the trade is not close.
+    An empty board is never cached: the fetchers cannot tell "no open roles"
+    from "the fetch failed", since ``fetch_board_json`` absorbs a 404, a spent
+    429 and a timeout alike and every one arrives as ``[]``. Caching that
+    would hand a transient board-side failure to every user for a whole TTL,
+    which is the one way this module could lose jobs.
     """
     if not enabled() or not jobs:
         return

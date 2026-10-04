@@ -864,7 +864,7 @@ def test_used_reports_the_stored_counter_and_rolls_with_the_day():
 
 
 def test_used_is_not_clamped_to_the_limit():
-    """#92 cut the cap 400 -> 3 mid-day. What was already rated stays true."""
+    """A mid-day cap cut (400 -> 3) leaves what was already rated true."""
     now = datetime(2026, 9, 27, 12, 30, tzinfo=UTC)
     state = {"day": "2026-09-27", "jobs_scored_today": 46}
     assert budget.used(state, now=now) > budget.Limits(3, 3).per_day

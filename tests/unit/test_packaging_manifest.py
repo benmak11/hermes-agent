@@ -2,24 +2,18 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Guard: the deploy manifests must ship every importable top-level package.
 
-Two independent allowlists gate what reaches the Cloud Run image:
+Two independent allowlists gate what reaches the Cloud Run image —
+``[tool.hatch.build.targets.wheel].packages`` in ``pyproject.toml`` (what the
+wheel installs, and therefore what ``import <pkg>`` resolves to) and the
+``COPY ./<pkg> ./<pkg>`` lines in the root ``Dockerfile`` (what source lands
+in the image). A new top-level package has to be in both or the container
+boots into ``ModuleNotFoundError``, and local dev and CI run from the repo
+root where everything is on the path, so the drift is invisible until a deploy
+crashes on start.
 
-1. ``[tool.hatch.build.targets.wheel].packages`` in ``pyproject.toml`` — what the
-   project wheel installs (and therefore what ``import <pkg>`` resolves to under
-   ``uv run``).
-2. the ``COPY ./<pkg> ./<pkg>`` lines in the root ``Dockerfile`` — what source
-   actually lands in the image.
-
-A new top-level package (e.g. ``obs/``) has to be added to BOTH or the container
-boots straight into ``ModuleNotFoundError``. Local dev and CI run from the repo
-root where everything is on the path, so only the wheel-based image build is
-selective — which means this drift is invisible until a deploy crashes on start.
-
-This test makes that drift fail at PR time instead: it derives the expected set
-from the filesystem (dirs with an ``__init__.py``) and asserts both manifests
-agree, rather than just checking the two lists against each other (which would
-happily pass when a package is missing from both — exactly how ``obs`` slipped
-through).
+The expected set is derived from the filesystem (dirs with an ``__init__.py``)
+rather than by comparing the two manifests to each other, which would pass
+when a package is missing from both.
 """
 
 from __future__ import annotations

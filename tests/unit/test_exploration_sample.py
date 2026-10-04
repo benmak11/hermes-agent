@@ -2,28 +2,26 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The exploration sample: labels from outside the scorer's own belief.
 
-Every decision Hermes has ever collected was made on a job the current scorer
-already liked — the queue hides everything under 60 — so the labels only ever
-cover the region the scorer put above its own bar. ``EXPLORATION_RATE``
-deterministically surfaces a slice of the hidden 21-59 band so some decisions
-come from outside it.
+Every decision Hermes has collected was made on a job the current scorer
+already liked — the queue hides everything under 60 — so the labels only cover
+the region above the scorer's own bar. ``EXPLORATION_RATE`` deterministically
+surfaces a slice of the hidden 21-59 band.
 
-Three properties carry the whole feature, and each has its own section below.
+Three properties carry the feature, one section each below.
 
-**Off is really off.** The default is ``0`` and that is what almost every user
-runs, so at rate 0 the job doc and the ``/jobs/pending`` payload have to be
-exactly what they were before this existed — same jobs, same order, same two
-counts, no new key anywhere.
+Off is really off: the default is ``0``, so at rate 0 the job doc and the
+``/jobs/pending`` payload must be byte-for-byte what they were before this
+existed.
 
-**The sample is stable across processes, not merely within one.** Python salts
+The sample is stable across processes, not merely within one. Python salts
 ``hash(str)`` per process, so a sample built on ``hash()`` reshuffles on every
-cold start while a single-process test passes happily. The subprocess test
-below is the one that can actually see that, and the pinned digest values stop
-the algorithm being swapped out quietly.
+cold start while a single-process test still passes; the subprocess test is
+the one that can see that, and the pinned digests stop the algorithm being
+swapped out quietly.
 
-**A sampled job is indistinguishable in the response.** The sample exists to
-get an unbiased decision on a job the scorer rated low; anything the UI could
-branch on tells the user it does not really count, and the label is worthless.
+A sampled job is indistinguishable in the response. Anything the UI could
+branch on tells the user the job does not really count, and the label is then
+worthless.
 """
 
 import asyncio

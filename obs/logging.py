@@ -240,12 +240,10 @@ def current_run_id() -> str | None:
 def current_request_id() -> str | None:
     """The ``request_id`` the middleware bound, or None outside a request.
 
-    The request-scoped twin of :func:`current_run_id`, and there for the same
-    reason: code that is *not* logging (an exposure record, see
-    ``tools.exposures``) needs the same correlation id every log line already
-    carries, so the row can be joined back to the request that produced it.
-    Reading it here rather than minting one is the point — a fresh id would
-    correlate with nothing.
+    The request-scoped twin of :func:`current_run_id`, for code that is not
+    logging but needs the same correlation id — an exposure row joins back to
+    the request that produced it. Reading rather than minting is the point: a
+    fresh id would correlate with nothing.
     """
     return structlog.contextvars.get_contextvars().get("request_id")
 
@@ -259,16 +257,12 @@ def log_agent_start(logger: Any, agent: str, **context: Any) -> float:
     """Log the explicit kickoff of a background "agent" cycle (discovery, sweep,
     tailoring, submission, profile extraction, ...).
 
-    Every one of these previously logged its own ad hoc ``"<domain>.start"``
-    event with whatever fields the author remembered — some had none at all,
-    making "what is this run actually doing" invisible without cross-referencing
-    the bound run_id against other lines. This standardizes the event name
-    (filter Cloud Logging on ``jsonPayload.message="agent.started"`` to see
-    every agent kickoff in the app) and requires the caller to state what's
-    being initiated via ``context`` (trigger, job_id, company, title, ...).
+    Standardizes the event name, so filtering Cloud Logging on
+    ``jsonPayload.message="agent.started"`` shows every agent kickoff, and
+    requires the caller to say what is being initiated via ``context``.
 
     Returns a ``time.perf_counter()`` start mark — pass it to
-    :func:`log_agent_end` to report how long the run took.
+    :func:`log_agent_end`.
     """
     logger.info("agent.started", agent=agent, **context)
     return time.perf_counter()
@@ -280,24 +274,16 @@ def log_agent_end(
     """Log the explicit end of a background "agent" cycle (pairs with
     :func:`log_agent_start`).
 
-    ``outcome`` is the field to filter/group on — e.g. ``"completed"``,
-    ``"failed"``, ``"discarded"``, ``"posting_removed"`` — so a scan of
-    ``jsonPayload.message="agent.finished"`` immediately shows what happened to
-    every run, not just that something with this run_id eventually stopped.
-    ``**result`` carries whatever summary is useful for that agent (counts,
-    resume_uri, error, ...).
+    ``outcome`` is the field to filter and group on — ``"completed"``,
+    ``"failed"``, ``"discarded"``, ``"posting_removed"`` — and ``**result``
+    carries whatever summary is useful for that agent.
 
-    **A ``duration_ms`` in ``result`` is renamed, not passed through.** The
-    sweep's counts dict carries its own ``duration_ms`` (``tools.ats.sweep``
-    times its board fetches), and splatting it here collided with the keyword
-    below — ``TypeError: got multiple values for keyword argument
-    'duration_ms'`` — raised *after* the sweep's Firestore success write, so
-    the caller's ``except`` logged ``sweep.failed`` and released the slot on a
-    run that had done its whole job. Three weeks of production logs (13
-    sweeps, 13 ``outcome=failed``, zero completed) were that one keyword.
-    Fixed here rather than at the call site so no future caller can
-    reintroduce it: whatever the caller measured lands as
-    ``step_duration_ms``, beside this function's own wall-clock figure.
+    A ``duration_ms`` in ``result`` is renamed to ``step_duration_ms`` rather
+    than passed through. Splatting it collided with this function's own
+    keyword and raised ``TypeError`` *after* the caller's success write, so
+    the caller's ``except`` logged a failure on a run that had done its whole
+    job — three weeks of sweeps logged ``outcome=failed`` that way. Fixed here
+    so no future caller can reintroduce it.
     """
     duration_ms = round((time.perf_counter() - started) * 1000, 1)
     step_duration_ms = result.pop("duration_ms", None)

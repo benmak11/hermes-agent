@@ -4,23 +4,20 @@
 
 Three rules, each of which was a way of getting this wrong:
 
-1. **Units come from the budget grant, never the backlog.** A fresh account
-   has thousands of pending jobs and a 200-job per-cycle grant; quoting the
-   backlog would be both terrifying and wrong by an order of magnitude. It
-   also means an estimate needs no query over ``jobs`` at all — everything it
-   reads is the ``scoring_budget`` map already on the user document.
-2. **Always a range, never a figure.** The measured rate moved ~2.2x once with
-   no change on our side. A single number invites being held to it.
-3. **Always its provenance.** "based on your last 3 runs" and "using the
-   2026-08-23 measurement" are different claims and the user is entitled to
-   know which one they are being shown.
+1. Units come from the budget grant, never the backlog. A fresh account has
+   thousands of pending jobs against a 200-job per-cycle grant, so quoting the
+   backlog is wrong by an order of magnitude — and reading the grant means an
+   estimate needs no query over ``jobs`` at all.
+2. Always a range, never a figure. The measured rate moved ~2.2x once with no
+   change on our side.
+3. Always its provenance: "based on your last 3 runs" and "using the
+   2026-08-23 measurement" are different claims.
 
-The estimate covers **both** batch legs. A backlog scored as a batch run pays
-Flash at submit and Pro hours later, when ``/tasks/batch/resume`` creates the
-score batch — long after the click. Consent captured at the click only covers
-that second, later charge because the quote is per *job over the whole grant*
-rather than per leg. If this is ever narrowed to one leg, the resume path
-starts spending money nobody was asked about.
+The estimate covers both batch legs, because a backlog scored as a batch pays
+Flash at submit and Pro hours later when ``/tasks/batch/resume`` creates the
+score batch. The quote is per job over the whole grant rather than per leg, so
+consent at the click covers that later charge; narrowed to one leg, the resume
+path would spend money nobody was asked about.
 """
 
 from __future__ import annotations

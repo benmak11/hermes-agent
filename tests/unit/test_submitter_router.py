@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Unit tests for the application submitter router (Phase 7).
+"""Unit tests for the application submitter router.
 
 Only the routing/guard logic is covered here — the Greenhouse path launches a
 real browser and is validated separately (dry-run), not in CI.

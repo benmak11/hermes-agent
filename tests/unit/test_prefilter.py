@@ -3,18 +3,16 @@
 """The free pre-filter, now that it exists exactly once.
 
 ``pipeline.prefilter`` is the extraction of a decision that was written out
-three times — once in ``match_job`` and once in each batch path, which never
-call ``match_job`` at all. Phase 1D widened it to carry the geo gate as well,
-so what is pinned here is less the family test itself (four lines) than the
-properties the seam has to keep:
+three times — in ``match_job`` and in each batch path, which never call
+``match_job``. It also carries the geo gate, so what is pinned is less the
+family test than the properties the seam has to keep:
 
 - the sentinels are always a **copy**, never a shared module singleton, or the
-  first rejected job in a run would rename every later one by mutating module
-  state;
+  first rejected job in a run would rename every later one;
 - an unparsed job is ``None`` and not a tombstone, because every caller settles
-  the unparsed case before asking and a parse failure must stay retryable;
-- all three call sites are looking at the *same* function object, which is the
-  only thing stopping one of them from quietly drifting back to its own copy;
+  the unparsed case first and a parse failure must stay retryable;
+- all three call sites look at the *same* function object, which is what stops
+  one of them drifting back to its own copy;
 - **with ``enforce=False`` the gate is not consulted at all**, which is what
   makes the geo work inert on merge.
 

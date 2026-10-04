@@ -1142,7 +1142,7 @@ def test_score_or_start_run_big_backlog_returns_run_tag(monkeypatch):
     assert counts["pending"] == 904 and counts["discarded"] == 7
 
 
-# ------------------------------------------------- committed cost (Phase 3)
+# ----------------------------------------------------------- committed cost
 #
 # **Committed spend used to be invisible until ingest.** Google bills a Vertex
 # batch when it runs it; our ledger prices it hours later, when a resume pass

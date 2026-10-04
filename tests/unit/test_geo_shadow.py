@@ -3,23 +3,19 @@
 """The geo gate wired into scoring — as a tape recorder, and nothing more.
 
 ``tools.matching.geo`` is provably safe (0 false positives over 1,127 replayed
-scores) and its coverage is provably *unmeasurable* from history: every job it
-would have caught was tombstoned out of `jobs` by ``persist_result``, and the
-tombstones carry no ``jd_parsed``. So the gate now runs live and writes down
-what it would have said, next to what Pro actually said.
+scores) and its coverage is unmeasurable from history, because every job it
+would have caught was tombstoned out of `jobs` by ``persist_result``. So the
+gate runs live and writes down what it would have said, next to what Pro
+actually said.
 
-Two questions run through everything below.
-
-**Is it really shadow?** The no-op tests are the load-bearing ones here. Score,
+**Is it really shadow?** The no-op tests are load-bearing: score,
 recommendation and discard outcome must be byte-identical with the gate wired
-in and without it — if any test could tell the difference in *scoring*
-behavior, this phase has quietly become a behavior change wearing a cost
-optimization's clothes.
+in and without it. If any test could tell the difference in scoring behavior,
+this is a behavior change wearing a cost optimization's clothes.
 
 **Is it recording everywhere?** Both batch paths get their own test, because
-the cheap path is the one that ships silently uninstrumented, and a coverage
-number measured over the online scorer alone would be wrong in a way nobody
-could see.
+the cheap path is the one that ships silently uninstrumented and a coverage
+number measured over the online scorer alone would be wrong invisibly.
 """
 
 import asyncio

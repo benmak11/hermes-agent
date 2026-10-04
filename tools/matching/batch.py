@@ -1,25 +1,22 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Bulk scoring through Vertex batch prediction.
+"""Bulk scoring through Vertex batch prediction, at half the interactive rate.
 
-The online scorer (``tools.matching.score``) is right for the scheduler's
-small incremental runs; a backlog of thousands of jobs doesn't need answers
-in seconds, and batch prediction bills at half the interactive rate on both
-models. This module mirrors ``score_pending_jobs``'s outcome contract
-(``match``/``jd_parsed`` persisted, low scores tombstoned into
-``discarded_jobs``) but runs the LLM legs as two batch jobs: parse (Flash,
-jobs missing ``jd_parsed`` after the free cross-user ``jd_cache`` is
-consulted) then score (Pro, in-family jobs), with the free family pre-filter
-applied locally in between.
+Mirrors ``score_pending_jobs``'s outcome contract (``match``/``jd_parsed``
+persisted, low scores tombstoned into ``discarded_jobs``) but runs the LLM legs
+as two batch jobs — parse (Flash, for jobs the free cross-user ``jd_cache``
+misses) then score (Pro, in-family jobs) — with the free family pre-filter
+applied locally in between. Worth it only on backlogs big enough that half
+price beats minutes-to-hours of turnaround.
 
-Batch requests can't use the Phase 3.2 context cache (caches are an
-interactive-API feature), so score requests inline the full static block —
-the 50% batch discount on the whole call still beats the cache's ~30%.
+Batch requests cannot use the context cache (an interactive-API feature), so
+score requests inline the full static block; the 50% batch discount on the
+whole call still beats the cache's ~30%.
 
 Vertex batch I/O is GCS JSONL: requests upload to
 ``gs://<bucket>/vertex-batch/<run-tag>/{parse,score}/input.jsonl`` and output
 lines echo each request next to its response. Responses join back to jobs by
-that echoed request text; identical texts (reposted JDs) collapse into one
+that echoed request text, so identical texts (reposted JDs) collapse into one
 billed request whose response fans out to every matching job.
 """
 
@@ -69,14 +66,11 @@ from tools.matching.score import (
 
 log = get_logger("tools.matching")
 
-# Batch prediction rejects model *aliases* outright ("Do not support publisher
-# model gemini-flash-latest" — verified live 2026-07-09, on both the global
-# and regional endpoints), so this leg has always pinned a concrete id.
-# tools/llm_models.FLASH_MODEL is now pinned to the same one, which makes the
-# two equal today — still two declarations, because the batch catalog and the
-# interactive one can diverge again and this is the side that cannot fall back
-# to an alias. Move either and the matching obs/llm_cost.py pricing entry has
-# to move with it. Concrete ids work fine on the global endpoint too.
+# Batch prediction rejects model *aliases* outright (verified live on both the
+# global and regional endpoints), so this leg must pin a concrete id. Kept as
+# its own declaration even though tools/llm_models.FLASH_MODEL currently holds
+# the same id, because the batch and interactive catalogs can diverge again.
+# Move either and the matching obs/llm_cost.py pricing entry moves with it.
 BATCH_FLASH_MODEL = "gemini-2.5-flash"
 BATCH_PRO_MODEL = PRO_MODEL  # already a concrete id — batch accepts it as-is
 
@@ -116,17 +110,17 @@ def batch_bucket_name() -> str:
 def _parse_generation_config() -> str:
     """REST ``generationConfig`` for a parse request, as a JSON string.
 
-    Mirrors the interactive config in ``pipeline.parse_jd`` exactly (minus
-    ``system_instruction``, which is a request-level sibling in REST). Cached
-    as a string so building thousands of request lines doesn't redo the
-    pydantic → REST schema conversion, and JSON round-tripped by the caller so
-    each line owns its dict.
+    Mirrors the interactive config in ``pipeline.parse_jd`` exactly, minus
+    ``system_instruction``, which is a request-level sibling in REST. Cached as
+    a string so building thousands of request lines does not redo the pydantic
+    → REST schema conversion; the caller JSON round-trips it so each line owns
+    its dict.
     """
     cfg = types.GenerateContentConfig(
         response_mime_type="application/json",
-        # t_schema is the SDK-private converter the interactive path runs on
-        # our pydantic models internally; using it keeps the batch schema
-        # byte-identical to what online calls send. Pinned by unit test.
+        # t_schema is the SDK-private converter the interactive path uses
+        # internally; it keeps the batch schema byte-identical to what online
+        # calls send. Pinned by unit test.
         response_schema=_transformers.t_schema(None, ParsedJD),
         temperature=0.1,
         thinking_config=_PARSE_JD_THINKING,
@@ -181,11 +175,11 @@ def _request_text(line: dict) -> str | None:
 def _response_of(line: dict, model: str) -> types.GenerateContentResponse | None:
     """Parse one output line's response, or None when the line errored.
 
-    Batch output carries fields the SDK's response model *forbids* as extras
-    (per-candidate ``score``, seen live 2026-07-09), so this rebuilds just the
-    shape downstream consumes — text, usage, model — rather than validating
-    the raw line. ``modelVersion`` defaults to the requested model (error
-    lines omit it) so ``record_llm_call``'s pricing lookup keeps working.
+    Batch output carries fields the SDK's response model forbids as extras
+    (per-candidate ``score``, seen live), so this rebuilds only the shape
+    downstream consumes — text, usage, model — rather than validating the raw
+    line. ``modelVersion`` defaults to the requested model, which error lines
+    omit, so ``record_llm_call``'s pricing lookup keeps working.
     """
     resp = line.get("response")
     if not isinstance(resp, dict):
@@ -231,10 +225,11 @@ async def submit_batch(
 ) -> str:
     """Upload request lines and create one batch job; returns the job name.
 
-    Submission takes seconds while completion takes minutes-to-hours, which is
-    why this is a separate seam: the resumable pipeline (``batch_runs``)
-    submits here and leaves polling/ingestion to later worker ticks, while
-    ``_run_batch`` below stays the blocking submit-poll-fetch path for the CLI.
+    Spends money: the created job bills on completion, and cancelling the
+    caller does not cancel it. Split from polling because submission takes
+    seconds while completion takes hours — ``batch_runs`` submits here and
+    ingests on later worker ticks, while ``_run_batch`` below is the blocking
+    submit-poll-fetch path for the CLI.
     """
     payload = "\n".join(json.dumps(line) for line in lines)
     await upload_text(
@@ -277,10 +272,10 @@ async def fetch_batch_output(gcs_dir: str) -> list[dict]:
         if not blob.name.endswith(".jsonl"):
             continue
         text = await asyncio.to_thread(blob.download_as_text)
-        # JSONL's delimiter is strictly "\n" — echoed JD text can contain
+        # JSONL's delimiter is strictly "\n". Echoed JD text can contain
         # U+2028/U+2029, which Vertex leaves unescaped and str.splitlines()
-        # treats as line breaks, shattering a JSON line mid-string (crashed a
-        # live run 2026-07-10).
+        # treats as line breaks, shattering a JSON line mid-string (it crashed
+        # a live run).
         out_lines.extend(json.loads(raw) for raw in text.split("\n") if raw.strip())
     return out_lines
 
@@ -313,9 +308,9 @@ async def _run_batch(
         try:
             job = await client.aio.batches.get(name=name)
         except Exception as e:
-            # One flaky poll (network blip, truncated JSON body — seen live
-            # 2026-07-10) must not kill an hours-long run; keep the last known
-            # state and ask again next tick. The deadline still bounds us.
+            # One flaky poll (network blip, truncated JSON body — both seen
+            # live) must not kill an hours-long run; keep the last known state
+            # and ask again next tick. The deadline still bounds us.
             log.warning("matching.batch.poll_retry", name=name, error=str(e)[:200])
     if job.state not in _USABLE_STATES:
         raise RuntimeError(f"Batch job {name} ended {job.state}: {job.error}")
@@ -415,15 +410,14 @@ async def batch_score_pending_jobs(
 ) -> dict:
     """Batch-mode twin of ``score_pending_jobs`` — same counts contract.
 
-    Expect minutes-to-hours of turnaround (Vertex targets 24h, hence the
-    default timeout); worth it only on runs big enough that half-price beats
-    waiting, which is why the CLI keeps online mode as the default.
+    Spends money. Expect minutes-to-hours of turnaround (Vertex targets 24h,
+    hence the default timeout), which is why the CLI keeps online mode as the
+    default.
 
     Reached only from ``cli.run_matching --batch``, which routes through
-    neither of the other two scorers — so the budget gate has to be here too,
-    or the CLI bypasses the cap entirely. ``ignore_budget`` skips it and, as
-    on every other entry point, leaves the run bounded by ``limit`` or
-    ``SCORE_LIMIT_CEILING``.
+    neither of the other two scorers, so the budget gate is repeated here or
+    the CLI bypasses the cap entirely. ``ignore_budget`` skips it and leaves
+    the run bounded by ``limit`` or ``SCORE_LIMIT_CEILING``.
     """
     db = firestore.AsyncClient()
     reservation = None
@@ -446,9 +440,9 @@ async def batch_score_pending_jobs(
     attempted = 0
     try:
         profile, pending = await load_profile_and_pending(db, user_id, limit)
-        # Every job handed to a batch draws its slot up front: the submission
-        # commits the spend, so unlike the online scorer's terminal counts
-        # there is nothing to give back once the requests go out.
+        # Every job handed to a batch draws its slot up front: submission
+        # commits the spend, so there is nothing to refund once the requests
+        # go out.
         attempted = len(pending)
         counts = await _batch_score(
             db,
@@ -517,9 +511,9 @@ async def _batch_score(
             continue
         to_parse.setdefault(job.jd_raw, []).append(job)
     parsed_now: list[Job] = []
-    # Jobs whose parse THIS run paid a Flash batch for — not the jd_cache
-    # hits below, which came out of some earlier run under a model this one
-    # cannot name. Feeds ``scored_with`` at the persist step.
+    # Jobs whose parse THIS run paid a Flash batch for. Excludes jd_cache
+    # hits, which came from an earlier run under a model this one cannot name.
+    # Feeds ``scored_with`` at the persist step.
     flash_parsed: set[str] = set()
     if to_parse:
         cached = await jd_cache.lookup_many(db, list(to_parse))
@@ -556,8 +550,8 @@ async def _batch_score(
             for job in jobs
             if job.jd_parsed is not None
         )
-        # Fresh parses become shared property: future runs — any user — skip
-        # the Flash call for these postings entirely.
+        # Fresh parses become shared property: future runs, for any user, skip
+        # the Flash call for these postings.
         await jd_cache.store_many(
             db,
             {
@@ -568,8 +562,8 @@ async def _batch_score(
             model=BATCH_FLASH_MODEL,
         )
     if parsed_now:
-        # Make the parse results durable before the Pro stage gets hours to
-        # fail (or this process to die) — the next run then skips stage 1.
+        # Persist parses before the Pro stage gets hours to fail, so the next
+        # run skips stage 1.
         psem = asyncio.Semaphore(_PERSIST_CONCURRENCY)
 
         async def _save_parse(job: Job) -> None:
@@ -579,15 +573,12 @@ async def _batch_score(
         await asyncio.gather(*(_save_parse(job) for job in parsed_now))
         log.info("matching.batch.parses_persisted", count=len(parsed_now))
 
-    # Stage 2 — the free local pre-filter; whatever it rejects goes straight to
-    # tombstones through the same persistence path the online scorer uses. The
-    # third tuple slot is the enforced geo record, ``None`` for everything the
-    # gate did not reject — including every Pro result appended below.
-    # The fourth slot is the model that produced the match — ``None`` for
-    # everything the free pre-filter decided, ``BATCH_PRO_MODEL`` for the Pro
-    # results appended below. It cannot be inferred at the persist step: an
-    # OUT_OF_FAMILY tombstone and a Pro result both arrive with ``enforced``
-    # set to ``None``.
+    # Stage 2 — the free local pre-filter; whatever it rejects is tombstoned
+    # through the same persistence path the online scorer uses. Third tuple
+    # slot: the enforced geo record, ``None`` unless the gate rejected the job.
+    # Fourth slot: the model that produced the match, ``None`` for anything the
+    # free pre-filter decided. The fourth cannot be inferred from the third —
+    # an OUT_OF_FAMILY tombstone and a Pro result both carry ``enforced=None``.
     to_persist: list[tuple[Job, JobMatch, dict | None, str | None]] = []
     to_score: list[Job] = []
     enforce_geo = geo_enforce_enabled()
@@ -632,13 +623,11 @@ async def _batch_score(
         job: Job, match: JobMatch, enforced: dict | None, match_model: str | None
     ) -> None:
         async with sem:
-            # The batch models, never the online constants. ``FLASH_MODEL``
-            # here would be unfalsifiable later — and since that constant was
-            # pinned to the same concrete id this one holds, it would also be
-            # *invisible*: the wrong name recording a right-looking string,
-            # until one of the two moves and retroactively mis-attributes
-            # every job scored in between. ``test_scored_with`` pins each path
-            # to a sentinel for exactly that reason.
+            # The batch models, never the online constants. They hold the same
+            # id today, so using ``FLASH_MODEL`` here would record a
+            # right-looking string and silently mis-attribute every job scored
+            # between now and whenever the two diverge. ``test_scored_with``
+            # pins each path to a sentinel for that reason.
             parse_model = BATCH_FLASH_MODEL if job.id in flash_parsed else None
             provenance = (
                 scored_with(parse_model=parse_model, match_model=match_model)
@@ -647,11 +636,9 @@ async def _batch_score(
             )
             try:
                 # ``profile`` turns on geo shadow recording (see
-                # ``score.shadow_geo_gate``). The OUT_OF_FAMILY tombstones in
-                # this same list carry score 0 and are skipped there — they
-                # never reached Pro, so there is no decision to compare against.
-                # ``enforced`` is the one case that bypasses the shadow path
-                # entirely, for the same reason: no Pro call was made.
+                # ``score.shadow_geo_gate``). Rows that never reached Pro —
+                # OUT_OF_FAMILY tombstones, and anything ``enforced`` — are
+                # skipped there: there is no Pro decision to compare against.
                 outcome = await persist_result(
                     ref_by_job_id[job.id],
                     job,

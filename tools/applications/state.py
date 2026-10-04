@@ -2,60 +2,37 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The application lifecycle as a state machine, with exactly one writer.
 
-Every status the funnel goes through used to be written by a blind
-``ref.set(..., merge=True)`` scattered across ``api/routes``. Two of those
-writes were races with real consequences: a double-click on Submit had both
-requests read ``ready_for_review``, both pass the check, and both start a live
-ATS submission — a **duplicate real job application**. This module makes that
-impossible by making one function the only place a ``status`` is ever written,
-and making that function a compare-and-swap.
+:func:`try_transition` is the only place an application's ``status`` is ever
+written, and it is a compare-and-swap. Without that, a double-click on Submit
+has both requests read ``ready_for_review``, both pass the check, and both
+start a live ATS submission — a duplicate real job application.
 
-There is a second compare-and-swap here, :func:`try_claim_lease`, for the
-question the status can't answer: **which process is running this right now.**
-The status claim is taken by the API request (a double-click loses it); the
-lease claim is taken by the worker that receives the task, so a redelivered
-Cloud Task finds a live lease and does nothing instead of starting a second
-live ATS submission.
+:func:`try_claim_lease` is a second compare-and-swap, for the question the
+status cannot answer: which process is running this right now. The status is
+claimed by the API request; the lease is claimed by the run, so a redelivered
+task finds a live lease and does nothing. That holds only because
+:data:`IN_PROGRESS` outlives the dispatch deadline. What actually keeps
+duplicates out of production today is ``max_attempts = 1`` on the
+``hermes-apply`` queue; the lease is what keeps the code correct if that
+changes, and what the reaper reads.
 
-That last sentence is only true because :data:`IN_PROGRESS` outlives the
-dispatch deadline — see the note on it. It is also, today, *not* the thing
-keeping duplicate submissions out of production: the ``hermes-apply`` queue is
-provisioned with ``max_attempts = 1`` (deployment/terraform/single-project/
-worker.tf), so a failed apply task is never redelivered at all. The lease is
-what makes the code correct if that ever changes, and what a reaper can read;
-the queue setting is what is load-bearing right now.
+The mechanism is the update-time precondition: read a snapshot, write with
+``last_update_time=snap.update_time``, and the loser gets
+``FailedPrecondition``, re-reads, and finds its transition no longer legal.
 
-**The mechanism is the update-time precondition**, the same one
-``tools.matching.batch_runs`` uses to stop racing resumers from double-
-submitting a paid Pro batch: read a snapshot, then write with
-``last_update_time=snap.update_time`` so the write fails if anything touched
-the document in between. The loser gets ``FailedPrecondition``, re-reads, finds
-the status has moved on, and discovers its transition is no longer legal.
+Legality is a table, :data:`TRANSITIONS`, not a set of ``if``s. A terminal
+status has no outgoing edges, and neither does an unknown one —
+``TRANSITIONS.get`` on a legacy or hand-edited value returns the empty set, so
+nothing can act on a document it does not understand. That is the whole
+backward-compatibility story: no migration.
 
-**Legality is a table, not a set of ``if``s.** :data:`TRANSITIONS` is the whole
-contract. Two properties fall out of it for free:
+The table covers ``ApplicationStatus`` values only. ``pending → scored →
+approved`` are facts about the *Job* document and are deliberately not here;
+approval is the entry event that creates an Application in :data:`INITIAL`.
 
-- A terminal status has no outgoing edges, so nothing can revive it.
-- An **unknown status has no outgoing edges either** — ``TRANSITIONS.get`` on a
-  legacy or hand-edited value returns the empty set, so no code path can act on
-  a document it doesn't understand while the UI still renders it. That is the
-  backward-compatibility story: no migration, no ``normalize()``.
-
-**What this table is not.** It covers ``ApplicationStatus`` values only. The
-``pending → scored → approved`` sequence is *not* in here: those are facts about
-the **Job** document (``user_decision`` plus the presence of ``match``), and no
-document holds both. Approval is the entry event that *creates* an Application
-in :data:`INITIAL`; a table spanning both would be a fake abstraction over two
-unrelated documents.
-
-Shape is modelled on ``tools.matching.budget``: pure logic that unit-tests
-against fakes, plus one thin Firestore-touching function.
-
-Synchronous on purpose — every caller (``api/routes/applications.py``,
-``api/routes/jobs.py``) holds a synchronous ``firestore.Client`` reference, and
-two of the call sites are synchronous FastAPI routes that FastAPI already runs
-in a threadpool. An ``async def`` here would force those routes onto the event
-loop where their blocking Firestore reads would stall it.
+Synchronous on purpose: every caller holds a synchronous ``firestore.Client``,
+and two call sites are sync FastAPI routes already run in a threadpool. An
+``async def`` here would put their blocking reads on the event loop.
 """
 
 from __future__ import annotations
@@ -76,36 +53,32 @@ from tools.queues import _DISPATCH_DEADLINE_SECONDS
 
 log = get_logger("tools.applications")
 
-# ``write_option`` is a *staticmethod* factory — it builds a precondition and
-# never touches a client or the network. Bound once here so this module needs no
-# client instance to construct one, and so a test that swaps out
-# ``firestore.Client`` (to fake a collection) can't take the precondition with it.
+# ``write_option`` is a staticmethod factory: it builds a precondition and never
+# touches a client or the network. Bound once here so this module needs no client
+# instance, and so a test that swaps out ``firestore.Client`` cannot take it too.
 _precondition = firestore.Client.write_option
 
 # Fields this module owns. Nothing outside it may write them, and a content
-# write (the tailoring result) must strip them before merging — a blanket
-# ``set()`` of the model used to wipe the whole timeline.
+# write must strip them before merging, or a blanket ``set()`` wipes the
+# timeline.
 STATUS_FIELD = "status"
 TIMELINE_FIELD = "timeline"
 LEASE_FIELD = "lease"
 OWNED_FIELDS = (STATUS_FIELD, TIMELINE_FIELD, LEASE_FIELD)
 
-#: The status every Application is created in. Approving a job enqueues the
-#: work; the background tailoring task *claims* it by moving queued → tailoring,
-#: so an application that never got picked up is visibly still queued rather
-#: than indistinguishable from one whose worker died mid-run.
+#: The status every Application is created in. The tailoring task claims its
+#: work by moving queued → tailoring, so an application that was never picked
+#: up stays visibly queued instead of looking like one whose worker died.
 INITIAL = "queued"
 
 #: The whole lifecycle contract. Keys and values are ``ApplicationStatus``
 #: values from ``models/application.py`` and nothing else.
 #:
-#: ``→ posting_removed`` hangs off *every* non-terminal status because the
-#: posting dying is an external fact discovered by whoever looks (the liveness
-#: sweep in ``tools.ats.sweep``, or the pre-flight check in tailoring and
-#: submission), not a step in the flow. ``tools.ats.sweep.ACTIVE_APP_STATUSES``
-#: is what decides which of those a *background* sweep may act on — it
-#: deliberately spares ``submitting`` so a sweep can't yank a document out from
-#: under a browser mid-submit.
+#: ``→ posting_removed`` hangs off every non-terminal status because the
+#: posting dying is an external fact, not a step in the flow.
+#: ``tools.ats.sweep.ACTIVE_APP_STATUSES`` decides which of those a background
+#: sweep may act on; it spares ``submitting`` so a sweep cannot yank a document
+#: out from under a browser mid-submit.
 TRANSITIONS: dict[str, frozenset[str]] = {
     # The tailoring task claims its work by moving out of queued.
     "queued": frozenset({"tailoring", "failed", "posting_removed"}),
@@ -127,15 +100,12 @@ TERMINAL_STATUSES: frozenset[str] = frozenset(
 #: Seconds a claim stays valid, and **the inequality that makes it a lock**:
 #: a lease must outlive the longest run it guards, or it stops being one.
 #:
-#: Cloud Tasks caps dispatch at ``_DISPATCH_DEADLINE_SECONDS`` (1800) and the
-#: worker's ``timeoutSeconds`` matches, so 1800s is the longest a task can run
-#: before Cloud Run kills it and the queue may redeliver. An earlier version of
-#: this file had the inequality backwards — a 1200s lease against 1800s of work
-#: — which is worse than no lease at all: worker A is killed at T+1800 with the
-#: browser possibly *past* the Submit click, the retry lands at T+1860, reads
-#: an expired lease, claims it, and files the application a second time. The
-#: grace is added on top of the deadline rather than subtracted from it, and
-#: the value is derived so the two cannot drift apart.
+#: Cloud Tasks caps dispatch at ``_DISPATCH_DEADLINE_SECONDS`` and the worker's
+#: ``timeoutSeconds`` matches, so that is the longest a task can run before the
+#: queue may redeliver. A lease shorter than the deadline is worse than none: a
+#: killed worker may be past the Submit click, and the retry would find the
+#: lease expired and file the application again. Hence grace added on top, and
+#: derived rather than restated so the two cannot drift.
 _LEASE_GRACE_SECONDS = 60
 _LEASE_SECONDS = _DISPATCH_DEADLINE_SECONDS + _LEASE_GRACE_SECONDS
 
@@ -144,30 +114,18 @@ _LEASE_SECONDS = _DISPATCH_DEADLINE_SECONDS + _LEASE_GRACE_SECONDS
 #: deadline, so each needs the same floor. ``queued`` carries one for the
 #: reaper's benefit — nothing claims that status today.
 #:
-#: ``tools.applications.reaper`` is what expires these. Three paths write a
-#: lease: :func:`try_claim_lease` (``run_submission``'s delivery claim on
-#: ``submitting``, and the reaper's own claim on all three), ``run_tailoring``'s
-#: ``queued → tailoring`` claim, which takes status and lease in one write, and
-#: the reaper's ``→ queued`` recovery, which lands a fresh ``queued`` lease so
-#: the next pass backs off instead of re-dispatching hourly.
+#: ``tools.applications.reaper`` is what expires these.
 #:
-#: **The asymmetry the reaper is built on.** For ``tailoring`` the status and
-#: the lease are written together, so an absent lease there means a document
-#: predating leases entirely. For ``submitting`` they are written by two
-#: different processes: ``POST /applications/{id}/submit`` writes the status and
-#: the run writes the lease, so there is a real window between the two — and,
-#: when the dispatch between them fails outright, a document that stays there.
-#: Every path that can drive a submission does take this lease (the claim lives
-#: in ``run_submission`` itself, not in the ``/tasks/apply`` handler, precisely
-#: so that is true of the in-process path too), but "submitting and no lease" is
-#: **ambiguous, not dead**: it must fall back to the age arithmetic in
-#: ``cli/unwedge_submitting`` and must never be read as "the owner is gone". The
-#: reaper honours that by refusing to touch an unleased ``submitting`` document
-#: at all — see its module docstring.
+#: The asymmetry the reaper is built on: for ``tailoring`` the status and lease
+#: are written together, so an absent lease means a document predating leases.
+#: For ``submitting`` they come from two processes — the route writes the
+#: status, the run writes the lease — so "submitting and no lease" is ambiguous,
+#: not dead, and must never be read as "the owner is gone". The reaper refuses
+#: to touch such a document and leaves it to ``cli/unwedge_submitting``.
 #:
-#: ``queued`` is the exception to "the lease decides": nothing claims that
-#: status in the ordinary flow, so the reaper decides its staleness by age and
-#: then takes this lease itself, as its own re-dispatch bookkeeping.
+#: ``queued`` is the exception to "the lease decides": nothing claims it in the
+#: ordinary flow, so the reaper judges staleness by age and then takes this
+#: lease itself as re-dispatch bookkeeping.
 IN_PROGRESS: dict[str, int] = {
     "queued": _LEASE_SECONDS,
     "tailoring": _LEASE_SECONDS,
@@ -225,13 +183,10 @@ def lease_for(
     ``expires_at`` is what a reaper compares against: past it, the claiming
     process is presumed dead and the application may be failed or re-queued.
 
-    ``owner`` names *which* run holds it, and exists so a release can be
-    checked rather than assumed. Without it, an expiry lets two runs believe
-    they hold the same document: B claims after A's lease lapses, then A —
-    alive, merely slow — finishes and clears the lease, freeing the document
-    for a third claim while B is still working. :func:`release_lease` refuses
-    that. Optional in the *stored* shape on purpose: documents written before
-    this field existed must still read back as valid leases.
+    ``owner`` names which run holds it, so a release can be checked rather
+    than assumed — otherwise a slow run can clear a lease a later run took
+    over. Optional in the stored shape, so documents written before the field
+    existed still read back as valid leases.
     """
     seconds = IN_PROGRESS.get(status)
     if seconds is None:
@@ -266,11 +221,10 @@ def _lease_expiry(lease) -> datetime | None:
 def lease_is_held(doc: dict, *, now: datetime | None = None) -> bool:
     """Is someone currently claiming this document? Pure.
 
-    A lease whose ``expires_at`` can't be read counts as **held**. The bias is
-    deliberate and asymmetric: refusing to claim leaves the document wedged
-    (which ``cli/unwedge_submitting`` and, later, the reaper can undo), while
-    claiming anyway risks a duplicate real job application, which nothing can
-    undo.
+    A lease whose ``expires_at`` cannot be read counts as held: refusing to
+    claim only wedges the document, which the reaper or
+    ``cli/unwedge_submitting`` can undo, while claiming anyway risks a
+    duplicate real job application, which nothing can undo.
     """
     lease = doc.get(LEASE_FIELD)
     if not isinstance(lease, dict):
@@ -298,55 +252,34 @@ def try_claim_lease(
 ) -> bool:
     """Compare-and-swap the **lease** of a document already in ``status``.
 
-    The second compare-and-swap in this module, and the one that makes an
-    at-least-once task delivery safe. A status transition can't do this job:
-    ``POST /applications/{id}/submit`` already claims the work by CAS-ing
-    ``→ submitting`` (that is what a double-click loses on), so by the time the
-    run starts the status *is* the claim and there is no second edge left to
-    take — ``submitting → submitting`` is illegal, exactly as it must be.
-    Claiming the lease instead splits the two questions cleanly: **who owns this
-    application** (the status, claimed by the API request) versus **who is
-    running it right now** (the lease, claimed by the run — meaning
-    ``run_submission`` itself, so that a queued task and an in-process
-    background task are fenced by the same primitive rather than only one of
-    them holding a claim).
+    This is what makes at-least-once task delivery safe. A status transition
+    cannot do the job: the API request already claimed the work by CAS-ing
+    ``→ submitting``, so by the time the run starts there is no legal edge
+    left. The lease is claimed by the run itself (inside ``run_submission``,
+    not the task handler, so the in-process path is fenced too).
 
-    Returns ``True`` when this caller took the lease. ``False`` means: the
-    document is gone, its status moved on, someone else's lease is still live,
-    or the write lost its precondition twice — in every case the caller's
-    correct response is to do nothing, which is what makes a redelivered task a
-    no-op rather than a second live ATS submission.
+    Returns ``True`` when this caller took the lease. ``False`` — the document
+    is gone, its status moved on, another lease is live, or the precondition
+    was lost twice — means do nothing, which is what makes a redelivered task
+    a no-op instead of a second live ATS submission.
 
-    Every terminal write on the claiming path passes :data:`CLEAR_LEASE`, so a
-    run that finishes releases the lease in the same write that records its
-    outcome; :func:`release_lease` covers the case where that terminal write
-    lost its race and the lease would otherwise be left behind. A run that
-    *dies* leaves the lease to expire on the :data:`IN_PROGRESS` clock — a
-    wedged document, which is the safe failure.
+    Terminal writes on the claiming path pass :data:`CLEAR_LEASE`, so a
+    finished run releases the lease in the same write as its outcome;
+    :func:`release_lease` covers the case where that write lost its race. A
+    run that dies leaves the lease to expire on the :data:`IN_PROGRESS` clock.
 
-    ``owner`` is stamped on the lease so the release can be checked rather than
-    assumed; :func:`new_owner` mints one per run.
+    ``extra`` lands in the same write as the claim and may not contain
+    :data:`OWNED_FIELDS`. It exists for the reaper's retry counter, which
+    bounds the re-dispatch loop and so must advance exactly once per winning
+    claim and never on a losing one.
 
-    ``extra`` carries fields that must land **in the same write as the claim**,
-    the same contract :func:`try_transition` offers, and it may not contain
-    :data:`OWNED_FIELDS`. It exists for the reaper's retry counter: the counter
-    is what bounds an automatic re-dispatch loop, so a claim that loses must not
-    advance it and a claim that wins must advance it exactly once — which is
-    only true if the claim and the bump are one write. This is the same reason
-    ``submit_attempts`` rides inside the ``→ submitting`` swap rather than
-    beside it. On the ``queued`` claim it is the *only* payload of consequence:
-    nothing else claims that status, so the reaper's own bookkeeping is all
-    there is to protect.
-
-    Retries once on a lost precondition for the same reason
-    :func:`try_transition` does (``_backfill_job_url`` writes on read), and
-    re-reads the status and the lease on that retry rather than trusting the
-    first read.
+    Retries once on a lost precondition (``_backfill_job_url`` writes on read)
+    and re-reads status and lease on that retry.
     """
     if status not in IN_PROGRESS:
         raise ValueError(f"{status!r} carries no lease; see state.IN_PROGRESS")
-    # Validated before the loop: a clash is a programming error, not a race, and
-    # it should raise whether or not the first attempt reaches the network.
+    # Validated before the loop: a clash is a programming error, not a race, so
+    # it must raise whether or not the first attempt reaches the network.
     _reject_owned(extra)
     for attempt in (0, 1):
         if not snap.exists:
@@ -401,16 +334,13 @@ def try_claim_lease(
 def release_lease(ref, snap, owner: str) -> bool:
     """Drop a lease **this** caller holds, leaving everything else alone.
 
-    The counterpart to :func:`try_claim_lease`, for the path where the run
-    finished but its terminal ``try_transition`` lost — the status write carries
-    :data:`CLEAR_LEASE`, so when it loses, the lease it would have cleared stays
-    behind and blocks the next claim for its full TTL.
+    For the path where the run finished but its terminal ``try_transition``
+    lost, leaving behind the lease that write would have cleared.
 
-    Refuses when the lease belongs to someone else, or when it carries no
-    ``owner`` at all: a lease we cannot prove is ours is one we might be about
-    to steal from a live run, and letting it expire costs only time. Returns
-    ``False`` for "nothing released" in every such case, including the ordinary
-    one where the terminal write already cleared it.
+    Refuses when the lease belongs to someone else or carries no ``owner``: a
+    lease we cannot prove is ours might belong to a live run, and letting it
+    expire costs only time. ``False`` means nothing was released, including
+    the ordinary case where the terminal write already cleared it.
     """
     for attempt in (0, 1):
         if not snap.exists:
@@ -468,27 +398,17 @@ def _reject_owned(extra: dict | None) -> dict:
 def append_note(ref, status: str, message: str, *, extra: dict | None = None) -> bool:
     """Append a timeline entry **without** touching the document's status.
 
-    For progress chatter: the submitter emits a label per step ("Filling
-    standard fields", "submitting"), which is a display string, not a lifecycle
-    edge. ``update`` rather than ``set(merge=True)`` so a late note can't
-    resurrect a document the undo path deleted.
+    For progress chatter — the submitter's per-step labels are display
+    strings, not lifecycle edges. ``update`` rather than ``set(merge=True)``,
+    so a late note cannot resurrect a document the undo path deleted.
 
-    ``extra`` lands in the *same* write, under the same :data:`OWNED_FIELDS`
-    guard as :func:`try_transition`'s. One progress note needs that:
-    ``submit_attempted_at``, the point-of-no-return marker
-    (``api.routes.applications.run_submission``'s ``progress``), which is the
-    single fact the reaper's apply fork reads to decide whether a dead run may
-    be retried. Written beside the note rather than with it, a crash between the
-    two writes could leave the timeline saying the form was being submitted
-    while the marker — the thing that stops an automatic re-submission — is
-    missing. This is deliberately *not* a compare-and-swap: the marker must land
-    whatever else has happened to the document.
-
-    Nothing is lost by that. The only writer that ever *clears* the marker is
-    the ``→ submitting`` swap in ``api.routes.applications.submit``, which runs
-    in the API request before the apply task is dispatched — so it cannot race
-    a note written by a browser that does not exist yet, and the two can only
-    interleave in the one order that is correct.
+    ``extra`` lands in the same write, under the same :data:`OWNED_FIELDS`
+    guard as :func:`try_transition`'s. It carries ``submit_attempted_at``, the
+    point-of-no-return marker the reaper reads before retrying a dead run:
+    written separately, a crash between the two writes could lose it.
+    Deliberately not a compare-and-swap — the marker must land whatever else
+    happened to the document — which is safe because the only writer that
+    clears it runs in the API request before the apply task is dispatched.
     """
     payload = _reject_owned(extra)
     payload[TIMELINE_FIELD] = firestore.ArrayUnion([timeline_event(status, message)])
@@ -532,37 +452,29 @@ def try_transition(
     ``last_submitted_at``); it may not contain :data:`OWNED_FIELDS`. ``lease``
     writes a claim alongside the status, or :data:`CLEAR_LEASE` to drop one.
 
-    ``allowed_from`` narrows the table for **this one call**: the current status
-    must be in it on *every* attempt, the retry's re-read included. A caller
-    whose precondition is narrower than the table must pass it here rather than
-    check it itself — **filtering outside the swap is not a compare-and-swap.**
-    The liveness sweep is the case that proves it: it may invalidate a
-    pre-submission application but must never touch one that is ``submitting``,
-    and ``submitting → posting_removed`` is a legal edge (the submission path
-    itself uses it). With the check outside, a sweep that read
-    ``ready_for_review``, lost the precondition to a user clicking Submit, and
-    retried would re-read ``submitting``, find the edge legal, and mark the
-    posting removed *while a browser was mid-submit* — losing the confirmation
-    evidence for an application the user really did send.
+    ``allowed_from`` narrows the table for this one call, and is re-checked on
+    every attempt including the retry's re-read. A caller whose precondition
+    is narrower than the table must pass it here rather than filter
+    beforehand: filtering outside the swap is not a compare-and-swap. The
+    liveness sweep is the case that proves it — ``submitting →
+    posting_removed`` is a legal edge, so a sweep that lost its precondition
+    to a user clicking Submit would otherwise retry and invalidate the posting
+    mid-submit.
 
-    Uses ``update``, never ``set``: an application deleted by the undo path in
-    ``jobs.decide`` must stay deleted, and ``set`` would recreate it from a
-    write that was already in flight.
+    Uses ``update``, never ``set``: an application deleted by the undo path
+    must stay deleted, and ``set`` would recreate it.
 
-    **One retry.** ``_backfill_job_url`` writes on read, so a plain
-    ``GET /applications`` concurrent with a transition bumps ``update_time`` and
-    fails the precondition without changing anything. Re-reading and retrying
-    once absorbs that; crucially the retry re-checks legality against the *new*
-    status, so a genuine race (the other click already moved us to
-    ``submitting``) fails on the table instead of overwriting the winner.
+    One retry, because ``_backfill_job_url`` writes on read and so a
+    concurrent ``GET /applications`` fails the precondition without changing
+    anything. The retry re-checks legality against the new status, so a
+    genuine race fails on the table instead of overwriting the winner.
     """
     for attempt in (0, 1):
         if not snap.exists:
             return False
         current = (snap.to_dict() or {}).get(STATUS_FIELD)
-        # Re-checked on the retry, not just the first read — that is the whole
-        # point of taking the caller's precondition instead of letting it
-        # filter beforehand.
+        # Re-checked on the retry, not just the first read — the whole point
+        # of taking the caller's precondition rather than letting it filter.
         if allowed_from is not None and current not in allowed_from:
             log.info(
                 "application.transition_not_allowed_from",

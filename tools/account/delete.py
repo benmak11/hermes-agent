@@ -2,30 +2,21 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Deleting one user: what gets erased, what must not be, and in what order.
 
-Lifted verbatim out of ``cli/reset_user.py``, which had performed this wipe for
-demo resets since 2026-07-22 and has been run in anger. The CLI is now a thin
-wrapper over this module and the API's ``POST /account/delete`` is another, so
-"delete my account" and "reset this demo account" cannot drift apart.
+Both ``cli/reset_user.py`` and the API's ``POST /account/delete`` are thin
+wrappers over this module, so "delete my account" and "reset this demo
+account" cannot drift apart. It is an extraction rather than an import because
+``cli/reset_user.py`` calls ``load_dotenv()`` at import time, and nothing in
+``api/`` or ``tools/`` may import from ``cli/``.
 
-**Why an extraction rather than an import.** ``cli/reset_user.py`` calls
-``load_dotenv()`` at import time and parses ``argparse`` flags. Neither belongs
-in the API's import graph — a route module that pulled in that CLI would load
-the developer's ``.env`` (including ``AUTH_DEV_MODE=1``) into the API process
-just by being imported, which is the exact leak ``tests/unit/conftest.py``
-documents. Nothing in ``api/`` or ``tools/`` imports from ``cli/``; this does
-not become the first thing that does.
+Erased for ``users/{uid}``: the per-user subcollections
+(:data:`USER_SUBCOLLECTIONS`), that user's ``batch_runs`` documents (top-level,
+matched on ``user_id``), their GCS blobs under ``users/{uid}/`` in the resumes
+bucket, and the user document itself.
 
-What is erased for ``users/{uid}``: the six per-user subcollections
-(:data:`USER_SUBCOLLECTIONS`), that user's ``batch_runs`` documents (a
-top-level collection, matched on the ``user_id`` field), their GCS blobs under
-``users/{uid}/`` in the resumes bucket, and the user document itself.
-
-**What is deliberately left alone: ``jd_cache`` and ``board_cache/``.** Both are
-content-keyed and shared across every user — a job description parsed once is
-reused by whoever sees that posting next. They hold no personal data (a JD is
-the employer's public text), and evicting them because one account closed would
-charge every remaining user a re-parse. ``board_cache/`` sits outside the
-``users/{uid}/`` prefix precisely so that this wipe cannot reach it; keep it
+Deliberately left alone: ``jd_cache`` and ``board_cache/``. Both are
+content-keyed and shared across users, hold no personal data, and evicting
+them would charge every remaining user a re-parse. ``board_cache/`` sits
+outside the ``users/{uid}/`` prefix so this wipe cannot reach it; keep it
 there.
 """
 
@@ -61,21 +52,13 @@ DELETED_AT = "deleted_at"
 #: nothing aggregates it across accounts.
 #:
 #: Everything after the first three is named by importing the constant the
-#: owning module already exports, not by repeating the string — ``company_prefs``
-#: was added by a later PR than the wipe and was missed here precisely because
-#: this list was hand-maintained. ``decisions`` then repeated the mistake and
-#: sat unwiped from Task 1 until Task 4 noticed, and ``spend_consents`` had
-#: been unwiped since the spend seam shipped — three in a row, which is why the
-#: guard below now discovers the collections instead of restating them.
-#: Anything that adds a subcollection under ``users/{uid}`` must be added here,
-#: or a deleted account leaves it behind.
+#: owning module exports rather than repeating the string. Anything that adds
+#: a subcollection under ``users/{uid}`` must be added here, or a deleted
+#: account keeps that data — this list has been missed three times.
 #:
-#: **The guard is
-#: ``tests/unit/test_account_delete.py::test_every_subcollection_the_code_writes_is_one_the_wipe_deletes``**,
-#: which discovers the exporting modules rather than restating them — named
-#: here by path so the link is findable from this end too, since the first
-#: version of that guard was itself a hand-written tuple and missed two
-#: collections in a row.
+#: The guard is
+#: ``tests/unit/test_account_delete.py::test_every_subcollection_the_code_writes_is_one_the_wipe_deletes``,
+#: which discovers the exporting modules rather than restating them.
 USER_SUBCOLLECTIONS = (
     "jobs",
     "applications",
@@ -118,9 +101,8 @@ class WipeCounts:
 def is_deleted(doc: Mapping | None) -> bool:
     """Has this ``users/{uid}`` document been tombstoned?
 
-    Pure, and takes the document rather than a user id, so the callers that
-    already hold one — ``cron_tick``'s fan-out streams every user document —
-    pay no extra read to ask.
+    Pure, and takes the document rather than a user id, so a caller that
+    already holds one pays no extra read.
     """
     return bool(doc and doc.get(DELETED_AT))
 
@@ -162,12 +144,12 @@ async def _delete_batch_runs(
 
 
 def _delete_gcs_prefix(user_id: str, *, execute: bool) -> int:
-    """Blocking; reached through ``asyncio.to_thread``.
+    """Delete one user's GCS blobs. Blocking; reached through
+    ``asyncio.to_thread``.
 
-    The prefix is the whole guarantee that this stays inside one user's data:
-    ``users/{uid}/`` is where resumes and application screenshots are written,
-    and ``board_cache/`` — shared, content-keyed — is a sibling of ``users/``
-    rather than a child of it.
+    The ``users/{uid}/`` prefix is the whole guarantee that this stays inside
+    one user's data; the shared ``board_cache/`` is a sibling of ``users/``,
+    not a child.
     """
     from google.cloud import storage
 
@@ -185,18 +167,15 @@ async def wipe_user_data(
 ) -> WipeCounts:
     """Erase everything belonging to ``user_id``. Reports counts either way.
 
-    With ``execute=False`` nothing is written: every branch still streams what
-    it would delete, so a dry run is an honest inventory rather than an
-    estimate. That is the CLI's default and the reason it is safe to type.
+    Destroys Firestore documents and GCS blobs. With ``execute=False``
+    nothing is written, but every branch still streams what it would delete,
+    so a dry run is an inventory rather than an estimate.
 
-    **``users/{uid}`` goes last.** The document is the index into everything
-    else — the profile, the settings, the tombstone the loops read — so a wipe
-    interrupted halfway (a killed container, a GCS error) leaves an account
-    that is still findable and still refusing work, and a re-run finishes the
-    job. Deleting it first would leave orphaned subcollections that only a
-    collection-group query could ever find again. (Firestore keeps
-    subcollections alive when their parent document is deleted, so the order
-    changes what a failure leaves behind, never what a success does.)
+    ``users/{uid}`` goes last, because it is the index into everything else:
+    an interrupted wipe then leaves an account that is still findable and
+    still refusing work, and a re-run finishes the job. Firestore keeps
+    subcollections alive when their parent is deleted, so deleting it first
+    would orphan them.
     """
     user_ref = db.collection("users").document(user_id)
 
@@ -240,57 +219,37 @@ async def delete_account(
     email: str | None = None,
     now: datetime | None = None,
 ) -> WipeCounts:
-    """Close the account, then erase it. **The order is the design.**
+    """Close the account, then erase it. Irreversible. The order is the design:
 
-    1. Write the :data:`DELETED_AT` tombstone. Every background loop reads it
-       and refuses (see :func:`is_deleted`), so no *new* cycle starts.
-    2. ``close_auth(user_id)`` — delete the Firebase Auth user. From here the
-       account cannot sign in, so no new request can create data behind the
-       wipe. It is the caller's job to make this idempotent: a re-run must
-       treat "already gone" as success, because a Firebase ID token stays
-       verifiable for up to an hour after the account it names is deleted, so
-       the user retrying a half-finished deletion is a reachable path and not
-       an exotic one.
-    2b. Free this user's allowlist seat, if they had one — see below.
-    2c. Drop this user's ``waitlist/{email}`` doc, if they had one. Not gated
-       on ``enforced()``: the doc can predate a flag flip, and deleting an
-       absent doc is a no-op.
-    3. The wipe, ending with ``users/{uid}`` itself.
+    1. Write the :data:`DELETED_AT` tombstone, which every background loop
+       reads and refuses on, so no new cycle starts.
+    2. ``close_auth(user_id)`` — delete the Firebase Auth user, so no new
+       request can create data behind the wipe. The caller must make this
+       idempotent: an ID token stays verifiable for up to an hour after the
+       account is deleted, so retrying a half-finished deletion is a real path.
+    3. Free the user's allowlist seat and drop their ``waitlist/{email}`` doc,
+       if any. The waitlist drop is not gated on ``enforced()``, since the doc
+       can predate a flag flip.
+    4. The wipe, ending with ``users/{uid}`` itself.
 
-    **What this does not do, and cannot: make deletion atomic against a cycle
-    that is already in flight.** ``api.routes.discovery.run_discovery_cycle``
-    finishes with ``_user_ref(user_id).set(..., merge=True)``, which *recreates*
-    a deleted document, and ``tools.discovery.pipeline.persist_new_jobs`` writes
-    job documents with an unconditional ``set()`` that never consults the user
-    doc. A cycle dispatched a second before the tombstone landed will therefore
-    still write both. Closing that would mean putting preconditions through
-    shipped Phase 2/3 machinery, which is a different and much larger change.
+    This cannot make deletion atomic against a cycle already in flight:
+    ``run_discovery_cycle`` finishes with a ``set(..., merge=True)`` that
+    recreates a deleted document, and ``persist_new_jobs`` writes jobs without
+    consulting the user doc. The tombstone bounds the window to one
+    already-dispatched cycle rather than closing it; both entry points are
+    re-runnable, so an operator who sees residue re-runs the wipe.
 
-    So: **the tombstone bounds the window to one already-dispatched cycle; it
-    does not close it.** The mitigation is that both entry points — the endpoint
-    and ``cli/reset_user.py`` — are re-runnable and cost nothing but a few
-    Firestore reads, so an operator who sees residue re-runs the wipe.
-
-    **Seat accounting (Phase 4 D1/D2).** ``email`` is the Auth email the
-    caller resolved *before* calling this — ``api.routes.account`` already
-    looks it up to compare against the typed confirmation, and by the time
-    step 2 has run, ``close_auth`` may have deleted the very Firebase Auth
-    record :func:`tools.allowlist.is_allowed` would otherwise need to be asked
-    about, so it has to be captured ahead of time and handed in rather than
-    looked up here. A no-op — no read, no write — while
-    ``tools.allowlist.enforced()`` is off, which is every deployment of this
-    PR; pass ``None`` when the caller has no address to give (the account had
-    none anywhere, which ``api.routes.account`` already refuses before it
-    would ever reach here).
+    ``email`` is the Auth email the caller resolved *before* calling this,
+    because step 2 may already have deleted the record it would be looked up
+    from. Pass ``None`` when there is none. Seat accounting is a no-op while
+    ``tools.allowlist.enforced()`` is off.
     """
     user_ref = db.collection("users").document(user_id)
     deleted_at = (now or _now()).isoformat()
 
-    # First, and merged rather than set: the document may still be being read
-    # by a cycle in flight, and this write is only about adding the field the
-    # loops check. It creates the document if the account has none, which costs
-    # one write on an account that never onboarded and keeps the ordering
-    # unconditional.
+    # Merged rather than set: a cycle in flight may still be reading the
+    # document, and this write only adds the field the loops check. It creates
+    # the document if the account has none, keeping the ordering unconditional.
     await user_ref.set({DELETED_AT: deleted_at}, merge=True)
     log.info("account.tombstoned", user_id=user_id, deleted_at=deleted_at)
 

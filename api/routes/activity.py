@@ -2,54 +2,29 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """``GET /activity`` — what is actually happening, from server-side records only.
 
-**The UI must never claim work is happening when it isn't.** This product has
-shipped that bug three times: a "Scoring in progress" banner over a queue with
-no consumer, a timer-driven onboarding progress bar, and a tint asserting a
-verdict the data could not support. Every state below is therefore defined by a
-**record** — a lease, an open run-ledger doc, a ``batch_runs`` document, an
-application status — and never by how long a client has been waiting.
+Every state below is derived from a record — a lease, an open run-ledger doc, a
+``batch_runs`` document, an application status — and never from how long a
+client has been waiting, because the UI must not claim work is happening when
+it isn't. Two rules follow: ``done``/``total`` are both present or both absent
+(that pair is the client's only licence to draw a bar, and it is populated only
+on the batch score leg), and staleness is derived rather than heartbeated — past
+``tools.run_costs.STALE_AFTER`` an open record reads ``stalled``.
 
-Two rules the contract exists to enforce:
+**This route can never schedule background work.** ``GET /jobs/pending`` and
+``GET /settings/discovery`` both ``add_task(tick_user, …)``, which under
+QUEUE_MODE can reach a paid Vertex batch; a status endpoint is polled harder
+than either. It takes no ``BackgroundTasks`` parameter, schedules nothing and
+writes nothing, and ``tests/unit/test_local_guards.py`` asserts that from the
+signature.
 
-- **No fabricated progress.** ``done``/``total`` are populated in exactly one
-  place (the batch score leg) and are always *both* present or *both* absent,
-  because that pair is the client's only licence to draw a bar. Everywhere else
-  the honest render is elapsed time from ``since`` plus "what happens next and
-  when" from ``next_at``.
-- **Staleness is derived, never heartbeated.** Past
-  ``tools.run_costs.STALE_AFTER`` an open record reads ``stalled`` rather than
-  ``running``. ``api.routes.discovery._LEASE_SECONDS`` settled this reasoning
-  and it is not relitigated here: recovery latency is bounded by the hourly
-  tick either way, so a heartbeat would be observably identical while having to
-  be threaded through every pipeline.
+The response also carries an ``allowance`` block — the two caps with what is
+left of each and two independent reset instants — read off the same
+``users/{uid}`` document the route already fetched. See :func:`_allowance`.
 
-**This route has no side effects, and that is load-bearing.** ``GET
-/jobs/pending`` and ``GET /settings/discovery`` both ``add_task(tick_user, …)``,
-which under QUEUE_MODE can reach a paid Vertex batch — so the two endpoints the
-app polls most are also endpoints that can spend money. A status endpoint is
-polled harder than either. It therefore takes **no** ``BackgroundTasks``
-parameter, schedules nothing, and writes nothing;
-``tests/unit/test_local_guards.py`` asserts that from the signature so the
-property cannot be lost by an edit. Moving ``tick_user`` off those two routes is
-a separate change.
-
-The response also carries an ``allowance`` block — the two caps (searches per
-week, ratings per day) with what is left of each and **two independent reset
-instants**. It is read off the same ``users/{uid}`` document the rest of the
-route already fetched, so it costs no extra read, and it is computed from the
-budget modules' own pure functions so a display can never promise something
-the next reservation would refuse. See :func:`_allowance`.
-
-Known limits, stated rather than papered over:
-
-- A discovery or sweep cycle that **failed** is not visible here. Its outcome
-  lives on a closed ledger doc, and this route queries only open ones; the
-  loops' ``last_*_at`` is written on success only. So a failed loop reads as
-  idle, which is true (nothing is running) and incomplete (why is not said).
-- Elapsed time is always elapsed. Nothing here estimates a duration: n=1
-  submission and n=0 tailorings/extracts have ever completed under the current
-  code, and no parse-leg ingest has been observed in 30 days of logs, so there
-  is no distribution to quote from.
+Known limits: a discovery or sweep cycle that *failed* is not visible here
+(this route queries only open ledger docs, and ``last_*_at`` is written on
+success only), so a failed loop reads as idle. And nothing here estimates a
+duration — there is no completion distribution to quote from.
 """
 
 from __future__ import annotations
@@ -138,9 +113,9 @@ _SUBMISSION_ACTIVE = ("submitting",)
 def _next_hour(now: datetime) -> str:
     """The top of the next hour — the Cloud Scheduler tick's real next fire.
 
-    ``hermes-discovery-tick`` is ``0 * * * *`` and ENABLED (verified against the
-    live project). This is the only schedule in the system, so it is the only
-    honest ``next_at`` for anything the tick drives.
+    ``hermes-discovery-tick`` is ``0 * * * *`` and enabled (verified live). It
+    is the only schedule in the system, so it is the only honest ``next_at``
+    for anything the tick drives.
     """
     return (
         now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -160,10 +135,9 @@ def _item(
 ) -> dict:
     """One leg's entry, with the both-or-neither rule enforced here.
 
-    ``done``/``total`` is the client's only licence to draw a progress bar, so a
-    half-populated pair is dropped rather than passed on: a bar drawn against a
-    known numerator and an unknown denominator is a fabricated percentage, which
-    is the exact bug this endpoint exists to stop.
+    ``done``/``total`` is the client's only licence to draw a progress bar, so
+    a half-populated pair is dropped rather than passed on — a known numerator
+    over an unknown denominator is a fabricated percentage.
     """
     if done is None or total is None:
         done = total = None
@@ -180,52 +154,32 @@ def _item(
 
 
 def _allowance(user_doc: dict, now: datetime) -> dict:
-    """What is left of the two caps, and when each one rolls.
+    """What is left of the two caps, and when each one rolls. Read off the
+    ``users/{uid}`` document the route already fetched, so no extra reads, and
+    nothing is written.
 
-    Read off the ``users/{uid}`` document the route has already fetched, so
-    this block costs **zero extra reads** and, like everything else here,
-    writes nothing.
+    ``limit``/``remaining`` are ``None``, never ``0``, when a cap is off:
+    "unlimited" is not a quantity and a ``0`` renders as "no searches left".
+    The scoring cap has no kill switch (``SCORING_BUDGET_PER_DAY=0`` means *no
+    ratings*, not *no cap*), so ``ratings.limit`` is a number today, typed
+    ``| None`` so a client cannot depend on that.
 
-    Two things this gets right on purpose:
+    The two ``resets_at`` are independent — searches roll next Monday 00:00
+    UTC, ratings next UTC midnight — and coincide only on a Sunday.
 
-    - **``limit``/``remaining`` are ``None``, never ``0``, when a cap is off.**
-      "Unlimited" is not a quantity, and a ``0`` renders as "no searches left"
-      — the opposite of the truth. This mirrors
-      ``discovery_budget.Reservation.remaining_week`` and the ``int | None``
-      that ``discovery_budget.remaining`` already returns for exactly this
-      reason. The scoring cap has no kill switch (``SCORING_BUDGET_PER_DAY=0``
-      means *no ratings*, not *no cap*), so ``ratings.limit`` is always a
-      number today; it is typed alongside the other one so a client cannot
-      grow a dependence on that staying true.
-    - **Two independent ``resets_at``.** Searches roll next Monday 00:00 UTC,
-      ratings next UTC midnight. They coincide only on a Sunday, and one
-      shared field could not express both.
+    ``ratings.remaining`` is what the next reservation would actually grant,
+    ``min(remaining_day, remaining_cycle)``: the per-cycle counter has no time
+    rollover, only a new ``cycle_id`` clears it, so a user who rated out this
+    search's window and then crossed midnight has a full daily allowance and a
+    grant of zero. ``remaining_cycle`` is carried alongside so a surface can
+    say which window binds — when it is the cycle, waiting for ``resets_at``
+    will not help, only a new search will.
 
-    **``ratings.remaining`` is what the next reservation would actually
-    grant**, which is ``min(remaining_day, remaining_cycle)`` and not the
-    daily figure alone. The per-cycle counter has **no time rollover** — only
-    a new ``cycle_id`` clears it — and every ad-hoc scorer (``POST
-    /jobs/score`` and the worker tasks) reserves with ``cycle_id=None``,
-    i.e. against the window that is already open. So a user who rated out
-    this search's window and then crossed midnight has a full *daily*
-    allowance and a grant of zero, and with ``auto_discovery`` off there is
-    no cycle coming to open a new window. Reporting the daily remainder there
-    promises three ratings and delivers none.
-
-    ``remaining_cycle`` is carried alongside it so a surface can say **which**
-    window binds: when it is the cycle, the ``resets_at`` instant is not the
-    answer and waiting for it will not help — only a new search will.
-
-    Both figures come from ``apply_reservation(..., wanted=0)`` — the pure
-    function, on a discarded copy of the state — rather than a second
-    implementation of its rollover rules. Asking for nothing grants nothing,
-    so nothing is debited and nothing is written, and a display can never
-    promise something the next reservation would refuse.
-
-    ``used`` on both blocks is the **stored counter**, read through each
-    module's ``used()``, never ``limit - remaining``: that derivation clamps
-    at the cap, so an account holding 46 rated jobs under #92's new limit of
-    3 would read "3 of 3" instead of the truth.
+    Both figures come from ``apply_reservation(..., wanted=0)`` on a discarded
+    copy of the state, rather than a second implementation of its rollover
+    rules, so a display can never promise what the next reservation would
+    refuse. ``used`` is the stored counter, never ``limit - remaining``, which
+    clamps at the cap and would read "3 of 3" over 46 rated jobs.
     """
     search_limits = discovery_budget.Limits.from_env()
     search_state = user_doc.get(discovery_budget.FIELD)
@@ -292,8 +246,8 @@ def _loop_item(
 
     detail = dict(last_metrics or {})
     if not enabled:
-        # **The state the product keeps getting wrong.** The toggle is off, so
-        # nothing is running and nothing will — there is no next time to show.
+        # The toggle is off, so nothing is running and nothing will — there is
+        # no next time to show.
         return _item(kind, IDLE_UNSCHEDULED, since=last_at, detail=detail)
     if last_at is None and not last_metrics:
         # Scheduled but never run: the interval has nothing to count from, so
@@ -341,24 +295,19 @@ def _scoring_item(
     if not metrics and backlog is None:
         return _item("scoring", NEVER_STARTED)
     if backlog == 0:
-        # A **measured** zero, and only that, licenses "up to date". No
-        # ``since``: the last cycle's timestamp belongs to the *discovery* leg,
-        # and reusing it here would date this leg to work it did not do.
+        # Only a measured zero licenses "up to date". No ``since``: the last
+        # cycle's timestamp belongs to the discovery leg.
         return _item("scoring", FINISHED, detail=detail)
     # Either jobs are waiting, or the count failed. ``None`` is treated as
-    # "there may be work" rather than as zero — found by running this against
-    # the live account, where ``_backlog`` had returned None on the last cycle
-    # while 9,219 pending jobs sat unscored, and an earlier version of this
-    # function answered ``finished``. A fabricated zero is the claim "nothing is
-    # waiting", which is the bug this endpoint exists to prevent, pointed the
-    # other way.
+    # "there may be work" rather than as zero — seen live, where a failed count
+    # sat over 9,219 unscored jobs and an earlier version answered ``finished``.
     if auto_discovery:
         # The hourly tick's discovery cycle scores what it finds, so a backlog
         # under auto-discovery really does have something coming.
         return _item("scoring", IDLE_SCHEDULED, next_at=_next_hour(now), detail=detail)
-    # Auto-discovery off: the cron will not fire, and the only other way in is a
-    # priced click nobody has made. Jobs are waiting and **nothing will score
-    # them**.
+    # Auto-discovery off: the cron will not fire and the only other way in is a
+    # priced click nobody has made, so jobs are waiting and nothing will score
+    # them.
     return _item("scoring", IDLE_UNSCHEDULED, detail=detail)
 
 
@@ -380,10 +329,9 @@ def _batch_item(
         ref = {"batch_run": run.get("id")}
         detail = {"stage": stage, **_committed_of(run)}
         if job_name and claimed is None:
-            # **With Google.** The batch was submitted and nothing of ours is
-            # touching it until a resume tick polls. No percent, and no
-            # duration: no parse-leg ingest has ever been observed, so there is
-            # nothing honest to quote.
+            # With Google: the batch was submitted and nothing of ours touches
+            # it until a resume tick polls. No percent and no duration — there
+            # is no observed ingest to quote from.
             return _item(
                 "batch_scoring",
                 WAITING_EXTERNAL,
@@ -430,10 +378,9 @@ def _batch_item(
             ref={"run_id": open_doc.get("run_id")},
         )
     if last_run:
-        # The last cycle started a batch and it is not in the running set, so it
-        # is terminal — which is a very different thing from never having run.
-        # Found against the live account, where this answered ``never_started``
-        # over a real ``batch_run`` tag recorded the day before.
+        # The last cycle started a batch and it is not in the running set, so
+        # it is terminal — not the same as never having run, which is what this
+        # answered live over a real ``batch_run`` tag from the day before.
         state = last_run.get("state")
         return _item(
             "batch_scoring",
@@ -454,9 +401,9 @@ def _batch_item(
 def _committed_of(run: dict) -> dict:
     """This run's un-ingested committed range — the money already owed Google.
 
-    The same per-leg rule ``tools.matching.batch_runs.outstanding_committed``
-    uses: a leg with a ``cost_banked_at`` marker has been priced for real and is
-    on the ledger, so counting its estimate too would double the same money.
+    Same per-leg rule as ``tools.matching.batch_runs.outstanding_committed``: a
+    leg with a ``cost_banked_at`` marker is already priced on the ledger, so
+    counting its estimate too would double the same money.
     """
     committed = run.get("committed") or {}
     banked = run.get("cost_banked_at") or {}
@@ -485,9 +432,8 @@ def _app_leg_item(
 ) -> dict:
     """``tailoring`` / ``submission``: the application state machine's own record.
 
-    An in-progress status *plus its lease* is the claim — the status alone is
-    not, because a worker killed mid-run leaves the status behind. That is the
-    same distinction ``tools.applications.reaper`` acts on.
+    An in-progress status plus its lease is the claim; the status alone is not,
+    because a worker killed mid-run leaves the status behind.
     """
     for status in active:
         for app in by_status.get(status, []):
@@ -555,7 +501,7 @@ async def _open_runs(db, user_id: str, now: datetime) -> dict[str, dict]:
     """The user's open ledger docs, newest per leg.
 
     One equality filter on a subcollection — no composite index. An open doc is
-    the *only* in-flight trace some legs leave, which is why PR 1 wrote it.
+    the only in-flight trace some legs leave.
     """
     newest: dict[str, dict] = {}
     query = (
@@ -586,12 +532,9 @@ def _after(a: Any, b: Any) -> bool:
 async def _running_batches(db, user_id: str) -> list[dict]:
     """This user's in-flight batch runs, newest first.
 
-    ``state == "running"`` only. A ``failed`` run is not liveness — it is money
-    owed, and it surfaces under ``committed`` where the figure belongs; putting
-    it here would make a dead run look like work in progress.
-
-    Two equality filters on ``batch_runs``. Verified read-only against the live
-    project: the query plans without a composite index.
+    ``state == "running"`` only: a ``failed`` run is money owed, not liveness,
+    and it surfaces under ``committed`` instead. Two equality filters on
+    ``batch_runs``; verified live to plan without a composite index.
     """
     runs = []
     query = (
@@ -610,11 +553,9 @@ async def _running_batches(db, user_id: str) -> list[dict]:
 async def _last_batch_run(db, tag: str | None) -> dict | None:
     """One ``batch_runs`` document by id — the tag the last cycle recorded.
 
-    A single ``get``, and only when there is a tag, so the common case (no batch
-    has ever been started) costs nothing. Reading it is what lets this endpoint
-    tell ``finished`` from ``failed`` from ``never_started`` for a batch that is
-    no longer running, instead of collapsing all three into the most optimistic
-    of them.
+    A single ``get``, and only when there is a tag, so the common case costs
+    nothing. It is what lets this endpoint tell ``finished`` from ``failed``
+    from ``never_started`` for a batch that is no longer running.
     """
     if not tag:
         return None
@@ -629,9 +570,8 @@ async def _last_batch_run(db, tag: str | None) -> dict | None:
 async def _applications(db, user_id: str) -> dict[str, list[dict]]:
     """Every application, bucketed by status, oldest first within a bucket.
 
-    Unfiltered on purpose: without the terminal statuses there is no way to tell
-    ``never_started`` from ``finished``, and guessing between those two is how
-    an empty screen ends up claiming work is underway.
+    Unfiltered on purpose: without the terminal statuses there is no way to
+    tell ``never_started`` from ``finished``.
     """
     by_status: dict[str, list[dict]] = {}
     query = db.collection("users").document(user_id).collection("applications")
@@ -648,7 +588,7 @@ async def _applications(db, user_id: str) -> dict[str, list[dict]]:
 async def get_activity(user_id: str = Depends(verify_user)) -> dict:
     """What is happening for this user, right now, from records only.
 
-    **No ``BackgroundTasks`` parameter, ever** — see the module docstring, and
+    Takes no ``BackgroundTasks`` parameter, ever — see the module docstring and
     ``test_the_activity_route_can_never_schedule_background_work``.
     """
     db = _client()
@@ -727,8 +667,8 @@ async def get_activity(user_id: str = Depends(verify_user)) -> dict:
         "items": items,
         "allowance": _allowance(user_doc, now),
         # Money already owed Google that the ledger has not priced yet. Never
-        # summed with actual spend in code — the two mean different things and a
-        # UI that wants both shows two lines.
+        # summed with actual spend: the two mean different things, and a UI
+        # that wants both shows two lines.
         "committed": {
             "usd_low": committed["usd_low"],
             "usd_high": committed["usd_high"],

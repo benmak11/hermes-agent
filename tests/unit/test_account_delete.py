@@ -2,23 +2,22 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Account deletion: what it erases, what it must not, and the order.
 
-Three claims, and the order is the one that carries the most weight:
+Three claims, in weight order:
 
-1. **The wipe stays inside one user.** Another user's documents, their GCS
-   blobs, and the two shared caches (``jd_cache``, ``board_cache/``) are still
-   there afterwards. Both caches are content-keyed and cross-user — evicting
-   them because one account closed charges everybody a re-parse.
+1. **The wipe stays inside one user.** Another user's documents and blobs and
+   the two shared caches (``jd_cache``, ``board_cache/``) survive. Both caches
+   are content-keyed and cross-user, so evicting them because one account
+   closed charges everybody a re-parse.
 2. **Nothing is destroyed until the inbound paths are closed.** The tombstone
-   lands, the Firebase Auth account is deleted, and *only then* does anything
-   get erased — with ``users/{uid}`` itself going last, so an interrupted wipe
-   leaves an account that is still findable and still refusing work.
+   lands, the Firebase Auth account goes, and only then does anything get
+   erased — ``users/{uid}`` last, so an interrupted wipe leaves an account
+   that is still findable and still refusing work.
 3. **A tombstoned account gets no more cycles.** ``run_discovery_cycle``,
-   ``run_sweep_cycle`` and ``cron_tick``'s fan-out each refuse before spending
-   anything. What that cannot do — and the reason it is a bound rather than a
-   fix — is stop a cycle already past the check: its success write recreates
-   the very document that was deleted.
+   ``run_sweep_cycle`` and ``cron_tick``'s fan-out each refuse before spending.
+   That is a bound, not a fix: a cycle already past the check recreates the
+   deleted document with its success write.
 
-No real Firestore, no real GCS, no real Firebase: every seam is faked.
+No real Firestore, GCS or Firebase: every seam is faked.
 """
 
 from __future__ import annotations
@@ -227,7 +226,7 @@ def world(monkeypatch):
             "users/u1/resume.docx",
             "users/u1/screenshots/j1.png",
             "users/u2/resume.docx",
-            # Outside users/, which is the whole reason PR B put it there.
+            # Outside users/, which is why it lives there.
             "board_cache/greenhouse/stripe.json",
         ],
     )
@@ -459,7 +458,7 @@ def test_a_close_auth_that_raises_stops_the_wipe(world):
 
 
 # ---------------------------------------------------------------------------
-# Seat freeing — the hook PR C left, wired for Phase 4 D1/D2
+# Seat freeing
 # ---------------------------------------------------------------------------
 def _seat(world, email: str = "user@example.com", *, revoked: bool = False) -> str:
     path = f"{ALLOWLIST_COLLECTION}/{email}"
@@ -481,8 +480,7 @@ def test_a_deletion_frees_the_departing_users_seat_when_enforced(world, monkeypa
 
 
 def test_seat_freeing_is_a_no_op_while_unenforced(world, monkeypatch):
-    """The whole point of D1 shipping before D2 flips the flag: every real
-    caller, including this one, must be inert with it unset."""
+    """Every real caller, including this one, is inert with the flag unset."""
     monkeypatch.delenv("ALLOWLIST_ENFORCED", raising=False)
     seat = _seat(world)
 
@@ -940,25 +938,17 @@ _NOT_USER_SUBCOLLECTIONS = {
 
 
 def test_every_subcollection_the_code_writes_is_one_the_wipe_deletes():
-    """Guards the *class* of bug, not the one instance of it — fail-closed.
+    """Guards the *class* of bug, not one instance of it — fail-closed.
 
-    The previous version of this test looped a hand-written tuple of three
-    constants, which made it exactly as hand-maintained as the list it was
-    guarding: it missed ``decisions`` (Task 1) and ``exposures`` (Task 4), and
-    ``spend_consents`` had been unwiped since the spend seam shipped. Three
-    misses is a design problem, not three oversights.
+    A hand-written list of collections is as hand-maintained as the wipe it
+    guards, and missed three. So this discovers every module declaring a
+    ``COLLECTION`` constant and requires each value to be wiped or explicitly
+    exempted with a reason: an unclassified collection fails here rather than
+    being silently kept on a deleted account.
 
-    So this **discovers** every module that declares a ``COLLECTION`` constant
-    and requires each value to be either wiped or explicitly exempted with a
-    reason. A new collection is in neither list and fails here, which is the
-    whole point: the default answer for an unclassified collection is "this
-    test fails", never "nothing happens and a deleted account keeps it".
-
-    Read by :mod:`ast` rather than imported, the same way
-    ``test_llm_models_stays_import_free`` reads ``llm_models``: this must see
-    every declaring module, including ones whose import needs credentials or
-    has side effects, and it must not be possible for an import failure to
-    quietly shrink the set being checked.
+    Read by :mod:`ast` rather than imported, so modules whose import needs
+    credentials or has side effects are still seen and an import failure
+    cannot quietly shrink the set being checked.
     """
     import ast
     from pathlib import Path
@@ -1008,10 +998,8 @@ def test_the_exemption_list_is_not_a_way_to_skip_the_wipe():
 
 
 def test_a_deleted_account_leaves_no_decisions_or_exposures_behind(world):
-    """The two label stores. They are the most sensitive thing the account
-    holds — every job the user was shown, when, and what they chose — and
-    ``decisions`` sat unwiped from Task 1 until Task 4 added a second one
-    beside it and the pair got noticed together."""
+    """The two label stores — the most sensitive thing the account holds:
+    every job the user was shown, when, and what they chose."""
     from tools.decisions import COLLECTION as DECISIONS
     from tools.exposures import COLLECTION as EXPOSURES
 

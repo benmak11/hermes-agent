@@ -2,53 +2,31 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Append-only vetting-decision log at ``users/{uid}/decisions``.
 
-``user_decision`` on the job document is *current state*, written with an
-in-place ``update``. That is the right shape for the product — every reader
-wants the latest answer — and the wrong shape for a training label: there is
-no timestamp, no history, and no record of the score the user was looking at
-when they chose. An undo overwrites the original choice and it is gone.
+``user_decision`` on the job document is current state, overwritten in place;
+that is right for the product and useless as a training label. Every change of
+a decision therefore also appends one auto-id document here, carrying a
+timestamp, the previous value and the score the user was looking at. The job
+document is unchanged, and this collection is write-only from the app's point
+of view.
 
-So each change of a decision also appends one auto-id document here. The job
-document keeps its ``user_decision`` exactly as before; nothing that reads it
-changes. This collection is additive, write-only from the app's point of view,
-and read for the first time by a ranking model.
+``actor`` separates the two writers: a human skip is a label, while the
+system's ``dismissed`` write for a vanished posting is no judgement about fit.
+``previous_decision`` is read off the job document *before* the update — the
+only place the prior answer still exists — which is what makes an undo
+reconstructible. No ``expires_at``/TTL: the record has to outlive the job
+document it describes.
 
-``actor`` separates the two writers. A human skip is a label ("not for me");
-the system's ``dismissed`` write when a posting disappears is not a judgement
-about fit at all, and a model that cannot tell them apart learns that dead
-postings are bad matches.
+Two bounds on the data:
 
-**``previous_decision`` comes from the job document as it was read *before*
-the update**, which is the only place the prior answer still exists. Together
-with ``decided_at`` it is what makes an undo reconstructible: approve → undo
-→ reject is three events chained ``None → approved → pending``, not one
-overwrite.
-
-No ``expires_at``/TTL here, unlike ``tools.run_costs``: the point of the
-collection is that the record outlives the job document it describes.
-
-Two bounds on the data, stated here because they are cheap to know now and
-expensive to rediscover from six months of labels:
-
-1. **read-then-update is not atomic.** Every caller reads the job document,
-   writes ``user_decision``, then logs. FastAPI runs ``decide()`` in a
-   threadpool, so two decisions racing on one job can both read ``pending``
-   and emit ``(approved, prev=pending)`` and ``(pending, prev=pending)`` — the
-   second's replaced value was really ``approved``, which makes that undo
-   indistinguishable from a first decision. ``decided_at`` is stamped at write
-   time, so a pair of events can also land in the opposite order to the
-   updates that caused them. **Deliberately not solved with a transaction**:
-   the window is a few milliseconds of one user double-deciding one job, and a
-   transaction is real complexity to buy for a log. A consumer that sees a
-   repeated ``previous_decision`` on one ``job_id`` is looking at this.
-2. **covered writers.** ``api.routes.jobs.decide`` (``actor: "user"``), plus
-   three system dismissals: the post-skip probe in ``api.routes.jobs``, the
-   liveness sweep in ``tools.ats.sweep`` (by volume, the main one), and the
-   pre-flight check in ``api.routes.applications``. Those are every writer of
-   ``user_decision`` the served app has as of this change, so the events
-   replay to the document's current state — an invariant a later join on
-   exposures will assume. The one uncovered writer is ``vetting_ui.py``, the
-   superseded local Streamlit console, which is not deployed.
+1. read-then-update is not atomic. Callers read the job document, write
+   ``user_decision``, then log, and ``decide()`` runs in a threadpool, so two
+   decisions racing on one job can both report ``prev=pending`` and can land
+   out of order. Deliberately not solved with a transaction — the window is a
+   few milliseconds of one user double-deciding one job. A repeated
+   ``previous_decision`` on one ``job_id`` is this.
+2. every deployed writer of ``user_decision`` logs here, so the events replay
+   to the document's current state. The one uncovered writer is the superseded
+   local Streamlit console ``vetting_ui.py``, which is not deployed.
 """
 
 from __future__ import annotations
@@ -66,12 +44,9 @@ log = get_logger("tools.decisions")
 COLLECTION = "decisions"
 
 #: Every value ``user_decision`` can take, from either writer. ``pending`` is
-#: the undo/restore path and is a real decision — it is how "I changed my
-#: mind" is distinguishable from "never reviewed".
-#:
-#: Mirrors ``models.job.Job.user_decision``, which is the field these events
-#: describe. ``test_decision_events`` pins the two together, because a copy of
-#: a Literal that nothing compares drifts silently.
+#: the undo/restore path and is a real decision, not "never reviewed".
+#: Mirrors ``models.job.Job.user_decision``; ``test_decision_events`` pins the
+#: two together.
 DecisionValue = Literal[
     "pending", "approved", "rejected", "starred", "applied", "dismissed"
 ]
@@ -82,33 +57,16 @@ Actor = Literal["user", "system"]
 def score_snapshot(job_doc: dict | None) -> dict | None:
     """What the scorer said about this job, as of the decision.
 
-    **The fields are under ``match``, not at the top level.** A scored job doc
-    is ``{company, title, url, ..., match: {overall_score, breakdown,
-    recommendation, reasoning, ...}}``; reading ``overall_score`` off the
-    document returns ``None`` for every job ever scored, and the label store is
-    then silently worthless. This project has already paid a debugging round
-    for that path once.
+    The score fields live under the job document's ``match`` key, not at the
+    top level; reading them off the document returns ``None`` for every job
+    ever scored, and has cost a debugging round once already.
 
-    An *unscored* job has no ``match`` key, and gets ``None`` rather than a
-    dict of nulls: "we never scored this" and "we scored it and got null" are
-    different facts, and a model trained on the second when the first is true
-    is learning from noise.
-
-    ``scored_with`` (which models ran, under which prompt versions — see
-    ``tools.matching.score.scored_with``) is copied off the job document, and
-    is ``None`` for every job scored before that field existed. **Read off the
-    document, never reconstructed from today's constants**: a job scored in
-    October and decided in December would then be labelled with December's
-    model and prompt, which is precisely the false comparability this record
-    was added to prevent. Absent on the document and ``None`` here mean the
-    same thing — unattributable — and that is an honest answer where a
-    fabricated one is not.
-
-    Note the two ``None``s in this function are different facts and stay
-    distinguishable: no ``match`` at all returns ``None`` for the whole
-    snapshot ("never scored"), while a scored job with no provenance returns a
-    snapshot whose ``scored_with`` is ``None`` ("scored, by we don't know
-    what").
+    An unscored job has no ``match`` key and gets ``None`` for the whole
+    snapshot rather than a dict of nulls: "never scored" and "scored, got
+    null" are different facts. ``scored_with`` is likewise copied off the
+    document and is ``None`` for a job scored before that field existed —
+    never reconstructed from today's constants, which would label an old job
+    with the current model and prompt.
     """
     match = (job_doc or {}).get("match")
     if not match:
@@ -117,10 +75,8 @@ def score_snapshot(job_doc: dict | None) -> dict | None:
         "overall_score": match.get("overall_score"),
         "breakdown": match.get("breakdown"),
         "recommendation": match.get("recommendation"),
-        # Top level, beside ``match`` — not inside it. ``score.persist_result``
-        # writes it as a sibling of ``match`` because it describes the act of
-        # scoring, not the score; reading it off ``match`` would return
-        # ``None`` for every job ever scored and nothing would ever say so.
+        # Top level, beside ``match`` — not inside it. Reading it off
+        # ``match`` returns ``None`` for every job ever scored, silently.
         "scored_with": (job_doc or {}).get("scored_with"),
     }
 
@@ -137,28 +93,18 @@ def log_decision(
 ) -> None:
     """Append one decision event. Never raises.
 
-    Called *after* the ``user_decision`` write has succeeded, so an event
-    exists only for a decision that really changed.
+    Writes to Firestore and swallows every failure, logging it: a lost label
+    is better than a 500 on a decision. Call it *after* the ``user_decision``
+    write has succeeded, so an event exists only for a decision that changed.
 
-    Swallowing every failure is deliberate: a lost label is an inconvenience,
-    a 500 on a decision is a broken product. The exception is logged rather
-    than dropped, which is what makes a systematically failing write visible.
+    ``shown_at`` (from ``tools.exposures.latest_shown_at``) joins the label to
+    the impression it answered. The key is always present, and ``None`` means
+    no exposure is known — legitimately so for decisions made off a shelf,
+    before ``LOG_EXPOSURES`` was on, or by ``actor: "system"``.
 
-    ``shown_at`` is when the deciding user was last shown a list of jobs
-    (``tools.exposures.latest_shown_at``), which is what joins this label to
-    the impression it answered — position in the list, and what else was on
-    screen and ignored. It is **``None`` whenever no exposure is known**, and
-    the key is always present with that ``None``, exactly as ``score_snapshot``
-    is: an absent measurement must never be mistakable for a measured one. It
-    is legitimately ``None`` for a decision made before ``LOG_EXPOSURES`` was
-    on, for one made off a shelf rather than the review queue, and for every
-    ``actor: "system"`` event — a sweep dismissal answers no impression at all,
-    so no caller of those passes it.
-
-    Synchronous, because both call sites are: ``decide()`` is a ``def`` route
-    on the sync client, and the dismissal task already drives that client's
-    ``update``. An ``asyncio.run`` here would build and memoise a client
-    against a loop that dies with the request — the trap ``PUT /profile`` hit.
+    Synchronous, because both call sites drive the sync client; an
+    ``asyncio.run`` here would memoise a client against a loop that dies with
+    the request.
     """
     try:
         user_ref.collection(COLLECTION).add(

@@ -1,21 +1,17 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""What scoring one job actually costs — the *empirical* rate, not the price list.
+"""What scoring one job actually costs — the empirical rate, not the price list.
 
-Deliberately not in ``obs.llm_cost``. That module owns Google's published
-per-million-token prices: a fact about Google's pricing page, re-checked when
-Google changes it. This is a fact about *our* pipeline — how many tokens a real
-job turns into, how often jd_cache absorbs a parse, how much the pre-filter
-tombstones for free — and it is re-measured on a completely different cadence,
-by running the thing and reading the ledger. Mixing the two is how a stale
-prompt change silently becomes a wrong quote.
+Deliberately separate from ``obs.llm_cost``, which owns Google's published
+per-token prices. This is a fact about our own pipeline, re-measured by running
+it and reading the ledger; mixing the two is how a prompt change silently
+becomes a wrong quote.
 
-**The user's own ledger is the primary source.** :func:`observed_rate` divides
-what ``users/{uid}/runs`` says was spent by how many jobs those runs scored.
-Anything shown to the user is then arithmetic over rows their own account
-holds, and they can check it. The constants below are the fallback for an
-account with no measured history — a real measurement, named and dated, not a
-guess.
+:func:`observed_rate` is the primary source and divides what
+``users/{uid}/runs`` spent by how many jobs those runs scored, so anything
+shown to the user is arithmetic over their own rows. The constants below are
+the fallback for an account with no history — real measurements, named and
+dated.
 """
 
 from __future__ import annotations
@@ -28,69 +24,55 @@ from obs.logging import get_logger
 
 log = get_logger("tools.matching")
 
-#: Blended USD per job scored, measured 2026-08-23 — the first real ledger
-#: measurement, and ~2x the July estimates it replaced. Re-measure before
-#: trusting it; the note below on :data:`UNCERTAINTY` is why.
+#: Blended USD per job scored, measured 2026-08-23 — ~2x the July estimates it
+#: replaced. Re-measure before trusting it; see :data:`UNCERTAINTY`.
 MEASURED_COST_PER_JOB_USD = 0.0098
 MEASURED_AT = "2026-08-23"
 #: The run this came from. Checkable: ``users/{uid}/runs/{MEASURED_RUN_ID}``.
 MEASURED_RUN_ID = "37338813872b4197a860e49d380c2813"
 
 #: Vertex batch prediction bills half the interactive rate on every token
-#: class. Mirrors ``obs.llm_cost._BATCH_DISCOUNT``; restated rather than
-#: imported because that one is Google's price rule and this one is the floor
-#: of an estimate — if they ever have to differ, they should be able to.
+#: class. Mirrors ``obs.llm_cost._BATCH_DISCOUNT``, restated rather than
+#: imported: that one is Google's price rule, this one is the floor of an
+#: estimate, and they must be free to differ.
 BATCH_MULTIPLIER = 0.5
 
 #: How far above the measured rate a quote's ceiling sits. Not a confidence
-#: interval: between the July estimate and the August measurement the real
-#: rate moved ~2.2x with no change on our side (longer JDs, a different model
-#: mix). A quote that cannot be exceeded is a quote that will be, so the
-#: ceiling carries that move.
+#: interval: the real rate moved ~2.2x between the July and August
+#: measurements with no change on our side, and the ceiling carries that move.
 UNCERTAINTY = 2.0
 
-#: How the per-job rate divides between the two batch legs, used only to price
-#: each leg's committed estimate so the two always sum to one per-job rate.
-#: Shares rather than two independent rates, precisely so they cannot drift
-#: apart.
+#: How the per-job rate divides between the two batch legs. Shares rather than
+#: two independent rates, so the legs always sum to one per-job rate.
 #:
-#: Both measurements on record:
-#:   2026-07-10  parse $0.00125 / score $0.0093   -> parse is 11.8%
-#:   2026-08-23  parse $0.00279 / score $0.01649  -> parse is 14.5%
-#:
-#: 0.13 sits between them. An earlier version said "13-15% both times" (wrong
-#: — neither figure is in that range) and used 0.15, which is *above* both:
-#: that over-attributes to the cheap parse leg and under-attributes to the
-#: expensive score leg, and the score leg is the one submitted hours after
-#: the click by ``/tasks/batch/resume``. Under-stating the late charge is the
-#: wrong direction for a number whose entire purpose is surfacing it.
+#: 0.13 sits between the two measurements on record (2026-07-10 parse 11.8%,
+#: 2026-08-23 parse 14.5%). Do not raise it above both: that under-attributes
+#: to the score leg, which is the one charged hours after the click by
+#: ``/tasks/batch/resume``, and understating the late charge defeats the
+#: number's purpose.
 PARSE_SHARE = 0.13
 SCORE_SHARE = 1.0 - PARSE_SHARE
 
-#: The same 2026-08-23 measurement's per-leg unit costs, named rather than
-#: left inside the comment above. **Not the same number as**
-#: :data:`MEASURED_COST_PER_JOB_USD`: that constant is total run cost over
-#: every job the run *attempted* (100), many of which hit jd_cache (skip
-#: parse) or were rejected free by the family/geo filter (skip score). These
-#: two are cost *per occurrence* of each leg, and their sum is the cost of
-#: taking one job all the way to a rated match. Since the 3-slot caps (see
-#: ``tools.matching.budget``), slots go to title-filtered jobs that mostly
-#: take both legs, so this sum — not the blended average — is the basis the
-#: budget prices against. Using the average understates a rated job by
-#: roughly 2x.
+#: The same 2026-08-23 measurement's per-leg unit costs. **Not the same number
+#: as** :data:`MEASURED_COST_PER_JOB_USD`, which is run cost over every job
+#: *attempted*, many of which skip a leg via jd_cache or a free pre-filter
+#: reject. These are cost per occurrence of a leg, so their sum is the cost of
+#: taking one job all the way to a rated match — and under the 3-slot caps
+#: (``tools.matching.budget``) a slot is a rated job, so the budget must price
+#: against this sum. The blended average understates a rated job by ~2x.
 MEASURED_PARSE_USD = 0.00279
 MEASURED_SCORE_USD = 0.01649
 MEASURED_RATED_JOB_USD = round(MEASURED_PARSE_USD + MEASURED_SCORE_USD, 6)
 
 #: Where a rate came from. ``observed`` is the user's own ledger; the constant
-#: names its measurement date so the UI string can't outlive the number.
+#: names its measurement date so the UI string cannot outlive the number.
 SOURCE_OBSERVED = "your_last_runs"
 SOURCE_MEASURED = f"measured_{MEASURED_AT.replace('-', '_')}"
 SOURCE_MEASURED_RATED = f"measured_rated_{MEASURED_AT.replace('-', '_')}"
 
 #: Ledger docs to read when deriving an observed rate. Recent runs only: the
-#: rate moves with prompt and model changes, and averaging over a year of them
-#: would quote the past rather than the present.
+#: rate moves with prompt and model changes, so a longer window quotes the
+#: past rather than the present.
 _RECENT_RUNS = 10
 
 
@@ -100,8 +82,8 @@ class Rate:
 
     usd_per_job: float
     source: str
-    #: Jobs behind the rate. 0 for the constant — which is what tells a caller
-    #: (and the user) that this is the fallback and not their own history.
+    #: Jobs behind the rate. 0 means the fallback constant, not the user's own
+    #: history.
     sample: int
 
     @property
@@ -109,41 +91,34 @@ class Rate:
         return self.source == SOURCE_OBSERVED
 
 
-#: The blended constant as a :class:`Rate` — cost per job *attempted*. Kept
-#: as :func:`committed_usd`'s default (a batch-leg ops reconciliation figure);
-#: :func:`observed_rate` no longer falls back to it.
+#: The blended constant as a :class:`Rate` — cost per job *attempted*. Used
+#: only as :func:`committed_usd`'s default, an ops reconciliation figure;
+#: :func:`observed_rate` does not fall back to it.
 MEASURED = Rate(MEASURED_COST_PER_JOB_USD, SOURCE_MEASURED, 0)
 
-#: What :func:`observed_rate` falls back to: cost per rated job, see
-#: :data:`MEASURED_RATED_JOB_USD`. Under the 3-slot caps a slot is, in
-#: practice, a rated job, so this is the unit a quote's ``units`` counts — and
-#: it is the closer of the two constants to what a real account's own observed
-#: rate measures (spend over ``jobs.scored``, free rejects excluded).
+#: What :func:`observed_rate` falls back to: cost per rated job. Under the
+#: 3-slot caps a slot is in practice a rated job, so this is the unit a quote's
+#: ``units`` counts, and the closer of the two constants to what an account's
+#: own observed rate measures.
 MEASURED_RATED = Rate(MEASURED_RATED_JOB_USD, SOURCE_MEASURED_RATED, 0)
 
 
 async def observed_rate(db, user_id: str, *, min_jobs: int = 100) -> Rate:
     """This user's own $/job over their most recent completed runs.
 
-    ``sum(llm.cost_usd) / sum(jobs.scored)``, and below ``min_jobs`` scored in
-    total it declines and returns :data:`MEASURED_RATED` instead — a two-job
-    run divides by a number small enough to quote anything.
+    ``sum(llm.cost_usd) / sum(jobs.scored)``, falling back to
+    :data:`MEASURED_RATED` below ``min_jobs`` scored in total — a two-job run
+    divides by a number small enough to quote anything. The fallback is the
+    rated constant rather than the blended :data:`MEASURED`, which averages in
+    free rejects and so quotes a fresh account too low.
 
-    The fallback is the *rated* constant, not the blended :data:`MEASURED`.
-    The blended figure averages in the free rejects of a 100-job run, and
-    since the 3-slot caps (``tools.matching.budget``) every slot goes to a
-    title-filtered job that mostly takes both legs — so quoting a fresh
-    account at the blended rate put the expected cost at the *top* of its
-    range and the remembered low end at half of it.
+    Docs with ``jobs.scored == 0`` are skipped rather than counted as zero: a
+    failed ingest banks a leg's spend without its outcome counts, so such a doc
+    is cost with no denominator. Skipping errs low; counting errs high and
+    unboundedly.
 
-    **Docs with ``jobs.scored == 0`` are skipped, not counted as zero.** An
-    ingest that raised banks the leg's spend without its outcome counts (see
-    ``batch_runs.resume``'s flush), so such a doc is cost with no denominator
-    and would drag the rate up. Skipping loses a little real spend from the
-    numerator, which errs low; counting it errs high and unboundedly.
-
-    Never raises: this feeds a *quote*, and a Firestore hiccup must degrade to
-    the documented constant rather than fail the user's click.
+    Never raises — this feeds a quote, so a Firestore hiccup degrades to the
+    constant rather than failing the user's click.
     """
     try:
         query = (
@@ -177,20 +152,16 @@ def committed_usd(
 ) -> tuple[float, float]:
     """Low/high USD for one batch leg of ``requests`` requests.
 
-    Job-count based on purpose: a per-request token estimator would have to
-    model prompt length, and would be a second, differently-wrong answer to a
-    question the ledger already answers empirically.
+    Job-count based on purpose: a per-request token estimator would model
+    prompt length and give a second, differently-wrong answer to a question the
+    ledger already answers empirically.
 
-    **Defaults to the measured constant, never** :func:`observed_rate`, so the
-    committed figure recorded on a ``batch_runs`` doc can disagree with the
-    quote the user consented to — a user whose own history runs cheaper than
-    the constant was quoted less than this records. That is accepted: this is
-    an internal ops figure answering "what has Google billed us that we have
-    not yet priced?", read only by :func:`outstanding_committed`. It never
-    reaches an ``Estimate``, a 402 body, the confirm sheet or the run ledger,
-    so it cannot mislead anybody about what they agreed to. Taking the
-    caller's rate would make it agree with one user's quote and disagree with
-    the ops question, which is the wrong trade for a reconciliation number.
+    Defaults to the measured constant rather than :func:`observed_rate`, so the
+    committed figure on a ``batch_runs`` doc may disagree with the quote the
+    user consented to. That is intended: this is an internal ops figure ("what
+    has Google billed us that we have not yet priced?") read only by
+    ``outstanding_committed``, and it never reaches an ``Estimate``, a 402
+    body, the confirm sheet or the run ledger.
     """
     share = PARSE_SHARE if leg == "parse" else SCORE_SHARE
     low = requests * rate.usd_per_job * share * BATCH_MULTIPLIER

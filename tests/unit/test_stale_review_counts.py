@@ -2,22 +2,19 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The two halves of "29 of 29 reviewed on an account with no jobs".
 
-The review header sums a server count (jobs still pending) with a browser count
-(decisions made, in ``localStorage``). A server-side wipe clears the first and
-cannot reach the second, so a wiped account kept reporting a finished review
-session for jobs that no longer existed.
+The review header sums a server count (jobs still pending) with a browser
+count (decisions made, in ``localStorage``). A server-side wipe clears the
+first and cannot reach the second, so a wiped account kept reporting a
+finished review session for jobs that no longer existed. Fixed server-side,
+because only the server knows a wipe happened:
 
-Fixed from the server side, because the server is the only side that knows a
-wipe happened:
-
-- ``GET /profile`` stamps a ``data_epoch``. The browser stores its counts
+- ``GET /profile`` stamps a ``data_epoch``; the browser stores its counts
   against it and drops them when it changes. A wipe deletes the user document,
   so the replacement gets a new epoch — which is why the stamp is lazy rather
   than written once at onboarding.
 - ``GET /jobs/pending`` reports how many pending jobs exist before filtering,
-  so an empty queue can say *why* it is empty. Only "all below the threshold"
-  is fixed by lowering the threshold; "nothing discovered" and "nothing scored
-  yet" are not, and were previously told to lower it anyway.
+  so an empty queue can say why it is empty. Only "all below the threshold" is
+  fixed by lowering the threshold.
 """
 
 import pytest

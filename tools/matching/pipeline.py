@@ -31,49 +31,36 @@ log = get_logger("tools.matching")
 # home for these ids. Parsing is high-volume → Flash; scoring is the call worth
 # paying for → Pro.
 
-# Thinking bills as output tokens at the full output rate — telemetry showed it
-# running 1.5x-4x the answer size on both calls below with no thinking_config
-# set at all. Both tasks still need real judgment (role/seniority classification
-# here; weighted scoring + geo-eligibility gating in match_job), so this trims
-# the default rather than disabling thinking outright — see obs/llm_cost.py
-# output post-deploy to confirm thinking_tokens actually dropped before going
-# lower.
+# Thinking bills as output tokens at the full output rate, and ran 1.5x-4x the
+# answer size on both calls below when left unconfigured. Both tasks need real
+# judgment, so these trim the default rather than disabling thinking.
 #
-# FLASH_MODEL is gemini-2.5-flash, which 400s on thinking_level ("not supported
-# by this model") and takes the older thinking_budget knob instead — verified
-# live 2026-07-08 after every parse_jd call in a backlog run failed with that
-# 400. That is why this knob is thinking_budget and the Pro one below is
-# thinking_level, and the asymmetry is a model-generation fact, not a
-# preference. 512 tokens caps thinking near the thinking_level=LOW intent.
-#
-# The id used to be the gemini-flash-latest alias, i.e. this config was one
-# Google-side repoint away from 400ing again with no commit here. It is pinned
-# now (tools/llm_models.py says why, and what moving it costs). A future pin to
-# a 3.x Flash leaves thinking_budget working — 3.x accepts either knob, just
-# not both — so it is a choice to make there, not a breakage.
+# The two knobs differ because the model generations do: 2.5 Flash 400s on
+# thinking_level and takes the older thinking_budget instead (it failed every
+# parse_jd call in a live backlog run), while Pro takes thinking_level. Pick the
+# knob the pinned model generation accepts — and keep the id pinned, because an
+# alias repointed Google-side would 400 this config with no commit here. 512
+# tokens caps thinking near the thinking_level=LOW intent.
 _PARSE_JD_THINKING = types.ThinkingConfig(thinking_budget=512)
 _MATCH_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MEDIUM)
 
-# Ceiling on what one Pro scoring call may generate — thinking counts toward
-# max_output_tokens, so this must cover answer + thinking. All-time telemetry
-# worst is ~3.0K combined (427 answer, 2,622 thinking); 4096 leaves headroom
-# while capping a runaway generation at ~$0.05 instead of the model's ~64K
-# default (~$0.79). Hitting the cap truncates the JSON, which fails schema
-# validation and surfaces as match.failed rather than a silent wrong score.
+# Ceiling on what one Pro scoring call may generate. Thinking counts toward
+# max_output_tokens, so this must cover answer + thinking; the all-time
+# telemetry worst is ~3.0K combined. 4096 leaves headroom while capping a
+# runaway generation at ~$0.05 instead of ~$0.79 at the model's default.
+# Hitting the cap truncates the JSON, which fails schema validation and
+# surfaces as match.failed rather than a silent wrong score.
 _MATCH_MAX_OUTPUT_TOKENS = 4096
 
-#: Version of :data:`PARSE_JD_PROMPT`. **Bump this whenever that prompt
-#: changes**, in the same commit — a stale version is worse than no version at
-#: all, because it asserts that two parses are comparable when they are not.
-#: Stamped onto every parse this repo pays for (``score.scored_with``), so a
-#: later consumer can tell a feature extracted by today's prompt from one
-#: extracted by a different prompt that happened to fill the same schema.
-#: Integer, monotonic, no semantics beyond "different number, different
-#: prompt".
+#: Version of :data:`PARSE_JD_PROMPT`, stamped onto every parse this repo pays
+#: for (``score.scored_with``). Bump it in the same commit as any change to
+#: that prompt: a stale version asserts that two parses are comparable when
+#: they are not. Integer, monotonic, no other semantics.
 #:
-#: **Not left to memory**: ``tests/unit/test_scored_with.py`` pins a digest of
-#: the prompt text per version, so editing the prompt without bumping this
-#: fails the suite, and bumping it without recording the new digest fails too.
+#: Enforced, not left to memory: ``tests/unit/test_scored_with.py`` pins a
+#: digest of the prompt text per version, so editing the prompt without
+#: bumping this fails the suite, and so does bumping it without recording the
+#: new digest.
 PARSE_PROMPT_VERSION = 1
 
 PARSE_JD_PROMPT = """Extract structured info from this job description.
@@ -107,34 +94,26 @@ For location, extract the job's geography from the posting and the location line
   Do not infer this from the company being US-headquartered; require an explicit statement.
 """
 
-#: Version of **the whole scoring prompt**, which is assembled from more than
-#: one template: :data:`MATCH_CONTEXT_TEMPLATE` (the per-user static block,
-#: uploaded as Vertex cached content) plus :data:`MATCH_JOB_TEMPLATE` (the
-#: per-job block). One number covers both, deliberately — the model sees one
-#: concatenated prompt and a score is a function of all of it, so a version
-#: per template would describe a split that does not exist in the thing being
-#: versioned. **Bump this whenever either template changes**, and also when
-#: the scoring rules text inside ``MATCH_CONTEXT_TEMPLATE`` changes, which is
-#: the edit most likely to move every score while looking cosmetic.
+#: Version of the whole scoring prompt: :data:`MATCH_CONTEXT_TEMPLATE` plus
+#: :data:`MATCH_JOB_TEMPLATE`. One number covers both, because the model sees
+#: one concatenated prompt. Bump it whenever either template changes,
+#: including the scoring rules text inside the context block — the edit most
+#: likely to move every score while looking cosmetic.
 #:
-#: What it does *not* cover: the model id (recorded separately as
-#: ``match_model``), the candidate profile interpolated into the context block
-#: (per-user data, not prompt), and :func:`build_match_context`'s
-#: ``rejection_patterns`` / ``approval_patterns`` (per-user data again).
+#: It does *not* cover the model id (recorded separately as ``match_model``) or
+#: any per-user data interpolated into the templates (profile, rejection and
+#: approval patterns).
 #:
-#: Digest-pinned per version in ``tests/unit/test_scored_with.py``, over both
+#: Digest-pinned per version in ``tests/unit/test_scored_with.py`` over both
 #: templates concatenated — see :data:`PARSE_PROMPT_VERSION`.
 MATCH_PROMPT_VERSION = 1
 
 
 # The scoring prompt is split into a per-user static block and a per-job block
-# so the static block (profile JSON + geography + decision patterns + scoring
-# rules — it dominates input tokens and was resent on every call) can be
-# uploaded once per scoring run as Vertex cached content and reused across all
-# jobs in the run; cached input bills at a tenth of the standard rate (see
-# obs/llm_cost.py). With or without a cache the model sees the same
-# information; the only semantic change from the pre-split prompt is ordering
-# (the job now comes after the rules, since a cache must be a strict prefix).
+# so the static block — which dominates input tokens — can be uploaded once per
+# run as Vertex cached content and billed at a tenth of the standard rate. The
+# model sees the same information either way; the job must come after the rules
+# because a cache has to be a strict prefix.
 MATCH_CONTEXT_TEMPLATE = """You are a careful, skeptical career advisor scoring jobs against the candidate's profile.
 
 # Candidate Profile
@@ -248,34 +227,29 @@ def build_match_job_block(job: Job) -> str:
 
 
 def match_cache_display_name(user_id: str) -> str:
-    """A cache is a per-user singleton — one live one per user, at most.
-
-    That is what makes :func:`reap_match_caches` able to clean up after a run
-    that never got to delete its own.
+    """The cache display name for a user. One live cache per user, at most —
+    which is what lets :func:`reap_match_caches` clean up after a run that
+    never deleted its own.
     """
     return f"hermes-match-{user_id}"
 
 
 # Caches are listed project-wide (the Vertex list API takes no display-name
-# filter), so the scan is bounded: with TTLs clamped to an hour there should
-# only ever be a handful alive, and a surprise is not worth an unbounded walk.
+# filter), so the scan is bounded: with TTLs clamped to an hour only a handful
+# should ever be alive, and a surprise is not worth an unbounded walk.
 _CACHE_SCAN_LIMIT = 200
 
 
 async def reap_match_caches(client, display_name: str) -> int:
-    """Delete any live cache still carrying ``display_name``; returns how many.
+    """Delete any live cache carrying ``display_name``; returns how many.
 
-    Every run deletes its own cache in a ``finally``, but a killed process
-    (Cloud Run scale-down, SIGKILL) leaves one standing and *billed* until its
-    TTL runs out — with the old 24h TTL, for a day. Since the display name is
-    a per-user singleton, anything found here is a previous run's corpse, so
-    each run buries the last one's. Best-effort: never let cache hygiene stop
-    a scoring run.
+    A killed process leaves its cache standing and billed until the TTL runs
+    out, and the display name is a per-user singleton, so anything found here
+    is a previous run's leak. Swallows all errors — cache hygiene must never
+    stop a scoring run.
 
-    Two runs for the same user overlapping would have the later one bury the
-    earlier one's *live* cache; that costs the first run its discount (
-    ``match_job`` falls back to the uncached prompt on a cache error) but not
-    its results, and the queue's named tasks already dedupe cycles per user.
+    If two runs for the same user overlap, the later buries the earlier one's
+    live cache; that costs the first run its discount but not its results.
     """
     deleted = 0
     try:
@@ -286,10 +260,9 @@ async def reap_match_caches(client, display_name: str) -> int:
                 await client.aio.caches.delete(name=cache.name)
                 deleted += 1
             if scanned >= _CACHE_SCAN_LIMIT:
-                # Truncated: the user's own leaked cache may be past here, so
-                # this reap silently becomes a no-op exactly when there are
-                # enough live caches for leaks to matter. Warn so that shows
-                # up in the logs instead of as a slow bill.
+                # Truncated: the user's leaked cache may lie past here, so the
+                # reap silently no-ops exactly when leaks start to matter. Warn
+                # so it shows up in the logs rather than as a slow bill.
                 log.warning(
                     "matching.cache.reap_truncated",
                     display_name=display_name,
@@ -316,14 +289,10 @@ async def create_match_cache(
 ) -> str | None:
     """Upload the static scoring block as Vertex cached content.
 
-    Returns the cache resource name to pass as ``match_job(...,
-    cached_content=)``, or ``None`` when creation fails — e.g. the block is
-    under the model's minimum cacheable size for a thin profile. Callers just
-    run uncached in that case; scoring behavior is identical either way.
-
-    Any previous cache for this user is reaped first (see
-    :func:`reap_match_caches`) — the display name is a per-user singleton, so
-    the only thing that can be standing here is a leak.
+    Returns the cache resource name for ``match_job(..., cached_content=)``, or
+    ``None`` when creation fails (e.g. a thin profile falls under the model's
+    minimum cacheable size); callers then run uncached, with identical scoring
+    behavior. Reaps any previous cache for this user first.
     """
     client = vertex_client()
     display_name = match_cache_display_name(profile.user_id)
@@ -365,10 +334,10 @@ async def delete_match_cache(cache_name: str) -> None:
 
 
 def _residence_str(profile: MasterProfile) -> str:
-    """Human-readable residence for the prompt, with country-level fallback.
+    """Human-readable residence for the prompt.
 
-    Prefers the structured `residence` (city, state, country); falls back to the
-    freeform `location` string when residence is not set.
+    Prefers the structured `residence` (city, state, country) and falls back to
+    the freeform `location` string.
     """
     r = profile.residence
     if r is None:
@@ -379,11 +348,11 @@ def _residence_str(profile: MasterProfile) -> str:
 
 # ------------------------------------------------------------- the pre-filter
 #
-# Everything a scorer can decide *without* buying a Pro call lives in
+# Everything a scorer can decide without buying a Pro call lives in
 # :func:`prefilter`, which all three scorers call immediately before deciding
-# to spend. Two rejections come out of it, and they must never be confused:
-# a role outside the target families, and — only under ``GEO_GATE_ENFORCE`` — a
-# job the deterministic geo gate proves the candidate cannot hold.
+# to spend. Its two rejections must never be confused: a role outside the
+# target families, and — only under ``GEO_GATE_ENFORCE`` — a job the
+# deterministic geo gate proves the candidate cannot hold.
 
 # Sentinel score for jobs filtered out before full scoring.
 OUT_OF_FAMILY = JobMatch(
@@ -405,18 +374,15 @@ OUT_OF_FAMILY = JobMatch(
 
 #: Sentinel for a job the geo gate rejected *instead of* calling Pro.
 #:
-#: **The score is 0, and it must never be 20.** 20 is
-#: ``score.DISCARD_AT_OR_BELOW`` and, across this codebase, means exactly one
-#: thing: *Pro* looked at the job and applied Rule 6's geographic cap. Three
-#: separate pieces of machinery read it that way — ``cli.geo_replay``'s
-#: ``GEO_CAP_SCORE``, ``score.shadow_geo_gate``'s ``pro_capped``, and every
-#: historical tombstone count derived from either. A gate-issued 20 would forge
-#: Pro decisions that were never made and silently corrupt the one measurement
-#: this whole phase is justified by.
+#: The score is 0 and must never be 20: 20 is ``score.DISCARD_AT_OR_BELOW`` and
+#: means, everywhere in this codebase, that Pro itself applied Rule 6's
+#: geographic cap (``cli.geo_replay``, ``score.shadow_geo_gate`` and every
+#: tombstone count derived from them read it that way). A gate-issued 20 would
+#: forge Pro decisions that were never made.
 #:
-#: 0 is already ``OUT_OF_FAMILY``'s "never reached Pro" sentinel, which is
-#: precisely what this is too. The two are told apart by ``geo_gate.enforced``
-#: on the tombstone — never by score, and never by ``reasoning``.
+#: 0 is also ``OUT_OF_FAMILY``'s "never reached Pro" sentinel. The two are told
+#: apart by ``geo_gate.enforced`` on the tombstone, never by score or by
+#: ``reasoning``.
 GEO_INELIGIBLE = JobMatch(
     job_id="",
     overall_score=0,
@@ -425,10 +391,9 @@ GEO_INELIGIBLE = JobMatch(
         qualifications_match=0,
         seniority_match=0,
         comp_alignment=0,
-        # 0 rather than OUT_OF_FAMILY's 100, mirroring what Rule 6 instructs Pro
-        # to write for a geographically ineligible role. The breakdown is
-        # fiction either way — nothing scored this job — but where a value can
-        # match what the paid path would have produced, it should.
+        # 0 rather than OUT_OF_FAMILY's 100, mirroring what Rule 6 instructs
+        # Pro to write for a geographically ineligible role. The breakdown is
+        # fiction either way, but should match what the paid path would write.
         deal_breaker_penalty=0,
     ),
     matched_strengths=[],
@@ -448,14 +413,12 @@ DEFAULT_GEO_HOLDOUT = 0.10
 def geo_enforce_enabled() -> bool:
     """True when the geo gate may *skip* Pro calls, not merely record them.
 
-    Off unless explicitly switched on, same shape as ``QUEUE_MODE``
-    (``tools.queues.enabled``). Off is the shipped state: the gate's
-    false-positive rate is measured (0 over 1,127
-    records) but a false positive under enforcement is not one lost job — the
-    tombstone is discovery's dedupe key, so it suppresses that posting on every
-    future re-discovery too. That is what :func:`score.restore_payload` and
-    ``cli.geo_resurrect`` exist to make reversible, and what this flag exists to
-    keep switched off until someone decides to turn it on.
+    Off unless explicitly switched on, and off is the shipped state. The gate
+    measured 0 false positives over 1,127 records, but a false positive under
+    enforcement loses the posting permanently rather than once: the tombstone
+    is discovery's dedupe key, so it suppresses that posting on every future
+    re-discovery (``score.restore_payload`` and ``cli.geo_resurrect`` are the
+    undo).
     """
     return os.getenv("GEO_GATE_ENFORCE", "").strip().lower() in {"1", "true", "on"}
 
@@ -464,8 +427,7 @@ def geo_holdout_fraction() -> float:
     """``GEO_GATE_HOLDOUT`` as a fraction in [0, 1]; default 10%.
 
     Anything unparseable or out of range falls back to the default rather than
-    disabling the hold-out, because a hold-out of zero is the one setting that
-    quietly destroys the measurement.
+    to zero, because a hold-out of zero quietly destroys the measurement.
     """
     raw = os.getenv("GEO_GATE_HOLDOUT", "").strip()
     if not raw:
@@ -484,21 +446,14 @@ def geo_holdout_fraction() -> float:
 def geo_holdout(job_id: str, fraction: float) -> bool:
     """Is this job in the hold-out — scored by Pro despite an ineligible verdict?
 
-    **Deterministic on the job id, never ``random()``.** The resumable batch
-    pipeline decides at submit time and joins the responses back at ingest,
-    hours later and in a different process (``batch_runs.resume``, typically a
-    worker cron tick). A job that answered "skip" at submit and "score" at
-    ingest — or the reverse — would break the content join: the ingest would
-    either look for a Pro response that was never requested, or tombstone a job
-    whose paid response is sitting in the output it is holding. Hashing the id
-    makes the answer a property of the job rather than of the process asking.
+    Deterministic on the job id, never ``random()``: the batch pipeline decides
+    at submit time and joins responses back at ingest, hours later in a
+    different process, so an answer that changed in between would break the
+    content join. SHA-256 rather than :func:`hash`, because Python salts
+    ``hash(str)`` per process.
 
-    SHA-256 rather than :func:`hash`, because Python salts ``hash(str)`` per
-    process by default — the exact failure this is written to avoid.
-
-    Sampling the id and not the *decision* also means the hold-out set is stable
-    across a ``GATE_VERSION`` bump, so the same jobs keep producing the Pro
-    comparison and the series stays readable.
+    Sampling the id rather than the decision also keeps the hold-out set stable
+    across a ``GATE_VERSION`` bump, so the series stays readable.
     """
     if fraction <= 0.0:
         return False
@@ -516,41 +471,28 @@ def prefilter(
     Returns ``(match, decision)``:
 
     - ``(OUT_OF_FAMILY copy, None)`` — role family outside the profile's
-      targets. No gate was consulted, hence no decision.
+      targets; the gate was not consulted.
     - ``(GEO_INELIGIBLE copy, decision)`` — ``enforce`` is on and the gate
-      proved the job unreachable. **The non-``None`` decision is the
-      discriminator**: a caller tells an enforced geo skip from a family miss by
-      whether a decision came back with the sentinel, never by comparing scores
-      (both are 0, deliberately — see :data:`GEO_INELIGIBLE`).
+      proved the job unreachable.
     - ``(None, ...)`` — go and score it.
 
-    This decision used to be written out three times (in :func:`match_job`, in
-    ``batch._batch_score``, in ``batch_runs._submit_score_stage``) because the
-    batch paths never call :func:`match_job` — they build their own Pro requests
-    from a list of jobs. That is also why Phase 1C's geo shadow recording had to
-    be hung off ``score.persist_result`` rather than off the pre-filter itself:
-    there was no single place the pre-filter *was*.
+    The non-``None`` decision is the discriminator between an enforced geo skip
+    and a family miss. Never compare scores: both sentinels are 0, deliberately
+    (see :data:`GEO_INELIGIBLE`). The returned match is a ``model_copy``, since
+    callers stamp ``job_id`` onto it.
 
-    The families are lowercased on the profile side only. ``role_family`` is a
-    ``Literal`` the parse prompt already constrains to lowercase, whereas
-    ``target_role_families`` is user-supplied and arrives however it was typed.
+    Families are lowercased on the profile side only: ``role_family`` is a
+    ``Literal`` the parse prompt already constrains to lowercase, while
+    ``target_role_families`` is user-supplied.
 
-    A job with no parse gets ``(None, None)``, and that ``None`` deliberately
-    does not have to be told apart from "go score it" at a call site: every
-    caller settles the unparsed case *before* asking. Do not "fix" this by
-    parsing here — that would put a billed Flash call inside the function whose
-    job is to avoid billed calls.
+    A job with no parse gets ``(None, None)``; every caller settles the
+    unparsed case before asking. Do not "fix" that by parsing here — it would
+    put a billed Flash call inside the function whose job is to avoid them.
 
-    **When ``enforce`` is false the gate is not consulted at all**, so this
-    reduces to the family test that shipped before Phase 1D, plus one boolean.
-    That is the merge-safety argument, and it is why the gate call sits behind
-    the flag rather than being evaluated and discarded: with the flag off there
-    is no new code path for anything — not even an exception — to come out of.
-    The shadow recording is unaffected; it has always had its own
-    ``geo.evaluate`` call inside ``score.persist_result``.
-
-    Returns a ``model_copy``, never a module-level singleton: callers stamp
-    ``job_id`` onto what they get back.
+    When ``enforce`` is false the gate is not consulted at all, so no new code
+    path, not even an exception, can come out of it. Shadow recording is
+    unaffected; it has its own ``geo.evaluate`` call in
+    ``score.persist_result``.
     """
     parsed = job.jd_parsed
     if parsed is None:
@@ -566,33 +508,27 @@ def prefilter(
     try:
         decision = geo.evaluate(parsed, profile)
     except Exception as e:
-        # The gate is pure and has no business raising, but a profile it cannot
-        # read (an old doc, a stub) must cost a skipped optimization and never a
-        # skipped job. Abstaining here is exactly the status quo.
+        # The gate is pure and has no business raising, but a profile it
+        # cannot read must cost a skipped optimization, never a skipped job.
         log.warning("matching.geo_gate_failed", job_id=job.id, error=str(e)[:200])
         return None, None
     if decision.verdict != "ineligible":
         return None, decision
 
-    # **US residents only, and this check belongs here rather than in geo.py.**
-    # ``geo.evaluate`` reads exactly one profile field (``residence.country``),
-    # and both profiles the gate was measured against normalize to "US" — so the
-    # effective sample is one profile, not two. For a non-US resident the
-    # structure inverts rather than merely shifting: ``us_remote_ok``, the
-    # safety valve carrying 73.4% of the kept corpus, is hard-gated on US inside
-    # the gate and so never fires, while ``country_mismatch`` fires against
-    # nearly every US posting. That population is unmeasured *and* structurally
-    # different, and there are zero non-US users today, so declining to enforce
-    # for them costs nothing. geo.py stays a pure statement of what is provable;
-    # who we are willing to act on it for is a policy, and policy lives here.
+    # US residents only. The gate was only ever measured against US-normalizing
+    # profiles, and for a non-US resident the structure inverts: ``us_remote_ok``
+    # is hard-gated on US and never fires, while ``country_mismatch`` fires
+    # against nearly every US posting. That population is unmeasured and
+    # structurally different. The check lives here rather than in geo.py, which
+    # states what is provable; who we act on it for is policy.
     if decision.residence_country != "US":
         return None, decision
 
     if geo_holdout(job.id, geo_holdout_fraction()):
-        # Scored by Pro anyway, and recorded through the normal shadow path.
-        # Permanent, not a rollout ramp: once enforcing, the enforced population
-        # stops producing Pro comparisons forever, which would leave the only
-        # metric that justifies the gate with a hole exactly where the gate acts.
+        # Scored by Pro anyway and recorded through the normal shadow path.
+        # Permanent, not a rollout ramp: without it the enforced population
+        # stops producing Pro comparisons, leaving a hole in the only metric
+        # that justifies the gate, exactly where the gate acts.
         log.info(
             "matching.geo_holdout",
             job_id=job.id,
@@ -644,18 +580,15 @@ async def match_job(
 ) -> JobMatch:
     """Parse (if needed), then full Pro scoring. **This call always spends.**
 
-    It does *not* pre-filter. :func:`prefilter` used to run here, which made the
-    online path the only one where the free rejections happened inside the paid
-    function — and left the caller unable to see *why* a job was rejected, which
-    the geo gate needs (it has to record a verdict onto the tombstone). So the
-    pre-filter moved out to the callers, where the two batch scorers had always
-    had it, and all three now call it immediately before deciding to spend.
+    It does *not* pre-filter: callers must run :func:`prefilter` themselves
+    immediately before deciding to spend, because they are the ones that need
+    the gate's verdict to record onto a tombstone.
 
     ``cached_content`` is a Vertex cache resource name from
-    :func:`create_match_cache`; when set, only the per-job block is sent and
-    the static block is read from the cache at the discounted rate. The cache
-    must have been built from the same profile/patterns, or the model will
-    score against stale context.
+    :func:`create_match_cache`; when set, only the per-job block is sent and the
+    static block is read from the cache at the discounted rate. It must have
+    been built from the same profile and patterns, or the model scores against
+    stale context.
     """
     started = time.monotonic()
     job_log = log.bind(job_id=job.id, company=job.company)

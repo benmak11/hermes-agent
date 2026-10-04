@@ -4,27 +4,22 @@
 Run the application reaper by hand: recover applications whose worker died.
 
 The scheduled pass lives on the cron tick (``api/routes/discovery.cron_tick``);
-this is the operator's copy of it, for legacy documents, for a user whose tick
-is not running, and for seeing what the hourly job *would* do before it does it.
+this is the operator's copy, for legacy documents, for a user whose tick is not
+running, and for seeing what the hourly job would do before it does it.
 
-Dry-run by default, like ``cli.reset_user``, ``cli.geo_resurrect`` and
-``cli.unwedge_submitting``: without ``--execute`` it classifies every in-progress
-application and reports the verdicts, taking no lease, writing nothing and
-dispatching nothing. (``cli.purge_discarded`` is the exception in this
-directory; do not copy it.)
+Dry-run by default: without ``--execute`` it classifies every in-progress
+application and reports verdicts, taking no lease, writing nothing and
+dispatching nothing.
 
-**This is not ``cli.unwedge_submitting``, and it does not replace it.** The two
-divide ``submitting`` between them along the line ``state.IN_PROGRESS`` draws:
-this tool acts only on documents holding an *expired lease*, which is first-hand
-evidence that a run started and stopped. A ``submitting`` document with **no**
-lease is ambiguous — the window between the submit request writing the status
-and the run claiming it is real — so it is reported here as ``ambiguous`` and
-left for ``unwedge_submitting``'s age arithmetic, which is a judgement call an
-operator should make rather than an hourly job.
+It divides ``submitting`` with ``cli.unwedge_submitting`` along the line
+``state.IN_PROGRESS`` draws: this tool acts only on documents holding an
+expired lease, which is first-hand evidence that a run started and stopped. A
+``submitting`` document with no lease is reported ``ambiguous`` and left to
+``unwedge_submitting``'s age arithmetic.
 
-What it never does: re-submit. A ``submitting`` document that died with
-``submit_attempted_at`` set is failed and flagged ``submission_uncertain``, never
-re-enqueued, because the browser may already have filed a real application.
+It never re-submits. A ``submitting`` document that died with
+``submit_attempted_at`` set is failed and flagged ``submission_uncertain``,
+because the browser may already have filed a real application.
 
 Usage:
     python -m cli.reap_applications --user-id me                    # dry run

@@ -2,36 +2,28 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Every score records what produced it — the right model, not a nearby one.
 
-A score with no provenance is an unattributable number: nothing in Firestore
-said which model ran or which prompt it ran, so there was no way to tell
-whether a December score was comparable to an October one. Every later task
-that compares scores depends on this record existing *and being true*.
+A score with no provenance is an unattributable number: nothing says which
+model or prompt produced it, so scores from different months are not known to
+be comparable.
 
-**The load-bearing test in this file is the batch one.** The batch and online
-paths read different constants for their Flash leg — ``BATCH_FLASH_MODEL``
-(batch prediction rejects a ``-latest`` alias, so it always had to pin a
-concrete id) and ``FLASH_MODEL``. Stamping the online constant on a
-batch-scored job records a lie of the worst kind: indistinguishable later from
-the truth, in the one field whose entire job is to be trustworthy. So the
-models are threaded in from the callers, and these tests drive the real
-scorers rather than calling ``scored_with`` directly, because a unit test of
-the record builder cannot catch a caller passing it the wrong id.
+The load-bearing test here is the batch one. The batch and online paths read
+different Flash constants (``BATCH_FLASH_MODEL``, because batch prediction
+rejects a ``-latest`` alias, and ``FLASH_MODEL``), and stamping the online
+constant on a batch-scored job records a lie that is indistinguishable from
+the truth later. Both constants currently hold ``gemini-2.5-flash``, so a
+wrong stamp would record a correct-looking string: the provenance tests
+monkeypatch the constant each path is supposed to read to a sentinel and
+assert on which name the value came from, which fails even while the real ids
+agree. Two further tests pin the shipped values, so "right wiring, wrong
+constant" cannot pass either. The tests drive the real scorers rather than
+``scored_with`` directly, because a unit test of the record builder cannot
+catch a caller passing the wrong id.
 
-**Since ``FLASH_MODEL`` was pinned, both constants hold ``gemini-2.5-flash``**
-— so a wrong stamp now records a correct-looking string and no assertion on
-the *value* can see it. The two provenance tests therefore monkeypatch the
-constant each path is supposed to read to a sentinel and assert on which name
-the recorded value came from. That is discrimination by construction: it fails
-even while the real ids agree, which asserting their inequality could not do.
-Two further tests pin the shipped values themselves, so "right wiring, wrong
-constant" cannot pass either.
-
-The second theme is **not claiming more than happened**. ``None`` means "this
-leg did not run here", and it appears in three real situations: the free
-pre-filter (no model at all), a parse that came from ``jd_cache`` or a
-previous run (ran, but not here, and by what is unknown), and a job scored
-before this field existed. All three must stay distinguishable from a
-confident wrong answer.
+The second theme is not claiming more than happened. ``None`` means "this leg
+did not run here" and covers three real cases — the free pre-filter, a parse
+served from ``jd_cache`` or a previous run, and a job scored before the field
+existed — all of which must stay distinguishable from a confident wrong
+answer.
 """
 
 from __future__ import annotations
@@ -197,27 +189,17 @@ def _line(request_text: str, response_text: str) -> dict:
 
 
 def test_the_two_flash_ids_now_name_the_same_model():
-    """The premise, inverted on purpose — and the reason the two provenance
-    tests below look the way they do.
+    """Both Flash constants hold the same id, on purpose.
 
-    This used to assert the two ids were *different*, with a note saying that
-    if they ever converged, the batch tests would stop discriminating and the
-    right response was to rewrite them rather than delete the guard. Pinning
-    ``FLASH_MODEL`` from ``gemini-flash-latest`` to the id the alias already
-    served is exactly that convergence, deliberately: both constants are now
-    ``gemini-2.5-flash``.
+    ``FLASH_MODEL`` is pinned to the id ``gemini-flash-latest`` already served,
+    so string inequality can no longer tell a batch stamp from an online one —
+    which is why the provenance tests monkeypatch the constant each path is
+    supposed to read rather than comparing values.
 
-    So string inequality can no longer tell the batch stamp from the online
-    one, and the two tests below were rewritten to monkeypatch the constant
-    each path is *supposed* to read to a sentinel and assert on which one came
-    out. That discriminates by construction — it fails even while the real ids
-    agree, which the old form could not do — so it is strictly stronger, not a
-    weakening to keep the suite green.
-
-    This test survives as a tripwire in both directions: the ids diverging
-    again (a new pin on one side only) fails it, and so does either pin moving
-    off this id. Either way, re-read ``tools/llm_models.py``'s ``FLASH_MODEL``
-    and ``obs/llm_cost.py``'s table before touching anything here.
+    A tripwire in both directions: the ids diverging (a new pin on one side
+    only) fails it, and so does either pin moving off this id. Either way,
+    re-read ``tools/llm_models.py``'s ``FLASH_MODEL`` and ``obs/llm_cost.py``'s
+    table first.
     """
     assert batch.BATCH_FLASH_MODEL == pipeline.FLASH_MODEL == "gemini-2.5-flash"
 
@@ -311,9 +293,8 @@ def test_a_scored_job_doc_carries_all_five_keys():
 
 
 def test_a_tombstone_carries_it_too():
-    """~71% of everything ever scored lands in ``discarded_jobs``. Provenance
-    on the survivors only cannot date the negatives, which is the half #97 just
-    made usable as training features."""
+    """~71% of everything ever scored lands in ``discarded_jobs``, so
+    provenance on the survivors alone cannot date the negatives."""
     ref = _DiscardingRef()
     provenance = score.scored_with(
         parse_model=pipeline.FLASH_MODEL, match_model=pipeline.PRO_MODEL
@@ -434,18 +415,14 @@ def test_a_parse_this_run_did_not_pay_for_is_not_attributed(
 
 
 def test_a_batch_scored_job_records_the_batch_models(monkeypatch, unlimited_budget):
-    """THE ONE. Both legs ran in batch, so both ids must be the batch ids.
+    """Both legs ran in batch, so both ids must be the batch ids.
 
-    ``FLASH_MODEL`` here would be a wrong attribution that no later query, no
-    replay and no audit could ever detect — which is precisely the failure this
-    whole task exists to prevent.
-
-    Since the pin, the two Flash constants hold the same string, so the wrong
-    stamp would record a *correct-looking* id and no assertion on the value
-    could see it. ``BATCH_FLASH_MODEL`` is therefore repointed at a sentinel
-    for this test: the record must carry the value read from **that name**.
-    The fake ``_run_batch`` below compares against the attribute rather than a
-    literal, so it follows the sentinel and still checks the right leg ran.
+    Stamping ``FLASH_MODEL`` here would be a wrong attribution no later query,
+    replay or audit could detect. The two Flash constants hold the same string,
+    so a wrong stamp records a correct-looking id; ``BATCH_FLASH_MODEL`` is
+    therefore repointed at a sentinel and the record must carry the value read
+    from *that name*. The fake ``_run_batch`` compares against the attribute
+    rather than a literal, so it follows the sentinel.
     """
     sentinel = "sentinel/batch-flash"
     monkeypatch.setattr(batch, "BATCH_FLASH_MODEL", sentinel)

@@ -7,33 +7,22 @@ Every real ``generate_content`` call site (``tools/matching/pipeline.py``,
 :func:`record_llm_call` right after the response comes back. It logs one
 structured ``llm.call`` event with token counts and a computed cost.
 
-No ``run_id``/``request_id`` plumbing is needed here: ``obs.logging`` already
-binds one of those onto structlog's contextvars for every code path that
-reaches these call sites (``run_context`` for the CLI/cron/background-task
-pipelines, the request middleware for synchronous API routes), and structlog
-merges bound contextvars into every log line automatically. Aggregating cost
-per application run downstream is therefore just "GROUP BY run_id" over these
-log lines — see ``deployment/terraform/shared/llm_cost.sql``.
+No ``run_id``/``request_id`` plumbing is needed: ``obs.logging`` binds one
+onto structlog's contextvars for every path that reaches these call sites, so
+cost per run is a "GROUP BY run_id" downstream — see
+``deployment/terraform/shared/llm_cost.sql``.
 
-That sink only exists on Cloud Run, though: a local process logs to stdout
-and its ``llm.call`` lines are gone the moment it exits. So the same numbers
-are *also* accumulated in process, keyed by ``run_id``, and flushed to a
-Firestore run ledger by ``tools.run_costs`` when the run ends — one answer to
-"what did that run cost?" that reads the same from a laptop, the API, and the
-worker.
+That sink only exists on Cloud Run, so the same numbers are also accumulated
+in process, keyed by ``run_id``, and flushed to a Firestore run ledger by
+``tools.run_costs`` when the run ends.
 
 Pricing is looked up by ``response.model_version``, and the table is keyed by
-whatever string actually shows up there — Vertex echoes the *requested* id
-back verbatim and does not resolve an alias to a concrete model (confirmed
-live 2026-07-08; an earlier version of this module assumed the opposite).
-Both call sites now request concrete pinned ids
-(``gemini-3.1-pro-preview``, ``gemini-2.5-flash``), so both lookups hit a
-pinned key. The ``gemini-flash-latest`` entry below is kept anyway, because
-months of already-written ledger rows and ``llm_call`` log lines carry that
-string and a cost replay over them has to price it; it is dead for new calls,
-not for history. A model string missing from ``_PRICING_PER_MILLION`` still
-gets its token counts logged, just with ``cost_usd=None`` and a warning,
-rather than silently reporting a wrong number.
+whatever string shows up there: Vertex echoes the requested id back verbatim
+and does not resolve an alias (confirmed live 2026-07-08). The dead
+``gemini-flash-latest`` entry is kept because already-written ledger rows and
+log lines carry that string and a cost replay has to price them. A model
+missing from ``_PRICING_PER_MILLION`` still gets its token counts logged,
+with ``cost_usd=None`` and a warning.
 """
 
 from __future__ import annotations
@@ -53,19 +42,13 @@ log = get_logger("llm.cost")
 # before relying on it for paywall pricing.
 _PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     "gemini-3.1-pro-preview": {"input": 2.00, "output": 12.00, "cached": 0.20},
-    # Historical only: no call site requests the alias any more, since both
-    # Flash declarations are pinned to the concrete id below. Kept because
+    # Historical only: no call site requests the alias any more. Kept because
     # ledger rows and llm_call log lines written before the pin carry this
-    # string and a cost replay over them still has to price it. Same rates —
-    # the alias served this model — so dropping the entry would silently turn
-    # every pre-pin row into cost_usd=None.
+    # string, and dropping it would silently turn every one into cost_usd=None.
     "gemini-flash-latest": {"input": 0.30, "output": 2.50, "cached": 0.03},
-    # Every Flash call site now: the online scorer and tailoring, via
-    # tools/llm_models.FLASH_MODEL and tools/tailoring/objective's
-    # OBJECTIVE_MODEL, plus the batch scorer via BATCH_FLASH_MODEL (which
-    # always had to pin a concrete id, because batch prediction rejects
-    # aliases). 2.5 Flash has no long-context pricing tier — flat rate at any
-    # input size, unlike Pro — so it needs no entry in the table below.
+    # Every Flash call site: the online scorer, tailoring, and the batch
+    # scorer via BATCH_FLASH_MODEL. 2.5 Flash has no long-context pricing tier
+    # — flat rate at any input size — so it needs no entry in the table below.
     "gemini-2.5-flash": {"input": 0.30, "output": 2.50, "cached": 0.03},
 }
 # Long-context (>200K prompt tokens) rates for the same models, keyed by
@@ -122,18 +105,15 @@ def compute_cost_usd(
 
 
 # run_id -> running totals for that run. An entry lives until something calls
-# ``reset_run_cost`` (``tools.run_costs.persist_run_cost`` always does, even on
-# failure), so this map only stays bounded as long as every context that binds
-# a run_id also flushes it. In the long-lived services they all do: the
-# discovery/sweep cycles, tailoring, profile extraction, and the batch resume
-# pass. A binding path added without a flush leaks one entry per invocation for
-# the life of the process — the short-lived CLIs get away with it only because
-# they exit.
+# ``reset_run_cost`` (``persist_run_cost`` always does, even on failure), so
+# this map stays bounded only while every context that binds a run_id also
+# flushes it. A binding path added without a flush leaks one entry per
+# invocation for the life of the process.
 #
 # No lock: ``run_context`` binds before the ``asyncio.gather`` fan-out and each
 # task copies the context at creation, so every concurrent scorer of one run
-# accumulates under the same key — and asyncio never interleaves the plain dict
-# mutations below, which have no await points.
+# accumulates under the same key, and the plain dict mutations below have no
+# await points for asyncio to interleave.
 _ACCUMULATORS: dict[str, dict[str, Any]] = {}
 
 
@@ -191,16 +171,13 @@ def record_llm_call(
 ) -> dict[str, Any]:
     """Log token usage + computed cost for one ``generate_content`` call.
 
-    ``step`` identifies the call site (e.g. ``"matching.parse_jd"``,
-    ``"matching.score"``, ``"profile.extract"``, ``"tailoring.objective"``).
-    ``run_id``/``user_id`` ride along automatically via structlog's bound
-    contextvars (see module docstring); ``job_id`` does not — the per-job
-    loggers in this codebase bind it locally (``log.bind(job_id=...)``,
-    scoped to that logger instance), which doesn't reach a separate logger
-    like this one. Passing it explicitly is what makes "cost per
-    application" (one job's parse + score + tailor calls) queryable, not
-    just "cost per run" (a whole discovery/matching cycle).
-    Returns the logged fields so callers/tests can assert on them.
+    ``step`` identifies the call site, e.g. ``"matching.parse_jd"``.
+    ``run_id`` and ``user_id`` ride along via structlog's bound contextvars,
+    but ``job_id`` does not: the per-job loggers bind it to their own logger
+    instance, which never reaches this one, so it must be passed explicitly
+    for cost-per-application to be queryable.
+
+    Returns the logged fields so callers and tests can assert on them.
     """
     usage = response.usage_metadata
     model = response.model_version or "unknown"

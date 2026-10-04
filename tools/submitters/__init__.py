@@ -10,27 +10,17 @@ depending on the other.
 
 from __future__ import annotations
 
-#: The progress token a submitter emits **immediately before it clicks Submit**,
-#: and the only one that is not a display label.
+#: The progress token a submitter emits immediately before it clicks Submit,
+#: and the only one that is not a display label. It marks the point of no
+#: return: everything before it can be retried for free, everything after it
+#: may already be a real application in a real company's ATS.
 #:
-#: Every other token a submitter emits is chatter for the timeline: "Opening
-#: ...", "Attaching resume", and — until this constant existed — the click
-#: itself, which used the same ``"submitting"`` token as the six steps around
-#: it and was therefore indistinguishable from them. That mattered because it is
-#: the **point of no return**: everything before it can be retried for free, and
-#: everything after it may already be a real job application sitting in a real
-#: company's ATS.
+#: ``run_submission``'s ``progress`` callback recognises it and writes
+#: ``submit_attempted_at``, which ``tools.applications.reaper`` reads to decide
+#: whether a dead submission may be retried. Nothing else may write that field:
+#: only the code standing next to the click knows a browser clicked.
 #:
-#: ``run_submission``'s ``progress`` callback recognises this token and writes
-#: ``submit_attempted_at`` onto the application. That field is what
-#: ``tools.applications.reaper`` reads to decide whether a submission that died
-#: without reporting an outcome may be handed back for retry or must be parked
-#: as uncertain. Nothing else may write it: it means "a browser clicked Submit
-#: on this document", and only the code standing next to the click knows that.
-#:
-#: **The timeline entry is still recorded as ``"submitting"``.** ``web/`` renders
-#: statuses from a closed union and filters the submission timeline on
-#: ``["submitting", "submitted", "failed"]``; a new token reaching the document
-#: would render as an unknown. So this token names an *event* on the wire
-#: between submitter and caller, and never reaches Firestore.
+#: The timeline entry is still recorded as ``"submitting"``, because ``web/``
+#: renders statuses from a closed union and would show a new token as unknown.
+#: This token names an event on the wire and never reaches Firestore.
 SUBMIT_CLICKED = "submit_clicked"

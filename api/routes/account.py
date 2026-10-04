@@ -2,30 +2,24 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """``POST /account/signup`` and ``POST /account/delete`` — the doors in and out.
 
-**Signup** is the one route that answers a *stranger*: it runs on
+Signup is the one route that answers a stranger: it runs on
 :func:`api.deps.verify_identity` (token verified, allowlist not consulted),
 records where the visitor came from, and answers ``{"allowed": bool}``. An
 allowlisted account gets ``users/{uid}`` stamped once with ``signup_source``
 and ``signed_up_at``; anyone else gets a ``waitlist/{email}`` doc and nothing
-under ``users/`` at all, so the operator can grant a seat later with
-``cli.allowlist add``. The allowlist stays the only gate — every other route
-still 403s a stranger through :func:`api.deps.verify_user`.
+under ``users/``. Every other route still 403s a stranger through
+:func:`api.deps.verify_user`.
 
-**Delete** is the user's own door out of the product.
+**Delete irreversibly destroys the user's data.** It runs
+:func:`tools.account.delete.delete_account` — the same wipe ``cli/reset_user``
+performs, in the order that matters: tombstone, close the login, then destroy.
+That module's docstring says what is erased, what is left alone, and that it
+cannot promise atomicity against an already-dispatched discovery cycle.
 
-Runs :func:`tools.account.delete.delete_account`, which is the same wipe
-``cli/reset_user.py`` performs, in the order that matters: tombstone, close the
-login, *then* destroy. Read that module's docstring for what is erased, what is
-deliberately left alone (``jd_cache`` and ``board_cache/`` are shared and
-content-keyed), and for the one thing this cannot promise — atomicity against a
-discovery cycle that was already dispatched when the tombstone landed.
-
-**The confirmation is a typed email, not a flag.** ``{"confirm": "<your
-email>"}`` has to match the address the caller signs in with, so this endpoint
-cannot be reached by a mis-click, a double-submitted form, or a cross-origin
-page that guesses the path — none of which can produce the string. It is not a
-password and is not treated as one: it proves intent, and the bearer token
-proves identity.
+The confirmation is a typed email, not a flag: ``{"confirm": "<your email>"}``
+must match the address the caller signs in with, so a mis-click, a
+double-submitted form or a cross-origin guess cannot reach it. It proves
+intent; the bearer token proves identity.
 """
 
 from __future__ import annotations
@@ -47,10 +41,9 @@ from tools.account.delete import delete_account, is_deleted
 router = APIRouter(tags=["account"])
 log = get_logger("api.account")
 
-# An async client, like ``api.routes.companies`` and for the same reason: what
-# this route runs is *literally* the function the CLI runs, rather than a second
-# implementation of the wipe that agrees until it doesn't. See the comment there
-# for why memoising it is safe (one uvicorn loop for the life of the process).
+# An async client, like ``api.routes.companies``, so this route runs literally
+# the function the CLI runs rather than a second implementation of the wipe.
+# Memoising is safe: one uvicorn loop for the life of the process.
 _db: firestore.AsyncClient | None = None
 
 
@@ -81,13 +74,13 @@ async def signup(
 ) -> dict:
     """Admit or waitlist the account behind this token. See the module docstring.
 
-    Timestamps are ISO-8601 strings, like every other timestamp this codebase
-    writes — not ``SERVER_TIMESTAMP``. The allowed branch is read-then-merge so
-    a repeat sign-in costs one read and no write, ``signup_source`` records the
-    *first* entry point, and a doc tombstoned by ``POST /account/delete`` is
-    never recreated by a token that outlives the account (up to an hour).
+    Timestamps are ISO-8601 strings, not ``SERVER_TIMESTAMP``. The allowed
+    branch is read-then-merge, so a repeat sign-in costs one read and no write,
+    ``signup_source`` records the first entry point, and a doc tombstoned by
+    ``POST /account/delete`` is never recreated by a token that outlives the
+    account (up to an hour).
 
-    The allowlist read here is deliberately **not** the 5-minute TTL cache
+    The allowlist read here is deliberately not the 5-minute TTL cache
     ``api.deps`` keeps for the other routes: a fresh grant must be visible on
     the very next sign-in.
     """
@@ -146,11 +139,10 @@ class DeleteAccount(BaseModel):
 def _auth_email(user_id: str) -> str | None:
     """The address this account signs in with, per Firebase Auth.
 
-    ``None`` when the account is already gone — which is a state a *caller* can
-    legitimately be in, because a Firebase ID token stays verifiable for up to
-    an hour after the user it names is deleted. That is exactly the window in
-    which someone retries a deletion that failed partway, so it is answered by
-    falling back to the profile document rather than by refusing.
+    ``None`` when the account is already gone, which a caller can legitimately
+    be: a Firebase ID token stays verifiable for up to an hour after the user
+    it names is deleted, and that is the window in which someone retries a
+    deletion that failed partway. The caller falls back to the profile document.
     """
     try:
         record = firebase_auth().get_user(user_id)
@@ -178,11 +170,9 @@ def _confirms(typed: str, expected: str) -> bool:
     """Does the typed confirmation match the caller's address?
 
     Case- and whitespace-insensitive, because the user is retyping something
-    they read off the screen. Two things it must *not* do: match on empty (the
-    default value of an untouched input, and what a missing address would
-    otherwise compare equal to), and short-circuit on the first differing byte —
-    hence ``compare_digest``. Neither is load-bearing security on its own; both
-    are one line.
+    off the screen. It must not match on empty — an untouched input, or a
+    missing address, would otherwise compare equal — and uses
+    ``compare_digest`` rather than short-circuiting on the first differing byte.
     """
     a = typed.strip().casefold()
     b = expected.strip().casefold()
@@ -195,19 +185,19 @@ def _confirms(typed: str, expected: str) -> bool:
 async def delete_my_account(
     body: DeleteAccount, user_id: str = Depends(verify_user)
 ) -> dict:
-    """Delete the caller's account and everything belonging to it.
+    """Delete the caller's account and everything belonging to it. Irreversible.
 
-    Returns the counts of what was erased, so the UI (and the log line behind
-    it) can say what actually happened rather than "ok". Safe to call twice: the
-    second call finds nothing left and answers 404.
+    Returns the counts of what was erased, so the UI can say what actually
+    happened rather than "ok". Safe to call twice: the second call finds
+    nothing left and answers 404.
     """
     snap = await _client().collection("users").document(user_id).get()
     doc = snap.to_dict() or {}
     doc_email = doc.get("email")
     # ``or None`` at the end, not just on the auth record: a profile whose
-    # ``email`` is blank or whitespace has no address either, and letting ""
-    # through as the expected value would leave ``_confirms`` comparing two
-    # empty strings — a deletion nobody typed anything to get.
+    # ``email`` is blank has no address either, and letting "" through would
+    # leave ``_confirms`` comparing two empty strings — a deletion nobody
+    # typed anything to get.
     fallback = doc_email.strip() if isinstance(doc_email, str) else ""
     expected = await asyncio.to_thread(_auth_email, user_id) or fallback or None
 
@@ -233,12 +223,10 @@ async def delete_my_account(
         )
 
     log.info("account.delete.requested", user_id=user_id)
-    # ``expected`` is the same Auth-preferred email already resolved above (for
-    # the confirmation check) — captured before ``_close_auth`` runs, which is
-    # the only window in which Firebase Admin can still answer for it. See
-    # ``tools.account.delete.delete_account`` for what it is used for (freeing
-    # this user's allowlist seat) and why it is a no-op everywhere that flag
-    # is off, which is every deployment of this PR.
+    # ``expected`` is the Auth-preferred email resolved above, captured before
+    # ``_close_auth`` runs — the only window in which Firebase Admin can still
+    # answer for it. ``delete_account`` uses it to free this user's allowlist
+    # seat, and is a no-op where that flag is off.
     counts = await delete_account(
         _client(), user_id, close_auth=_close_auth, email=expected
     )

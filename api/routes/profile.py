@@ -1,16 +1,11 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Profile endpoints: the front of the funnel (onboarding) + the Profile surface.
+"""Profile endpoints: onboarding + the Profile surface.
 
-Nothing populated the ``users/{uid}`` profile doc that Discovery and Matching
-read — these endpoints add it:
-
-- ``GET  /profile``         first-run gate: is there a profile yet?
-- ``POST /profile/extract`` upload a resume (file or pasted text) → Gemini →
-                            draft profile saved with ``onboarding_complete=false``.
-- ``PUT  /profile``         save the reviewed/edited profile and mark onboarding
-                            complete (the "Looks good — find me jobs" action, and
-                            later edits from the Profile page).
+These populate the ``users/{uid}`` profile doc that Discovery and Matching
+read. ``POST /profile/extract`` and the first ``PUT /profile`` both commit real
+Gemini spend — the extract calls Gemini directly, and the first completion of
+onboarding kicks off a discovery cycle.
 """
 
 from __future__ import annotations
@@ -62,18 +57,16 @@ def _user_ref(user_id: str):
 def _ensure_data_epoch(user_id: str, data: dict) -> dict:
     """Stamp ``data_epoch`` on a profile that predates it, and return the data.
 
-    The epoch identifies *this incarnation* of the user's server-side data. The
+    The epoch identifies this incarnation of the user's server-side data. The
     browser stores its review tallies against it and discards them when it
-    changes, which is the only way a server-side wipe can reach counts that
-    live in ``localStorage`` — see ``web/src/lib/session.ts``.
+    changes, which is the only way a server-side wipe can reach counts living
+    in ``localStorage``.
 
-    Stamped lazily on read rather than written at onboarding, for one reason:
-    :func:`tools.account.delete.wipe_user_data` **deletes the user document
-    outright**, so a value written at onboarding does not survive to be bumped.
-    A fresh document simply has no epoch, gets a new one here, and the mismatch
-    clears the stale counts. Doing it on read also covers documents created by
-    paths that never touch onboarding at all (the CLI profile sync), and costs
-    one write per user, once, ever.
+    Stamped lazily on read rather than at onboarding because
+    :func:`tools.account.delete.wipe_user_data` deletes the user document
+    outright, so a value written at onboarding does not survive to be bumped.
+    Reading also covers documents created by paths that never touch onboarding,
+    such as the CLI profile sync. One write per user, once.
     """
     if data.get("data_epoch"):
         return data
@@ -108,11 +101,12 @@ async def extract(
     file: UploadFile | None = File(default=None),
     text: str | None = Form(default=None),
 ) -> dict:
-    """Extract a draft profile from an uploaded resume or pasted text.
+    """Extract a draft profile from an uploaded resume or pasted text. Spends
+    real money on Gemini.
 
-    Saves the result to ``users/{uid}`` as a draft (``onboarding_complete=false``)
-    and returns it for the review screen. The blocking Gemini call runs off the
-    event loop.
+    Saves the result to ``users/{uid}`` as a draft
+    (``onboarding_complete=false``) and returns it for the review screen. The
+    blocking Gemini call runs off the event loop.
     """
     if file is not None:
         raw = await file.read()
@@ -163,14 +157,14 @@ async def extract(
                 )
             except Exception:
                 # Re-raised untouched (the outer handler turns it into a 422);
-                # this clause exists only to record the outcome on the ledger.
+                # this clause only records the outcome on the ledger.
                 ledger_state = FAILED
                 raise
             finally:
-                # The first paid call a new user ever triggers, and it binds a
-                # run_id — flush it here or its cost sits in the API process
-                # forever, unbanked. A parse that failed validation still
-                # spent the tokens, hence the finally.
+                # The first paid call a new user triggers, and it binds a
+                # run_id — flush it here or its cost sits unbanked in the API
+                # process. In the finally because a parse that failed
+                # validation still spent the tokens.
                 await persist_run_cost(
                     _client,
                     user_id,
@@ -202,29 +196,23 @@ def save_profile(
 ) -> dict:
     """Persist the reviewed/edited profile and mark onboarding complete.
 
-    The body is validated as a full :class:`MasterProfile`; ``user_id`` is forced
-    to the authenticated user so a client can't write someone else's profile.
+    **The first completion kicks off a discovery cycle (fetch + score), which
+    commits real Gemini spend**, with no separate button: nothing else in the
+    app fires an initial run and ``auto_discovery`` defaults to off. Later
+    edits to an already-complete profile do not repeat it, and the run is
+    charged against the weekly search allowance here, at dispatch.
 
-    The *first* time a user completes onboarding, this also kicks off one
-    discovery cycle (fetch + score) so the "Discovery and Matching are running
-    now" promise on the review screen is actually true — nothing else in the
-    app fires an initial run, and ``auto_discovery`` defaults to off. Later
-    profile edits (re-PUTting an already-complete profile) don't repeat this.
+    The body is validated as a full :class:`MasterProfile`; ``user_id`` is
+    forced to the authenticated user so a client cannot write someone else's
+    profile.
 
-    That kickoff enqueues **inside the request** where there is a queue to
-    enqueue to. It is one RPC, and it is the only thing that ever fires for a
-    brand-new user, so it must not be the one part of this route that depends on
-    the instance still having CPU after the response — the same failure mode
-    that made "discovery never runs" a bug in the first place.
-
-    **And if that RPC fails, ``onboarding_complete`` does not stick.** The flag
-    is the only thing that makes this kickoff fire again, so leaving it set on a
-    failed enqueue re-creates the very bug under a different cause: onboarded
-    user, error on screen, discovery never runs, nothing to retry. Rolling it
-    back costs the user one more click of a button whose contents are already
-    saved, and that click re-fires the kickoff. (Without a queue the kickoff is
-    a background task whose failure this request cannot see, exactly as before —
-    the flag is written and stays written.)
+    Where there is a queue, the kickoff enqueues inside the request rather than
+    deferring one RPC to an instance that may have no CPU after the response.
+    If that RPC fails, ``onboarding_complete`` is rolled back: the flag is the
+    only thing that makes the kickoff fire again, so leaving it set would mean
+    an onboarded user whose discovery never runs and has nothing to retry.
+    Without a queue the kickoff is a background task whose failure this request
+    cannot see, and the flag stays written.
     """
     existing = _user_ref(user_id).get().to_dict() or {}
     first_completion = not existing.get("onboarding_complete")
@@ -242,15 +230,14 @@ def save_profile(
     if first_completion:
         from api.routes.discovery import dispatch_cycle, enqueue_cycle
 
-        # The third and last site that charges the weekly search allowance —
-        # charged here, at dispatch, never inside the cycle. Synchronous
-        # because this route is: see ``discovery_budget.reserve_sync``.
+        # The third and last site that charges the weekly search allowance,
+        # here at dispatch and never inside the cycle. Synchronous because
+        # this route is.
         reservation = discovery_budget.reserve_sync(_client(), user_id)
         if reservation.granted <= 0:
             # A brand-new account cannot hit this; a re-completion after a
-            # failed enqueue can. Fail closed and say nothing alarming — the
-            # user has already had this week's searches, and the scheduled
-            # loop picks them up next week.
+            # failed enqueue can. Fail closed: the user has already had this
+            # week's searches, and the scheduled loop picks them up next week.
             log.info("profile.onboarding_kickoff_capped", user_id=user_id)
             return {"ok": True}
 
@@ -259,11 +246,10 @@ def save_profile(
             try:
                 queued = enqueue_cycle("discovery", user_id, trigger="onboarding")
             except Exception as e:
-                # Everything that can throw here is environmental — Cloud Tasks
-                # 503, a missing IAM binding, an unset WORKER_URL/TASKS_SA_EMAIL
-                # (queues.enqueue reads those with os.environ[...]) — and none of
-                # it means the profile save failed. Give the flag back so the
-                # retry is a real retry, and tell the user something to retry.
+                # Everything that can throw here is environmental (Cloud Tasks
+                # 503, a missing IAM binding, unset config) and none of it means
+                # the profile save failed. Give the flag back so the retry is a
+                # real retry, and tell the user something to retry.
                 _user_ref(user_id).set({"onboarding_complete": False}, merge=True)
                 # The retry re-fires the kickoff, so it must not pay twice.
                 discovery_budget.release_sync(
@@ -281,17 +267,17 @@ def save_profile(
                 discovery_budget.release_sync(
                     _client(), user_id, 1, week=reservation.week_key
                 )
-            # Deduped means a kickoff for this user and hour is already queued,
-            # which is the outcome we wanted; it is not a failure.
+            # Deduped means a kickoff for this user and hour is already
+            # queued, which is the outcome we wanted, not a failure.
             log.info(
                 "profile.onboarding_kickoff_queued",
                 user_id=user_id,
                 deduped=not queued,
             )
         else:
-            # No queue: dispatch_cycle would run the whole discovery-and-scoring
-            # cycle right here, which is minutes of work and cannot happen
-            # inside the request. Deferred, as before.
+            # No queue: dispatch_cycle would run the whole discovery-and-
+            # scoring cycle here, which is minutes of work and cannot happen
+            # inside the request.
             background_tasks.add_task(
                 dispatch_cycle, "discovery", user_id, trigger="onboarding"
             )

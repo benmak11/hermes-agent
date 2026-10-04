@@ -2,17 +2,12 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Worker task handlers + the queue/in-process dispatch seam.
 
-Pins the security contract (task routes 404 without WORKER_MODE, so the
-public API service never exposes them) and the dispatch behavior on both
-sides of QUEUE_MODE.
-
-The Phase 2 funnel routes (``/tasks/tailor``, ``/tasks/apply``) shipped one
-merge ahead of their callers — the deploy-ordering seam, so the API could never
-enqueue to a route the worker didn't have yet. This is the merge that turns the
-callers on, so what is pinned here now is the other half: the dispatch helpers
-enqueue to routes the worker actually serves, they commit before they enqueue,
-and a redelivered task is a no-op that spends nothing rather than a second LLM
-run or a duplicate real job application.
+Pins the security contract (task routes 404 without WORKER_MODE, so the public
+API service never exposes them) and the dispatch behavior on both sides of
+QUEUE_MODE: the dispatch helpers enqueue only to routes the worker actually
+serves, they commit before they enqueue, and a redelivered task is a no-op
+that spends nothing rather than a second LLM run or a duplicate real job
+application.
 """
 
 import ast
@@ -586,7 +581,7 @@ def test_the_tick_reports_what_the_reaper_recovered(cron_world, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# Phase 2: the funnel routes.
+# The funnel routes.
 #
 # Fakes are a trimmed copy of tests/unit/test_application_state.py's — same
 # rule, and for the same reason: this suite is *about* the compare-and-swap, so
@@ -710,7 +705,7 @@ def _app_doc(status: str, **extra) -> _FakeDoc:
 
 
 # --------------------------------------------------------------------------
-# Phase 2 PR C: the funnel's own dispatch seam.
+# The funnel's own dispatch seam.
 # --------------------------------------------------------------------------
 
 
@@ -1356,7 +1351,7 @@ def test_an_uncontested_rehearsal_does_record_a_dead_posting(submission_world):
 
 
 # --------------------------------------------------------------------------
-# Phase 2 PR D: the point-of-no-return marker.
+# The point-of-no-return marker.
 #
 # Every _emit in the Greenhouse submitter used the same "submitting" token, so
 # the Submit click — the one step that cannot be undone — was indistinguishable
@@ -1861,20 +1856,15 @@ def _literal_enqueue_calls(source: str) -> set[tuple[str, str]]:
 
 
 def test_the_funnel_routes_have_callers_and_they_agree():
-    """The replacement for PR B's deploy-ordering guard.
+    """Every funnel dispatch names a provisioned queue and a served route.
 
-    That guard asserted **nothing in the repo enqueued** to ``/tasks/tailor`` or
-    ``/tasks/apply``: CI deploys hermes-api and hermes-worker from the same
-    merge, so the handlers had to land one merge ahead of their callers or the
-    API could enqueue to a route that 404s. This is the merge that adds the
-    callers, so the guard is replaced by its opposite — the two names each
-    dispatch helper hard-codes have to be a queue that is provisioned and a
-    route the worker actually serves. A typo in either is a task that vanishes.
+    The two names each dispatch helper hard-codes must be a queue that exists
+    and a route the worker actually serves; a typo in either is a task that
+    vanishes silently.
 
-    Scanned across the whole repo rather than just ``applications.py``, and
-    keyed by file: the funnel has exactly two entry points and they live in one
-    module, so a third appearing anywhere else is something to look at, not
-    something to add to a list.
+    Scanned across the whole repo and keyed by file: the funnel has exactly two
+    entry points in one module, so a third appearing elsewhere is something to
+    look at rather than to add to a list.
     """
     served = {route.path for route in worker.router.routes}
     funnel_queues, funnel_paths = {"tailor", "apply"}, {"/tasks/tailor", "/tasks/apply"}
@@ -2189,7 +2179,7 @@ def test_run_tailorings_terminal_writes_name_the_status_they_own():
 
 
 # --------------------------------------------------------------------------
-# Phase 2 PR E: the schedule-slot lease.
+# The schedule-slot lease.
 #
 # ``tick_user`` used to write ``last_*_at`` = now and *then* dispatch, so a run
 # that died looked exactly like one that succeeded and the user waited out a
@@ -2387,8 +2377,8 @@ def _explode(message="the boards all died"):
 
 
 def test_the_slot_lease_outlives_the_run_it_guards():
-    """**The inequality is the lock**, and this project has already shipped it
-    backwards once (PR B: a 1200s lease over 1800s of work).
+    """The inequality is the lock, and it has shipped backwards here once —
+    a 1200s lease over 1800s of work.
 
     A lease shorter than the work it covers is not a weaker lock, it is *no*
     lock — it is guaranteed to have lapsed before the run could possibly have
@@ -2545,7 +2535,7 @@ def test_a_cycle_killed_mid_run_leaves_its_lease_to_expire(cycle_world, slot_wor
 def test_a_tick_cannot_take_a_slot_another_tick_claimed_between_read_and_write(
     slot_world,
 ):
-    """**The phase's signature bug, in this file's shape.**
+    """A slot claim must be a compare-and-swap, not a read then a write.
 
     ``tick_user`` reads ``discovery_state`` and writes it two statements later,
     and the two triggers that reach it — the hourly cron and the opportunistic
@@ -2729,7 +2719,7 @@ def test_the_next_run_display_says_due_again_once_a_failed_run_lets_go():
 
 
 # --------------------------------------------------------------------------
-# PR E, review pass: the guards the first round left undefended.
+# The remaining guards on the slot lease.
 # --------------------------------------------------------------------------
 
 
@@ -2815,9 +2805,8 @@ def test_a_cycle_survives_a_release_that_cannot_reach_firestore(
 def test_a_successful_sweep_claims_its_slot_and_hands_the_lease_back(
     slot_world, monkeypatch
 ):
-    """The matched pair, made whole: the discovery cycle's success write was
-    pinned and the sweep's was not, so ``sweep_lease``'s release could be
-    deleted with the whole suite green — which is what got PR D sent back."""
+    """The sweep's half of the matched pair: without it, ``sweep_lease``'s
+    release could be deleted with the whole suite green."""
 
     async def fake_sweep(user_id):
         return {"checked": 4, "dismissed": 1}

@@ -3,6 +3,9 @@
 """
 Score pending, unscored jobs against the user's profile and persist the result.
 
+**This costs money**: every run drives real Gemini calls on the live project.
+Say what a run will cost before starting one.
+
 Usage:
     python -m cli.run_matching --user-id me [--limit N] [--concurrency K]
     python -m cli.run_matching --user-id me --batch [--poll-seconds S]
@@ -10,23 +13,17 @@ Usage:
     python -m cli.run_matching --user-id me --batch-resume
     python -m cli.run_matching --user-id me --ignore-budget --limit 5000
 
-Every scoring path is capped by the per-user scoring budget
-(``tools.matching.budget``, ``SCORING_BUDGET_PER_CYCLE`` / ``_PER_DAY``), so a
-plain run scores at most one cycle's worth. ``--ignore-budget`` is the operator
-escape hatch for hand-scoring a backlog — it exists only here, never on the
-HTTP surface. It does not mean "unbounded": without ``--limit`` the run is
-still capped at ``SCORE_LIMIT_CEILING`` (300) on every mode, so a real backlog
-run is ``--ignore-budget --limit N``.
+Every path is capped by the per-user scoring budget
+(``tools.matching.budget``), so a plain run scores at most one cycle's worth.
+``--ignore-budget`` is the operator escape hatch for hand-scoring a backlog and
+exists only here, never on the HTTP surface; it is not unbounded, since without
+``--limit`` every mode is still capped at ``SCORE_LIMIT_CEILING`` (300).
 
-``--batch`` runs the LLM legs as Vertex batch prediction jobs — half price on
-both models, but async: expect minutes to hours before results land. Right
-for big backlogs, wrong for "score what discovery just found".
-
-``--batch-async`` is the fire-and-forget version: submit a resumable run
-(tracked in the ``batch_runs`` collection) and exit; the hermes-worker's
-hourly ticks poll and ingest it. ``--batch-resume`` runs one such
-poll-and-ingest pass locally, for watching a run land without waiting on the
-worker.
+``--batch`` runs the LLM legs as Vertex batch prediction jobs: half price on
+both models, but minutes to hours before results land. ``--batch-async``
+submits a resumable run (tracked in ``batch_runs``) and exits, leaving the
+worker's hourly ticks to poll and ingest it; ``--batch-resume`` runs one such
+poll-and-ingest pass locally.
 """
 
 import argparse
@@ -60,8 +57,8 @@ def _print_result(job: Job, match: JobMatch | None, error: str | None) -> None:
 async def _score(args: argparse.Namespace) -> None:
     """Do whatever the flags asked for.
 
-    Split out of ``main`` so the cost flush there can wrap every path in one
-    ``finally`` — including the early returns of the two batch modes.
+    Split out of ``main`` so the cost flush there wraps every path in one
+    ``finally``, including the batch modes' early returns.
     """
     if args.batch_resume:
         summary = await batch_runs.resume(user_id=args.user_id)
@@ -121,9 +118,7 @@ async def _score(args: argparse.Namespace) -> None:
             )
     except ValueError as e:
         # Only the missing-profile ValueError gets the friendly exit;
-        # JSONDecodeError is also a ValueError and must surface as itself
-        # (a batch run once died mid-poll and was misreported as "no
-        # profile" by this handler).
+        # JSONDecodeError is also a ValueError and must surface as itself.
         if "No profile" not in str(e):
             raise
         raise SystemExit(f"{e} Run `cli.sync_profile` first.") from None
@@ -194,9 +189,8 @@ async def main() -> None:
         ledger_state = FAILED
         raise
     finally:
-        # In a finally: a run killed mid-scoring has still paid for every
-        # call it got through, and that spend lives only in this process
-        # until it reaches the ledger.
+        # In a finally: a run killed mid-scoring still paid for every call it
+        # got through, and that spend reaches the ledger only from here.
         await persist_run_cost(
             firestore.AsyncClient,
             args.user_id,

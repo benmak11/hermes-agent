@@ -2,25 +2,23 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The weekly discovery cap: 14 searches a week, charged at dispatch.
 
-Finding jobs is free of LLM cost but not free of everything — it is a crawl of
-~198 boards per run, it is what fills the backlog the scoring budget then has
-to cap, and it is the number the product promises. This is its cap, and it is
-built as the mirror of ``tools.matching.budget``: a pure core (rollover,
-clamping, refund windowing) with a transaction as a thin shell.
+Discovery is free of LLM cost but not of everything — it crawls ~198 boards
+per run and fills the backlog the scoring budget then has to cap. The cap
+mirrors ``tools.matching.budget``: a pure core (rollover, clamping, refund
+windowing) with a transaction as a thin shell.
 
-Three things are easy to get wrong here and each has its own test:
+Three things are easy to get wrong, one test each:
 
 1. **The week key must carry the ISO year.** ``isocalendar()[1]`` alone
    collapses week 1 of one year onto week 1 of the next, and ``now.year``
    splits a single ISO week across a New Year.
-2. **The charge happens at dispatch, never inside the cycle** — the worker's
-   task handlers must not charge, or a Cloud Tasks redelivery bills a second
-   run for one user-visible search.
+2. **The charge happens at dispatch, never inside the cycle** — otherwise a
+   Cloud Tasks redelivery bills a second run for one user-visible search.
 3. **A capped tick must cost nothing**: no lease, no write.
 
 Zero LLM calls, zero GCP: the Firestore transaction is faked at the protocol
-the real decorators drive, so their own retry behaviour is exercised rather
-than stubbed out.
+the real decorators drive, so their retry behaviour is exercised rather than
+stubbed.
 """
 
 from __future__ import annotations

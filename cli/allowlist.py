@@ -1,26 +1,19 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
 """
-Manage the sign-up allowlist — Phase 4 D1's machinery.
+Manage the sign-up allowlist.
 
 ``tools.allowlist`` is the module this operates; read its docstring for the
-document shape and the transactional seat cap. This CLI ships useful before
-``ALLOWLIST_ENFORCED`` is ever turned on: seeding the allowlist with the three
-real accounts is exactly the prerequisite Phase 4 D2 (a separate PR) needs
-before it can flip that flag without locking anyone out.
+document shape and the transactional seat cap.
 
-**``add`` resolves the email from Firebase Admin, never from
-``users/{uid}.email``** — the same reasoning ``tools.allowlist.is_allowed``
-documents for itself: the profile field is résumé-extracted by onboarding and
-is not guaranteed to be the address the account signs in with, where Firebase
-Auth's own record is. Identify the account by ``--uid`` or by ``--email``;
-either way, what gets written to the allowlist is ``fb_auth.get_user(...)``'s
-own ``.email``, not the string you typed.
+``add`` resolves the email from Firebase Admin, never from
+``users/{uid}.email``: the profile field is résumé-extracted by onboarding and
+is not guaranteed to be the address the account signs in with. Identify the
+account with ``--uid`` or ``--email``; either way what gets written is
+``fb_auth.get_user(...)``'s own ``.email``, not the string you typed.
 
-Dry-run by default, like ``cli.reset_user`` and ``cli.geo_resurrect``: without
-``--execute``, ``add`` and ``revoke`` report what they would do and write
-nothing. (``cli.purge_discarded`` is the one exception to this project's
-convention — do not follow that one.)
+Dry-run by default: without ``--execute``, ``add`` and ``revoke`` report what
+they would do and write nothing.
 
 Usage:
     python -m cli.allowlist add --uid U6WbOc8MjhBpKD3 --note "beta"             # dry run
@@ -51,10 +44,9 @@ log = get_logger("cli.allowlist")
 def _resolve_email(fb_auth, *, uid: str | None, email: str | None) -> str:
     """The Firebase Auth record's own email for ``uid`` or ``email``.
 
-    Never ``users/{uid}.email`` — see the module docstring. Raises
-    ``SystemExit`` (not caught) rather than returning a fabricated value: a
-    lookup that fails or comes back with no address is a reason to stop, not
-    to guess.
+    Never ``users/{uid}.email`` — see the module docstring. Exits via
+    ``SystemExit`` rather than guessing when the lookup fails or returns no
+    address.
     """
     try:
         record = fb_auth.get_user(uid) if uid else fb_auth.get_user_by_email(email)

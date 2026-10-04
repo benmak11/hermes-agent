@@ -2,9 +2,8 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The incident test: clicking "run now" must not start a paid batch unasked.
 
-2026-09-26. The user clicked *Run now* on the discovery settings card. The run
-persisted 9,219 jobs and then, with no estimate and no confirmation, submitted
-a **paid Vertex batch** on gemini-2.5-flash. The chain was not subtle:
+2026-09-26: a click on *Run now* persisted 9,219 jobs and then submitted a
+paid Vertex batch on gemini-2.5-flash with no estimate and no confirmation:
 
     POST /settings/discovery/run
       -> dispatch_cycle("discovery", ..., trigger="manual")   # QUEUE_MODE on
@@ -13,20 +12,16 @@ a **paid Vertex batch** on gemini-2.5-flash. The chain was not subtle:
       -> batch_runs.score_or_start_run(...)                   # queues.enabled()
       -> batch_runs.start(...)                                # >= BATCH_MIN_PENDING
 
-``BATCH_MIN_PENDING`` is 50 and a fresh account always exceeds it, so **the
-first click could never not spend.** The scoring budget capped the damage
-(~$90 of backlog down to ~$2-3) — it is the thing that worked, and this test is
-not about it. What was missing is consent: nothing anywhere in that chain asked.
+``BATCH_MIN_PENDING`` is 50 and a fresh account always exceeds it, so the
+first click could never not spend. The scoring budget capped the damage
+(~$90 down to ~$2-3); what was missing was consent.
 
-The test drives the real chain rather than a stand-in for it, because the bug
-lived in the *seams*: the route hands the queue a task, the worker route hands
-it to the cycle, and the cycle decides on its own to spend. Only the two ends
-are faked — Cloud Tasks (the enqueue is recorded and the test plays the worker
-delivering it) and ``batch_runs.start`` itself, which is the paid call and the
-thing being asserted about.
-
-**No mutation is needed to prove this test can fail: it fails on the tree as it
-was before the spend-safeguards PR.** That failure is the incident.
+The test drives the real chain rather than a stand-in, because the bug lived
+in the seams between route, worker route and cycle. Only the two ends are
+faked: Cloud Tasks (the enqueue is recorded and the test plays the worker
+delivering it) and ``batch_runs.start``, the paid call being asserted about.
+It fails on the tree as it was before the spend-safeguards change, so no
+mutation is needed to show it can fail.
 """
 
 from __future__ import annotations
@@ -334,18 +329,16 @@ def test_a_replayed_run_now_token_does_not_buy_a_second_batch(run_now):
 
 
 def test_a_capped_run_now_answers_429_without_burning_the_token(run_now):
-    """**The weekly cap must not eat a consent token**, which is why the cap
-    is screened *before* the seam rather than only by the reservation after it.
+    """The weekly cap must not eat a consent token.
 
-    This is the shape the spend PR already fixed once in the other direction —
-    a 403 raised inside the handler body, after FastAPI had consumed and
-    deleted the token, so the developer had to confirm again to be refused
-    again. A cap is a worse place for it: the answer does not change until
-    next week, so the user would mint and burn a token per attempt for days.
+    The cap is screened *before* the consent seam, not only by the reservation
+    after it: a refusal raised once the token has been consumed makes the user
+    mint and burn a token per attempt, and a cap does not clear until next
+    week.
 
     Without the pre-seam screen the reservation still produces a 429 and the
-    whole suite stays green — the refusal is right and the token is gone. Only
-    the surviving consent document tells the two apart.
+    suite stays green — only the surviving consent document tells the two
+    apart.
     """
     client, db, dispatched, allowance = run_now
     token = _mint(db, spend.DISCOVERY_SCAN)

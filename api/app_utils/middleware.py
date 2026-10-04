@@ -8,11 +8,10 @@ the route runs, so every log line emitted while handling the request (including
 tools it calls) is stitched together by ``request_id``. The same id is echoed
 back in the ``X-Request-Id`` response header for client-side correlation.
 
-The access-log lines below spell the method/path/status directly into the
-message (deliberately not just key/value fields, unlike the rest of the app's
-logging) — "GET /jobs/pending" is legible at a glance in a Cloud Logging list
-view without expanding the payload; ``method``/``path``/``status_code``/
-``duration_ms`` still land as separate fields for filtering.
+The access-log lines below spell method/path/status into the message rather
+than only into fields, so "GET /jobs/pending" is legible in a Cloud Logging
+list view without expanding the payload; the same values still land as
+separate fields for filtering.
 """
 
 from __future__ import annotations
@@ -70,11 +69,10 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 f"{request.method} {request.url.path} raised an unhandled exception",
                 duration_ms=duration_ms,
             )
-            # Answer with the correlation id instead of re-raising into a bare
-            # 500: the UI surfaces "request <id>", which is exactly the string
-            # to paste into Cloud Logging (jsonPayload.request_id) to find the
-            # traceback above. HTTPException never lands here — FastAPI turns
-            # it into a response inside call_next.
+            # Answer with the correlation id instead of re-raising into a
+            # bare 500: the UI surfaces "request <id>", which is the string to
+            # paste into Cloud Logging (jsonPayload.request_id) to find the
+            # traceback above. HTTPException never lands here.
             return JSONResponse(
                 {"detail": "Internal server error", "request_id": request_id},
                 status_code=500,

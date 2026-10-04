@@ -70,8 +70,8 @@ async def main() -> None:
         ledger_state = FAILED
         raise
     finally:
-        # In a finally: a run that dies partway through still spent whatever
-        # it spent, and that only reaches the ledger from here.
+        # In a finally: a run that dies partway still spent what it spent, and
+        # that reaches the ledger only from here.
         await persist_run_cost(
             firestore.AsyncClient,
             args.user_id,

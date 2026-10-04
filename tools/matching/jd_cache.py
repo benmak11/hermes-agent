@@ -2,17 +2,14 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Cross-user JD parse cache: a posting parses once, ever.
 
-Job boards serve the same posting to every user (and every re-discovery after
-a purge), but parses were stored only on per-user job docs — so the same
-jd_raw could be paid for repeatedly. This module caches ``ParsedJD`` results
-in a top-level ``jd_cache`` collection keyed by the SHA-256 of the raw JD
-text: both scoring paths consult it before spending a Flash call and write
-back after any fresh parse.
+Job boards serve the same posting to every user, so ``ParsedJD`` results are
+cached in a top-level ``jd_cache`` collection keyed by the SHA-256 of the raw
+JD text; both scoring paths consult it before spending a Flash call and write
+back after any fresh parse. The cache holds only posting content, no user data,
+so sharing across users is safe.
 
-The cache holds only posting content (no user data), so sharing across users
-is safe. Staleness self-heals: if ``ParsedJD`` grows a field and an old cache
-doc no longer validates, the lookup misses, the JD re-parses, and the store
-overwrites the doc.
+Staleness self-heals: if ``ParsedJD`` grows a field, an old doc no longer
+validates, the lookup misses and the store overwrites it.
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Unit tests for deterministic resume bullet reranking (Phase 6)."""
+"""Unit tests for deterministic resume bullet reranking."""
 
 from datetime import date
 

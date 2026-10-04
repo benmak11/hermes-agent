@@ -31,11 +31,10 @@ _EXTRACT_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
 
 # Ceiling on what one extraction call may generate — thinking counts toward
 # max_output_tokens, so this must cover answer + thinking. Telemetry worst so
-# far is ~4.2K combined (1,529 answer, 2,683 thinking) on a normal resume;
-# output scales with resume length, so 8192 gives ~2x headroom while capping a
-# runaway generation at ~$0.10 instead of the model's ~64K default (~$0.79).
-# Hitting the cap truncates the JSON, which fails MasterProfile validation and
-# surfaces as extract.gemini.failed rather than a silent partial profile.
+# far is ~4.2K combined, so 8192 gives ~2x headroom while capping a runaway
+# generation at ~$0.10 instead of ~$0.79 at the model's default. Hitting the
+# cap truncates the JSON, which fails MasterProfile validation and surfaces as
+# extract.gemini.failed rather than a silent partial profile.
 _EXTRACT_MAX_OUTPUT_TOKENS = 8192
 
 SYSTEM_PROMPT = """You extract structured career data from resumes.

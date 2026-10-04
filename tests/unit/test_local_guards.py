@@ -293,13 +293,9 @@ def test_billed_tests_are_deselected_by_default():
 def test_integration_suite_costs_nothing():
     """``tests/integration`` contains no billed test at all.
 
-    It used to hold two that drove a live model. Both are gone, so the whole
-    directory is free to run — no marker, no deselect, no ``-m billed``
-    caveat needed to type ``pytest tests/integration``.
-
-    The guard inverts rather than disappears: it now fails the moment someone
-    adds a paid test back, which is the point at which that property, and the
-    README/docstrings resting on it, stop being true.
+    The two that drove a live model are gone, so the whole directory is free
+    to run. The guard fails the moment a paid test is added back, which is
+    when that property — and the docs resting on it — stop being true.
     """
     marked = set()
     for path in sorted((REPO_ROOT / "tests" / "integration").glob("test_*.py")):
@@ -415,8 +411,8 @@ BILLING_CALL_SITES = {
     # B: the Vertex batch legs. Priced at ingest, hours later — which is why
     # they record a committed estimate at submit (batch_runs._committed).
     "tools/matching/batch.py": "gemini",
-    # C: résumé extraction. **Still ungated** — PUT /profile on first
-    # onboarding completion fires it with no button. Deferred (Phase 5).
+    # C: résumé extraction. Still ungated — PUT /profile on first onboarding
+    # completion fires it with no button.
     "tools/profile/extract.py": "gemini",
     # D: the tailoring objective rewrite, per approved job.
     "tools/tailoring/objective.py": "gemini",

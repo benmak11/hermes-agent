@@ -3,35 +3,26 @@
 """
 Undo geo-gate tombstones the current gate no longer agrees with.
 
-This is the other half of ``GEO_GATE_ENFORCE``. When the gate skips a Pro call
-it writes a ``discarded_jobs`` tombstone, and ``discarded_jobs`` is not a log —
-it is discovery's dedupe key (``tools/discovery/pipeline.py`` checks the
-tombstone *before* the job doc). So an enforced skip does not cost the user one
-job; it suppresses that posting on every future re-discovery, silently, forever.
-The whole enforcement design rests on that being reversible, and this is the
-thing that reverses it.
+The other half of ``GEO_GATE_ENFORCE``. ``discarded_jobs`` is not a log, it is
+discovery's dedupe key (checked *before* the job doc), so an enforced skip
+suppresses that posting on every future re-discovery. This is what reverses
+that, and the enforcement design depends on it existing.
 
-Dry-run by default, like ``cli.reset_user``: without ``--execute`` it reports
-exactly what it would move and writes nothing.
+Dry-run by default: without ``--execute`` it reports what it would move and
+writes nothing. With ``--execute`` it writes to Firestore.
 
-**Free and offline.** ``score.restore_payload`` stores the complete ``Job`` —
-``jd_raw``, ``jd_parsed``, and every identifying field — on each enforced
-tombstone, so a ``geo.GATE_VERSION`` bump resolves by streaming those
-tombstones, re-running the current gate over the stored parse, and resurrecting
-exactly the ones whose verdict changed. No re-parse, no LLM call, no dependence
-on the posting still being live on a board months later, and the whole thing is
-deterministic enough to unit-test.
+Free and offline. ``score.restore_payload`` stores the complete ``Job`` on each
+enforced tombstone, so a ``geo.GATE_VERSION`` bump resolves by re-running the
+current gate over the stored parse — no re-parse, no LLM call, no dependence on
+the posting still being live.
 
-Selects only ``geo_gate.enforced == true``. Everything else in that collection
-is a *Pro* decision — reversing one of those would mean re-running the call, not
-reading a stored copy — and the ``OUT_OF_FAMILY`` tombstones sitting beside
-these share their score of 0, which is exactly why the flag and not the score is
-the selector.
+Selects only ``geo_gate.enforced == true``. Everything else in the collection
+is a Pro decision, which reversing would mean re-running; the ``OUT_OF_FAMILY``
+tombstones beside these share their score of 0, which is why the flag and not
+the score is the selector.
 
-**This is not ``cli.purge_discarded``.** Same collection, opposite direction,
-different inputs: that one moves scored jobs *into* tombstones from the `jobs`
-collection; this one moves gate-rejected postings back out. Merging them would
-put a restore path and a discard path behind one set of flags.
+Not ``cli.purge_discarded``, which moves scored jobs the other way, out of
+``jobs`` and into tombstones.
 
 Usage:
     python -m cli.geo_resurrect --user-id me                        # dry run
@@ -61,22 +52,13 @@ log = get_logger("cli.geo_resurrect")
 
 
 async def resurrect_one(user_ref, job: Job) -> None:
-    """Put the job doc back, then drop the tombstone. **Order is load-bearing.**
+    """Put the job doc back, then drop the tombstone. The order is load-bearing.
 
-    Discovery checks the tombstone before the job doc, so the two orderings fail
-    very differently:
-
-    - job first, then tombstone — a crash in between leaves the posting
-      *suppressed but present*: the scorer picks the job doc up on its next run,
-      and discovery still sees the tombstone so it never re-persists a duplicate.
-      Nothing is lost and nothing is doubled; the next pass of this tool deletes
-      the stranded tombstone.
-    - tombstone first, then job — a crash in between, or merely a discovery
-      cycle running concurrently, leaves a window in which the posting is neither
-      tombstoned nor present, so discovery re-persists a *stale* copy fetched
-      from the board and this tool's ``set`` then races it.
-
-    So: write, then delete. Never the reverse.
+    Discovery checks the tombstone before the job doc. Writing the job first
+    means a crash in between leaves the posting present but still suppressed,
+    which the next pass cleans up. Deleting the tombstone first opens a window
+    where the posting is neither tombstoned nor present, so a concurrent
+    discovery cycle re-persists a stale copy and races this write.
     """
     await user_ref.collection("jobs").document(job.id).set(job.model_dump(mode="json"))
     await user_ref.collection("discarded_jobs").document(job.id).delete()
@@ -85,10 +67,9 @@ async def resurrect_one(user_ref, job: Job) -> None:
 def _restored_job(doc: dict) -> Job | None:
     """The ``Job`` a tombstone's ``restore`` payload rebuilds, or ``None``.
 
-    ``None`` covers tombstones written before ``restore`` existed and any whose
-    payload no longer satisfies the current ``models.job.Job`` — both are
-    unresurrectable by this tool and both must be *reported*, never skipped
-    quietly, because the posting stays suppressed either way.
+    ``None`` covers tombstones written before ``restore`` existed and payloads
+    the current ``models.job.Job`` no longer accepts. Both must be reported
+    rather than skipped quietly, because the posting stays suppressed.
     """
     restore = doc.get("restore")
     if not isinstance(restore, dict):
@@ -99,9 +80,8 @@ def _restored_job(doc: dict) -> Job | None:
         return None
 
 
-#: What classifying one enforced tombstone can conclude. Every one of these is
-#: counted and printed — a tombstone this tool declines to act on leaves a
-#: posting suppressed, so silence is never the right report.
+#: What classifying one enforced tombstone can conclude. Every one is counted
+#: and printed: a tombstone left alone leaves a posting suppressed.
 Outcome = Literal[
     "resurrect",
     "still_ineligible",
@@ -116,10 +96,9 @@ def classify(
 ) -> tuple[Outcome, Job | None, geo.GeoDecision | None]:
     """Decide what to do with one enforced tombstone. Pure — no I/O, no clock.
 
-    Everything that decides whether a posting comes back lives here so the whole
-    matrix is unit-testable without Firestore, which matters more than usual: the
-    failure mode of getting it wrong is invisible by construction (a job the user
-    never sees, that no future run will surface either).
+    Kept pure so the whole matrix is unit-testable without Firestore; getting
+    it wrong is invisible by construction, since the cost is a job the user
+    never sees and no future run surfaces.
     """
     gate = doc.get("geo_gate") or {}
     if below_version is not None:
@@ -134,15 +113,15 @@ def classify(
     if job is None:
         return "unrestorable", None, None
     if job.jd_parsed is None:
-        # The gate takes a parse, not raw text. Re-parsing would cost a Flash
-        # call, which is exactly what this tool promises not to do.
+        # The gate takes a parse, not raw text, and re-parsing would cost a
+        # Flash call this tool promises not to make.
         return "no_parse", job, None
 
     decision = geo.evaluate(job.jd_parsed, profile)
     if decision.verdict == "ineligible":
-        # Still unreachable under the current gate: leave it exactly as it is.
-        # Resurrecting it would buy the Pro call the gate exists to avoid, and
-        # the next enforcing run would tombstone it straight back.
+        # Still unreachable under the current gate: resurrecting it would buy
+        # the Pro call the gate exists to avoid, and the next run would
+        # tombstone it again.
         return "still_ineligible", job, decision
     return "resurrect", job, decision
 
@@ -185,9 +164,8 @@ async def main() -> None:
         parser.error(f"no profile at users/{args.user_id}")
     profile = MasterProfile.model_validate(snap.to_dict())
 
-    # The gate is re-run against the profile as it stands *now*, which is the
-    # second thing that can change a verdict: a user who moves country makes
-    # every one of these decisions stale without GATE_VERSION moving at all.
+    # Re-run against the profile as it stands now: a user who moves country
+    # makes every one of these decisions stale without GATE_VERSION moving.
     residence = geo.normalize_country(
         profile.residence.country if profile.residence else None
     )

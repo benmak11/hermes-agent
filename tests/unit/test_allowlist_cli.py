@@ -6,7 +6,7 @@
 The one property worth its own emphasis: ``add`` resolves the email from
 Firebase Admin, never from a string the operator typed and never from
 ``users/{uid}.email`` — see ``tools.allowlist``'s docstring for why that field
-is the wrong one everywhere in this PR.
+is the wrong one everywhere.
 
 No real Firestore, no real Firebase Admin: both are faked at the same seam
 ``test_geo_enforce.py`` fakes them at for ``cli.geo_resurrect`` — a
