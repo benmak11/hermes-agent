@@ -133,6 +133,7 @@ def log_decision(
     previous_decision: str | None,
     job_doc: dict | None,
     actor: Actor = "user",
+    shown_at: str | None = None,
 ) -> None:
     """Append one decision event. Never raises.
 
@@ -142,6 +143,17 @@ def log_decision(
     Swallowing every failure is deliberate: a lost label is an inconvenience,
     a 500 on a decision is a broken product. The exception is logged rather
     than dropped, which is what makes a systematically failing write visible.
+
+    ``shown_at`` is when the deciding user was last shown a list of jobs
+    (``tools.exposures.latest_shown_at``), which is what joins this label to
+    the impression it answered — position in the list, and what else was on
+    screen and ignored. It is **``None`` whenever no exposure is known**, and
+    the key is always present with that ``None``, exactly as ``score_snapshot``
+    is: an absent measurement must never be mistakable for a measured one. It
+    is legitimately ``None`` for a decision made before ``LOG_EXPOSURES`` was
+    on, for one made off a shelf rather than the review queue, and for every
+    ``actor: "system"`` event — a sweep dismissal answers no impression at all,
+    so no caller of those passes it.
 
     Synchronous, because both call sites are: ``decide()`` is a ``def`` route
     on the sync client, and the dismissal task already drives that client's
@@ -157,6 +169,7 @@ def log_decision(
                 "decided_at": datetime.now(UTC).isoformat(),
                 "actor": actor,
                 "score_snapshot": score_snapshot(job_doc),
+                "shown_at": shown_at,
             }
         )
     except Exception:

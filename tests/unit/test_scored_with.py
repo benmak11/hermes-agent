@@ -7,15 +7,24 @@ said which model ran or which prompt it ran, so there was no way to tell
 whether a December score was comparable to an October one. Every later task
 that compares scores depends on this record existing *and being true*.
 
-**The load-bearing test in this file is the batch one.** Batch prediction
-rejects the ``gemini-flash-latest`` alias, so the batch path parses with
-``gemini-2.5-flash`` while the online path parses with the alias — genuinely
-two different models. Stamping the online constant on a batch-scored job
-would record a lie, and it is a lie of the worst kind: indistinguishable
-later from the truth, in the one field whose entire job is to be trustworthy.
-So the models are threaded in from the callers, and these tests drive the
-real scorers rather than calling ``scored_with`` directly, because a unit test
-of the record builder cannot catch a caller passing it the wrong id.
+**The load-bearing test in this file is the batch one.** The batch and online
+paths read different constants for their Flash leg — ``BATCH_FLASH_MODEL``
+(batch prediction rejects a ``-latest`` alias, so it always had to pin a
+concrete id) and ``FLASH_MODEL``. Stamping the online constant on a
+batch-scored job records a lie of the worst kind: indistinguishable later from
+the truth, in the one field whose entire job is to be trustworthy. So the
+models are threaded in from the callers, and these tests drive the real
+scorers rather than calling ``scored_with`` directly, because a unit test of
+the record builder cannot catch a caller passing it the wrong id.
+
+**Since ``FLASH_MODEL`` was pinned, both constants hold ``gemini-2.5-flash``**
+— so a wrong stamp now records a correct-looking string and no assertion on
+the *value* can see it. The two provenance tests therefore monkeypatch the
+constant each path is supposed to read to a sentinel and assert on which name
+the recorded value came from. That is discrimination by construction: it fails
+even while the real ids agree, which asserting their inequality could not do.
+Two further tests pin the shipped values themselves, so "right wiring, wrong
+constant" cannot pass either.
 
 The second theme is **not claiming more than happened**. ``None`` means "this
 leg did not run here", and it appears in three real situations: the free
@@ -187,12 +196,30 @@ def _line(request_text: str, response_text: str) -> dict:
 # --- the premise ------------------------------------------------------------
 
 
-def test_the_two_flash_ids_are_actually_different():
-    """Everything below is only worth testing because of this. If the two ever
-    converge, the batch tests stop discriminating and would pass against a
-    scorer that stamps the wrong constant — so this failing is the signal to
-    rewrite those tests, not to delete this one."""
-    assert batch.BATCH_FLASH_MODEL != pipeline.FLASH_MODEL
+def test_the_two_flash_ids_now_name_the_same_model():
+    """The premise, inverted on purpose — and the reason the two provenance
+    tests below look the way they do.
+
+    This used to assert the two ids were *different*, with a note saying that
+    if they ever converged, the batch tests would stop discriminating and the
+    right response was to rewrite them rather than delete the guard. Pinning
+    ``FLASH_MODEL`` from ``gemini-flash-latest`` to the id the alias already
+    served is exactly that convergence, deliberately: both constants are now
+    ``gemini-2.5-flash``.
+
+    So string inequality can no longer tell the batch stamp from the online
+    one, and the two tests below were rewritten to monkeypatch the constant
+    each path is *supposed* to read to a sentinel and assert on which one came
+    out. That discriminates by construction — it fails even while the real ids
+    agree, which the old form could not do — so it is strictly stronger, not a
+    weakening to keep the suite green.
+
+    This test survives as a tripwire in both directions: the ids diverging
+    again (a new pin on one side only) fails it, and so does either pin moving
+    off this id. Either way, re-read ``tools/llm_models.py``'s ``FLASH_MODEL``
+    and ``obs/llm_cost.py``'s table before touching anything here.
+    """
+    assert batch.BATCH_FLASH_MODEL == pipeline.FLASH_MODEL == "gemini-2.5-flash"
 
 
 def test_the_prompt_versions_are_integers_next_to_their_prompts():
@@ -354,17 +381,42 @@ def _online_run(monkeypatch, ref, job, *, cache_hit: ParsedJD | None = None):
 
 
 def test_an_online_scored_job_records_the_online_models(monkeypatch, unlimited_budget):
+    """Discriminates by *which constant was read*, not by two ids differing.
+
+    The online scorer reads ``score.FLASH_MODEL`` (imported from
+    ``pipeline``/``llm_models``); the batch one reads
+    ``batch.BATCH_FLASH_MODEL``. Both now hold ``gemini-2.5-flash``, so
+    asserting the recorded string equals the real constant would also pass
+    against a scorer stamping the batch one. Repointing the online constant at
+    a sentinel for the duration of the test removes that coincidence: the
+    assertion is now "the value came from *this* name", which is the only thing
+    that was ever worth asserting.
+    """
+    sentinel = "sentinel/online-flash"
+    monkeypatch.setattr(score, "FLASH_MODEL", sentinel)
     ref, job = _KeepingRef(), _job()
     counts = _online_run(monkeypatch, ref, job)
 
     assert counts["scored"] == 1
     rec = ref.written["scored_with"]
-    assert rec["parse_model"] == pipeline.FLASH_MODEL
+    assert rec["parse_model"] == sentinel
     assert rec["match_model"] == pipeline.PRO_MODEL
-    # The discriminator: this path did not run the batch Flash.
+    # The discriminator, now by construction rather than by luck: whatever
+    # concrete id the batch constant holds, it is not this sentinel.
     assert rec["parse_model"] != batch.BATCH_FLASH_MODEL
     assert rec["parse_prompt_version"] == pipeline.PARSE_PROMPT_VERSION
     assert rec["match_prompt_version"] == pipeline.MATCH_PROMPT_VERSION
+
+
+def test_an_online_scored_job_records_the_real_online_id_too(
+    monkeypatch, unlimited_budget
+):
+    """The sentinel above proves the *wiring*; this proves the shipped value,
+    so the pair cannot both pass while the constant itself is wrong."""
+    ref, job = _KeepingRef(), _job()
+    _online_run(monkeypatch, ref, job)
+
+    assert ref.written["scored_with"]["parse_model"] == "gemini-2.5-flash"
 
 
 def test_a_parse_this_run_did_not_pay_for_is_not_attributed(
@@ -386,7 +438,17 @@ def test_a_batch_scored_job_records_the_batch_models(monkeypatch, unlimited_budg
 
     ``FLASH_MODEL`` here would be a wrong attribution that no later query, no
     replay and no audit could ever detect — which is precisely the failure this
-    whole task exists to prevent."""
+    whole task exists to prevent.
+
+    Since the pin, the two Flash constants hold the same string, so the wrong
+    stamp would record a *correct-looking* id and no assertion on the value
+    could see it. ``BATCH_FLASH_MODEL`` is therefore repointed at a sentinel
+    for this test: the record must carry the value read from **that name**.
+    The fake ``_run_batch`` below compares against the attribute rather than a
+    literal, so it follows the sentinel and still checks the right leg ran.
+    """
+    sentinel = "sentinel/batch-flash"
+    monkeypatch.setattr(batch, "BATCH_FLASH_MODEL", sentinel)
     ref, job = _KeepingRef(), _job()  # unparsed: forces the Flash batch leg
     profile = _profile()
 
@@ -418,10 +480,11 @@ def test_a_batch_scored_job_records_the_batch_models(monkeypatch, unlimited_budg
 
     assert counts["scored"] == 1
     rec = ref.written["scored_with"]
-    assert rec["parse_model"] == batch.BATCH_FLASH_MODEL == "gemini-2.5-flash"
+    assert rec["parse_model"] == sentinel
     assert rec["match_model"] == batch.BATCH_PRO_MODEL
-    # Spelled out rather than left implicit in the equality above: this is the
-    # exact substitution the task is about.
+    # Spelled out rather than left implicit above: stamping the online constant
+    # here is the exact substitution this test exists for, and with the real
+    # ids equal the sentinel is the only thing that can still catch it.
     assert rec["parse_model"] != pipeline.FLASH_MODEL
 
 

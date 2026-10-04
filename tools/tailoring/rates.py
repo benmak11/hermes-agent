@@ -53,19 +53,20 @@ _MODELED_THINKING_TOKENS = 512  # the full thinking_budget ceiling
 #: out a local copy of the per-million rates.
 #:
 #: ``obs.llm_cost`` is this repo's price list, and it says of itself that
-#: Google revises these and that ``gemini-flash-latest`` is keyed by the
-#: *alias* because the alias currently serves a 2.5-generation model. Both are
-#: reasons a second copy of $0.30/$2.50 would go stale silently: the day the
-#: alias moves, or the day the pricing page changes, the canonical table is
-#: updated and a duplicate is not. Asking the pricer also means this figure
-#: inherits its cached-token and long-context handling for free instead of
-#: re-deriving a simplified version of the same arithmetic.
+#: Google revises these. That is reason enough for a second copy of
+#: $0.30/$2.50 to go stale silently: the day the pricing page changes, the
+#: canonical table is updated and a duplicate is not. (It used to be two
+#: reasons — the other was ``gemini-flash-latest`` moving under us, which
+#: ``OBJECTIVE_MODEL`` being pinned has now closed.) Asking the pricer means
+#: this figure inherits its cached-token and long-context handling for free
+#: instead of re-deriving a simplified version of the same arithmetic.
 #:
 #: ``OBJECTIVE_MODEL`` comes from the module that makes the call, so the model
 #: priced here cannot drift from the model actually used. A model with no
 #: pricing entry returns ``None``; that is a programming error rather than a
-#: runtime condition — the alias is in the table and pinned by a test — so it
-#: raises here instead of poisoning a quote with a silent zero.
+#: runtime condition — the pinned id is in the table, and a test pins that it
+#: stays there — so it raises here instead of poisoning a quote with a silent
+#: zero.
 _ESTIMATED = compute_cost_usd(
     model=OBJECTIVE_MODEL,
     input_tokens=_MODELED_INPUT_TOKENS,

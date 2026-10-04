@@ -22,16 +22,16 @@ Firestore run ledger by ``tools.run_costs`` when the run ends — one answer to
 "what did that run cost?" that reads the same from a laptop, the API, and the
 worker.
 
-Pricing is looked up by ``response.model_version``. For the Pro call sites
-this is the concrete pinned model id (``gemini-3.1-pro-preview``). For the
-Flash call sites it is **not** resolved to a concrete model — Vertex just
-echoes back the requested alias ``gemini-flash-latest`` verbatim (confirmed
+Pricing is looked up by ``response.model_version``, and the table is keyed by
+whatever string actually shows up there — Vertex echoes the *requested* id
+back verbatim and does not resolve an alias to a concrete model (confirmed
 live 2026-07-08; an earlier version of this module assumed the opposite).
-So the pricing table is keyed by whatever string actually shows up in
-``model_version``, alias or not — if ``gemini-flash-latest`` is ever
-repointed at a different concrete model with different pricing, this table
-needs a matching update, since there's no way to detect that from the
-response alone. A model string missing from ``_PRICING_PER_MILLION`` still
+Both call sites now request concrete pinned ids
+(``gemini-3.1-pro-preview``, ``gemini-2.5-flash``), so both lookups hit a
+pinned key. The ``gemini-flash-latest`` entry below is kept anyway, because
+months of already-written ledger rows and ``llm_call`` log lines carry that
+string and a cost replay over them has to price it; it is dead for new calls,
+not for history. A model string missing from ``_PRICING_PER_MILLION`` still
 gets its token counts logged, just with ``cost_usd=None`` and a warning,
 rather than silently reporting a wrong number.
 """
@@ -53,14 +53,19 @@ log = get_logger("llm.cost")
 # before relying on it for paywall pricing.
 _PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     "gemini-3.1-pro-preview": {"input": 2.00, "output": 12.00, "cached": 0.20},
-    # Keyed by the literal alias, not a resolved model id — see module
-    # docstring. gemini-flash-latest currently serves a 2.5-generation model;
-    # 2.5 Flash has no long-context pricing tier (flat rate at any input
-    # size), unlike Pro, so no matching entry below is needed for it.
+    # Historical only: no call site requests the alias any more, since both
+    # Flash declarations are pinned to the concrete id below. Kept because
+    # ledger rows and llm_call log lines written before the pin carry this
+    # string and a cost replay over them still has to price it. Same rates —
+    # the alias served this model — so dropping the entry would silently turn
+    # every pre-pin row into cost_usd=None.
     "gemini-flash-latest": {"input": 0.30, "output": 2.50, "cached": 0.03},
-    # The batch scorer (tools/matching/batch.py) pins this concrete id because
-    # batch prediction rejects aliases; it's the same model the alias serves
-    # today, so the rates match the entry above.
+    # Every Flash call site now: the online scorer and tailoring, via
+    # tools/llm_models.FLASH_MODEL and tools/tailoring/objective's
+    # OBJECTIVE_MODEL, plus the batch scorer via BATCH_FLASH_MODEL (which
+    # always had to pin a concrete id, because batch prediction rejects
+    # aliases). 2.5 Flash has no long-context pricing tier — flat rate at any
+    # input size, unlike Pro — so it needs no entry in the table below.
     "gemini-2.5-flash": {"input": 0.30, "output": 2.50, "cached": 0.03},
 }
 # Long-context (>200K prompt tokens) rates for the same models, keyed by

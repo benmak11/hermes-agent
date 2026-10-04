@@ -386,17 +386,26 @@ EMPTY_GEO_COUNTS = {"geo_ineligible": 0, "geo_abstain": 0, "geo_skipped": 0}
 # A score is only comparable to another score if you know what produced it.
 # Until this existed, nothing in Firestore recorded either half of that: the
 # prompts live in git but the documents carry no pointer at git, and
-# ``FLASH_MODEL`` is ``gemini-flash-latest`` — a *moving alias* that can start
-# serving a different model with no commit in this repo at all.
+# ``FLASH_MODEL`` was ``gemini-flash-latest`` — a *moving alias* that could
+# start serving a different model with no commit in this repo at all, which is
+# a model column meaning "whatever Google served that week". That alias is
+# pinned now (``tools.llm_models``), so this record finally names something
+# stable; it does not make the record redundant, because the prompts and the
+# Pro id still move and because a pin is only honest if something wrote down
+# which pin was in force.
 #
 # The one rule that makes this record worth having: **stamp the leg that
 # actually ran in this call, never the constant that names the leg that
-# usually runs.** The batch path parses with ``batch.BATCH_FLASH_MODEL``
-# (``gemini-2.5-flash``), not ``FLASH_MODEL`` — batch prediction rejects
-# aliases, so they are genuinely different models — and a batch-scored job
-# stamped from the online constant records a lie that nothing downstream can
-# ever detect. Hence the models are threaded in from the caller and this
-# module never reaches for one itself.
+# usually runs.** The batch path parses with ``batch.BATCH_FLASH_MODEL`` and
+# the online path with ``FLASH_MODEL``; both now read ``gemini-2.5-flash``, so
+# a wrong stamp no longer shows up as a wrong *string* — it is invisible until
+# one of the two constants moves, and then every job scored under the mix-up is
+# mis-attributed retroactively. That is a weaker safety net than before, not a
+# reason to relax: the models stay threaded in from the caller, this module
+# still never reaches for one itself, and
+# ``tests/unit/test_scored_with.py`` now pins each path to a sentinel so the
+# tests discriminate by which constant was read rather than by the ids
+# differing.
 
 
 def scored_with(*, parse_model: str | None, match_model: str | None) -> dict:

@@ -220,6 +220,8 @@ def test_run_batch_polls_to_success_and_reads_output(monkeypatch):
 
     out = asyncio.run(
         batch._run_batch(
+            # Arbitrary input to a faked _run_batch — asserts nothing about
+            # BATCH_FLASH_MODEL, so this is not a missed rename.
             model="gemini-flash-latest",
             lines=lines_in,
             gcs_dir="gs://test-bucket/vertex-batch/run1/parse",
@@ -277,6 +279,8 @@ def test_run_batch_raises_on_failed_job(monkeypatch):
     with pytest.raises(RuntimeError, match="quota"):
         asyncio.run(
             batch._run_batch(
+                # Arbitrary input to a faked _run_batch — asserts nothing about
+                # BATCH_FLASH_MODEL, so this is not a missed rename.
                 model="gemini-flash-latest",
                 lines=[batch.build_parse_request("x")],
                 gcs_dir="gs://b/vertex-batch/r/parse",

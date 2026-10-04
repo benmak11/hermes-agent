@@ -206,9 +206,15 @@ def world(monkeypatch):
             "users/u1/runs/r1": {"cost_usd": 0.03},
             "users/u1/company_prefs/greenhouse:stripe": {"state": "excluded"},
             "users/u1/journeys/jn1": {"company": "Shopify"},
+            # The label stores and the spend seam's tokens. All three were
+            # missing from the wipe at some point; see the discovery guard.
+            "users/u1/decisions/d1": {"job_id": "j1", "decision": "approved"},
+            "users/u1/exposures/e1": {"items": [{"job_id": "j1", "rank": 0}]},
+            "users/u1/spend_consents/sc1": {"intent": "score_backlog"},
             "users/u2": {"email": "other@example.com"},
             "users/u2/jobs/j9": {"title": "not mine"},
             "users/u2/journeys/jn9": {"company": "not mine"},
+            "users/u2/decisions/d9": {"job_id": "j9", "decision": "rejected"},
             "batch_runs/b1": {"user_id": "u1", "state": "running"},
             "batch_runs/b2": {"user_id": "u2", "state": "running"},
             # Shared, content-keyed, and nobody's personal data.
@@ -270,6 +276,9 @@ def test_a_dry_run_counts_everything_and_writes_nothing(world):
         "runs": 1,
         "company_prefs": 1,
         "journeys": 1,
+        "decisions": 1,
+        "exposures": 1,
+        "spend_consents": 1,
         "batch_runs": 1,
         "gcs_blobs": 2,
         "user_doc_existed": True,
@@ -344,6 +353,9 @@ def test_a_wipe_of_an_already_wiped_account_is_a_no_op(world):
         "runs": 0,
         "company_prefs": 0,
         "journeys": 0,
+        "decisions": 0,
+        "exposures": 0,
+        "spend_consents": 0,
         "batch_runs": 0,
         "gcs_blobs": 0,
         "user_doc_existed": False,
@@ -911,22 +923,117 @@ def test_a_deleted_account_leaves_no_journeys_behind(world):
     assert counts.journeys == 1
 
 
+#: Collections whose module exports a ``COLLECTION`` constant but which are
+#: **not** under ``users/{uid}``, with the reason each one is not wiped. This
+#: is the only way a collection may be absent from ``USER_SUBCOLLECTIONS``:
+#: the discovery test below fails on anything that is in neither list, so a new
+#: collection cannot pass by being overlooked — its author has to say which it
+#: is. (``batch_runs`` is per-user but top-level, so the wipe deletes it with a
+#: ``user_id`` query rather than as a subcollection; it is exempt from the
+#: *subcollection* list, not from deletion, and
+#: ``test_a_deleted_account_leaves_no_batch_runs_behind`` covers it.)
+_NOT_USER_SUBCOLLECTIONS = {
+    "jd_cache": "cross-user content-keyed parse cache — shared, not the user's",
+    "allowlist": "top-level access seats, keyed by email, outlive the account",
+    "batch_runs": "top-level, per-user; wiped by _delete_batch_runs's query",
+}
+
+
 def test_every_subcollection_the_code_writes_is_one_the_wipe_deletes():
-    """Guards the *class* of bug, not the one instance of it.
+    """Guards the *class* of bug, not the one instance of it — fail-closed.
 
-    A new ``users/{uid}/<name>`` collection is added by whichever feature needs
-    it, and nothing links that back to here — so this asserts the wipe's list
-    against the constants those modules export. Adding a subcollection without
-    adding it to ``USER_SUBCOLLECTIONS`` fails this, rather than quietly
-    orphaning documents on every future deletion.
+    The previous version of this test looped a hand-written tuple of three
+    constants, which made it exactly as hand-maintained as the list it was
+    guarding: it missed ``decisions`` (Task 1) and ``exposures`` (Task 4), and
+    ``spend_consents`` had been unwiped since the spend seam shipped. Three
+    misses is a design problem, not three oversights.
+
+    So this **discovers** every module that declares a ``COLLECTION`` constant
+    and requires each value to be either wiped or explicitly exempted with a
+    reason. A new collection is in neither list and fails here, which is the
+    whole point: the default answer for an unclassified collection is "this
+    test fails", never "nothing happens and a deleted account keeps it".
+
+    Read by :mod:`ast` rather than imported, the same way
+    ``test_llm_models_stays_import_free`` reads ``llm_models``: this must see
+    every declaring module, including ones whose import needs credentials or
+    has side effects, and it must not be possible for an import failure to
+    quietly shrink the set being checked.
     """
-    from tools.account.delete import USER_SUBCOLLECTIONS
-    from tools.company_prefs import COLLECTION as COMPANY_PREFS
-    from tools.journeys import COLLECTION as JOURNEYS
-    from tools.run_costs import COLLECTION as RUN_COSTS
+    import ast
+    from pathlib import Path
 
-    for owned in (RUN_COSTS, COMPANY_PREFS, JOURNEYS):
-        assert owned in USER_SUBCOLLECTIONS, (
-            f"{owned!r} is written under users/{{uid}} but the wipe would "
-            f"leave it behind"
+    from tools.account.delete import USER_SUBCOLLECTIONS
+
+    tools_dir = Path(__file__).resolve().parents[2] / "tools"
+    found: dict[str, str] = {}
+    for path in sorted(tools_dir.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in tree.body:  # module level only
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == "COLLECTION"
+                    and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)
+                ):
+                    found[node.value.value] = str(path.relative_to(tools_dir))
+
+    # The discovery itself has to be load-bearing: if the walk silently stopped
+    # finding modules, every assertion below would pass vacuously.
+    assert len(found) >= 9, f"only found {found} — the module walk is broken"
+
+    for name, module in sorted(found.items()):
+        assert name in USER_SUBCOLLECTIONS or name in _NOT_USER_SUBCOLLECTIONS, (
+            f"tools/{module} declares COLLECTION = {name!r}, which is in "
+            f"neither USER_SUBCOLLECTIONS nor _NOT_USER_SUBCOLLECTIONS. If it "
+            f"lives under users/{{uid}}, add it to the wipe — otherwise a "
+            f"deleted account keeps it forever. If it does not, add it to "
+            f"_NOT_USER_SUBCOLLECTIONS with the reason."
         )
+
+
+def test_the_exemption_list_is_not_a_way_to_skip_the_wipe():
+    """The escape hatch has to be narrow, or it becomes the bug. Nothing may be
+    in both lists, and every exemption must carry a non-empty reason — an empty
+    string would let a future author silence the test above without saying
+    anything."""
+    from tools.account.delete import USER_SUBCOLLECTIONS
+
+    for name, reason in _NOT_USER_SUBCOLLECTIONS.items():
+        assert name not in USER_SUBCOLLECTIONS, f"{name!r} is in both lists"
+        assert reason.strip(), f"{name!r} is exempted with no reason"
+
+
+def test_a_deleted_account_leaves_no_decisions_or_exposures_behind(world):
+    """The two label stores. They are the most sensitive thing the account
+    holds — every job the user was shown, when, and what they chose — and
+    ``decisions`` sat unwiped from Task 1 until Task 4 added a second one
+    beside it and the pair got noticed together."""
+    from tools.decisions import COLLECTION as DECISIONS
+    from tools.exposures import COLLECTION as EXPOSURES
+
+    assert f"users/u1/{DECISIONS}/d1" in world.db.docs
+    assert f"users/u1/{EXPOSURES}/e1" in world.db.docs
+
+    counts = _wipe(world, execute=True)
+
+    assert f"users/u1/{DECISIONS}/d1" not in world.db.docs
+    assert f"users/u1/{EXPOSURES}/e1" not in world.db.docs
+    assert counts.decisions == 1
+    assert counts.exposures == 1
+
+
+def test_a_deleted_account_leaves_no_spend_consents_behind(world):
+    """Found by the discovery guard above, not by this diff's own feature: the
+    spend seam's per-user confirmation tokens were never in the wipe."""
+    from tools.spend.consent import COLLECTION as SPEND_CONSENTS
+
+    assert f"users/u1/{SPEND_CONSENTS}/sc1" in world.db.docs
+
+    counts = _wipe(world, execute=True)
+
+    assert f"users/u1/{SPEND_CONSENTS}/sc1" not in world.db.docs
+    assert counts.spend_consents == 1

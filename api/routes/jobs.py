@@ -18,8 +18,8 @@ from api.deps import SpendConfirm, required, verify_user
 from api.routes.applications import application_id, dispatch_tailor
 from api.routes.discovery import refuse_live_runs, tick_user
 from models.job import Job
-from obs.logging import get_logger, run_context
-from tools import decisions, queues, spend
+from obs.logging import current_request_id, get_logger, run_context
+from tools import decisions, exposures, queues, spend
 from tools.applications import state as app_state
 from tools.ats.validate import check_posting
 from tools.matching.score import score_pending_jobs
@@ -82,18 +82,44 @@ def list_pending_jobs(
     the UI could branch on — a badge, a key, a different shape — tells the user
     "this one doesn't really count" and destroys the label. Popped
     unconditionally, so no response can leak it however the doc was written.
+
+    Under ``LOG_EXPOSURES`` (default off) the returned list is also recorded in
+    ``users/{uid}/exposures`` — see :mod:`tools.exposures` for why, and for the
+    volume: one document per *response*, including every poll, and the client
+    polls this route every 3 seconds while anything is running. Three things
+    about that record are load-bearing here:
+
+    - ``rank`` is **0-based** and is the position in the list *actually
+      returned*, so it is stamped after the sort, over the response list. The
+      index of the streaming loop above is a Firestore ordering of the
+      unfiltered collection and is not a position in anything the client saw.
+      Note what ``rank`` is *not*: the web client renders a one-card deck off
+      ``jobs[0]``, so ranks 1..n were returned and prefetched, never displayed.
+      This is a candidate set with an order, not a list of impressions;
+    - ``exploration`` is carried into the record even though it is popped out
+      of the response, because the record is server-side and the whole point of
+      the sample is that the queue sorts sampled jobs to the bottom — where,
+      with a one-card deck, they are reached only in a session that clears the
+      queue. It is the value this loop already computed, not a re-read;
+    - the write runs as a background task so the main screen does not wait on
+      it, which means the request id has to be read *here*, on the request's
+      own thread, while the middleware's contextvar is still bound.
+
+    ``min_score`` goes into the record too: it is the parameter that defined
+    the choice set and it cannot be recovered from the items (the lowest score
+    shown only bounds it, and an empty list bounds nothing).
+
+    Nothing about the response changes, with the flag on or off, and with the
+    flag off no item is built and no write is scheduled.
     """
-    # Opportunistic scheduler tick (throttled in-process): opening the review
-    # queue runs any due auto-discovery/sweep loop without external cron infra.
-    background_tasks.add_task(tick_user, user_id)
+    user_ref = _client().collection("users").document(user_id)
     snaps = (
-        _client()
-        .collection("users")
-        .document(user_id)
-        .collection("jobs")
+        user_ref.collection("jobs")
         .where(filter=FieldFilter("user_decision", "==", "pending"))
         .stream()
     )
+    log_exposures = exposures.enabled()
+    explored_ids: set[str] = set()
     jobs = []
     pending_total = 0
     scored_total = 0
@@ -107,8 +133,37 @@ def list_pending_jobs(
         explored = bool(d.pop("exploration", False))
         if match.get("overall_score", 0) < min_score and not explored:
             continue
+        if log_exposures and explored:
+            explored_ids.add(snap.id)
         jobs.append({"id": snap.id, **d})
     jobs.sort(key=lambda j: j["match"]["overall_score"], reverse=True)
+    if log_exposures:
+        background_tasks.add_task(
+            exposures.log_exposure,
+            user_ref,
+            items=[
+                exposures.ExposureItem(
+                    job_id=job["id"],
+                    rank=rank,
+                    overall_score=job["match"].get("overall_score"),
+                    exploration=job["id"] in explored_ids,
+                )
+                for rank, job in enumerate(jobs)
+            ],
+            min_score=min_score,
+            request_id=current_request_id(),
+        )
+    # Opportunistic scheduler tick (throttled in-process): opening the review
+    # queue runs any due auto-discovery/sweep loop without external cron infra.
+    #
+    # **Registered after the exposure write, deliberately.** Starlette runs
+    # background tasks in order and abandons the rest when one raises, and
+    # ``tick_user`` does a Firestore ``get`` that can — so with the tick first,
+    # every tick failure silently dropped the exposure. That loss would be
+    # correlated with discovery trouble rather than random, which is the worst
+    # shape for a dataset: the impressions missing would be exactly the ones
+    # from the sessions where something was going wrong.
+    background_tasks.add_task(tick_user, user_id)
     return {
         "jobs": jobs,
         "pending_total": pending_total,
@@ -343,6 +398,17 @@ def decide(
     Every decision also appends one event to ``users/{uid}/decisions`` (see
     :mod:`tools.decisions`), because the job document only ever holds the
     latest answer and an undo would otherwise erase the original choice.
+
+    Under ``LOG_EXPOSURES`` that event also carries the ``shown_at`` of the
+    user's most recent exposure **if that exposure contained this job** — this
+    route is also what the starred/skipped shelves POST to, and those never
+    fetch ``/jobs/pending``, so the latest list is routinely one this job was
+    never in. See :func:`tools.exposures.latest_shown_at`. The lookup is gated
+    on the flag so the decision path takes no extra read while the feature is
+    off, and so a decision is never stamped from an older flag-on window that
+    did not record *this* impression. It never raises and never defaults: no
+    exposure, or one without this job, means ``shown_at: None``, never
+    ``now``.
     """
     user_ref = _client().collection("users").document(user_id)
     job_ref = user_ref.collection("jobs").document(job_id)
@@ -378,6 +444,9 @@ def decide(
         decision=body.decision,
         previous_decision=(before_doc or {}).get("user_decision"),
         job_doc=before_doc,
+        shown_at=(
+            exposures.latest_shown_at(user_ref, job_id) if exposures.enabled() else None
+        ),
     )
 
     if body.decision == "pending":

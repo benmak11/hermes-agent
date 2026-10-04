@@ -71,10 +71,12 @@ log = get_logger("tools.matching")
 
 # Batch prediction rejects model *aliases* outright ("Do not support publisher
 # model gemini-flash-latest" — verified live 2026-07-09, on both the global
-# and regional endpoints), so the Flash leg pins the concrete model the alias
-# currently serves. If the alias is ever repointed, update this and the
-# matching obs/llm_cost.py pricing entry together. Concrete ids work fine on
-# the global endpoint the rest of the app uses.
+# and regional endpoints), so this leg has always pinned a concrete id.
+# tools/llm_models.FLASH_MODEL is now pinned to the same one, which makes the
+# two equal today — still two declarations, because the batch catalog and the
+# interactive one can diverge again and this is the side that cannot fall back
+# to an alias. Move either and the matching obs/llm_cost.py pricing entry has
+# to move with it. Concrete ids work fine on the global endpoint too.
 BATCH_FLASH_MODEL = "gemini-2.5-flash"
 BATCH_PRO_MODEL = PRO_MODEL  # already a concrete id — batch accepts it as-is
 
@@ -630,10 +632,13 @@ async def _batch_score(
         job: Job, match: JobMatch, enforced: dict | None, match_model: str | None
     ) -> None:
         async with sem:
-            # The batch models, never the online constants: batch prediction
-            # rejects the ``gemini-flash-latest`` alias, so this path really
-            # does run a different Flash than ``score.score_pending_jobs``,
-            # and stamping ``FLASH_MODEL`` here would be unfalsifiable later.
+            # The batch models, never the online constants. ``FLASH_MODEL``
+            # here would be unfalsifiable later — and since that constant was
+            # pinned to the same concrete id this one holds, it would also be
+            # *invisible*: the wrong name recording a right-looking string,
+            # until one of the two moves and retroactively mis-attributes
+            # every job scored in between. ``test_scored_with`` pins each path
+            # to a sentinel for exactly that reason.
             parse_model = BATCH_FLASH_MODEL if job.id in flash_parsed else None
             provenance = (
                 scored_with(parse_model=parse_model, match_model=match_model)

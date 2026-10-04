@@ -237,6 +237,19 @@ def current_run_id() -> str | None:
     return structlog.contextvars.get_contextvars().get("run_id")
 
 
+def current_request_id() -> str | None:
+    """The ``request_id`` the middleware bound, or None outside a request.
+
+    The request-scoped twin of :func:`current_run_id`, and there for the same
+    reason: code that is *not* logging (an exposure record, see
+    ``tools.exposures``) needs the same correlation id every log line already
+    carries, so the row can be joined back to the request that produced it.
+    Reading it here rather than minting one is the point — a fresh id would
+    correlate with nothing.
+    """
+    return structlog.contextvars.get_contextvars().get("request_id")
+
+
 def clear_request_context() -> None:
     """Drop all context-bound values (call at the start of each request)."""
     structlog.contextvars.clear_contextvars()

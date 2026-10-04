@@ -159,10 +159,11 @@ def test_a_firestore_failure_degrades_to_estimated_not_an_exception(db):
 def test_the_objective_model_is_priced_by_the_canonical_table():
     """The fallback asks ``obs.llm_cost`` for the price of the model
     ``tools.tailoring.objective`` actually calls, instead of carrying its own
-    copy of $0.30/$2.50. That only works while the table has an entry for it —
-    and ``obs.llm_cost`` keys Flash by the *alias*, noting the alias currently
-    serves a 2.5-generation model, so the day it moves is exactly when a local
-    copy would have gone stale and this import would start raising instead.
+    copy of $0.30/$2.50. That only works while the table has an entry for it,
+    and the consequence of it not having one is not a bad number — ``rates``
+    raises at **import**, so an unpriced model id takes the service down at
+    startup rather than quietly poisoning a quote. This is the test that stands
+    between a one-character model-id edit and that outage.
     """
     from obs.llm_cost import compute_cost_usd
     from tools.tailoring.objective import OBJECTIVE_MODEL
@@ -176,6 +177,23 @@ def test_the_objective_model_is_priced_by_the_canonical_table():
     )
     assert priced is not None, f"{OBJECTIVE_MODEL} has no entry in obs.llm_cost"
     assert rates.ESTIMATED_COST_PER_OBJECTIVE_USD > 0
+
+
+def test_the_objective_model_is_a_pinned_id_not_a_moving_alias():
+    """Tailoring declares its own model id — deliberately, so it can move
+    without retuning the scorer — which also means a pin applied to
+    ``llm_models.FLASH_MODEL`` does not reach it. It was left on
+    ``gemini-flash-latest`` once; pinned here too, to the same concrete id.
+
+    The literal is checked rather than equality with ``FLASH_MODEL``, because
+    the two being equal is a fact about today and not a requirement: moving
+    tailoring to a different model on purpose should mean editing this literal,
+    while leaving it on a ``-latest`` alias is the thing this test refuses.
+    """
+    from tools.tailoring.objective import OBJECTIVE_MODEL
+
+    assert OBJECTIVE_MODEL == "gemini-2.5-flash"
+    assert not OBJECTIVE_MODEL.endswith("-latest")
 
 
 def test_the_modeled_rate_is_the_canonical_price_not_a_local_copy():

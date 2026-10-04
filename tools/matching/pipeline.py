@@ -39,12 +39,18 @@ log = get_logger("tools.matching")
 # output post-deploy to confirm thinking_tokens actually dropped before going
 # lower.
 #
-# gemini-flash-latest currently serves a 2.5-generation model: it 400s on
-# thinking_level ("not supported by this model") and takes the older
-# thinking_budget knob instead — verified live 2026-07-08 after every parse_jd
-# call in a backlog run failed with that 400. 512 tokens caps thinking near the
-# thinking_level=LOW intent. If the alias moves to a 3.x Flash, thinking_budget
-# still works (3.x accepts either knob, just not both).
+# FLASH_MODEL is gemini-2.5-flash, which 400s on thinking_level ("not supported
+# by this model") and takes the older thinking_budget knob instead — verified
+# live 2026-07-08 after every parse_jd call in a backlog run failed with that
+# 400. That is why this knob is thinking_budget and the Pro one below is
+# thinking_level, and the asymmetry is a model-generation fact, not a
+# preference. 512 tokens caps thinking near the thinking_level=LOW intent.
+#
+# The id used to be the gemini-flash-latest alias, i.e. this config was one
+# Google-side repoint away from 400ing again with no commit here. It is pinned
+# now (tools/llm_models.py says why, and what moving it costs). A future pin to
+# a 3.x Flash leaves thinking_budget working — 3.x accepts either knob, just
+# not both — so it is a choice to make there, not a breakage.
 _PARSE_JD_THINKING = types.ThinkingConfig(thinking_budget=512)
 _MATCH_THINKING = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MEDIUM)
 
