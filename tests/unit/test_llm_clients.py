@@ -121,16 +121,55 @@ def test_pipeline_shares_the_model_ids():
 
 
 def test_model_ids_are_unchanged():
-    """A de-duplication, not a retune.
+    """Both ids are load-bearing catalog strings, not preferences.
 
-    ``gemini-3.1-pro-preview`` is load-bearing: there is no bare
-    ``gemini-3-pro`` in this project's Vertex catalog, and substituting one 404s
-    every scoring call. Pinned so the move cannot have quietly changed a value.
+    ``gemini-3.1-pro-preview``: there is no bare ``gemini-3-pro`` in this
+    project's Vertex catalog, and substituting one 404s every scoring call.
+
+    ``gemini-2.5-flash``: pinned, where this used to be the
+    ``gemini-flash-latest`` alias. The alias is what it resolved to anyway, so
+    the pin changed no behaviour — it stopped Google changing it for us, which
+    had already cost a 400 on every parse call once and would silently
+    falsify ``scored_with`` thereafter.
     """
     from tools import llm_models
 
-    assert llm_models.FLASH_MODEL == "gemini-flash-latest"
+    assert llm_models.FLASH_MODEL == "gemini-2.5-flash"
     assert llm_models.PRO_MODEL == "gemini-3.1-pro-preview"
+
+
+def test_no_model_id_is_a_moving_alias():
+    """The property the pin exists for, stated as a property rather than as a
+    literal: a ``-latest`` id makes the model a function of Google's release
+    calendar instead of this file, so the next reviewer cannot tell what ran
+    last month, and ``scored_with`` records a name that may no longer mean what
+    it meant. Catches a revert to the alias and any future ``-latest`` id."""
+    from tools import llm_models
+
+    for name, value in vars(llm_models).items():
+        if name.endswith("_MODEL"):
+            assert not value.endswith("-latest"), f"{name} is a moving alias"
+
+
+def test_every_model_id_here_is_priced_by_the_canonical_table():
+    """An id with no entry in ``obs.llm_cost`` makes ``compute_cost_usd``
+    return ``None``, which costs the ledger its cost column silently — and for
+    the tailoring model it is worse than silent, see
+    ``test_tailoring_rates``'s import-time guard. Checked for every id in this
+    module so a future pin cannot land unpriced."""
+    from obs import llm_cost
+    from tools import llm_models
+
+    for name, value in vars(llm_models).items():
+        if name.endswith("_MODEL"):
+            cost = llm_cost.compute_cost_usd(
+                model=value,
+                input_tokens=1000,
+                output_tokens=100,
+                thinking_tokens=0,
+                cached_tokens=0,
+            )
+            assert cost is not None, f"{name} ({value!r}) has no pricing entry"
 
 
 def test_llm_models_stays_import_free():

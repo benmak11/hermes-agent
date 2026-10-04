@@ -42,8 +42,11 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from obs.logging import get_logger
 from tools import allowlist
 from tools.company_prefs import COLLECTION as COMPANY_PREFS
+from tools.decisions import COLLECTION as DECISIONS
+from tools.exposures import COLLECTION as EXPOSURES
 from tools.journeys import COLLECTION as JOURNEYS
 from tools.run_costs import COLLECTION as RUN_COSTS
+from tools.spend.consent import COLLECTION as SPEND_CONSENTS
 from tools.tailoring.render import resume_bucket_name
 
 log = get_logger("tools.account.delete")
@@ -57,11 +60,22 @@ DELETED_AT = "deleted_at"
 #: ledger; it goes with the rest, because it is per-user billing detail and
 #: nothing aggregates it across accounts.
 #:
-#: The last three are named by importing the constant the owning module already
-#: exports, not by repeating the string — ``company_prefs`` was added by a
-#: later PR than the wipe and was missed here precisely because this list was
-#: hand-maintained. Anything that adds a subcollection under ``users/{uid}``
-#: must be added here, or a deleted account leaves it behind.
+#: Everything after the first three is named by importing the constant the
+#: owning module already exports, not by repeating the string — ``company_prefs``
+#: was added by a later PR than the wipe and was missed here precisely because
+#: this list was hand-maintained. ``decisions`` then repeated the mistake and
+#: sat unwiped from Task 1 until Task 4 noticed, and ``spend_consents`` had
+#: been unwiped since the spend seam shipped — three in a row, which is why the
+#: guard below now discovers the collections instead of restating them.
+#: Anything that adds a subcollection under ``users/{uid}`` must be added here,
+#: or a deleted account leaves it behind.
+#:
+#: **The guard is
+#: ``tests/unit/test_account_delete.py::test_every_subcollection_the_code_writes_is_one_the_wipe_deletes``**,
+#: which discovers the exporting modules rather than restating them — named
+#: here by path so the link is findable from this end too, since the first
+#: version of that guard was itself a hand-written tuple and missed two
+#: collections in a row.
 USER_SUBCOLLECTIONS = (
     "jobs",
     "applications",
@@ -69,6 +83,9 @@ USER_SUBCOLLECTIONS = (
     RUN_COSTS,
     COMPANY_PREFS,
     JOURNEYS,
+    DECISIONS,
+    EXPOSURES,
+    SPEND_CONSENTS,
 )
 
 #: Firestore's hard cap on writes per batch.
@@ -85,6 +102,9 @@ class WipeCounts:
     runs: int = 0
     company_prefs: int = 0
     journeys: int = 0
+    decisions: int = 0
+    exposures: int = 0
+    spend_consents: int = 0
     batch_runs: int = 0
     gcs_blobs: int = 0
     #: Whether ``users/{uid}`` was there to delete. False on a re-run of a wipe
@@ -203,6 +223,9 @@ async def wipe_user_data(
         runs=counts[RUN_COSTS],
         company_prefs=counts[COMPANY_PREFS],
         journeys=counts[JOURNEYS],
+        decisions=counts[DECISIONS],
+        exposures=counts[EXPOSURES],
+        spend_consents=counts[SPEND_CONSENTS],
         batch_runs=counts["batch_runs"],
         gcs_blobs=counts["gcs_blobs"],
         user_doc_existed=user_doc_existed,

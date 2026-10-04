@@ -64,8 +64,8 @@ overview.)
 | Stage | Model | What it does |
 |-------|-------|--------------|
 | Discovery (`tools/discovery/`) | — (no model) | Fans out across job boards and company career pages concurrently |
-| Matching (`tools/matching/pipeline.py`) | `gemini-flash-latest` → `gemini-3.1-pro-preview` | Flash parses the JD; a free Python pre-filter and geo-eligibility gate drop what Pro shouldn't be paid to read; Pro scores the rest against the profile |
-| Tailoring (`tools/tailoring/`) | `gemini-flash-latest` | Reranks bullets, writes an objective, renders an ATS-safe résumé |
+| Matching (`tools/matching/pipeline.py`) | `gemini-2.5-flash` → `gemini-3.1-pro-preview` | Flash parses the JD; a free Python pre-filter and geo-eligibility gate drop what Pro shouldn't be paid to read; Pro scores the rest against the profile |
+| Tailoring (`tools/tailoring/`) | `gemini-2.5-flash` | Reranks bullets, writes an objective, renders an ATS-safe résumé |
 | Application (`tools/submitters/`) | — (Playwright) | Submits to Greenhouse by driving the real form; falls back to manual apply |
 | Tracking | — | Records application status (deferred) |
 

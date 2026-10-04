@@ -1347,6 +1347,10 @@ def test_an_uncontested_rehearsal_does_record_a_dead_posting(submission_world):
             "decided_at": submission_world.decision_events[0]["decided_at"],
             "actor": "system",
             "score_snapshot": None,
+            # No impression to join to: a pre-flight dismissal answers no list
+            # anybody was shown, so the exposure link is explicitly absent
+            # rather than stamped with whenever the user last opened the queue.
+            "shown_at": None,
         }
     ]
 
