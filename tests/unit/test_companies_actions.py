@@ -2,23 +2,19 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The company-management endpoints, now that they write a per-user overlay.
 
-This file used to test ``tools.companies``' YAML mutators — ``promote_to_known``
-and friends. They passed, and the feature did not work: they edited
-``data/companies/*.yaml`` on the container serving the API request, while under
-``QUEUE_MODE=1`` the crawl reads that file on ``hermes-worker``, and a deploy
-replaced the filesystem regardless. Passing tests over a write nobody reads.
+The predecessor tests covered ``tools.companies``' YAML mutators and passed
+while the feature did not work: they edited ``data/companies/*.yaml`` on the
+API container, while under ``QUEUE_MODE=1`` the crawl reads that file on
+``hermes-worker`` and a deploy replaces the filesystem anyway. So the claims
+here are about the seam that actually decides the fetch set:
 
-So the claims here are about the seam that actually decides the fetch set:
-
-1. A click writes **one document, at the key the reader reads**, and the crawl's
-   composed fetch set changes as a result. The last test walks the whole path
-   rather than trusting that the write shape and the read shape agree.
+1. A click writes **one document, at the key the reader reads**, and the
+   crawl's composed fetch set changes as a result. The last test walks the
+   whole path rather than trusting the write and read shapes to agree.
 2. The write is a blind ``set()`` of a document whose id is the key — never a
-   read-modify-write of a list, which is what the old mutators did and what
-   loses one of two concurrent clicks.
-3. The pool and the overlay stay distinguishable in the response. The global
-   blocklist applies to everyone; an exclusion applies to one user. A UI that
-   showed them as one thing would be lying about both.
+   read-modify-write of a list, which loses one of two concurrent clicks.
+3. The pool and the overlay stay distinguishable in the response: the global
+   blocklist applies to everyone, an exclusion to one user.
 4. ``promote`` is gone, and a slug that cannot be a document id is a 4xx.
 """
 

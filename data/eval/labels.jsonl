@@ -1,0 +1,7 @@
+# Hand-written scoring labels, one JSON object per line. See README.md.
+# Blank lines and lines starting with '#' are ignored.
+# These three rows are a committed EXAMPLE of the schema, not real labels —
+# the job ids are fake. Replace them; never generate labels.
+{"job_id": "example-greenhouse-0001", "fit": true}
+{"job_id": "example-greenhouse-0002", "fit": false, "parse": {"seniority": "staff"}}
+{"job_id": "example-lever-0003", "fit": false, "parse": {"job_country": "US", "remote_policy": "hybrid", "us_remote_ok": false}}

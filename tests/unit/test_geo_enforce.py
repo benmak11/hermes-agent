@@ -2,27 +2,25 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The geo gate allowed to *act* — and shipped switched off.
 
-Phase 1C wired ``tools.matching.geo`` in as a tape recorder
-(``test_geo_shadow.py``). This is the machinery that lets it skip the Pro call
-instead, behind ``GEO_GATE_ENFORCE``, which defaults to off. Three things are
-being pinned, and they are not equally important:
+``test_geo_shadow.py`` covers the gate as a tape recorder. This is the
+machinery that lets it skip the Pro call instead, behind ``GEO_GATE_ENFORCE``,
+which defaults to off. Three things are pinned:
 
-**1. The merge-safety proof.** With the flag off — the shipped state — nothing
-in this phase can produce a skip, and the pre-filter never so much as consults
-the gate. If any test here could tell the enforcing code apart from the code
-that shipped before it *while the flag is off*, the phase has quietly become a
-behavior change.
+**1. Merge safety.** With the flag off — the shipped state — nothing here can
+produce a skip and the pre-filter never consults the gate. If any test could
+tell the enforcing code from its predecessor while the flag is off, this has
+quietly become a behavior change.
 
-**2. The sentinel is 0, not 20.** ``score.DISCARD_AT_OR_BELOW`` is 20 and means
-one thing everywhere: *Pro* applied Rule 6's geographic cap. A gate-issued 20
-would forge Pro decisions that were never made — corrupting
-``cli.geo_replay``'s ``GEO_CAP_SCORE``, ``shadow_geo_gate``'s ``pro_capped``,
-and every tombstone count derived from either.
+**2. The sentinel is 0, not 20.** ``score.DISCARD_AT_OR_BELOW`` is 20 and
+means one thing everywhere: *Pro* applied Rule 6's geographic cap. A
+gate-issued 20 would forge Pro decisions, corrupting ``cli.geo_replay``'s
+``GEO_CAP_SCORE``, ``shadow_geo_gate``'s ``pro_capped`` and every tombstone
+count derived from either.
 
-**3. The skip is reversible.** ``discarded_jobs`` is discovery's dedupe key, so
-a wrong skip suppresses a posting forever rather than losing one job. The
-``restore`` payload and ``cli.geo_resurrect`` are what make that recoverable,
-and the write ordering inside a resurrection is itself load-bearing.
+**3. The skip is reversible.** ``discarded_jobs`` is discovery's dedupe key,
+so a wrong skip suppresses a posting forever. The ``restore`` payload and
+``cli.geo_resurrect`` make it recoverable, and the write ordering inside a
+resurrection is itself load-bearing.
 """
 
 import asyncio

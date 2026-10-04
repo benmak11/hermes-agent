@@ -3,47 +3,33 @@
 """
 Replay ``tools.matching.geo`` over already-scored history and measure it.
 
-READ-ONLY, and free: this streams Firestore, writes nothing, and calls no
-model. It exists because the geo gate is only worth shipping if it is provably
-safe, and "provably" here means one number — the false-positive rate against
+READ-ONLY and free: streams Firestore, writes nothing, calls no model. It
+exists to produce one number — the gate's false-positive rate against
 decisions Pro already made and was paid for.
 
-The corpus is every job doc carrying **both** ``jd_parsed`` and ``match``.
-Those docs all survived ``score.persist_result``, which tombstones anything at
-or below 20 — so with rare exceptions (docs the user acted on before the
-discard rule existed) *Pro judged every one of them eligible*. That makes the
-arithmetic unusually clean:
+The default corpus is every job doc carrying both ``jd_parsed`` and ``match``.
+Those all survived ``score.persist_result``, which tombstones anything at or
+below 20, so Pro judged essentially every one of them eligible:
 
 - **false positive** — the gate says ``ineligible``, Pro scored above 20. A job
-  the user would have been shown and now never sees. This is the number that
-  decides whether the gate ships.
+  the user would have been shown and now never sees. This decides whether the
+  gate ships.
 - **true positive** — the gate says ``ineligible`` and Pro also capped at
   exactly 20. A Pro call we could have skipped.
 - **miss** — the gate abstains where Pro capped at 20. Coverage left on the
-  table, which costs money but nothing else.
+  table, which costs money and nothing else.
 
-``--with-discarded`` also counts the ``discarded_jobs`` tombstones, which is
-where most of the geo rejections actually went. They can only ever be a
-denominator: ``score.discard_tombstone`` writes a deliberately minimal record
-with a ``score`` and no ``jd_parsed``, so there is nothing to run the gate
-against.
+``--with-discarded`` also counts the ``discarded_jobs`` tombstones, where most
+geo rejections went. They are counted as a denominator only.
 
-``--corpus jd-cache`` answers the *other* question — the one the per-user
-``jobs`` corpus structurally cannot. That corpus is survivorship-filtered: every
-job the gate would have caught was tombstoned out of it, so it can falsify the
-gate (any ``ineligible`` verdict in it is a false positive) but can never show
-that the gate fires at all. The top-level ``jd_cache`` collection has neither
-problem. Parses are cached the moment Flash produces one, independently of
-whether the job was later kept, tombstoned or never scored, and the cache is
-cross-user — so it is the closest thing to an unfiltered sample of what the
-crawler actually finds. It costs nothing to read and nothing to evaluate: the
-parses are already paid for and the gate is pure.
-
-What it reports is a distribution, not a contingency table. A ``jd_cache`` doc
-carries no ``match``, so there is no Pro decision to compare against and no
-false-positive rate to compute; the FP number stays the ``jobs`` corpus's job.
-Read the two together — one says the gate is safe, the other says it is not
-silent.
+``--corpus jd-cache`` answers the question the per-user ``jobs`` corpus
+structurally cannot. That corpus is survivorship-filtered — every job the gate
+would have caught was tombstoned out of it — so it can falsify the gate but can
+never show that the gate fires at all. The cross-user ``jd_cache`` collection
+caches parses the moment Flash produces one, regardless of what happened to the
+job afterwards, so it is the closest thing to an unfiltered sample. It reports
+a distribution, not a contingency table: a cache doc carries no ``match``, so
+there is no false-positive rate to compute there.
 
 Usage:
     python -m cli.geo_replay --user-id me
@@ -123,10 +109,9 @@ class Replay:
     def pro_calls(self) -> int:
         """Every Pro call this user's history represents.
 
-        The kept records, plus the tombstones that cost a Pro call — which is
-        all of them *except* the out-of-family sentinel, since
-        ``pipeline.OUT_OF_FAMILY`` is returned by the pre-filter without any
-        call being made. Zero unless ``--with-discarded`` did the counting.
+        The kept records plus every tombstone except the out-of-family
+        sentinel, which the pre-filter returns without calling Pro. Zero unless
+        ``--with-discarded`` did the counting.
         """
         return self.n + self.tombstones - self.tombstones_free
 
@@ -144,11 +129,10 @@ class Replay:
 def upper_bound_95(k: int, n: int) -> float:
     """95% one-sided upper bound on a rate, as a percentage.
 
-    Zero observed failures is the expected outcome here and the case a naive
-    ``k/n`` reports as "0%, done" — which is not what a sample of 1,127 can
-    support. The rule of three (``3/n``) is the standard answer for that case;
-    anything else falls back to a Wilson score bound, which stays sane at the
-    small counts this will actually see.
+    Zero observed failures is the expected outcome, and a naive ``k/n`` reports
+    that as "0%", which no finite sample supports. ``k == 0`` uses the rule of
+    three; anything else uses a Wilson score bound, which stays sane at small
+    counts.
     """
     if n == 0:
         return 100.0
@@ -200,8 +184,8 @@ async def replay_user(
         try:
             parsed = ParsedJD.model_validate(doc["jd_parsed"])
         except Exception:
-            # An old doc whose parse predates a schema change contributes
-            # nothing either way; counted so it can't hide a systematic gap.
+            # A parse predating a schema change contributes nothing either
+            # way; counted so it can't hide a systematic gap.
             result.unparseable += 1
             continue
         decision = geo.evaluate(parsed, profile)
@@ -217,9 +201,8 @@ async def replay_user(
             if score == GEO_CAP_SCORE:
                 result.tombstones_capped += 1
             elif score == 0.0:
-                # pipeline.OUT_OF_FAMILY's sentinel: the family pre-filter
-                # returned it without ever calling Pro, so it is free and must
-                # not inflate the denominator below.
+                # pipeline.OUT_OF_FAMILY's sentinel: no Pro call was made, so
+                # it must not inflate the denominator below.
                 result.tombstones_free += 1
     return result
 
@@ -228,11 +211,10 @@ async def replay_user(
 class CacheReplay:
     """The gate's verdict distribution over the cross-user parse cache.
 
-    Deliberately *not* a :class:`Replay`. There is no ``capped`` axis here — a
-    ``jd_cache`` doc is a parse and nothing else — and reusing the contingency
-    table would print a false-positive rate of zero over a corpus that cannot
-    measure one, which is the single most misreadable number this tool could
-    emit.
+    Deliberately not a :class:`Replay`: a cache doc is a parse and nothing
+    else, so there is no ``capped`` axis, and reusing the contingency table
+    would print a false-positive rate of zero over a corpus that cannot measure
+    one.
     """
 
     user_id: str
@@ -253,11 +235,9 @@ async def replay_jd_cache(
 ) -> CacheReplay | None:
     """Run the gate over every cached parse. ``None`` = no usable profile.
 
-    A profile is still needed, and for one field: ``geo.evaluate`` reads
-    ``residence.country`` and nothing else (see ``tools/matching/geo.py``). So
-    ``--user-id`` here does not select the corpus — the corpus is everything —
-    it selects the *residence the corpus is evaluated against*. Two users whose
-    residence normalizes to the same country produce byte-identical output.
+    ``--user-id`` does not select the corpus — the corpus is every cached
+    parse. It selects the residence the corpus is evaluated against, since
+    ``geo.evaluate`` reads ``residence.country`` and nothing else.
     """
     result = CacheReplay(user_id=user_id)
     snap = await db.collection("users").document(user_id).get()
@@ -278,9 +258,8 @@ async def replay_jd_cache(
         try:
             parsed = ParsedJD.model_validate(doc.get("jd_parsed"))
         except Exception:
-            # Schema drift, exactly as ``jd_cache.lookup_many`` treats it: a
-            # doc the current model can't read is a miss, not a verdict.
-            # Counted so a systematic gap can't hide behind a clean histogram.
+            # Schema drift, as ``jd_cache.lookup_many`` treats it: a doc the
+            # current model can't read is a miss, not a verdict.
             result.unparseable += 1
             continue
         result.record(geo.evaluate(parsed, profile))
@@ -339,12 +318,9 @@ def report(r: Replay, *, title: str) -> None:
     )
 
     if r.tp + r.missed == 0:
-        # The expected outcome, and it must not be misread as a broken gate.
-        # `persist_result` tombstones everything at or below 20, so the geo
-        # rejections are exactly the records that are NOT here. This corpus
-        # can therefore falsify the gate (any ineligible verdict in it is a
-        # false positive) but can never confirm its coverage — the reduction
-        # figure above is a floor of zero, not a measurement.
+        # Expected, not a broken gate: `persist_result` tombstones everything
+        # at or below 20, so the geo rejections are the records that are NOT
+        # here. The reduction figure above is a floor, not a measurement.
         print(
             "   ^ this corpus is survivorship-biased: every geo rejection was\n"
             "     tombstoned out of `jobs`, so 0 is the expected reduction here\n"
@@ -356,9 +332,11 @@ def report(r: Replay, *, title: str) -> None:
         print(f"     {count:6d}  {rule}")
 
     if r.tombstones:
-        # The other half of the denominator — counts only, since a tombstone
-        # carries a score and no jd_parsed. This is where the gate's actual
-        # upside lives, and the one place its size can be seen.
+        # The other half of the denominator, counted rather than replayed.
+        # This is where the gate's upside lives and the one place its size
+        # shows. (Tombstones have carried ``jd_parsed`` since the negatives
+        # began storing features, so they are replayable in principle; the
+        # printed note below still says otherwise and is stale.)
         print(
             f"\n   discarded_jobs tombstones: {r.tombstones}"
             f" ({r.tombstones_free} scored 0 = out-of-family, never a Pro call)"
@@ -412,9 +390,9 @@ async def main() -> None:
         parser.error("pass --user-id (repeatable) or --all-users")
 
     if args.corpus == "jd-cache":
-        # One residence, one distribution. Allowing several would print the
-        # same corpus repeatedly under different profiles with no way to tell
-        # from the totals that the denominator never changed.
+        # One residence, one distribution: several would print the same corpus
+        # repeatedly with no sign in the totals that the denominator never
+        # changed.
         if args.all_users or len(args.user_ids) != 1:
             parser.error("--corpus jd-cache takes exactly one --user-id")
         bind_run_context("geo_replay", user_id=args.user_ids[0])

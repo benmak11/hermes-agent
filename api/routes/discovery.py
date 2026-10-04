@@ -2,25 +2,21 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Auto-discovery settings + scheduler.
 
-The user regulates, from the Profile page, how often the discovery agent finds
-new jobs and how often already-discovered postings are re-checked against
-their ATS (the liveness sweep). Two triggers drive the loops:
+The user sets, from the Profile page, how often the discovery agent finds new
+jobs and how often already-discovered postings are re-checked against their ATS
+(the liveness sweep). Two triggers drive the loops: opportunistic ticks, where
+hot endpoints schedule ``tick_user`` as a background task, and
+``POST /internal/cron/tick`` for unattended runs.
 
-- **Opportunistic ticks**: hot endpoints schedule ``tick_user`` as a background
-  task, so cadences are honored whenever the app is in use — no infra needed.
-- **``POST /internal/cron/tick``**: a secret-protected endpoint for Cloud
-  Scheduler / a GitHub Actions cron, for truly unattended runs while the
-  Cloud Run instance is otherwise scaled to zero.
+A tick leases the slot; the cycle's own success write releases it. The slot is
+claimed by ``last_*_at``, written by :func:`run_discovery_cycle` /
+:func:`run_sweep_cycle` only once the work has actually happened, so a run that
+died is never mistaken for one that succeeded. The lease covers the gap in
+between: it stops a second tick dispatching on top of a live run, expires on
+its own if the run is killed silently, and is dropped if the run fails loudly
+so the next hourly tick retries.
 
-**A tick leases the slot; the cycle's own success write releases it.** The
-slot is claimed by ``last_*_at``, and that field is written by
-:func:`run_discovery_cycle` / :func:`run_sweep_cycle` when the work has
-actually happened. A tick used to write it *before* dispatching, which made a
-run that died indistinguishable from one that succeeded — the user then waited
-out a full ``discovery_interval_hours`` before anything retried. The lease
-covers only the gap in between: it stops a second tick dispatching on top of a
-live run, expires on its own if the run is killed silently, and is dropped
-immediately if the run fails loudly, so the next hourly tick retries.
+Discovery cycles commit real Gemini spend.
 """
 
 from __future__ import annotations
@@ -62,49 +58,28 @@ log = get_logger("api.discovery")
 router = APIRouter(tags=["discovery"])
 
 # In-process throttle so polling endpoints don't re-read settings on every hit.
-# Deliberately per-instance and not moved to Firestore: it is a throttle, not a
-# lock — correctness against multiple Cloud Run instances is the slot lease's
-# job (_LEASE_SECONDS below), and the worst a missed throttle costs is one extra
-# settings read. Decided and closed in Phase 3; please don't re-litigate.
+# Per-instance on purpose: it is a throttle, not a lock — correctness across
+# Cloud Run instances is the slot lease's job (_LEASE_SECONDS below).
 _TICK_CHECK_EVERY = timedelta(minutes=5)
 _last_tick_check: dict[str, datetime] = {}
 
-# ``write_option`` is a *staticmethod* factory: it builds a precondition and
-# never touches a client or the network. Bound once, the way
-# ``tools.applications.state`` binds it, so the compare-and-swaps below need no
-# client instance to construct one.
+# ``write_option`` is a staticmethod factory: it builds a precondition and never
+# touches a client or the network, so the compare-and-swaps below need no client
+# instance to construct one.
 _precondition = firestore.Client.write_option
 
-#: Seconds a slot lease stays valid, and **the inequality that makes it a
-#: lock**: a lease must outlive the longest run it guards.
+#: Seconds a slot lease stays valid. The inequality that makes it a lock: a
+#: lease must outlive the longest run it guards, so it is derived from Cloud
+#: Tasks' ``_DISPATCH_DEADLINE_SECONDS`` (1800) with the grace added on top,
+#: never subtracted. A lease shorter than the run is not a weaker lock but no
+#: lock at all — it has expired before the run could have finished, so every
+#: tick in the meantime reads it as permission (shipped once, as a 1200s lease
+#: over 1800s of work).
 #:
-#: Derived from the dispatch deadline rather than restated, for the reason
-#: ``tools.applications.state._LEASE_SECONDS`` spells out. Cloud Tasks abandons
-#: a dispatch at ``_DISPATCH_DEADLINE_SECONDS`` (1800), so 1800s is the longest
-#: a queued cycle can still be running *as far as the queue is concerned* — and
-#: that is the load-bearing anchor here, because it is the one that lives in
-#: this repo. hermes-worker's ``timeoutSeconds`` is also 1800, but it is a Cloud
-#: Run value set by hand and represented in no terraform CI would check; if it
-#: were raised, the queue would abandon and possibly redeliver at 1800s anyway,
-#: which is a duplicate-dispatch exposure this module already had and does not
-#: add to.
-#:
-#: A lease *shorter* than the run is not a weaker lock, it is **no lock**: it is
-#: guaranteed to have expired before the run could possibly have finished, so
-#: every tick in the meantime reads it as permission. This project has already
-#: shipped that bug once (a 1200s lease over 1800s of work, PR B). The grace is
-#: added on top of the deadline, never subtracted from it.
-#:
-#: **This bounds run duration and nothing else**, which is why the lease is
-#: re-stamped when the run starts — see :func:`_extend_slot`. Sizing it to also
-#: cover an unbounded queue wait would mean a silently dead run held its slot
-#: for that whole span.
-#:
-#: **Deliberately not a heartbeat.** Recovery latency here is bounded by the
-#: hourly Cloud Scheduler tick, not by this TTL: a lease that lapses at T+1860
-#: and one a dead heartbeat frees at T+1830 are collected by the same next tick,
-#: so a heartbeat would be observably identical while having to be threaded
-#: through the whole body of ``run_discovery_cycle``.
+#: This bounds run duration and nothing else, which is why the lease is
+#: re-stamped when the run starts — see :func:`_extend_slot`. Covering an
+#: unbounded queue wait too would mean a silently dead run held its slot for
+#: that whole span.
 _LEASE_GRACE_SECONDS = 60
 _LEASE_SECONDS = queues._DISPATCH_DEADLINE_SECONDS + _LEASE_GRACE_SECONDS
 
@@ -119,32 +94,29 @@ _CRON_TRIGGER = "cron"
 _OPPORTUNISTIC_TRIGGER = "opportunistic"
 
 #: The triggers :func:`tick_user` dispatches under, and therefore the only ones
-#: that arrive holding a lease. ``manual`` (``POST /settings/discovery/run``)
-#: and ``onboarding`` (the kickoff in ``api.routes.profile``) go straight to
-#: :func:`dispatch_cycle` and take no slot at all, so a failing one of those
-#: must not release a *scheduled* run's lease out from under it.
+#: that arrive holding a lease. ``manual`` and ``onboarding`` go straight to
+#: :func:`dispatch_cycle` and take no slot, so a failure on one of those must
+#: not release a scheduled run's lease out from under it.
 SLOT_TRIGGERS = frozenset({_CRON_TRIGGER, _OPPORTUNISTIC_TRIGGER})
 
 _MANUAL_TRIGGER = "manual"
 _ONBOARDING_TRIGGER = "onboarding"
 
-#: The triggers whose dispatch **charged a run against the weekly allowance**,
-#: and therefore the only ones a pre-work refusal inside the cycle may refund.
-#: Every other trigger (a CLI ``scheduled`` run, a worker replaying something
-#: by hand) never took a run, and crediting one back for it would hand out an
-#: allowance nobody spent — the one direction a cap must not fail in.
+#: The triggers whose dispatch charged a run against the weekly allowance, and
+#: therefore the only ones a pre-work refusal inside the cycle may refund.
+#: Every other trigger never took a run, and crediting one back would hand out
+#: an allowance nobody spent — the one direction a cap must not fail in.
 #:
-#: The charge itself lives at the three *dispatch* sites — :func:`tick_user`
-#: once its ``_claim_slot`` has won, :func:`run_discovery_now`, and the
-#: onboarding kickoff in ``api.routes.profile`` — and deliberately **not** in
-#: the worker's ``/tasks/discovery*`` handlers, where a Cloud Tasks redelivery
-#: would charge a second time for one user-visible search.
+#: The charge lives at the three dispatch sites — :func:`tick_user` once its
+#: ``_claim_slot`` has won, :func:`run_discovery_now`, and the onboarding
+#: kickoff in ``api.routes.profile`` — and not in the worker's
+#: ``/tasks/discovery*`` handlers, where a redelivery would charge twice for
+#: one user-visible search.
 CHARGED_TRIGGERS = SLOT_TRIGGERS | {_MANUAL_TRIGGER, _ONBOARDING_TRIGGER}
 
-#: The one way to run the real pipeline from a developer's machine anyway.
-#: Deliberately a second, explicit variable rather than "unset AUTH_DEV_MODE":
-#: unsetting the bypass also takes away the way you were calling the API, so the
-#: cheapest route around the guard would have been to delete it.
+#: The one way to run the real pipeline from a developer's machine anyway. A
+#: separate variable rather than "unset AUTH_DEV_MODE", because unsetting the
+#: bypass also takes away the way you were calling the API.
 LIVE_RUN_OVERRIDE = "ALLOW_LIVE_RUNS"
 
 LIVE_RUN_REFUSED = (
@@ -156,16 +128,11 @@ LIVE_RUN_REFUSED = (
 def refuse_live_runs() -> None:
     """Dependency form of :func:`live_runs_refused`, for paid routes.
 
-    **Exists for an ordering reason, not a style one.** A route that carries
-    the consent seam as a dependency has its token *consumed* — and deleted,
-    single-use — while FastAPI is still solving parameters, before a line of
-    the handler body runs. A ``live_runs_refused()`` check at the top of that
-    body therefore 403s having already spent the user's confirmation, and
-    they have to confirm again to be refused again.
-
-    Route-level ``dependencies=[...]`` are inserted ahead of the signature's
-    own dependencies, so this runs first and the token survives the refusal.
-    Pinned in ``test_jobs_score_route.py``.
+    Exists for ordering: a route carrying the consent seam as a dependency has
+    its single-use token consumed while FastAPI is still solving parameters, so
+    a check in the handler body would 403 after spending the confirmation.
+    Route-level ``dependencies=[...]`` run ahead of the signature's own, so this
+    refuses with the token intact. Pinned in ``test_jobs_score_route.py``.
     """
     if live_runs_refused():
         raise HTTPException(status_code=403, detail=LIVE_RUN_REFUSED)
@@ -174,23 +141,14 @@ def refuse_live_runs() -> None:
 def live_runs_refused() -> bool:
     """Would starting a real crawl here be a local process driving production?
 
-    **This has happened.** On 2026-08-23 a local harness posted to
-    ``POST /settings/discovery/run`` through FastAPI's ``TestClient``, which runs
-    ``background_tasks`` *synchronously* — so the call did not schedule a crawl
-    for later, it ran one: ~110s against production on ADC credentials, 8,469
-    junk jobs written to a real user, ~$0.50-1.00 spent. Phase 1's budget cap
-    bounded the damage; nothing prevented the trigger.
+    The guard exists because it happened: a local harness once ran a real
+    production crawl, writing thousands of junk jobs and spending money.
 
-    The signal is ``api.deps.dev_mode()`` — ``AUTH_DEV_MODE=1`` — because that is
-    what actually tells the two cases apart. There is one GCP project and it is
-    production, so "am I pointed at production?" is always yes and cannot
-    discriminate; what a deployed revision never has is this variable, which
-    Terraform does not set. So: dev bypass on ⇒ local process ⇒ the pipeline it
-    would drive is the real one, and it needs to be asked for by name.
-
-    Not applied to the queued path *versus* the in-process one, but to both: an
-    enqueue from a laptop with ``QUEUE_MODE=1`` hands the same crawl to the real
-    worker, which is the same spend one process further away.
+    The signal is ``api.deps.dev_mode()`` (``AUTH_DEV_MODE=1``), because there
+    is one GCP project and it is production — "am I pointed at production?"
+    cannot discriminate, but a deployed revision never has this variable.
+    Applies to the queued path as well as the in-process one: an enqueue from a
+    laptop hands the same spend to the real worker.
     """
     if os.getenv(LIVE_RUN_OVERRIDE, "").strip().lower() in {"1", "true", "on"}:
         return False
@@ -207,13 +165,9 @@ def _client() -> firestore.Client:
     return _db
 
 
-#: An async client, for the two things in this module that are natively async:
-#: :func:`_allowlisted` (``tools.allowlist.is_allowed`` is shared with
-#: ``api.deps``, which runs on an event loop with no thread hop to spare) and
-#: :func:`_backlog`. Everything else here is sync-plus-``asyncio.to_thread``.
-#: Memoising it is safe for the reason ``_client`` above and
-#: ``api.routes.account``'s async client both are: one uvicorn loop for the
-#: life of the process.
+#: An async client, for the two natively async things here (:func:`_allowlisted`
+#: and :func:`_backlog`); everything else is sync plus ``asyncio.to_thread``.
+#: Memoising is safe because there is one uvicorn loop for the process's life.
 _adb: firestore.AsyncClient | None = None
 
 
@@ -235,22 +189,15 @@ def _now() -> datetime:
 async def _allowlisted(user_id: str) -> bool:
     """Is this user's Auth email an active allowlist seat?
 
-    Reached only from :func:`cron_tick`'s fan-out, and only while
-    ``tools.allowlist.enforced()`` is on. That endpoint is the one caller that
-    reaches a user without ever passing through ``verify_user`` — it streams
-    every document in ``users`` — which is exactly why PR C's
-    :func:`is_deleted` check lives at this same seam: a de-allowlisted user's
-    background loops have to stop *here*, or removing them from the allowlist
-    bounds none of their spend.
+    Reached only from :func:`cron_tick`'s fan-out, which is the one caller that
+    reaches a user without passing through ``verify_user`` — a de-allowlisted
+    user's background loops have to stop here or removing their seat bounds
+    none of their spend.
 
-    Reads the Auth email, never ``users/{uid}.email`` — same reasoning as
-    everywhere else this PR touches: the profile field is résumé-extracted and
-    is not guaranteed to be the login address, where the Auth email is what
-    :func:`tools.allowlist.is_allowed` is keyed on. ``get_user`` is a blocking
-    Firebase Admin call, off the event loop via ``asyncio.to_thread``; a
-    lookup that fails for any reason (the account is gone, the Admin SDK is
-    unreachable) reads as "not allowed" — the same fail-closed bias
-    :func:`tools.allowlist.is_allowed` documents for itself.
+    Reads the Auth email, never ``users/{uid}.email``: the profile field is
+    résumé-extracted and may not be the login address, which is what
+    :func:`tools.allowlist.is_allowed` is keyed on. Any failed lookup reads as
+    "not allowed" — fail closed.
     """
     try:
         record = await asyncio.to_thread(firebase_auth().get_user, user_id)
@@ -263,21 +210,14 @@ async def _allowlisted(user_id: str) -> bool:
 async def _account_deleted(user_id: str) -> bool:
     """Has this user deleted their account? One read, on the cycle's own thread.
 
-    ``tick_user`` and ``cron_tick`` already hold the user document and check
-    :func:`is_deleted` directly; the cycles do not, because they are reached
-    from the worker's ``/tasks/*`` handlers with nothing but a user id — so a
-    deletion that lands while a task sits in the queue is only visible here.
-    One extra ``get`` per cycle, against a crawl that costs a hundred HTTP
-    fetches and a Gemini call per job.
+    The cycles reach the worker's ``/tasks/*`` handlers with nothing but a user
+    id, so a deletion that lands while a task sits in the queue is only visible
+    here.
 
-    Deliberately not exception-handled, unlike :func:`_extend_slot` and
-    :func:`_release_slot`. Those are bookkeeping *after* a run has been
-    committed to, and a cycle must not die because its bookkeeping did; this is
-    a precondition *before* one, like :func:`_claim_slot`, which also lets a
-    failed read propagate. A raise here costs a retry of a run that has not
-    happened and spent nothing. Swallowing it would instead mean treating an
-    unreadable document as "not deleted" — the guard turning itself off exactly
-    when Firestore is unhappy.
+    Not exception-handled, unlike :func:`_extend_slot` and :func:`_release_slot`:
+    this is a precondition before a run, so a raise costs a retry of work that
+    never happened, where swallowing would read an unreadable document as "not
+    deleted" and turn the guard off exactly when Firestore is unhappy.
     """
     snap = await asyncio.to_thread(_user_ref(user_id).get)
     return is_deleted(snap.to_dict())
@@ -312,14 +252,11 @@ def _lease_at(lease, key: str) -> datetime | None:
 def _lease_held(lease, now: datetime) -> bool:
     """Is a run holding this loop's slot right now? Pure.
 
-    **The bias is the opposite of ``tools.applications.state.lease_is_held``'s,
-    deliberately.** There an unreadable lease counts as *held*, because refusing
-    to claim only wedges one document while claiming anyway risks a duplicate
-    real job application. Here nothing reaps a slot: a lease read as held is
-    never dispatched against, so nothing ever runs to clear it, and this user's
-    loops stop **permanently** — which is precisely the "discovery never runs"
-    failure this module exists to prevent. Reading a corrupt lease as free costs
-    at most one extra cycle and overwrites the corrupt value on the way past.
+    An unreadable lease reads as *free* here — the opposite bias to
+    ``tools.applications.state.lease_is_held``. Nothing reaps a slot, so a lease
+    read as held is never dispatched against and this user's loops would stop
+    permanently; reading a corrupt lease as free costs at most one extra cycle
+    and overwrites the corrupt value on the way past.
     """
     expiry = _lease_at(lease, "expires_at")
     return expiry is not None and expiry > now
@@ -330,11 +267,10 @@ def _due(
 ) -> bool:
     """Is this loop's interval up *and* its slot free?
 
-    A live lease is not-due however old ``last_iso`` is: it means a cycle is in
-    flight that has not yet written its ``last_*_at``. Both halves are only
-    advisory at the call sites — the authoritative copy of this check runs
-    inside :func:`_claim_slot`, against the snapshot the claim is conditioned
-    on.
+    A live lease is not-due however old ``last_iso`` is: a cycle is in flight
+    that has not yet written its ``last_*_at``. Advisory at the call sites —
+    the authoritative check runs inside :func:`_claim_slot`, against the
+    snapshot the claim is conditioned on.
     """
     if _lease_held(lease, now):
         return False
@@ -353,14 +289,11 @@ def _next_iso(
 ) -> str | None:
     """The Profile card's "next run at", counted from the last *successful* run.
 
-    A held lease has to be folded in or the card reads as broken. ``last_*_at``
-    is now written only when a cycle succeeds, so while a run is in flight the
-    last success is by definition more than an interval old and the naive answer
-    is a "next run" in the past. Counting from the moment the slot was claimed
-    restores exactly what the old pre-claim displayed, and degrades honestly at
-    both ends: a run that succeeds moves the answer by its own duration, and a
-    run that fails drops its lease and the card goes back to saying the loop is
-    due now — which it is.
+    A held lease has to be folded in or the card reads as broken: ``last_*_at``
+    moves only on success, so while a run is in flight the last success is more
+    than an interval old and the naive answer is a "next run" in the past.
+    Counting from the moment the slot was claimed degrades honestly at both
+    ends — a failed run drops its lease and the card goes back to "due now".
     """
     now = now or _now()
     since = _parse_ts(last_iso)
@@ -376,27 +309,21 @@ def _next_iso(
 def _claim_slot(user_id: str, kind: str, interval_hours: int, now: datetime) -> bool:
     """Compare-and-swap this loop's lease. ``True`` iff this caller took it.
 
-    Synchronous, reached through ``asyncio.to_thread`` — the hop ``tick_user``
-    already makes for its Firestore writes — and modelled on
-    ``tools.applications.state.try_claim_lease``: read a snapshot, decide
+    Synchronous, reached through ``asyncio.to_thread``: read a snapshot, decide
     against *that* snapshot, then write with ``last_update_time=`` so the write
     fails if anything touched the document in between.
 
-    **Both preconditions are re-checked here, against this read.** The screen in
-    :func:`tick_user` runs on a document a caller may have handed over seconds
-    ago, and reads a lease another tick may have taken since — filtering outside
-    the swap is not a compare-and-swap, which is the bug every PR of this phase
-    has contained. Re-checking the *interval* matters as much as re-checking the
-    lease: a tick holding a stale document would otherwise dispatch a second
-    cycle in the window after the first one succeeded, wrote a fresh
-    ``last_*_at``, and released.
+    Both preconditions — interval and lease — are re-checked here against this
+    read. The screen in :func:`tick_user` runs on a document that may be seconds
+    old, and filtering outside the swap is not a compare-and-swap. Re-checking
+    the interval matters as much as the lease: a tick holding a stale document
+    would otherwise dispatch a second cycle in the window after the first
+    succeeded, wrote a fresh ``last_*_at`` and released.
 
-    ``dispatch_cycle``'s hour-granular task ids do not make this redundant. They
-    dedupe one ``(trigger, kind, user, hour)`` — so two cron ticks in the same
-    hour collapse — but a cron tick and the opportunistic tick from
-    ``jobs.list_pending_jobs`` carry *different* triggers and both get through,
-    as do two ticks straddling an hour boundary; and with ``QUEUE_MODE`` off
-    there is no queue and therefore no name to dedupe on at all.
+    ``dispatch_cycle``'s hour-granular task ids do not make this redundant: they
+    dedupe one ``(trigger, kind, user, hour)``, so a cron tick and an
+    opportunistic tick both get through, as do two ticks straddling an hour
+    boundary, and with ``QUEUE_MODE`` off there is no name to dedupe on at all.
     """
     field, lease_field = _SLOTS[kind]
     ref = _user_ref(user_id)
@@ -425,10 +352,9 @@ def _claim_slot(user_id: str, kind: str, interval_hours: int, now: datetime) -> 
             if attempt:
                 log.warning("tick.slot_contended", user_id=user_id, kind=kind)
                 return False
-            # One retry, for the reason ``state.try_claim_lease`` takes one:
-            # ``tools.matching.budget`` reserves out of this very document in a
-            # transaction, so a scoring run in flight bumps its update_time
-            # without going anywhere near the slot.
+            # One retry: ``tools.matching.budget`` reserves out of this very
+            # document in a transaction, so a scoring run in flight bumps its
+            # update_time without going anywhere near the slot.
             snap = ref.get()
     return False  # pragma: no cover - the loop always returns
 
@@ -436,31 +362,18 @@ def _claim_slot(user_id: str, kind: str, interval_hours: int, now: datetime) -> 
 def _extend_slot(user_id: str, kind: str, trigger: str, began: datetime) -> bool:
     """Re-stamp this loop's lease against the moment the run actually started.
 
-    **The claim and the run do not start at the same time.** ``tick_user`` takes
-    the lease *before* ``enqueue_cycle``, but :data:`_LEASE_SECONDS` is derived
-    from the dispatch deadline, which bounds how long a run may take — not how
-    long it may sit in a queue first. So a claim stamped at dispatch time is
-    spending its TTL on queue wait, and the shortfall is real rather than
-    theoretical: the ``discovery`` queue allows 3 concurrent dispatches and the
-    worker runs at ``containerConcurrency = 1`` across five queues, so a
-    fan-out where several users come due at one tick can leave the last of them
-    waiting tens of minutes. Its lease would then lapse *mid-run*, and because
-    the next hourly cron is a different task name nothing would dedupe the
-    second dispatch — a duplicate paid cycle, and a regression against the old
-    pre-claim, which held for a full interval however long the queue was.
+    The claim and the run do not start at the same time: ``tick_user`` takes the
+    lease before ``enqueue_cycle``, but :data:`_LEASE_SECONDS` bounds run
+    duration, not queue wait. Queue wait can be tens of minutes, so a lease
+    stamped at dispatch time can lapse mid-run and nothing would dedupe the
+    second dispatch — a duplicate paid cycle. Re-stamping here starts the TTL
+    when the work does, extending the tick-side claim rather than replacing it.
 
-    Re-stamping here is what ``tools.applications.state.try_claim_lease`` gets
-    for free by being taken on the worker: the TTL starts when the work does.
-    The tick-side claim is still needed and still does its own job — it is what
-    stops two ticks *dispatching* — so this extends that claim rather than
-    replacing it.
-
-    Unconditional, and deliberately not a compare-and-swap. A re-stamp that lost
-    a race would leave the lease too short, which is the bug being fixed; and
-    there is nothing to protect, because a dotted-path write touches this slot
-    and nothing else. Gated on :data:`SLOT_TRIGGERS` for the same reason
-    :func:`_release_slot` is: a manual or onboarding run holds no slot, and
-    stamping one would lock scheduled ticks out of a cadence it never joined.
+    Unconditional, not a compare-and-swap: a re-stamp that lost a race would
+    leave the lease too short, which is the bug being fixed, and a dotted-path
+    write touches this slot and nothing else. Gated on :data:`SLOT_TRIGGERS` —
+    a manual or onboarding run holds no slot, and stamping one would lock
+    scheduled ticks out of a cadence it never joined.
 
     Never raises — a cycle must not die because its bookkeeping did.
     """
@@ -480,28 +393,21 @@ def _extend_slot(user_id: str, kind: str, trigger: str, began: datetime) -> bool
 def _release_slot(user_id: str, kind: str, trigger: str, began: datetime) -> bool:
     """Hand back a lease **this** run holds, leaving the schedule alone.
 
-    The loud-failure counterpart to :func:`_claim_slot`. A cycle that raised has
-    written no ``last_*_at``, so its lease is the only thing keeping the next
-    tick off the slot — and the run is over. Leaving it there makes a failure
-    cost a lease TTL of silence on top of the failure itself.
+    The loud-failure counterpart to :func:`_claim_slot`. A cycle that raised
+    wrote no ``last_*_at``, so its lease is the only thing keeping the next tick
+    off the slot, and leaving it there costs a lease TTL of silence.
 
-    **Conditional, where the success path is not, and that asymmetry is the
-    point.** A successful cycle clears its lease inside the same unconditional
-    ``set`` that writes ``last_*_at``: even if that clear frees a *successor's*
-    lease, the fresh timestamp landing beside it holds the slot shut for a whole
-    interval (the shortest offered is 6h, against a 31-minute lease), so nothing
-    is actually unlocked and the write must never be allowed to lose. A failure
-    writes no timestamp, so the lease is all there is, and freeing one that
-    isn't ours would put two cycles on one user.
+    Conditional, where the success path is not. A successful cycle clears its
+    lease in the same unconditional ``set`` that writes ``last_*_at``, and the
+    fresh timestamp holds the slot shut for a whole interval anyway. A failure
+    writes no timestamp, so the lease is all there is and freeing one that isn't
+    ours would put two cycles on one user. Two things say whose it is:
+    ``trigger`` (see :data:`SLOT_TRIGGERS`) says a tick dispatched this run at
+    all, and ``acquired_at <= began`` says the lease on the document is still
+    the one that dispatch came from — a successor's can only be later.
 
-    Two things say whose it is, without a token to pass across the queue
-    boundary. ``trigger`` says a tick dispatched this run at all — see
-    :data:`SLOT_TRIGGERS`. ``acquired_at <= began`` says the lease on the
-    document is still the one that dispatch came from: this run's own claim was
-    taken before it started, and a successor's can only have been taken after.
-
-    Never raises: it is called from an ``except`` block, and must not replace
-    the failure the cycle already logged or skip the cost flush behind it.
+    Never raises: called from an ``except`` block, it must not replace the
+    failure the cycle already logged or skip the cost flush behind it.
     """
     if trigger not in SLOT_TRIGGERS:
         return False
@@ -541,14 +447,12 @@ def _release_slot(user_id: str, kind: str, trigger: str, began: datetime) -> boo
 
 
 def _allowance_left(user_id: str, doc: dict) -> bool:
-    """Has this user a search left this week? A **screen**, on a document the
-    caller already holds — no read, no write, no counter moved.
+    """Has this user a search left this week? A screen, on a document the caller
+    already holds — no read, no write, no counter moved.
 
-    Ordered ahead of :func:`_claim_slot` for the reason the interval check
-    already is (see that function): a capped user must cost nothing at all,
-    and a lease taken and then handed back is two writes plus a window in
-    which a second tick sees the slot as busy. The reservation that actually
-    binds is taken after the claim wins.
+    Ordered ahead of :func:`_claim_slot` so a capped user costs nothing: a lease
+    taken and handed back is two writes plus a window in which a second tick
+    sees the slot as busy. The reservation that binds is taken after the claim.
     """
     left = discovery_budget.remaining(doc.get(discovery_budget.FIELD))
     # ``None`` is the kill switch, not "zero left": with the cap off every
@@ -563,10 +467,9 @@ def _allowance_left(user_id: str, doc: dict) -> bool:
 def _cap_429(runs_this_week: int, limits: discovery_budget.Limits) -> HTTPException:
     """The weekly-cap refusal.
 
-    **429, never 402.** 402 already means "confirm the spend" to this client
-    (``api.deps.spend_402``), and it hands back a token that makes the action
-    go through. A cap is not a price: there is no token, and the only thing
-    that changes the answer is time.
+    429, never 402: 402 means "confirm the spend" to this client and hands back
+    a token that makes the action go through. A cap is not a price — there is
+    no token, and only time changes the answer.
     """
     return HTTPException(
         status_code=429,
@@ -584,14 +487,14 @@ def _cap_429(runs_this_week: int, limits: discovery_budget.Limits) -> HTTPExcept
 async def _refund_run(user_id: str, trigger: str, *, week: str | None = None) -> None:
     """Hand back a charged run that never became work. Never raises.
 
-    Only for **pre-work** outcomes — a queue dedupe, a refused live run, a
-    deleted account. A crawl that ran and then failed keeps its charge: the
-    next scheduled tick is the retry, and 14/week is itself the retry bound.
+    Only for pre-work outcomes — a queue dedupe, a refused live run, a deleted
+    account. A crawl that ran and then failed keeps its charge; the next
+    scheduled tick is the retry.
 
     ``week`` defaults to the current key rather than the reservation's, because
-    the cycle-side callers run on the worker with nothing but a user id. That
-    is the right semantic either way: ``apply_release`` credits a counter only
-    while it still describes the window the run was taken from.
+    the cycle-side callers run on the worker with nothing but a user id;
+    ``apply_release`` credits a counter only while it still describes the
+    window the run was taken from.
     """
     if trigger not in CHARGED_TRIGGERS:
         return
@@ -606,12 +509,10 @@ async def _refund_run(user_id: str, trigger: str, *, week: str | None = None) ->
 async def _backlog(user_id: str) -> int | None:
     """The unscored backlog, or ``None`` when it could not be counted.
 
-    Never raises. This is a *report*, and it runs inside the cycle's ``try``
-    where an exception would mark a run that already did its work — and may
-    already have paid for scoring — as failed. ``None`` rather than 0 for the
-    same reason the Profile card refuses to render an absent budget: a
-    fabricated zero says "nothing is waiting", which is a claim, and a wrong
-    one.
+    Never raises: it runs inside the cycle's ``try``, where an exception would
+    mark a run that already did its work — and may already have paid for
+    scoring — as failed. ``None`` rather than 0 because a fabricated zero
+    claims "nothing is waiting".
     """
     try:
         return await count_unscored(_async_client(), user_id)
@@ -625,36 +526,24 @@ async def run_discovery_cycle(
 ) -> None:
     """Background: discover new jobs, and (unless ``score`` is off) score them.
 
-    **``score`` separates the two verbs, and only the manual path uses it.**
-    Finding jobs is free; scoring them is the money. A manual "run now" with
-    no scoring consent runs with ``score=False`` and stops at the persist, and
-    the card then offers a second, priced click. Every *unattended* trigger —
-    ``cron``, ``opportunistic``, ``onboarding`` — keeps ``score=True``: there
-    is nobody there to make the second click, so splitting them would mean
-    nothing ever gets scored, and for those the auto-discovery toggle is the
-    consent.
+    Scoring spends real money on Gemini; finding jobs is free. ``score``
+    separates the two, and only the manual path uses it: a "run now" without
+    scoring consent stops at the persist and the card offers a second, priced
+    click. Unattended triggers (``cron``, ``opportunistic``, ``onboarding``)
+    keep ``score=True`` — nobody is there to make the second click, and the
+    auto-discovery toggle is the consent.
 
-    Runs under a ``run_id`` log context, so every line the cycle emits — the
-    discovery fetches, the per-job ``matching.scored`` events, the summary —
-    can be pulled up with ``jsonPayload.run_id="..."`` in Cloud Logging.
+    Runs under a ``run_id`` log context, so every line the cycle emits can be
+    pulled up with ``jsonPayload.run_id="..."`` in Cloud Logging.
 
-    **The chokepoint for :func:`live_runs_refused`.** The manual route refuses
-    early so the caller gets a 403 instead of silence, but every other way into
-    a live crawl lands here — the opportunistic tick that ``GET
-    /settings/discovery`` schedules, ``cron_tick``'s fan-out, the onboarding
-    kickoff, the worker's ``/tasks/*`` handlers — and under ``TestClient`` a
-    background task is not "later", it is now. Refusing before the first
-    ``_extend_slot`` write means a refused run touches no Firestore either.
-
-    **And the chokepoint for a deleted account**, for the same reason: a task
-    already on the queue when the user deleted themselves arrives here holding
-    nothing but a user id. The refusal is ahead of every write this function
-    makes, which matters more here than anywhere else — the success write below
-    is a ``set(..., merge=True)`` that would **recreate** the deleted user
-    document, and ``persist_new_jobs`` would refill the subcollection under it.
-    That is also this guard's honest limit: it stops a cycle that has not
-    started, not one already past this line. See
-    :func:`tools.account.delete.delete_account`.
+    The chokepoint for :func:`live_runs_refused` and for a deleted account:
+    every other way into a live crawl lands here holding nothing but a user id,
+    and under ``TestClient`` a background task runs immediately rather than
+    later. Both refusals are ahead of every write this function makes, which
+    matters because the success write is a ``set(..., merge=True)`` that would
+    recreate a deleted user document and ``persist_new_jobs`` would refill the
+    subcollection under it. The guard stops a cycle that has not started, not
+    one already past this line.
     """
     if live_runs_refused():
         log.warning("discovery.cycle_refused", user_id=user_id, trigger=trigger)
@@ -662,10 +551,9 @@ async def run_discovery_cycle(
         return
     if await _account_deleted(user_id):
         log.warning("discovery.cycle_account_deleted", user_id=user_id, trigger=trigger)
-        # Safe against the resurrection hazard this guard exists for: the
-        # refund is a read-modify-write that declines when there is no counter
-        # to credit, and a deleted account's document is gone with it. See
-        # ``tools.discovery.budget.apply_release``.
+        # Safe against the resurrection hazard: the refund is a
+        # read-modify-write that declines when there is no counter to credit,
+        # and a deleted account's document is gone with it.
         await _refund_run(user_id, trigger)
         return
     with run_context(
@@ -679,16 +567,14 @@ async def run_discovery_cycle(
         )
         counts: dict = {}
         # ``running`` until some leg below decides otherwise. A cycle killed by
-        # CancelledError or SIGKILL reaches neither the success nor the failure
-        # branch, so it banks ``running`` and the activity contract derives
-        # ``stalled`` from its age — which is what it is.
+        # CancelledError or SIGKILL reaches neither branch, so it banks
+        # ``running`` and the activity contract derives ``stalled`` from its age.
         ledger_state = RUNNING
         # Before any work: the tick's claim has been paying for queue wait, and
         # from here the TTL has to cover the run.
         await asyncio.to_thread(_extend_slot, user_id, "discovery", trigger, began)
-        # The liveness record, before the first fetch: until this existed an
-        # in-flight cycle had no document at all, so "is discovery running?"
-        # was unanswerable from the server and the UI guessed.
+        # The liveness record, before the first fetch, so "is discovery
+        # running?" is answerable from the server.
         await open_run(
             _client,
             user_id,
@@ -705,9 +591,8 @@ async def run_discovery_cycle(
             jobs, title_dropped = prefilter_jobs(summary["jobs"], preferences)
             new = await persist_new_jobs(jobs)
             if not score:
-                # The find-only leg. **Nothing below this line may reach an
-                # LLM**: it is the whole point of the branch, and the counts
-                # are zeros-because-nothing-ran, not zeros-so-far.
+                # The find-only leg. Nothing below this line may reach an LLM;
+                # the counts are zeros-because-nothing-ran, not zeros-so-far.
                 counts = {"scored": 0, "discarded": 0, "failed": 0}
                 log.info("discovery.found_only", user_id=user_id, new_jobs=new)
             # Big backlogs go to a resumable half-price batch run instead of
@@ -720,10 +605,9 @@ async def run_discovery_cycle(
             metrics = {
                 "run_id": run_id,
                 "trigger": trigger,
-                # Whether this cycle was allowed to spend at all. On the
-                # ledger and the Profile card because "0 scored" otherwise
-                # reads as a failure rather than as a run that was never
-                # asked to score.
+                # Whether this cycle was allowed to spend at all, so that "0
+                # scored" does not read as a failure rather than as a run that
+                # was never asked to score.
                 "scored_leg": score,
                 "jobs_fetched": len(summary["jobs"]),
                 "title_filtered": sum(title_dropped.values()),
@@ -736,20 +620,12 @@ async def run_discovery_cycle(
                 "boards_cached": summary["boards_cached"],
                 "boards_fetched": summary["boards_fetched"],
                 "new_jobs": new,
-                # **The backlog, and nothing else.** Counted the same way by
-                # every branch of this cycle, from the one definition in
-                # ``tools.matching.score.count_unscored`` — jobs the user has
-                # not decided on and nothing has scored.
-                #
-                # It used to be ``counts["pending"]``, which meant three
-                # different things depending on which branch produced it
-                # (jobs newly persisted / jobs this run attempted / jobs the
-                # batch reserved), all of them grant-bounded except the first,
-                # while the Profile card labelled it "waiting to be scored".
-                # A find-only run on a 9,219-job backlog advertised 60.
-                #
-                # What a priced click actually covers is ``min(this, the
-                # grant)``; the grant is the estimate's job, not this one.
+                # The backlog and nothing else: jobs the user has not decided on
+                # that nothing has scored, counted the same way by every branch
+                # from the one definition in
+                # ``tools.matching.score.count_unscored``. Not grant-bounded —
+                # what a priced click covers is ``min(this, the grant)``, and
+                # the grant is the estimate's job.
                 "unscored_backlog": await _backlog(user_id),
                 "scored": counts["scored"],
                 "discarded": counts["discarded"],
@@ -775,23 +651,19 @@ async def run_discovery_cycle(
                     "discovery_state": {
                         "last_discovery_at": _now().isoformat(),
                         "last_discovery": metrics,
-                        # **This write is the slot claim**, and it lands only
-                        # now that the work is done — a tick used to write the
-                        # timestamp before dispatching, which made a run that
-                        # died look exactly like one that succeeded. The lease
-                        # is released in the same write because the timestamp
-                        # beside it holds the slot for a whole interval, so
-                        # there is nothing left for the lease to protect.
+                        # This write is the slot claim, and it lands only now
+                        # that the work is done, so a run that died never looks
+                        # like one that succeeded. The lease goes in the same
+                        # write: the timestamp beside it holds the slot for a
+                        # whole interval, so nothing is left to protect.
                         "discovery_lease": firestore.DELETE_FIELD,
                     }
                 },
                 merge=True,
             )
-            # **A cycle that handed its scoring to a Vertex batch is not over.**
-            # The results land when the worker's resume ticks ingest them, under
-            # this same run_id, and that ingest is what closes the doc — so
-            # closing it here would advertise a finished run while Google still
-            # holds the work.
+            # A cycle that handed its scoring to a Vertex batch is not over: the
+            # worker's resume ticks ingest the results under this same run_id
+            # and that ingest closes the doc.
             ledger_state = RUNNING if counts.get("batch_run") else DONE
             # The one line to watch per auto search: how the run performed.
             log.info("auto_discovery.metrics", **metrics)
@@ -808,28 +680,17 @@ async def run_discovery_cycle(
             ledger_state = FAILED
             log.exception("auto_discovery.failed")
             log_agent_end(log, "discovery", agent_started, outcome="failed")
-            # A run that fails *loudly* is over, and it wrote no
-            # ``last_discovery_at`` — so its lease is all that stands between
-            # this user and the next tick, and holding it buys nothing but
-            # silence. In the ``except`` and **not** the ``finally``, which is
-            # the whole distinction: a worker killed mid-cycle raises
-            # ``CancelledError``, which is not an ``Exception`` and never
-            # reaches here, so a run that dies *silently* — and may still be
-            # running — leaves its lease to expire on the clock instead.
+            # A run that fails loudly is over and wrote no ``last_discovery_at``,
+            # so holding its lease buys nothing but silence. In the ``except``
+            # and not the ``finally``, deliberately: a worker killed mid-cycle
+            # raises ``CancelledError``, which never reaches here, so a run that
+            # dies silently — and may still be running — leaves its lease to
+            # expire on the clock instead.
             #
-            # **No backoff, decided rather than overlooked.** Waiting out a full
-            # interval after a failure was an accidental circuit breaker in the
-            # old pre-claim, and dropping it does raise the re-run rate of a
-            # deterministically failing cycle. Under QUEUE_MODE — every
-            # deployment that has a worker — the hour-granular task names cap
-            # that at two dispatches an hour, which is the retry this PR is
-            # for. The 5-minute storm is reachable only with QUEUE_MODE off,
-            # where the cycle runs in-process: local and dev. What actually
-            # bounds the spend either way is ``tools.matching.budget``'s daily
-            # cap, which is the guard built for that job. A backoff lease would
-            # also have to be told apart from a run lease in ``_next_iso``, or
-            # the Profile card would advertise a next run a day out when it is
-            # minutes away — a lease taxonomy for a dev-only exposure.
+            # No backoff, decided rather than overlooked. Under QUEUE_MODE the
+            # hour-granular task names cap retries at two dispatches an hour;
+            # with QUEUE_MODE off (local and dev only) spend is bounded by
+            # ``tools.matching.budget``'s daily cap.
             await asyncio.to_thread(_release_slot, user_id, "discovery", trigger, began)
         finally:
             # In the finally, not the happy path: a cycle that died after
@@ -857,18 +718,12 @@ async def run_discovery_cycle(
 async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
     """Background: re-check served postings; dismiss ones the ATS took down.
 
-    Refuses from a local process for the same reason discovery does — see
-    :func:`live_runs_refused`. The sweep buys no LLM calls, so this is not
-    about spend: it writes ``user_decision: dismissed`` onto real jobs and
-    moves real applications to ``posting_removed``, and a laptop pointed at
-    production should not be able to retire a user's queue by accident.
-    Refusing before the ``_extend_slot`` write means a refused sweep also
-    leaves no lease behind.
-
-    Refuses on a deleted account too — see :func:`run_discovery_cycle`. The
-    sweep's success write is the same recreating ``set(..., merge=True)``, so a
-    swept deleted account would leave a ``users/{uid}`` document behind holding
-    nothing but discovery state.
+    Refuses from a local process (see :func:`live_runs_refused`) — not for
+    spend, since the sweep buys no LLM calls, but because it writes
+    ``user_decision: dismissed`` onto real jobs and moves real applications to
+    ``posting_removed``. Refuses on a deleted account too: the success write is
+    a recreating ``set(..., merge=True)``. Both refusals precede
+    ``_extend_slot``, so a refused sweep leaves no lease behind either.
     """
     if live_runs_refused():
         log.warning("sweep.cycle_refused", user_id=user_id, trigger=trigger)
@@ -925,39 +780,28 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
             )
 
 
-#: The find-only discovery task's own worker route. **Not a field on the
-#: existing task, and that is the whole design.**
-#:
-#: Cloud Tasks delivers to whichever hermes-worker revision is live when the
-#: task runs, which during a rollout is the *old* one. An old worker handed
-#: ``{"score": false}`` on ``/tasks/discovery`` would ignore the unknown field
-#: — pydantic drops extras — and score the backlog anyway: the guard would
-#: fail open, silently, on every deploy. An old worker handed this path 404s
-#: instead, Cloud Tasks retries with backoff, and the task lands once the new
-#: revision is serving. Nothing is spent in the window.
-#:
-#: Collapsing this into a bool belongs to a later PR, after both revisions are
-#: past. Please don't "simplify" it before then.
+#: The find-only discovery task's own worker route, deliberately a separate
+#: path rather than a field on the existing task: during a rollout Cloud Tasks
+#: still delivers to the old revision, which would drop an unknown
+#: ``{"score": false}`` and score the backlog anyway — a guard failing open on
+#: every deploy. An old worker 404s this path instead and the retry lands once
+#: the new revision is serving, so nothing is spent in the window.
 SCAN_TASK_PATH = "/tasks/discovery/scan"
 
 
 def enqueue_cycle(kind: str, user_id: str, *, trigger: str, score: bool = True) -> bool:
     """Push one cycle onto the discovery queue. Returns False when deduped.
 
-    The queue half of :func:`dispatch_cycle`, split out because it is the half
-    that is one RPC and needs no event loop: a synchronous caller (the
-    onboarding kickoff in ``api.routes.profile``) can enqueue *inside* its
-    request instead of deferring the RPC to a background task on an instance
-    that may be frozen by then.
+    The queue half of :func:`dispatch_cycle`, split out because it is one RPC
+    and needs no event loop: a synchronous caller (the onboarding kickoff in
+    ``api.routes.profile``) can enqueue inside its request rather than defer to
+    a background task on an instance that may be frozen by then.
 
-    Hour-granular ids for scheduled work — one per user per hour no matter how
-    many triggers race — and minute-granular ids for manual runs, so a
-    double-click dedupes but a deliberate re-run a minute later doesn't.
-
-    ``score=False`` routes to :data:`SCAN_TASK_PATH` and takes its own slice of
-    the id namespace: a find-only run and a scored run in the same minute are
-    different asks, and deduping the second into the first would drop exactly
-    the click the user paid attention to.
+    Hour-granular ids for scheduled work and minute-granular ids for manual
+    runs, so a double-click dedupes but a deliberate re-run a minute later
+    does not. ``score=False`` routes to :data:`SCAN_TASK_PATH` and takes its
+    own slice of the id namespace — a find-only run and a scored run in the
+    same minute are different asks.
     """
     grain = "%Y%m%d%H%M" if trigger == "manual" else "%Y%m%d%H"
     scan = kind == "discovery" and not score
@@ -977,10 +821,9 @@ async def dispatch_cycle(
     """Run a discovery/sweep cycle — on the worker via queue when enabled.
 
     With QUEUE_MODE on, the cycle becomes a named Cloud Tasks task pushed to
-    the worker service. Without QUEUE_MODE the cycle runs in-process, exactly
-    as before — which is why callers that must not block for the length of a
-    whole cycle branch on ``queues.enabled()`` themselves rather than treating
-    this as "the cheap one".
+    the worker. Without it the cycle runs in-process, so callers that must not
+    block for a whole cycle branch on ``queues.enabled()`` themselves rather
+    than treating this as the cheap call.
     """
     if queues.enabled():
         # Off the event loop: the enqueue is a blocking gRPC call, and this
@@ -999,23 +842,18 @@ async def dispatch_cycle(
 async def tick_user(
     user_id: str, *, force_check: bool = False, doc: dict | None = None
 ) -> None:
-    """Run whichever opted-in loops are due for this user.
+    """Run whichever opted-in loops are due for this user. A due discovery loop
+    dispatches a cycle that spends real money on Gemini.
 
-    **Leases each slot rather than claiming it.** The slot itself is claimed by
-    ``last_*_at``, which the cycle writes when the work has actually happened;
-    this used to be written here, before dispatching, so a run that died was
-    indistinguishable from one that succeeded and the user waited out a full
-    interval before anything retried. The lease covers only the gap in between.
+    Leases each slot rather than claiming it: the slot itself is claimed by
+    ``last_*_at``, which the cycle writes once the work has actually happened,
+    and the lease covers only the gap in between.
 
-    ``doc`` lets a caller that has already read this user's document hand it
-    over instead of paying for a second read — the cron fan-out streams the
-    whole ``users`` collection and would otherwise re-fetch every document it
-    just had. It stays safe to pass a moments-old read, but for a different
-    reason than before: it is now only a **screen**. Nothing is dispatched off
-    it; a loop it says is due goes on to :func:`_claim_slot`, which re-reads and
-    re-checks both the interval and the lease inside a compare-and-swap. So the
-    hand-over still saves the read on the overwhelmingly common not-due path,
-    and the rare due path pays one read to get a precondition worth having.
+    ``doc`` lets a caller that already read this user's document hand it over
+    instead of paying for a second read (the cron fan-out streams the whole
+    ``users`` collection). A moments-old read is safe because this is only a
+    screen — nothing is dispatched off it, and a loop it says is due goes on to
+    :func:`_claim_slot`, which re-reads inside a compare-and-swap.
     """
     now = _now()
     last_check = _last_tick_check.get(user_id)
@@ -1048,10 +886,9 @@ async def tick_user(
             _claim_slot, user_id, "discovery", settings.discovery_interval_hours, now
         )
     ):
-        # **Charged here, once the claim has won.** The screen above runs on a
-        # document that may be seconds old; this is the transaction that
-        # actually binds, and it is on the dispatch side so a redelivery of the
-        # queued task cannot charge a second time.
+        # Charged here, once the claim has won: the screen above runs on a
+        # document that may be seconds old, and this is on the dispatch side so
+        # a redelivery of the queued task cannot charge a second time.
         reservation = await discovery_budget.reserve(_async_client(), user_id)
         if reservation.granted <= 0:
             # Lost the race between the screen and the reservation. Give the
@@ -1065,19 +902,15 @@ async def tick_user(
             try:
                 dispatched = await dispatch_cycle("discovery", user_id, trigger=trigger)
             except Exception:
-                # **A charge whose dispatch never happened, which is the one
-                # way this cap could take a transient outage and make it last
-                # a week.** ``queues.enqueue`` raises on a Cloud Tasks 503, a
-                # missing IAM binding, an unset WORKER_URL/TASKS_SA_EMAIL —
-                # and ``cron_tick`` swallows the raise as one failed user. Left
-                # unrefunded, fourteen hourly ticks would spend the whole
-                # allowance on zero searches and then screen the user out for
-                # the rest of the calendar week, with the outage long fixed.
+                # A charge whose dispatch never happened: ``queues.enqueue``
+                # raises on a Cloud Tasks 503 or a config problem, and left
+                # unrefunded the hourly ticks would spend the whole weekly
+                # allowance on zero searches.
                 #
-                # Only where the dispatch really is *just* an enqueue. With no
-                # queue, ``dispatch_cycle`` **is** the cycle: a raise there is a
-                # crawl that ran and then failed, which keeps its charge (and
-                # releases its own lease in ``run_discovery_cycle``).
+                # Only where the dispatch really is just an enqueue. With no
+                # queue ``dispatch_cycle`` *is* the cycle, so a raise there is a
+                # crawl that ran and failed, which keeps its charge and
+                # releases its own lease in ``run_discovery_cycle``.
                 if queues.enabled():
                     await _refund_run(user_id, trigger, week=reservation.week_key)
                     await asyncio.to_thread(
@@ -1158,44 +991,30 @@ async def run_discovery_now(
 ) -> dict:
     """Explicit user action: find new jobs now — and score them only if asked.
 
-    **This route is the 2026-09-26 incident.** It used to mean "find *and*
-    score", and under QUEUE_MODE that meant a Vertex batch was submitted the
-    moment the backlog cleared ``BATCH_MIN_PENDING`` (50, which a fresh
-    account always clears). No estimate, no confirmation. The click could not
-    not spend.
+    Scoring spends real money, so the default verb is the free one: without
+    ``confirm`` the cycle runs with ``score=False`` and the response says
+    ``scored: false``, and the card then quotes the scoring step for a second,
+    deliberate click. A ``confirm`` that is present but invalid answers 402
+    rather than quietly downgrading to find-only — the user asked for the paid
+    thing. (This route once meant "find and score" unconditionally and could
+    submit a Vertex batch with no estimate and no confirmation.)
 
-    Now the default verb is the free one. Without ``confirm`` the cycle runs
-    with ``score=False`` and the response says ``scored: false``; the card
-    then quotes the scoring step and takes a second, deliberate click. With a
-    valid token — minted by ``POST /jobs/score``'s 402, or by this route's own
-    — the cycle scores in one go, consented.
+    ``mode`` reports where the work went: "queued" (Cloud Tasks → hermes-worker)
+    or "in_process" (a background task on this instance, which scale-down can
+    kill).
 
-    A ``confirm`` that is present but **invalid** answers 402 rather than
-    quietly downgrading to find-only: the user asked for the paid thing, and
-    silently doing something else is how a guard becomes a surprise in the
-    other direction.
-
-    ``mode`` reports where the work actually went — "queued" (Cloud Tasks →
-    hermes-worker) or "in_process" (a background task on this instance, which
-    scale-down can kill). It is the cheapest way to confirm from outside that a
-    deployment's QUEUE_MODE is what you think it is.
-
-    Refuses outright from a local process — see :func:`live_runs_refused`. The
-    check is the *first* thing here, ahead of both the consent seam and the
-    QUEUE_MODE branch, because every arm of it spends the same money.
-
-    **And it answers 429 once the week's searches are gone** (``reason:
-    "discovery_cap"``, with ``runs_this_week``, ``per_week`` and an ISO
-    ``resets_at``). Not 402: see :func:`_cap_429`.
+    Refuses from a local process (see :func:`live_runs_refused`) as the very
+    first thing, ahead of the consent seam and the QUEUE_MODE branch, because
+    every arm spends the same money. Answers 429, not 402, once the week's
+    searches are gone — see :func:`_cap_429`.
     """
     if live_runs_refused():
         log.warning("discovery.run_now_refused", user_id=user_id)
         raise HTTPException(status_code=403, detail=LIVE_RUN_REFUSED)
 
-    # **The cap is screened before the consent seam, and it gates the free verb
-    # too.** Finding jobs costs no money but it does cost a search, so a capped
-    # user gets 429 whether or not they brought a token — and screening first
-    # means a 429 never burns a confirmation the user would have to mint again.
+    # Screened before the consent seam, and it gates the free verb too: finding
+    # jobs costs no money but does cost a search, and screening first means a
+    # 429 never burns a confirmation the user would have to mint again.
     adb = _async_client()
     limits = discovery_budget.Limits.from_env()
     snap = await adb.collection("users").document(user_id).get()
@@ -1215,9 +1034,8 @@ async def run_discovery_now(
             raise await spend_402(db, user_id, spend.DISCOVERY_SCAN) from None
         score = True
 
-    # The reservation that binds, taken after consent and **before** anything
-    # is dispatched: a run that is going to be refused must not have been
-    # started first. It can still come back empty — two clicks can race for the
+    # The reservation that binds, taken after consent and before anything is
+    # dispatched. It can still come back empty — two clicks can race for the
     # last run of the week — and that is the same 429.
     reservation = await discovery_budget.reserve(adb, user_id, limits=limits)
     if reservation.granted <= 0:
@@ -1256,9 +1074,9 @@ async def run_sweep_now(
 ) -> dict:
     """Explicit user action: run the liveness sweep immediately.
 
-    Refused from a local process, and — as on the discovery route — refused
-    *before* the ``queues.enabled()`` branch: enqueueing from a laptop hands
-    the same production writes to the real worker one process further away.
+    Refused from a local process before the ``queues.enabled()`` branch:
+    enqueueing from a laptop hands the same production writes to the real
+    worker one process further away.
     """
     if live_runs_refused():
         log.warning("sweep.run_now_refused", user_id=user_id)
@@ -1274,19 +1092,14 @@ async def run_sweep_now(
 async def reap_user(user_id: str, *, background_tasks: BackgroundTasks) -> dict:
     """One reaper pass for this user: collect applications whose worker died.
 
-    Unlike discovery and the sweep this is not on a per-user cadence and takes
-    no slot claim. It costs one indexless Firestore query and no LLM call, and
-    the thing it recovers from — an instance killed mid-run — is not something a
-    user opts into. A document it does move gets a lease that keeps the next
-    tick off it, so "every hour, for everyone" cannot become a retry storm.
-
-    ``asyncio.to_thread`` because ``tools.applications.state`` is synchronous by
-    design; the same hop ``tick_user`` makes for its own Firestore writes.
+    Unlike discovery and the sweep this takes no slot claim and is not on a
+    per-user cadence: it costs one indexless Firestore query and no LLM call,
+    and a document it does move gets a lease that keeps the next tick off it,
+    so "every hour, for everyone" cannot become a retry storm.
 
     The dispatcher is bound to *this* request's ``background_tasks`` so the
-    in-process path still works with ``QUEUE_MODE`` off. Under QUEUE_MODE —
-    every deployment that has a worker — ``dispatch_tailor`` enqueues and the
-    object is never touched.
+    in-process path still works with ``QUEUE_MODE`` off; under QUEUE_MODE
+    ``dispatch_tailor`` enqueues and the object is never touched.
     """
     return await asyncio.to_thread(
         reaper.reap_applications,
@@ -1304,32 +1117,23 @@ async def cron_tick(
 ) -> dict:
     """External scheduler entry point (Cloud Scheduler / GH Actions cron).
 
-    Ticks every user; per-user settings decide whether anything actually runs,
-    and a tombstoned account (``deleted_at``) is skipped whole. On the worker
-    service no app-level guard is needed: the service is
-    private, so Cloud Run has already verified the scheduler's OIDC token.
-    Elsewhere (public hermes-api) the ``CRON_SECRET`` header guards it —
+    Ticks every user, so this fans out into cycles that spend real money on
+    Gemini. Per-user settings decide whether anything actually runs, and a
+    tombstoned account (``deleted_at``) is skipped whole. On the private worker
+    service Cloud Run has already verified the scheduler's OIDC token; on the
+    public hermes-api the ``CRON_SECRET`` header guards it, and leaving it
     unset disables the endpoint.
 
-    **Under QUEUE_MODE the fan-out is in-request.** This endpoint's real home is
-    hermes-worker, which does *not* run with ``cpu-throttling: false``, so
-    anything deferred past the response runs on an instance that may already be
-    frozen — the hourly tick would then fire for nobody, which is the same shape
-    of bug as "discovery never runs". With a queue a tick is a settings read
-    plus an enqueue, so it costs the request nothing to do it properly.
+    Under QUEUE_MODE the fan-out is in-request, because hermes-worker does not
+    run with ``cpu-throttling: false`` and anything deferred past the response
+    would run on an instance that may already be frozen. Without a queue it
+    stays a background task: a due tick there runs the whole
+    discovery-and-scoring cycle, which cannot happen inside an HTTP request.
 
-    Without a queue it stays a background task: there, a due tick runs the whole
-    discovery-and-scoring cycle, which is minutes of work per user and cannot
-    happen inside an HTTP request.
-
-    One user's failure never costs the rest theirs — the loop logs and carries
-    on rather than abandoning the fan-out mid-way, which is what an exception
-    escaping a background task did before. But **swallowing every failure and
-    answering 200 would be worse than the bug above**: with, say,
-    ``TASKS_SA_EMAIL`` unset, every tick raises, the scheduler sees success, and
-    the hourly loops are dead with nothing to alert on. The count comes back in
-    the response, and a fan-out where *nothing* got through answers 5xx so the
-    scheduler's own retry and alerting are worth something.
+    One user's failure never costs the rest theirs; the loop logs and carries
+    on. But a fan-out where *nothing* got through answers 5xx rather than 200,
+    so an environmental failure (an unset ``TASKS_SA_EMAIL``, say) is visible
+    to the scheduler's retry and alerting instead of looking like success.
     """
     if not queues.worker_mode():
         secret = os.getenv("CRON_SECRET")
@@ -1355,28 +1159,23 @@ async def cron_tick(
     enforce_allowlist = allowlist.enforced()
     for uid, doc in users:
         if is_deleted(doc):
-            # This fan-out is the one caller that reaches a user without ever
-            # passing ``verify_user``: it streams *every* document in ``users``,
-            # so a tombstoned account with a wipe still in flight (or one whose
-            # wipe failed partway) is picked up here and nowhere else. Skipped
-            # whole — not just the tick, but the reaper too, which would
+            # This fan-out streams every document in ``users``, so a tombstoned
+            # account whose wipe is still in flight is picked up here and
+            # nowhere else. Skipped whole — including the reaper, which would
             # otherwise dispatch tailoring for a user who is leaving.
             deleted += 1
             continue
         if enforce_allowlist and not await _allowlisted(uid):
-            # Same seam, same reason, same shape as the ``is_deleted`` skip
-            # above: a de-allowlisted user's background loops must stop here,
-            # or removing them from the allowlist doesn't bound their spend.
-            # Off entirely while ALLOWLIST_ENFORCED is unset — this whole
-            # branch never runs on the shipped state of this PR.
+            # Same seam, same reason: a de-allowlisted user's background loops
+            # must stop here, or removing their seat doesn't bound their spend.
+            # Off entirely while ALLOWLIST_ENFORCED is unset.
             not_allowlisted += 1
             continue
         if not inline:
             background_tasks.add_task(tick_user, uid, force_check=True, doc=doc)
-            # Appending to the collection that is already being iterated when
-            # this runs, which is how dispatch_tailor's in-process fallback
-            # reaches the loop at all. A background task added mid-iteration is
-            # still picked up.
+            # Appends to the collection already being iterated, which is how
+            # dispatch_tailor's in-process fallback reaches the loop at all; a
+            # task added mid-iteration is still picked up.
             background_tasks.add_task(reap_user, uid, background_tasks=background_tasks)
             continue
         try:
@@ -1384,16 +1183,15 @@ async def cron_tick(
         except Exception:
             failed += 1
             log.exception("cron.tick_failed", user_id=uid)
-        # Its own try/except, *inside* the per-user one: a reaper that throws
-        # for every user must not turn a fan-out whose discovery ticks all
-        # worked into the 5xx below. It is reported on its own counter instead,
-        # which is the thing to alert on.
+        # Its own try/except, inside the per-user one: a reaper that throws for
+        # every user must not turn a fan-out whose discovery ticks all worked
+        # into the 5xx below. It gets its own counter instead.
         try:
             tally = await reap_user(uid, background_tasks=background_tasks)
             reaped += tally["recovered"]
             # A pass that ran out of its per-tick budget looks exactly like a
-            # pass with nothing to do. Carried up so it can be alerted on: it is
-            # the signal that a backlog is draining slower than it accumulates.
+            # pass with nothing to do, so it is carried up: it signals a backlog
+            # draining slower than it accumulates.
             reap_truncated += tally.get("truncated", 0)
         except Exception:
             reap_failed += 1
@@ -1410,15 +1208,13 @@ async def cron_tick(
         reap_truncated=reap_truncated,
         inline=inline,
     )
-    # Against the users this tick actually *tried*, not the collection size: a
-    # tombstoned account is skipped by design, and counting it as a success
-    # would mask a fan-out where every real user's tick failed. A
-    # de-allowlisted user is skipped the same way and for the same reason —
-    # always 0 while ALLOWLIST_ENFORCED is off.
+    # Against the users this tick actually tried, not the collection size:
+    # counting a skipped (deleted or de-allowlisted) account as a success would
+    # mask a fan-out where every real user's tick failed.
     attempted = len(users) - deleted - not_allowlisted
     if attempted and failed == attempted:
         # Nothing ticked. Almost always environmental (credentials, queue
-        # config), so let the scheduler retry it and let it be visible as a
+        # config), so let the scheduler retry and let it be visible as a
         # failing job rather than an hourly 200 that does nothing.
         raise HTTPException(
             status_code=500, detail=f"every tick failed ({failed} users)"
@@ -1427,16 +1223,16 @@ async def cron_tick(
         "ok": True,
         "users": len(users),
         "failed": failed,
-        # Tombstoned accounts, skipped whole. Additive, and worth its own
-        # counter: a fan-out that suddenly ticks nobody should be readable as
-        # "everyone deleted themselves" rather than "the loop is broken".
+        # Tombstoned accounts, skipped whole. Its own counter so a fan-out that
+        # suddenly ticks nobody reads as "everyone deleted themselves" rather
+        # than "the loop is broken".
         "deleted": deleted,
-        # Seat-revoked accounts, skipped whole — see ``deleted`` above for the
-        # identical reasoning. Always 0 while ALLOWLIST_ENFORCED is off.
+        # Seat-revoked accounts, skipped whole, same reasoning. Always 0 while
+        # ALLOWLIST_ENFORCED is off.
         "not_allowlisted": not_allowlisted,
-        # Additive to the contract PR C established. The reaper is the one loop
-        # here whose *inaction* is invisible — a stuck application looks like an
-        # idle one — so the count comes back rather than living only in logs.
+        # The reaper is the one loop here whose inaction is invisible — a stuck
+        # application looks like an idle one — so the count comes back rather
+        # than living only in logs.
         "reaped": reaped,
         "reap_failed": reap_failed,
         "reap_truncated": reap_truncated,

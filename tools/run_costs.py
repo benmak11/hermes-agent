@@ -19,10 +19,9 @@ originating cycle's doc instead of clobbering it.
 Retention
 ---------
 Every cycle leaves one doc here forever, so each write stamps ``expires_at``
-(``RETENTION_DAYS`` out) for Firestore's TTL to collect. Writing the field is
-all the client library can do — **the policy itself is a per-collection-group
-setting in GCP and is not in this repo or in terraform.** Until it is enabled
-the field is inert and nothing is ever deleted. To activate it, once per
+(``RETENTION_DAYS`` out) for Firestore's TTL to collect. The policy itself is
+a per-collection-group setting in GCP, not in this repo or in terraform, and
+until it is enabled the field is inert and nothing is deleted. Once per
 database:
 
     gcloud firestore fields ttls update expires_at \
@@ -34,35 +33,29 @@ database:
     # verify (state should read ACTIVE, after a one-off index build):
     gcloud firestore fields ttls list --database='(default)'
 
-``--collection-group=runs`` matches *every* collection named ``runs`` at any
-depth; ``users/{uid}/runs`` is the only one. Docs written before the policy
-existed carry no ``expires_at`` and are never collected — TTL ignores a
-missing or non-timestamp field rather than deleting the doc, which is also why
-``expires_at`` is written as a plain ``datetime`` literal and not an ISO
-string like ``ended_at``. It is deliberately kept out of the ``jobs``/``llm``
-maps for the same reason: ``_increments`` would turn it into an Increment,
-which is not a timestamp and would silently disable collection for that doc.
+``--collection-group=runs`` matches every collection named ``runs`` at any
+depth; ``users/{uid}/runs`` is the only one. TTL ignores a missing or
+non-timestamp field rather than deleting the doc, so docs predating the policy
+are never collected — and so ``expires_at`` must be a plain ``datetime``, not
+an ISO string like ``ended_at``, and must stay out of the ``jobs``/``llm``
+maps, where ``_increments`` would turn it into an Increment and silently
+disable collection.
 
 Liveness
 --------
-The ledger is also the product's **record that a run exists**. It used to be
-written only from ``persist_run_cost``'s ``finally``, so an in-flight run had
-no document at all and a run killed by ``CancelledError`` or SIGKILL never got
-one — 67 live docs, every one already closed. :func:`open_run` now writes
-``state: "running"`` the moment a run starts, and ``persist_run_cost`` closes
-it with the caller's own outcome. That makes "is anything happening?"
-answerable from one query (``runs where state == "running"``) instead of from
-client state, which is what ``GET /activity`` reads.
+The ledger is also the record that a run exists. :func:`open_run` writes
+``state: "running"`` when a run starts and :func:`persist_run_cost` closes it
+with the caller's outcome, so "is anything happening?" is one query
+(``runs where state == "running"``) rather than client state — which is what
+``GET /activity`` reads. Written only on close, a run killed by
+``CancelledError`` or SIGKILL left no document at all.
 
-``state`` is a **plain field**, never a member of the ``jobs``/``llm`` maps:
-``_increments`` would call ``firestore.Increment("done")``, which raises
-``ValueError: Pass an integer / float value.``
+``state`` is a plain field, never a member of the ``jobs``/``llm`` maps:
+``_increments`` would call ``firestore.Increment("done")``, which raises.
 
-A SIGKILLed process leaves a permanently open doc, and that is intended.
-Staleness is **derived, not heartbeated** (see
-``api.routes.discovery._LEASE_SECONDS`` for the reasoning, which is the same
-reasoning and is settled): past :data:`STALE_AFTER` an open doc reads
-``stalled``, which is more honest than no record at all, and needs no reaper.
+A SIGKILLed process leaves a permanently open doc, which is intended.
+Staleness is derived rather than heartbeated: past :data:`STALE_AFTER` an open
+doc reads ``stalled``, which needs no reaper and is more honest than no record.
 """
 
 from __future__ import annotations
@@ -87,8 +80,8 @@ log = get_logger("tools.run_costs")
 COLLECTION = "runs"
 
 #: The three values ``state`` ever holds on disk. ``stalled`` is deliberately
-#: not among them — it is *derived* from ``RUNNING`` plus age (see
-#: :func:`run_is_stalled`), so nothing has to write it and no reaper has to run.
+#: not among them: it is derived from ``RUNNING`` plus age (see
+#: :func:`run_is_stalled`), so nothing has to write it.
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
@@ -100,17 +93,13 @@ _LEASE_GRACE_SECONDS = 60
 
 #: How long an open ledger doc may stay open before it stops being evidence
 #: that anything is running. Cloud Tasks abandons a dispatch at
-#: ``_DISPATCH_DEADLINE_SECONDS`` (1800), so past 1860s no queued run can still
-#: be alive as far as the queue is concerned, and an open doc means the process
-#: died without closing it.
+#: ``_DISPATCH_DEADLINE_SECONDS``, so past that plus the grace no queued run
+#: can still be alive and an open doc means the process died without closing.
 STALE_AFTER = timedelta(seconds=_DISPATCH_DEADLINE_SECONDS + _LEASE_GRACE_SECONDS)
 
-# How long a ledger doc lives once the TTL policy above is enabled. These are
-# cost records, and the question they answer ("what did this month cost, and
-# how does that compare?") is month-over-month — so a year plus a margin, not
-# days. 400 rather than 365 so a review run late in a month can still see the
-# same month a year earlier; below that, the year-ago comparison silently
-# vanishes mid-review.
+# How long a ledger doc lives once the TTL policy above is enabled. 400 rather
+# than 365 so a review late in a month can still see the same month a year
+# earlier; below that the year-ago comparison silently vanishes mid-review.
 RETENTION_DAYS = 400
 
 
@@ -135,10 +124,9 @@ def _parse_iso(value: Any) -> datetime | None:
 def run_is_stalled(doc: dict, *, now: datetime | None = None) -> bool:
     """Has this open ledger doc outlived any run that could still be alive?
 
-    Pure, and the only definition of ``stalled`` in the codebase. A closed doc
-    is never stalled — it has an outcome. An open one with no readable
-    ``started_at`` *is*, because it cannot be aged and "it is running" is the
-    dishonest direction to guess in.
+    Pure, and the only definition of ``stalled`` in the codebase. A closed
+    doc is never stalled; an open one with no readable ``started_at`` is,
+    since it cannot be aged and "running" is the dishonest guess.
     """
     if doc.get("state") != RUNNING:
         return False
@@ -159,14 +147,11 @@ async def open_run(
 ) -> None:
     """Record that ``run_id`` has **started**, before it has done anything.
 
-    The counterpart to :func:`persist_run_cost`, and the whole reason the run
-    ledger can answer "is anything happening right now?". Written with
-    ``set(merge=True)`` so it composes with the close (and with a batch
-    ingest's later wave) rather than racing it.
+    Writes to Firestore with ``set(merge=True)`` so it composes with the
+    close, and with a batch ingest's later wave, rather than racing them.
 
-    ``db`` resolution, the ``None``-dropping and the swallowed Firestore error
-    are all :func:`persist_run_cost`'s, for the same reasons — a liveness
-    record that could fail a pipeline would be worse than no liveness record.
+    ``db`` resolution and the swallowed Firestore error are
+    :func:`persist_run_cost`'s: a liveness record must never fail a pipeline.
     """
     try:
         now = datetime.now(UTC)
@@ -176,8 +161,8 @@ async def open_run(
             "state": RUNNING,
             "runner": runner,
             "started_at": started_at,
-            # Stamped here too: a run that dies without ever closing must not
-            # be the one doc the TTL can never collect.
+            # Stamped here too, so a run that dies without closing is still
+            # collectable by the TTL.
             "expires_at": now + timedelta(days=RETENTION_DAYS),
         }
         if trigger is not None:
@@ -210,29 +195,23 @@ async def persist_run_cost(
 ) -> None:
     """Flush ``run_id``'s accumulated spend onto its ledger doc.
 
-    ``db`` is a Firestore client *or* a zero-arg factory for one (``_client``,
-    ``firestore.AsyncClient``); a factory is preferred, because every caller
-    flushes from a ``finally`` and building a client lazily runs
-    ``google.auth.default()``, which can raise. Resolving it inside the guard
-    below is what keeps that failure out of the caller.
+    ``db`` is a Firestore client or a zero-arg factory for one; a factory is
+    preferred, because callers flush from a ``finally`` and building a client
+    lazily runs ``google.auth.default()``, which can raise inside the guard
+    here rather than in the caller.
 
-    ``meta`` sets the doc's scalar fields (runner, trigger, started_at,
-    batch_run, ...). ``None`` values are dropped so a later write — the batch
-    ingest, arriving hours after the cycle that ordered it — can't blank out
-    what the originating cycle recorded. That is also why callers no longer
-    re-send ``started_at`` on close: :func:`open_run` already wrote it, and the
-    close must not move it.
+    ``meta`` sets the doc's scalar fields. ``None`` values are dropped so a
+    later write — a batch ingest arriving hours after the cycle that ordered
+    it — cannot blank out what the originating cycle recorded; for the same
+    reason the close must not re-send ``started_at``.
 
-    ``state`` is this run's own outcome and an **explicit parameter**, so it
-    can never be mistaken for a count: every leaf under ``jobs``/``llm`` goes
-    through :func:`_increments`, and ``firestore.Increment("done")`` raises. A
-    caller whose work is still outstanding — a cycle that submitted a Vertex
-    batch and will be closed by the ingest hours later — passes
-    ``state=RUNNING`` and keeps the doc open.
+    ``state`` is an explicit parameter so it can never be mistaken for a count
+    and passed through :func:`_increments`. A caller whose work is still
+    outstanding passes ``state=RUNNING`` and keeps the doc open.
 
-    Telemetry must never fail a pipeline, so a Firestore error is logged and
-    swallowed. The accumulator is dropped either way: whatever this write
-    missed is worth less than double-counting it on a later flush.
+    Writes to Firestore; errors are logged and swallowed, since telemetry must
+    never fail a pipeline. The accumulator is dropped either way, because
+    losing this write is better than double-counting it on the next.
     """
     try:
         totals = run_cost_snapshot(run_id)
@@ -243,21 +222,18 @@ async def persist_run_cost(
             "user_id": user_id,
             "ended_at": now.isoformat(),
             # A plain datetime, not an Increment and not an ISO string: see
-            # the module docstring's Retention section. Re-stamped on every
-            # wave, so a doc a batch ingest is still adding to keeps its full
-            # retention from the *last* write rather than the first.
+            # Retention above. Re-stamped on every wave, so a doc a batch
+            # ingest is still adding to keeps its retention from the last.
             "expires_at": now + timedelta(days=RETENTION_DAYS),
             **{key: value for key, value in meta.items() if value is not None},
-            # A plain field, deliberately outside every map ``_increments``
-            # touches, and written last so no ``meta`` key can shadow it — see
-            # the docstring.
+            # A plain field, outside every map ``_increments`` touches, and
+            # written last so no ``meta`` key can shadow it.
             "state": state,
             "llm": _increments(totals),
         }
         # Only written when non-empty: an empty map is not a transform, so it
-        # would land in the update mask as a literal and wipe the breakdown a
-        # previous wave of this same run already recorded. (``llm`` is safe —
-        # every leaf there is an Increment.)
+        # lands in the update mask as a literal and wipes the breakdown an
+        # earlier wave of this run recorded. (``llm`` is safe — all Increments.)
         if by_step:
             doc["by_step"] = {step: _increments(c) for step, c in by_step.items()}
         if jobs:
@@ -270,10 +246,9 @@ async def persist_run_cost(
             .collection(COLLECTION)
             .document(run_id)
         )
-        # Both Firestore clients are in play across the call sites — the API
-        # routes hold the sync one, the pipelines and CLIs an AsyncClient. The
-        # sync client's set() blocks on network I/O, and every caller here is
-        # async, so it goes to a thread rather than stalling the event loop.
+        # Both Firestore clients are in play across the call sites. The sync
+        # client's set() blocks on network I/O and every caller here is async,
+        # so it goes to a thread rather than stalling the event loop.
         if inspect.iscoroutinefunction(ref.set):
             await ref.set(doc, merge=True)
         else:

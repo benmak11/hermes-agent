@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Context caching on the match_job static block (Phase 3.2 cost work)."""
+"""Context caching on the match_job static block."""
 
 import asyncio
 from datetime import UTC, datetime

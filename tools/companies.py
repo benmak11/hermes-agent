@@ -6,14 +6,12 @@ This module is the only thing in the codebase that touches the company YAML
 files. Everything else goes through it.
 
 It is read-only apart from :func:`append_unvetted`, which the offline sweep
-(``cli.discover_companies``) uses to grow the pool from a laptop. The
-promote/block/dismiss/pause mutators that used to live here are gone: they
-edited the YAML inside whichever container served the API request, so under
-``QUEUE_MODE=1`` the crawl — running in a *different* container — never saw
-the edit, and a deploy replaced the filesystem anyway. Per-user exclusions are
-now a Firestore overlay (:mod:`tools.company_prefs`) subtracted at compose time
-by :func:`all_active_companies`; promotion is a reviewed edit to
-``known.yaml``.
+(``cli.discover_companies``) uses to grow the pool from a laptop. Nothing here
+mutates the YAML on behalf of a request: an edit inside the container serving
+the request is invisible to the crawl under ``QUEUE_MODE=1`` and is replaced
+by the next deploy. Per-user exclusions are a Firestore overlay
+(:mod:`tools.company_prefs`) subtracted at compose time by
+:func:`all_active_companies`; promotion is a reviewed edit to ``known.yaml``.
 """
 
 from __future__ import annotations
@@ -78,12 +76,12 @@ def load_blocklist_detailed() -> list[dict]:
 def append_unvetted(platform: Platform, new_slugs: list[str]) -> int:
     """Append new slugs to unvetted.yaml. Returns count actually added (after dedup).
 
-    The only writer left in this module, and the only way the global pool grows:
+    The only writer in this module and the only way the global pool grows:
     ``cli.discover_companies`` runs the sweep on a laptop and the diff is
-    committed. It is a read-modify-write and that is survivable *only* because
-    of where it runs — one process, one working copy, a human reviewing the
-    result. Nothing on the request path may write here; per-user exclusions are
-    an overlay in Firestore (:mod:`tools.company_prefs`).
+    committed. It is a read-modify-write, survivable only because of where it
+    runs — one process, one working copy, a human reviewing the result.
+    Nothing on the request path may write here; per-user exclusions are an
+    overlay in Firestore (:mod:`tools.company_prefs`).
     """
     raw = _load(DATA_DIR / "unvetted.yaml")
     existing = {c["slug"] for c in raw.get(platform, [])}
@@ -108,12 +106,10 @@ def all_active_companies(
     """Flat list of (platform, slug, source) tuples to fetch on a daily run.
 
     ``exclusions`` is the per-user overlay read by
-    :func:`tools.company_prefs.load_exclusions` — the pool above is global and
-    stays in YAML; what one user has excluded is subtracted here, at compose
-    time, so nothing about the shared pool has to know a user exists.
-
-    It defaults to empty, which composes exactly the set this has always
-    composed. That default is what makes every existing caller unchanged.
+    :func:`tools.company_prefs.load_exclusions`. The pool stays global in
+    YAML and one user's exclusions are subtracted here, at compose time, so
+    nothing about the shared pool has to know a user exists. It defaults to
+    empty, which composes the whole pool.
     """
     out: list[tuple[Platform, str, Literal["known", "unvetted"]]] = []
     for plat, entries in load_known().items():

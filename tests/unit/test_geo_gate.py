@@ -2,23 +2,20 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The deterministic geo gate: what it must decide, and what it must refuse to.
 
-``tools.matching.geo`` exists to skip Pro calls, so every test here is really
-asking one of two questions. "Does it fire when it provably can?" — a missed
-firing costs money. "Does it stay quiet otherwise?" — a wrong ``ineligible``
-costs the user a job they will never see, and that is the failure this module
-was designed around, at a measured bar of ≤0.5% false positives over 1,127
+``tools.matching.geo`` exists to skip Pro calls, so every test asks one of two
+questions. Does it fire when it provably can — a missed firing costs money.
+Does it stay quiet otherwise — a wrong ``ineligible`` costs the user a job they
+will never see, at a measured bar of ≤0.5% false positives over 1,127
 historical scores.
 
-Three groups below carry most of the weight:
+Three groups carry most of the weight:
 
-- the **invariance** test, which pins the two clauses Rule 6 asks for and this
-  gate deliberately omits (state/city comparison at 2.48% FP, work-style at
-  a scale nobody measured). It exists so that re-adding either one turns red
-  instead of quietly shipping.
-- the **timezone** cases, which are the single guard that took the stated-scope
-  clause from 0.44% FP to zero. "EST and EU" is a meeting window, not an
-  immigration rule.
-- the **regression fixtures**, lifted field-for-field from real documents —
+- the **invariance** test, pinning the two clauses Rule 6 asks for and this
+  gate deliberately omits (state/city comparison, measured at 2.48% FP, and
+  work-style, never measured), so re-adding either turns red.
+- the **timezone** cases, the guard that took the stated-scope clause from
+  0.44% FP to zero. "EST and EU" is a meeting window, not an immigration rule.
+- the **regression fixtures**, lifted field-for-field from real documents,
   above all the Vanta shape (``"Remote - USA"`` with a null ``job_country``)
   that a naive Rule 6 port calls ineligible and that Pro scored 86.
 
@@ -287,8 +284,8 @@ def test_a_stated_scope_outranks_the_office_country():
 
     Labelled ``scope_covers_foreign_office`` rather than ``country_unknown``:
     the country was read perfectly well and then judged not to matter, which
-    is a different fact from failing to read one. Phase 3 persists these
-    strings, so the two cases have to stay separable after the fact.
+    is a different fact from failing to read one. These strings are
+    persisted, so the two cases have to stay separable after the fact.
     """
     parsed = _parsed(job_country="Germany", remote_scope="United States")
     assert _verdict(parsed) == ("abstain", "scope_covers_foreign_office")

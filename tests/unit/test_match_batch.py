@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Vertex batch prediction for bulk scoring (Phase 3.4 cost work)."""
+"""Vertex batch prediction for bulk scoring."""
 
 import asyncio
 import json

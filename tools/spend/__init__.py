@@ -11,14 +11,12 @@ Two pieces, deliberately separate:
   Firestore token minted with an estimate attached and consumed by the route
   that spends.
 
-**This is not the spend cap.** ``tools.matching.budget`` is, it is untouched,
-and nothing here can grant a slot. The budget bounds what a yes can cost; this
-package is only about the yes.
+This is not the spend cap — ``tools.matching.budget`` is, and nothing here
+can grant a slot. The budget bounds what a yes can cost; this package is only
+about the yes.
 
-The FastAPI half — the ``confirm`` body field and the dependency that answers
-402 — lives in ``api.deps`` rather than here, so ``tools/`` stays free of any
-import from ``api/`` or from FastAPI. That boundary holds everywhere else in
-this package and the CLIs depend on it.
+The FastAPI half (the ``confirm`` body field and the dependency that answers
+402) lives in ``api.deps``, so ``tools/`` imports nothing from ``api/``.
 """
 
 from tools.spend.consent import ConsentRequired, consume, preflight

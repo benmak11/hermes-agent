@@ -1,18 +1,15 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Cloud Tasks dispatch for long-running work (Phase B ops architecture).
+"""Cloud Tasks dispatch for long-running work.
 
-Discovery/scoring cycles used to run as in-process background tasks on the
-API server — sequential, unthrottled, and lost on instance restart. With
-``QUEUE_MODE`` on, work is enqueued to per-type Cloud Tasks queues that push
-to the dedicated ``hermes-worker`` Cloud Run service instead: queue rate
-limits stop 429 storms and retry-amplified token burn, and named tasks give
-idempotency (a task id can't be re-created while its tombstone lives, so a
-double-click or overlapping tick dedupes at the queue).
+With ``QUEUE_MODE`` on, work is enqueued to per-type Cloud Tasks queues that
+push to the dedicated ``hermes-worker`` Cloud Run service: queue rate limits
+stop 429 storms and retry-amplified token burn, and named tasks give
+idempotency, since a task id cannot be re-created while its tombstone lives,
+so a double-click or overlapping tick dedupes at the queue.
 
-``QUEUE_MODE`` unset/off means every caller falls back to running the work
-in-process, which keeps local dev, tests, and the pre-worker deployment
-working with zero infrastructure.
+``QUEUE_MODE`` unset or off means every caller runs the work in-process
+instead, which keeps local dev and tests working with no infrastructure.
 
 Env contract (all required only when QUEUE_MODE is on):
 - ``QUEUE_MODE``: "1"/"true"/"on" enables dispatch.

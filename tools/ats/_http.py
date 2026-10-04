@@ -43,15 +43,13 @@ _TIMEOUT = 30
 #: The client the current task should fetch through, when a caller has opened a
 #: :func:`board_client` scope.
 #:
-#: **A ContextVar, deliberately not a module-level memo.** A memoised client
-#: would have to be lazily bound to the running event loop (an
-#: ``httpx.AsyncClient``'s pool binds to whichever loop first uses it, and every
-#: ``cli/`` entry point gets a fresh loop from ``asyncio.run``), would never be
-#: closed, and — the failure this project has already shipped once — would go on
-#: handing out a client built before a test's patch was installed, so patching
-#: the constructor would silently catch nothing. A ContextVar has none of that:
-#: nothing is cached between cycles, the scope closes the client deterministically
-#: on exit, and a caller who never opens a scope gets exactly today's behaviour.
+#: A ContextVar, deliberately not a module-level memo. An
+#: ``httpx.AsyncClient``'s pool binds to whichever loop first uses it and every
+#: ``cli/`` entry point gets a fresh loop, a memo would never be closed, and —
+#: a failure this project has shipped once — it would keep handing out a client
+#: built before a test's patch, so patching the constructor catches nothing.
+#: With a ContextVar nothing is cached between cycles, the scope closes the
+#: client on exit, and a caller who opens no scope is unaffected.
 _client: ContextVar[httpx.AsyncClient | None] = ContextVar(
     "ats_board_client", default=None
 )
@@ -61,14 +59,13 @@ _client: ContextVar[httpx.AsyncClient | None] = ContextVar(
 async def board_client() -> AsyncIterator[httpx.AsyncClient]:
     """Lend one pooled client to every :func:`fetch_board_json` call inside.
 
-    Discovery fetches ~198 boards against a handful of hosts; without this each
-    fetch built and tore down its own client, so no connection was ever reused.
-    Open this once around a fan-out.
+    Open this once around a fan-out; without it each fetch builds and tears
+    down its own client and no connection is reused.
 
     The value is read from a ContextVar, which asyncio tasks inherit from the
-    context active when they were *created* — so the scope must be entered
-    before the ``gather``, as ``tools.discovery.pipeline`` does. Nesting is
-    safe: the inner scope wins and the outer client is restored on exit.
+    context active when they were *created*, so the scope must be entered
+    before the ``gather``. Nesting is safe: the inner scope wins and the outer
+    client is restored on exit.
     """
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         token = _client.set(client)
@@ -85,9 +82,9 @@ async def board_client() -> AsyncIterator[httpx.AsyncClient]:
 #: ~35s even if *every* board were failing, well inside the 1800s dispatch
 #: deadline. ``tests/unit/test_ats_http.py`` pins that budget.
 #:
-#: ``_RETRY_MAX_WAIT`` does not currently bind: at 0.5s initial the exponential
-#: only reaches 4.0s on the fourth retry, and there are two. It is a ceiling for
-#: whoever raises ``_RETRY_ATTEMPTS``, not an active constraint today.
+#: ``_RETRY_MAX_WAIT`` does not currently bind — the exponential only reaches
+#: it on the fourth retry and there are two. It is a ceiling for whoever
+#: raises ``_RETRY_ATTEMPTS``.
 _RETRY_ATTEMPTS = 3
 _RETRY_INITIAL_WAIT = 0.5
 _RETRY_MAX_WAIT = 4.0

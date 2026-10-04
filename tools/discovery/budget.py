@@ -2,40 +2,31 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Per-user discovery budget: a weekly allowance of searches.
 
-The sibling of :mod:`tools.matching.budget`, and deliberately its mirror —
-same reserve-don't-count shape, same pure ``apply_*`` core with the
-transaction as a thin shell, same lazy rollover *inside* the transaction, same
-fail-closed ``reserve`` / never-raising ``release``. Read that module first;
-what follows is only what a *weekly* window changes.
+The sibling of :mod:`tools.matching.budget` and deliberately its mirror: same
+reserve-don't-count shape, same pure ``apply_*`` core with the transaction as
+a thin shell, same lazy rollover inside the transaction, same fail-closed
+``reserve`` and never-raising ``release``. Read that module first; what
+follows is what a *weekly* window changes.
 
-**One counter, not two.** A search has no per-cycle analogue: the unit being
-capped is the search itself. So the state is a single ``runs_this_week``
-against a ``week`` key, and ``wanted`` is always 1 — ``granted`` is 0 or 1.
-The :class:`Reservation` keeps its sibling's shape anyway so the two read
-alike at the call sites.
+One counter, not two: the unit being capped is the search itself, so the state
+is a single ``runs_this_week`` against a ``week`` key and ``granted`` is 0 or
+1. :class:`Reservation` keeps its sibling's shape so the call sites read
+alike.
 
-**Charged at dispatch, never inside the cycle**, which is the one structural
-difference from scoring. A scoring slot is charged per job attempted by the
-scorer itself; a search is charged by whoever *starts* one — ``tick_user``
-once its ``_claim_slot`` has won, ``POST /settings/discovery/run``, and the
-onboarding kickoff in ``api.routes.profile``. The worker's ``/tasks/discovery*``
-handlers must never charge: a Cloud Tasks redelivery of an already-charged
-task would take a second run off the allowance for one user-visible search.
+Charged at dispatch, never inside the cycle — by whoever starts a search, not
+by the worker's ``/tasks/discovery*`` handlers, where a Cloud Tasks redelivery
+would take a second run off the allowance for one user-visible search. So this
+counts dispatches, not crawls, and a redelivered task runs a second crawl on
+one charge: the undercount direction, which is safe for a counter whose job is
+to stop a user being locked out, and the crawl itself is free.
 
-The cost of that choice, stated plainly: **this counts dispatches, not
-crawls.** A redelivered task runs a second crawl on one charge. That is the
-undercount direction, which is the safe one for a counter whose job is to stop
-a user being locked out of their own product, and the crawl itself is free —
-the money is downstream, behind the scoring budget.
+Refunds are for pre-work outcomes only — a dispatch deduped by the queue,
+refused by ``live_runs_refused()``, or landing on a deleted account. A crawl
+that ran and then failed keeps its charge; the next scheduled tick is the
+retry, and the weekly cap is itself the retry bound.
 
-**Refunds are for pre-work outcomes only.** A dispatch that never became work
-— ``dispatch_cycle``/``enqueue_cycle`` deduped by the queue, a run refused by
-``live_runs_refused()``, a cycle that found a deleted account — hands its run
-back. A crawl that *ran* and then failed keeps its charge: retrying it is what
-the next scheduled tick is for, and 14/week is itself the retry bound.
-
-Rollover is **lazy, at read time inside the transaction**, exactly as for
-scoring: a stored ``week`` that isn't this week reads as zero. No cron.
+Rollover is lazy, at read time inside the transaction: a stored ``week`` that
+is not this week reads as zero. No cron.
 
 State lives in one map on the user doc, ``users/{uid}.discovery_budget``::
 
@@ -43,17 +34,16 @@ State lives in one map on the user doc, ``users/{uid}.discovery_budget``::
     runs_this_week: int
     updated_at: iso
 
-The same document already holds ``scoring_budget`` and ``discovery_state``, so
-a surface that wants both caps reads them in the one ``get`` it already does.
+The same document already holds ``scoring_budget`` and ``discovery_state``,
+so a surface wanting both caps reads them in one ``get``.
 
-Env contract: ``DISCOVERY_RUNS_PER_WEEK``, default 14, clamped to the 10-20
-range the design offers. 14 is two searches a day; at the six-hourly cadence
-the Profile card offers, a week wants 28, so the card's copy has to say what a
-cadence costs rather than the cap silently truncating it.
+Env contract: ``DISCOVERY_RUNS_PER_WEEK``, default 14, clamped to 10-20. 14 is
+two searches a day, while the six-hourly cadence the Profile card offers wants
+28 a week, so that card's copy has to say what a cadence costs.
 
-Exceeding the allowance is a normal outcome, not an error: the caller logs
-``discovery.budget_capped`` at info and answers 429 (a cap is not a price —
-402 already means "confirm the spend").
+Exceeding the allowance is a normal outcome: the caller logs
+``discovery.budget_capped`` at info and answers 429, not 402 — a cap is not a
+price.
 """
 
 from __future__ import annotations
@@ -80,22 +70,17 @@ DEFAULT_PER_WEEK = 14
 MIN_PER_WEEK = 10
 MAX_PER_WEEK = 20
 
-#: The kill switch. ``DISCOVERY_RUNS_PER_WEEK=0`` (or any value at or below
-#: zero) turns the cap **off** rather than clamping to :data:`MIN_PER_WEEK` —
-#: without this, backing the cap out of a live service would mean reverting
-#: code, because every other value in range is still a cap. Off means off at
-#: the shell: :func:`reserve` short-circuits before it reads or writes
-#: anything, so an uncapped user costs exactly what they cost before this
-#: module existed. Deliberately *outside* the clamped range: a value between
-#: the floor and the ceiling is a cap, and only an explicit zero is not.
+#: The kill switch. ``DISCOVERY_RUNS_PER_WEEK`` at or below zero turns the cap
+#: off rather than clamping to :data:`MIN_PER_WEEK`, so a live service can be
+#: uncapped without reverting code. :func:`reserve` short-circuits before it
+#: reads or writes anything. Deliberately outside the clamped range: every
+#: value between floor and ceiling is a cap, and only an explicit zero is not.
 OFF = 0
 
 #: The timezone every call site passes today, as a value rather than a default
-#: buried in the signatures. No timezone is stored on a user (``Residence`` is
-#: ``{country, state?, city?}``), deriving one needs a dependency and still
-#: guesses for multi-timezone countries. Making the boundary a pure function of
-#: ``(now, tz)`` from day one means switching to per-user local weeks later is
-#: a value change at three call sites, not a refactor.
+#: buried in the signatures. No timezone is stored on a user, so making the
+#: week boundary a pure function of ``(now, tz)`` keeps a later switch to
+#: per-user local weeks a value change at three call sites, not a refactor.
 UTC_TZ = "UTC"
 
 
@@ -111,8 +96,7 @@ class Limits:
 
         Read at the transaction shells rather than inside
         :func:`apply_reservation`, so an uncapped dispatch does no Firestore
-        work whatsoever — the point of a kill switch is that the feature stops
-        costing anything, not that it keeps bookkeeping nobody reads.
+        work at all.
         """
         return self.per_week > OFF
 
@@ -165,10 +149,9 @@ def _count(state: dict, key: str) -> int:
 def week_start(now: datetime, tz: str) -> datetime:
     """Midnight on the Monday of ``now``'s week, in ``tz``.
 
-    Built from the *local date* rather than by subtracting a ``timedelta`` from
-    a local midnight: the two agree under UTC and disagree by an hour across a
-    DST transition, and the version that disagrees is the one that would start
-    quietly misfiling runs the day this stops being UTC.
+    Built from the local date rather than by subtracting a ``timedelta`` from
+    a local midnight: the two disagree by an hour across a DST transition, and
+    the subtracting version would misfile runs the day this stops being UTC.
     """
     local = now.astimezone(ZoneInfo(tz))
     monday = local.date() - timedelta(days=local.isoweekday() - 1)
@@ -178,13 +161,10 @@ def week_start(now: datetime, tz: str) -> datetime:
 def week_key(now: datetime, tz: str) -> str:
     """The stored window key for ``now`` — ``"2026-W40"``.
 
-    **The ISO year is part of the key, and that is the whole point of this
-    function existing.** ``isocalendar()[1]`` alone collapses week 1 of one
-    year onto week 1 of the next, and at a year boundary the two are days
-    apart: 2026-12-31 is ISO week 53 of 2026 while 2027-01-01 is week 53 of
-    *2026* too, and 2024-12-30 is already week 1 of **2025**. A bare week
-    number therefore either refuses a legitimate rollover or grants a free one,
-    depending on which side of the boundary the user is on.
+    The ISO year is part of the key, which is why this function exists: a
+    bare ``isocalendar()[1]`` collapses week 1 of one year onto week 1 of the
+    next, and at a year boundary that either refuses a legitimate rollover or
+    grants a free one.
     """
     iso_year, iso_week, _ = now.astimezone(ZoneInfo(tz)).isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
@@ -193,9 +173,8 @@ def week_key(now: datetime, tz: str) -> str:
 def resets_at(now: datetime, tz: str) -> str:
     """When the current window rolls, as an **ISO instant** in UTC.
 
-    Never a formatted local time: the client renders it. A server that decides
-    what "Monday 9am" looks like has to know the viewer's timezone, and this
-    one deliberately does not.
+    Never a formatted local time: the client renders it, because the server
+    does not know the viewer's timezone.
     """
     return (week_start(now, tz) + timedelta(days=7)).astimezone(UTC).isoformat()
 
@@ -203,10 +182,9 @@ def resets_at(now: datetime, tz: str) -> str:
 def used(state: dict | None, *, now: datetime | None = None, tz: str = UTC_TZ) -> int:
     """Searches already started in the window ``now`` falls in. Pure.
 
-    A stored counter from a *previous* week reads as zero here, which is the
-    same lazy rollover :func:`apply_reservation` applies — not a second
-    implementation of it, the same one, so a display can never disagree with
-    what the next reservation will do.
+    A stored counter from a previous week reads as zero, by the same lazy
+    rollover :func:`apply_reservation` applies, so a display can never
+    disagree with what the next reservation will do.
     """
     now = now or datetime.now(UTC)
     state = dict(state or {})
@@ -224,10 +202,9 @@ def remaining(
 ) -> int | None:
     """Searches left this week, **without reserving one**.
 
-    The read-only twin of :func:`apply_reservation`, for screens that must not
-    move a counter: the tick's pre-claim screen, and the allowance an activity
-    surface shows. It deliberately does not call ``apply_reservation`` — that
-    returns the post-debit state, and looking must never cost.
+    The read-only twin of :func:`apply_reservation`, for screens that must
+    not move a counter. It deliberately does not call ``apply_reservation``,
+    which returns the post-debit state.
     """
     limits = limits or Limits.from_env()
     if not limits.enforced:
@@ -247,10 +224,9 @@ def apply_reservation(
 ) -> tuple[dict, Reservation]:
     """Draw ``wanted`` runs from ``state``; return the new map and the grant.
 
-    Pure — every rollover and clamping rule lives here, so the whole matrix is
-    testable with no Firestore. :func:`reserve` is only the transaction around
-    it, and that is what makes "two ticks cannot both take the last run" a
-    property of one readable function rather than of a race.
+    Pure — every rollover and clamping rule lives here, so the whole matrix
+    is testable with no Firestore, and :func:`reserve` is only the transaction
+    around it.
     """
     state = dict(state or {})
     key = week_key(now, tz)
@@ -279,16 +255,14 @@ def apply_release(
 ) -> dict | None:
     """Give ``unused`` runs back; ``None`` when the refund no longer applies.
 
-    Pure, like :func:`apply_reservation`. The counter is credited only while it
-    still describes the window the run was taken from — a refund that arrives
-    after the week rolled was a debit on last week's counter and crediting this
-    week's would hand out a run nobody spent.
+    Pure, like :func:`apply_reservation`. The counter is credited only while
+    it still describes the window the run was taken from: crediting after the
+    week rolled would hand out a run nobody spent.
 
-    **An absent counter refunds nothing, and that is load-bearing beyond
-    tidiness.** One caller of :func:`release` is the cycle's deleted-account
-    refusal, and ``delete_account`` removes the user document outright; a
-    refund that wrote anyway would recreate ``users/{uid}`` *without* its
-    ``deleted_at`` tombstone and quietly resurrect the account.
+    An absent counter refunds nothing, which is load-bearing — one caller of
+    :func:`release` is the cycle's deleted-account refusal, and a refund that
+    wrote anyway would recreate ``users/{uid}`` without its ``deleted_at``
+    tombstone and resurrect the account.
     """
     if unused <= 0:
         return None
@@ -306,11 +280,9 @@ def unlimited(
 ) -> Reservation:
     """The grant when the cap is off: everything asked for, and no write.
 
-    The twin of :func:`no_document` — both are grants that deliberately leave
-    Firestore alone, one because there is nothing to charge and one because
-    there is no cap to charge against. ``remaining_week`` is ``None`` rather
-    than a large number: "unlimited" is not a quantity, and a display that
-    treats it as one would invent a figure.
+    The twin of :func:`no_document`: both grants leave Firestore alone.
+    ``remaining_week`` is ``None`` rather than a large number, because
+    "unlimited" is not a quantity.
     """
     now = now or datetime.now(UTC)
     return Reservation(
@@ -324,18 +296,14 @@ def unlimited(
 def no_document(*, now: datetime | None = None, tz: str = UTC_TZ) -> Reservation:
     """The grant for a user whose document is not there: nothing, and no write.
 
-    **The charge side of the hazard** :func:`apply_release` **already guards.**
-    ``reserve`` writes with ``merge=True``, which *creates* a missing document —
-    and ``delete_account`` removes ``users/{uid}`` outright. A request racing
-    the delete, or arriving on an ID token that has not expired yet (nothing
-    verifies ``check_revoked``), would otherwise leave a document holding a
-    ``discovery_budget`` and no ``deleted_at``: an account that reads as live
-    to every loop that screens on the tombstone.
+    The charge side of the hazard :func:`apply_release` guards: ``reserve``
+    writes with ``merge=True``, which would *create* the document
+    ``delete_account`` removed, leaving a ``discovery_budget`` and no
+    ``deleted_at`` — an account that reads as live to every loop screening on
+    the tombstone.
 
-    Declining is also the right answer on its own terms. No document means no
-    profile, no boards and nothing to search for, so a grant would buy a crawl
-    that cannot run — and refusing to hand one out is the fail-closed direction
-    this whole module is built in.
+    Declining is right on its own terms too: no document means no profile and
+    nothing to search for, so a grant would buy a crawl that cannot run.
     """
     return Reservation(
         granted=0,
@@ -371,9 +339,9 @@ async def reserve(
 ) -> Reservation:
     """Transactionally draw one run for one dispatch.
 
-    Errors propagate. A dispatch that cannot reserve must not happen: failing
-    closed is the safe direction for a cap, and the same Firestore the
-    reservation failed against is the one the cycle would have to read anyway.
+    Errors propagate: a dispatch that cannot reserve must not happen, and the
+    Firestore the reservation failed against is the one the cycle would have
+    to read anyway.
     """
     limits = limits or Limits.from_env()
     if not limits.enforced:
@@ -408,12 +376,10 @@ def reserve_sync(
     """:func:`reserve`, for the one charge site that has no event loop.
 
     The onboarding kickoff (``PUT /profile``) is a synchronous route that
-    enqueues **inside the request** on purpose — it is the only thing that ever
-    fires for a brand-new user, so it must not depend on the instance still
-    having CPU after the response. Charging it through ``asyncio.run`` would
-    build (and memoise) an async Firestore client on a loop that dies with the
-    call; the sync transaction shell is the honest way round. The pure core
-    below is the same one :func:`reserve` drives.
+    enqueues inside the request, because it is the only thing that fires for a
+    brand-new user. Charging it through ``asyncio.run`` would memoise an async
+    Firestore client on a loop that dies with the call. Same pure core as
+    :func:`reserve`.
     """
     limits = limits or Limits.from_env()
     if not limits.enforced:
@@ -444,15 +410,12 @@ async def release(
 
     A read-modify-write rather than a blind ``Increment(-1)``: the counter is
     windowed, and crediting a window the run was not taken from would hand a
-    *later* week an allowance it never earned — the one direction a cap must
-    not fail in.
+    later week an allowance it never earned.
 
-    **Deliberately not short-circuited on the kill switch**, unlike
-    :func:`reserve`. With the cap off nothing is charged, so there is normally
-    nothing to credit and :func:`apply_release` writes nothing anyway — but a
-    refund for a charge taken *before* the switch was thrown still has to land,
-    or toggling the cap off and on again would leave the counter permanently
-    over-stated.
+    Deliberately not short-circuited on the kill switch, unlike
+    :func:`reserve`: a refund for a charge taken before the switch was thrown
+    still has to land, or toggling the cap off and on leaves the counter
+    permanently over-stated.
     """
     if unused <= 0:
         return

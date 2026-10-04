@@ -14,22 +14,17 @@ from tools.genai_client import vertex_client
 # Objective writing is low-volume and benefits from a little warmth/variation, so
 # Flash at a higher temperature is the right cost/quality point.
 #
-# Pinned, where this used to be gemini-flash-latest, for the reasons in
-# tools/llm_models.py's FLASH_MODEL (which this deliberately still does not
-# import — see that module's docstring on independent declarations; tailoring
-# must stay movable without retuning the scorer). Same concrete id, so this is
-# a no-op on behaviour today. It must have a pricing entry in obs/llm_cost.py:
-# tools/tailoring/rates.py prices the quote through compute_cost_usd with this
-# constant and raises at import if it comes back None, so an unpriced pin here
-# does not degrade a quote — it stops the service booting.
+# A concrete pinned id, for the reasons in tools/llm_models.py's FLASH_MODEL,
+# which this deliberately does not import: tailoring must stay movable without
+# retuning the scorer. It must have a pricing entry in obs/llm_cost.py —
+# tools/tailoring/rates.py prices the quote with this constant and raises at
+# import if it comes back None, so an unpriced pin stops the service booting.
 OBJECTIVE_MODEL = "gemini-2.5-flash"
 
 # Thinking bills as output tokens at the full output rate. gemini-2.5-flash
-# 400s on thinking_level ("not supported by this model") and takes the older
-# thinking_budget knob instead — verified live 2026-07-08, back when this was
-# the alias and the alias served this model. Filling a 2-sentence template is
-# light stylistic judgment, not deep reasoning — 512 tokens trims rather than
-# disables; confirm
+# 400s on thinking_level and takes the older thinking_budget knob instead
+# (verified live 2026-07-08). Filling a 2-sentence template is light
+# stylistic judgment, so 512 trims rather than disables; confirm
 # thinking_tokens actually dropped before cutting toward 0.
 _OBJECTIVE_THINKING = types.ThinkingConfig(thinking_budget=512)
 

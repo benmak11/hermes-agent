@@ -54,16 +54,10 @@ _origins_env = (
 )
 allow_origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
 
-# ``/docs`` and ``/openapi.json`` are a development tool, and they were
-# answering 200 unauthenticated on production. Nothing behind them is data or a
-# billable model — they publish the *shape* of the API — so this is
-# reconnaissance aid rather than a vulnerability, and the fix is
-# correspondingly plain: don't publish it.
-#
-# Gated on ``deps.dev_mode()`` rather than a flag of its own, because that is
-# already the codebase's answer to "is this a developer's machine?" — Terraform
-# never sets AUTH_DEV_MODE, so a deployed revision cannot turn these back on by
-# accident.
+# ``/docs`` and ``/openapi.json`` are a development tool and were answering 200
+# unauthenticated on production. Gated on ``deps.dev_mode()`` rather than a flag
+# of its own: Terraform never sets AUTH_DEV_MODE, so a deployed revision cannot
+# turn them back on by accident.
 app = FastAPI(
     docs_url="/docs" if dev_mode() else None,
     openapi_url="/openapi.json" if dev_mode() else None,
@@ -108,32 +102,22 @@ app.include_router(worker_routes.router)
 def collect_feedback(
     feedback: Feedback, user_id: str = Depends(verify_user)
 ) -> dict[str, str]:
-    """Collect and log feedback.
-
-    Args:
-        feedback: The feedback data to log
-        user_id: Verified caller, injected by the auth dependency
-
-    Returns:
-        Success message
-    """
-    # Feedback.user_id is client-supplied and defaults to a random uuid; drop it
-    # so the log carries the *verified* uid that verify_user bound into the
-    # request context instead of whatever the caller claimed.
+    """Log a feedback submission from the authenticated caller."""
+    # Feedback.user_id is client-supplied and defaults to a random uuid; drop
+    # it so the log carries the verified uid verify_user bound into the request
+    # context instead of whatever the caller claimed.
     payload = feedback.model_dump()
     payload.pop("user_id", None)
     logger.info("feedback.received", **payload)
     return {"status": "success"}
 
 
-# One line at boot recording how this process will actually behave. All of it is
-# environment-driven and none of it is in version control (see
-# deployment/terraform/README.md), so "which mode is this revision in?" is
-# otherwise only answerable by reading the Cloud Run config.
+# One line at boot recording how this process will actually behave. All of it
+# is environment-driven and none of it is in version control, so "which mode is
+# this revision in?" is otherwise only answerable from the Cloud Run config.
 logger.info(
     "api.boot",
-    # Reads back the app that was actually built, not the flag that was meant
-    # to build it — this line exists to answer "which mode is this revision in?"
+    # Read back off the app that was built, not the flag meant to build it.
     docs_published=app.docs_url is not None,
     execution_mode="queued" if queues.enabled() else "in_process",
     worker_mode=queues.worker_mode(),

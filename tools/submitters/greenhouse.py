@@ -185,18 +185,15 @@ async def submit_greenhouse(
                 job.url, wait_until="domcontentloaded", timeout=30000
             )
 
-            # **Check the status before reading the DOM.** An error page has no
-            # email field and no file input, so without this it falls through to
-            # the custom-wrapper check below and is reported as "this employer
-            # uses a custom careers wrapper" — a permanent, structural verdict —
-            # when the truth may be a transient 406 from the ATS's bot
-            # detection. That misdiagnosis is not hypothetical: a 50-posting
-            # measurement on 2026-09-01 tripped Greenhouse's rate limiting and
-            # returned 48 false ``custom_wrapper`` bails, which would have sent
-            # the fix at the wrong problem entirely.
+            # Check the status before reading the DOM. An error page has no
+            # email field and no file input, so it would otherwise fall
+            # through to the custom-wrapper check and report a permanent,
+            # structural verdict for a transient bot-detection 406: a
+            # 50-posting measurement on 2026-09-01 tripped Greenhouse's rate
+            # limiting and returned 48 false ``custom_wrapper`` bails.
             #
             # ``goto`` returns None only for a same-document navigation, which
-            # this never is; treat it as unknown rather than assuming failure.
+            # this never is; treat it as unknown rather than as failure.
             status = response.status if response is not None else None
             if status is not None and status >= 400:
                 # A challenge page is often 403 and *is* a captcha, so prefer
@@ -226,28 +223,21 @@ async def submit_greenhouse(
                     "pre_submit_screenshot": pre_path,
                 }
 
-            # **A 200 is not proof the posting still exists.** Greenhouse
-            # expires postings as a 302 to the employer's board index (usually
-            # ``?error=true``), which Playwright follows, so the status check
-            # above passes and a job-list page arrives instead of a form. Of
-            # the 50 postings measured on 2026-09-04, 12 bailed as
-            # ``custom_wrapper``; hand-checking all 12 found every one
-            # redirecting to ``job-boards.greenhouse.io/{board}?error=true``
-            # and *no* genuine wrapper — a reported 24% wrapper rate against a
-            # true rate of zero.
+            # A 200 is not proof the posting still exists: Greenhouse expires
+            # postings as a 302 to the employer's board index (usually
+            # ``?error=true``) which Playwright follows, so a job-list page
+            # arrives instead of a form. Of 50 postings measured 2026-09-04,
+            # all 12 ``custom_wrapper`` bails were this and none was a genuine
+            # wrapper — a reported 24% wrapper rate against a true zero.
             #
-            # This sits before the email-field wait for two reasons: it skips
-            # the ~10s selector timeout (every false "wrapper" in the
-            # measurement took ~10.8s), and it forecloses the Apply fallback
-            # below, where ``a:has-text("Apply")`` could match a link on a
-            # board *index* and click through to a different posting whose
-            # form we would then fill. The timing says that did not happen in
-            # the 12, but placing the check here removes it permanently.
+            # Placed before the email-field wait so it skips the ~10s selector
+            # timeout, and so it forecloses the Apply fallback below, where
+            # ``a:has-text("Apply")`` could match a link on a board index and
+            # click through to a different posting's form.
             #
-            # Residual risk: a block page served as a 200 redirect to the board
-            # root lands here as ``posting_gone`` and is indistinguishable from
-            # expiry by URL alone. It shows up only as a cross-board spike of
-            # ``posting_gone`` with ``final_url`` set.
+            # Residual risk: a block page served as a 200 redirect to the
+            # board root is indistinguishable from expiry by URL alone, and
+            # shows up only as a cross-board spike of ``posting_gone``.
             final_url = response.url if response is not None else None
             detail = _redirected_off_posting(job.url, final_url or "")
             if detail:
@@ -306,12 +296,10 @@ async def submit_greenhouse(
                 job_log.warning("submit.bail", reason="custom_wrapper", status=status)
                 return {
                     "success": False,
-                    # Hedged deliberately. The 200 above rules out the error
-                    # pages that used to land here, but "served a page with no
-                    # Greenhouse form in it" still has more than one cause — a
-                    # custom wrapper, a client-rendered block, a redirect to a
-                    # closed-role notice. The screenshot is what settles it, so
-                    # point at that rather than asserting the cause.
+                    # Hedged deliberately: "a page with no Greenhouse form in
+                    # it" has several causes — a custom wrapper, a
+                    # client-rendered block, a closed-role notice — and the
+                    # screenshot is what settles which.
                     "error": (
                         "No Greenhouse application form on the page — most often a "
                         "custom careers wrapper, which needs the Computer Use path "
@@ -406,18 +394,14 @@ async def submit_greenhouse(
                     "pre_submit_screenshot": pre_path,
                 }
 
-            # SUBMIT_CLICKED, not "submitting": the next statement is the point
-            # of no return, and the six other _emit calls in this function all
-            # use "submitting", so until this token existed the click was
-            # indistinguishable from "Attaching resume". The caller turns this
-            # into ``submit_attempted_at`` — the fact that stops a reaper from
-            # ever auto-retrying this application — and still records the
-            # timeline entry as "submitting", so nothing in web/ changes.
+            # SUBMIT_CLICKED, not "submitting": the next statement is the
+            # point of no return, and the caller turns this token into
+            # ``submit_attempted_at``, the fact that stops a reaper from ever
+            # auto-retrying this application.
             #
-            # Emitted *before* the click and awaited, so the marker is on the
-            # document by the time the browser can possibly have submitted. The
-            # dry-run path above returns before reaching this line: a rehearsal
-            # never clicks, so it must never leave the marker behind.
+            # Emitted before the click and awaited, so the marker is on the
+            # document by the time the browser can have submitted. The dry-run
+            # path returns above: a rehearsal must never leave the marker.
             await _emit(on_progress, "Submitting application", SUBMIT_CLICKED)
             submit_btn = page.locator(
                 'button[type="submit"]:has-text("Submit"), '

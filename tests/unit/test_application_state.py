@@ -277,7 +277,7 @@ def test_a_lease_is_written_and_cleared_atomically_with_the_status():
 
 
 def test_no_lease_field_appears_when_none_is_passed():
-    """PR A ships the lease shape but must not add a field to live documents."""
+    """The lease shape must not add a field to documents that pass no lease."""
     doc = _ready()
     assert state.try_transition(doc, doc.get(), "submitting") is True
     assert doc.data is not None and "lease" not in doc.data

@@ -3,9 +3,12 @@
 """
 One-off cleanup: move already-scored pending jobs at/below the discard
 threshold out of `jobs` and into `discarded_jobs` tombstones. Newly scored
-jobs are discarded inline by `score_pending_jobs`; this backfills the rule
-for docs persisted before it existed. Only touches `user_decision ==
-"pending"` docs — anything the user acted on is left alone.
+jobs are discarded inline by `score_pending_jobs`; this backfills the rule for
+docs persisted before it existed. Only touches `user_decision == "pending"`
+docs.
+
+Unlike the other CLIs here it writes by default — pass `--dry-run` to report
+without deleting anything.
 
 Usage:
     python -m cli.purge_discarded --user-id me [--dry-run]
@@ -29,25 +32,14 @@ log = get_logger("cli.purge_discarded")
 
 
 def backfill_tombstone(job: Job, match: JobMatch, doc: dict) -> dict:
-    """The tombstone for a job this purge is moving, carrying the doc's own
-    history rather than this run's.
+    """The tombstone for a job this purge is moving, carrying the job doc's own
+    provenance rather than this run's.
 
-    Both fields come off the job document because **this purge spends
-    nothing**. It makes no model call and takes no budget reservation, so
-    anything it stamps from the ambient context describes the purge, not the
-    score.
-
-    - ``scored_run_id``: stamping this run's would misattribute the tombstone,
-      and tombstones are where most of a cycle's spend lands.
-    - ``scored_with``: the job was scored by a real model under a real prompt,
-      and the record of that is sitting right here in ``doc``. Dropping it
-      would be worse than never having had it: ``discard_tombstone`` treats an
-      absent ``scored_with`` as "no scoring model ran" (that is what
-      ``batch_runs._persist_prefiltered`` means by it), so a Pro-scored job
-      demoted by a threshold change would land in ``discarded_jobs`` asserting
-      the exact opposite of the truth. ``None`` for a job scored before the
-      field existed, which is the honest answer and the one the key already
-      has everywhere else.
+    This purge spends nothing, so ``scored_run_id`` and ``scored_with`` are
+    read off ``doc``: stamping the ambient run would describe the purge, not
+    the score. Dropping ``scored_with`` would be worse still, since
+    ``discard_tombstone`` reads an absent one as "no scoring model ran".
+    ``None`` for a job scored before the field existed.
     """
     return discard_tombstone(
         job,

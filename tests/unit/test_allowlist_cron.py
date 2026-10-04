@@ -1,11 +1,10 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""``cron_tick``'s allowlist skip — the seam PR C's ``is_deleted`` check also
-lives at.
+"""``cron_tick``'s allowlist skip — the same seam as its ``is_deleted`` check.
 
 ``cron_tick`` streams every ``users/{uid}`` document without ever calling
 ``verify_user``, so a de-allowlisted user's background loops have to be
-stopped *here* too, or removing them from the allowlist bounds none of their
+stopped here too, or removing them from the allowlist bounds none of their
 spend. Modelled on the ``is_deleted`` skip immediately above it in the loop:
 same ``continue``, same counter shape — see ``test_account_delete.py``'s
 ``test_the_cron_fan_out_skips_a_deleted_account_whole`` for that one's twin.

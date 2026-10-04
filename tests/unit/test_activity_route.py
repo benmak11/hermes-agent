@@ -823,8 +823,8 @@ def test_allowance_remaining_is_the_day_when_the_day_is_what_binds(client, monke
 
 
 def test_allowance_reports_ratings_actually_used_not_the_cap(client, monkeypatch):
-    """#92 cut the daily cap 400 -> 3 **mid-day**. An account holding 46 rated
-    jobs under the old cap must read 46, not the new limit.
+    """A mid-day cap cut (400 -> 3) must not rewrite history: an account
+    holding 46 rated jobs under the old cap reads 46, not the new limit.
 
     ``limit - remaining`` clamps, and clamping here understates what was
     spent, which is the direction this whole program exists to stop.

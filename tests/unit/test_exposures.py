@@ -2,24 +2,23 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The impression log (``users/{uid}/exposures``) and its join to a decision.
 
-A decision event says what was chosen. Only an exposure says what it was
-chosen *against* — the position in the list, and the jobs that were on screen
-and ignored. Without it the exploration sample of #97 is uninterpretable,
-because the queue sorts sampled jobs below every normally-surfaced one.
+A decision event says what was chosen; only an exposure says what it was
+chosen *against* — the position in the list and the jobs that were on screen
+and ignored. Without it the exploration sample is uninterpretable, because the
+queue sorts sampled jobs below every normally-surfaced one.
 
-The things most likely to be silently wrong, and therefore what is pinned
-hardest here:
+What is pinned hardest is what could be silently wrong:
 
-- ``rank`` must be the position in the list **actually returned**. The index of
-  the streaming loop is a Firestore ordering of the unfiltered collection, it
-  survives every obvious test, and it is not what anybody saw;
-- ``exploration`` is popped out of the response on purpose, so recording a
-  constant ``False`` here looks exactly like working code and destroys the one
-  field the sample needs;
-- ``request_id`` must be the id the middleware bound. A fresh uuid is a
-  perfectly valid id that joins to nothing, which is most of its value gone;
-- the decision-side lookup is a read on the decision path. Task 1 shipped one
-  unwrapped there and a transient Firestore error cost an approval.
+- ``rank`` must be the position in the list **actually returned**. The
+  streaming loop's index is a Firestore ordering of the unfiltered collection;
+  it survives every obvious test and is not what anybody saw;
+- ``exploration`` is popped out of the response, so recording a constant
+  ``False`` here looks like working code and destroys the one field the sample
+  needs;
+- ``request_id`` must be the id the middleware bound. A fresh uuid is valid and
+  joins to nothing;
+- the decision-side lookup is wrapped: a transient Firestore error on it must
+  not fail the decision.
 """
 
 from __future__ import annotations
@@ -661,9 +660,9 @@ def test_with_the_flag_off_the_decision_takes_no_exposure_read(world, monkeypatc
 
 
 def test_a_failing_exposure_lookup_does_not_fail_the_decision(world, monkeypatch):
-    """Task 1's lesson, re-learned on the same path: an unwrapped read here
-    turns a transient Firestore error into a failed approval with no tailoring
-    dispatched. Degraded — an event without ``shown_at`` — never absent."""
+    """An unwrapped read here turns a transient Firestore error into a failed
+    approval with no tailoring dispatched. Degraded — an event without
+    ``shown_at`` — never absent."""
     _on(monkeypatch)
     client, user = _decided_world(world, ["2026-10-03T09:00:00+00:00"], fail_read=True)
 

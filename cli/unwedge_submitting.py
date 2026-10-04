@@ -3,49 +3,27 @@
 """
 Move applications wedged in ``submitting`` to ``failed`` so the user can act.
 
-``submitting`` is the one status with no automatic way out. ``run_submission``
-writes ``failed`` from its own ``except``, but that never fires if the process
-dies — and it runs as a Cloud Tasks delivery on ``hermes-worker`` (or, without a
-queue, as a FastAPI ``BackgroundTask`` on ``hermes-api``), so an ordinary Cloud
-Run eviction mid-submit strands the document there.
-Everything else then refuses to touch it, correctly: ``submit`` and
-``regenerate`` return 409, the undo path declines to delete it, and the liveness
-sweep skips it (``tools.ats.sweep.ACTIVE_APP_STATUSES``). Before the state
-machine, ``regenerate`` rewrote the status unconditionally and was the accidental
-escape hatch; closing that hole is what makes this tool necessary.
+``submitting`` is the one status with no automatic way out: ``run_submission``
+writes ``failed`` from its own ``except``, which never fires if the process
+dies, and every other path then refuses to touch the document. This is the
+manual operator lever for that case. It is a CLI rather than an endpoint on
+purpose — a user-facing escape from ``submitting`` is what risks a duplicate
+real job application.
 
-**This is a manual stopgap, not the reaper.** The real fix is a scheduled pass
-that expires ``state.IN_PROGRESS`` leases; that is a later PR. This is the
-operator lever for the interim, and it is deliberately a CLI rather than an
-endpoint: a *user-facing* way out of ``submitting`` is exactly what risks a
-duplicate real job application, which is the thing the compare-and-swap exists
-to prevent.
+It never retries the submission; it only unwedges the document, and the note it
+writes says the outcome is unknown, because the browser may have clicked Submit
+a millisecond before the process died.
 
-**It never retries the submission.** All it does is unwedge the document. The
-note it writes says the outcome is unknown, because it is: the browser may have
-clicked Submit successfully a millisecond before the process died. The user must
-check their email before resubmitting, and the note tells them so.
+Dry-run by default: without ``--execute`` it reports what it would move and
+writes nothing. With ``--execute`` it writes to Firestore through
+``state.try_transition``.
 
-Dry-run by default, like ``cli.reset_user`` and ``cli.geo_resurrect``: without
-``--execute`` it reports exactly what it would move and writes nothing.
-
-**A live lease is never released, at any age.** ``tools.applications.state``
-leases are written by the process actually running the work, so they are the
-one first-hand signal here; everything else on this page is inference. The age
-arithmetic below only decides documents that hold no lease. Every path that
-drives a submission now takes one — the claim lives in ``run_submission``
-itself, so the in-process path is leased too — but there is still a window
-between the request writing ``submitting`` and the run claiming it, a permanent
-one where the dispatch in between failed outright, and documents predating the
-lease entirely. Those are what the age arithmetic is for.
-
-Age is measured from ``last_submitted_at`` (written atomically with the
-``submitting`` status by ``POST /applications/{id}/submit``), falling back to the
-newest timeline entry for documents predating it. The default floor is the
-``submitting`` lease from ``tools.applications.state.IN_PROGRESS`` — which is
-deliberately *longer* than the 1800s Cloud Tasks dispatch deadline, since a lock
-that expires while its work can still be running is not a lock — so a submission
-still legitimately in flight is never touched.
+A held ``tools.applications.state`` lease is never released, at any age — the
+lease is written by the process actually doing the work, so the age arithmetic
+below only decides documents that hold none. Age comes from
+``last_submitted_at``, falling back to the newest timeline entry, and the
+default floor is the ``submitting`` lease, which is deliberately longer than the
+1800s Cloud Tasks dispatch deadline.
 
 Usage:
     python -m cli.unwedge_submitting --user-id me                    # dry run
@@ -103,8 +81,8 @@ def started_at(doc: dict) -> datetime | None:
     """When this submission began, or ``None`` if the document doesn't say.
 
     ``last_submitted_at`` is written in the same update as the ``submitting``
-    status, so it is the authoritative answer. The timeline fallback covers
-    documents written before that field existed.
+    status, so it is authoritative; the timeline fallback covers documents
+    written before that field existed.
     """
     when = _parse_iso(doc.get("last_submitted_at"))
     if when is not None:
@@ -129,22 +107,13 @@ def age_minutes(doc: dict, *, now: datetime) -> float | None:
 def is_wedged(doc: dict, *, now: datetime, min_age_minutes: float) -> bool:
     """Is this document stuck in ``submitting`` past the lease? Pure.
 
-    **A held lease wins over the age arithmetic, whatever the age says.** The
-    ages here are inferred: ``last_submitted_at`` records when the *request*
-    claimed the status, which is not when the run started — once submission goes
-    through the queue, a task can sit enqueued for minutes before a worker picks
-    it up, so an application can be older than the floor while its browser is
-    still on the first page of the form. Releasing that one writes ``failed``
-    and clears the lease under a working submitter, and the real outcome is then
-    refused when it reports back: the user is told "failed" about an application
-    that went out, with the confirmation screenshot dropped. The lease is the
-    only signal that comes from the process actually doing the work, so it is
-    the one that decides.
+    A held lease wins over the age arithmetic whatever the age says: ages are
+    inferred from when the *request* claimed the status, and a queued task can
+    sit enqueued for minutes, so releasing a leased document would report
+    "failed" for an application that is still being submitted.
 
-    A document whose age can't be determined *and* holds no lease is treated as
-    wedged: it has no ``last_submitted_at`` and no usable timeline, which only
-    happens to documents old enough that no submission of theirs is still
-    running.
+    A document whose age can't be determined and holds no lease counts as
+    wedged — that only happens to documents too old for a run to be live.
     """
     if doc.get("status") != WEDGED_STATUS:
         return False
@@ -155,10 +124,8 @@ def is_wedged(doc: dict, *, now: datetime, min_age_minutes: float) -> bool:
 
 
 def main() -> None:
-    # Synchronous, unlike the other CLIs: ``state.try_transition`` is sync
-    # (every production caller holds a sync ``firestore.Client``), and going
-    # through it is non-negotiable — it is the only writer of ``status``, and
-    # this tool must not become a second one.
+    # Synchronous, unlike the other CLIs: ``state.try_transition`` is sync, and
+    # it must stay the only writer of ``status``.
     parser = argparse.ArgumentParser()
     parser.add_argument("--user-id", required=True)
     parser.add_argument(
@@ -224,9 +191,8 @@ def main() -> None:
             f"{doc.get('job_company') or '?'} - {(doc.get('job_title') or '?')[:50]}"
         )
         if args.execute:
-            # allowed_from re-checks inside the swap: if the real submission
-            # was merely slow and reported back between the read above and this
-            # write, it wins and this releases nothing.
+            # allowed_from re-checks inside the swap, so a slow submission that
+            # reported back since the read above wins and nothing is released.
             if state.try_transition(
                 ref,
                 snap,

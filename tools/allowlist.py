@@ -1,12 +1,11 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Who may sign in at all — Phase 4 D1, shipped with enforcement off.
+"""Who may sign in at all — a cap on how many accounts exist.
 
-``web/src/app/login/page.tsx`` reads ``NEXT_PUBLIC_INVITE_CODES`` as a
-client-side gate, but the API never validates it — Google sign-up is
-unconditionally open. Phase 1's per-user scoring budget
-(:mod:`tools.matching.budget`) bounds one user's spend once they are in;
-nothing bounds *how many* users get in. This module is that bound::
+:mod:`tools.matching.budget` bounds one user's spend once they are in; this
+bounds how many get in. The login page's ``NEXT_PUBLIC_INVITE_CODES`` is a
+client-side gate the API never validates, so without this Google sign-up is
+unconditionally open::
 
     allowlist/{lowercased-email}
       {
@@ -34,62 +33,24 @@ Written by ``POST /account/signup`` for a non-allowlisted account, listed by
 (or on account deletion). Keyed through the same :func:`_key` as the allowlist
 so an operator's later ``add`` of the address lands on a matching id.
 
-**Keyed on email, not uid.** At invite time an operator only has an email
-address — the account may not exist yet — and this has to match what Firebase
-Auth carries on the token being verified, which is what ``api.deps`` checks
-against. ``users/{uid}.email`` is a *different* field: it is résumé-extracted
-by onboarding and is not guaranteed to be the login address at all. Every
-function here keys off the Auth email, never the profile document.
+Keyed on the Firebase Auth email, never on uid and never on
+``users/{uid}.email`` — that field is résumé-extracted and need not be the
+login address. At invite time an operator may have nothing but an address, and
+the account may not exist yet.
 
-**The predicate fails closed; this is the opposite bias from the discovery
-guards on purpose.** ``api.routes.discovery.run_discovery_cycle`` and friends
-fail *open* on an unreadable lease or a broken read, because refusing there
-wedges one user's background loops shut for no good reason — the guard exists
-to survive crashes, not to block spend. :func:`is_allowed` is a spend gate: a
-read error, a missing doc, or a malformed doc must all come back "not
-allowed", because the failure mode of guessing wrong here is a signup nobody
-approved, not a delayed background loop. Two guards, two different jobs,
-deliberately different biases — not an inconsistency to reconcile.
+:func:`is_allowed` fails closed on every error, which is the opposite bias
+from the discovery guards on purpose: guessing wrong here admits a signup
+nobody approved, where guessing wrong there only delays a background loop.
 
-**Enforcement is a separate flag from the machinery.** :func:`enforced` reads
-``ALLOWLIST_ENFORCED``, unset by default — same shape as
-``tools.queues.enabled`` (``QUEUE_MODE``) and
-``tools.matching.pipeline.geo_enforce_enabled`` (``GEO_GATE_ENFORCE``). This
-module works, and is tested, with the flag on; every real caller in this PR
-checks the flag first and is a no-op while it is off.
+Enforcement is a separate flag from the machinery. :func:`enforced` reads
+``ALLOWLIST_ENFORCED``, unset by default; the module works and is tested with
+it on, and every caller checks the flag first.
 
-**Ops runbook — flipping this on (Phase 4 D2 closes the code gap; a human
-does this step, by hand, after D2 is reviewed and merged).** No step here is
-run by an agent or by CI — ``gcloud`` against the live services is a human
-action, deliberately outside anything this codebase automates. In order:
-
-1. Confirm both real accounts are already seeded and active
-   (``techedoutben@gmail.com``, ``btmakusha@yahoo.com``) — ``list_entries``
-   via the CLI, or a Firestore console check. Do not skip this: everything
-   below assumes it is already true.
-2. Deploy the D2 PR (the frontend pre-flight check and this comment) to both
-   services. It is inert until step 3 — ``ALLOWLIST_ENFORCED`` is still
-   unset everywhere at this point.
-3. Set ``ALLOWLIST_ENFORCED=1`` on ``hermes-worker`` **first**. It is
-   private and has no user-facing traffic, so a mistake here costs nothing a
-   real user can see.
-4. Verify ``cron_tick`` still processes both real accounts — check worker
-   logs for the allowlist fan-out and confirm ``not_allowlisted`` count is
-   0. A nonzero count means step 1 was wrong (a seed is missing or
-   mis-cased) — fix the seed, do not proceed to step 5 until this reads 0.
-5. Only then set ``ALLOWLIST_ENFORCED=1`` on ``hermes-api``.
-6. Sign in as both seeded accounts (Google and, if applicable, email) and
-   confirm real access — not just a 200 from ``/profile`` in isolation.
-7. Only after 6 is confirmed, remove ``NEXT_PUBLIC_INVITE_CODES`` and the
-   client-side invite gate in ``web/src/app/login/page.tsx`` — a follow-up
-   PR, not part of D2. From then on, granting someone from ``cli.allowlist
-   waitlist`` is just ``add``; their waitlist doc clears itself on their next
-   sign-in.
-
-**Reversing the order in step 3/5 (api before worker), or skipping step 1 or
-4, risks locking out the two real accounts** — a 403 with no seat to blame it
-on, discovered by a human being unable to sign in, not by an alert. The
-rollback, on whichever service was flipped, is a single flag removal:
+Turning it on is a manual ``gcloud`` step. Seed and verify the real accounts
+first, then set ``ALLOWLIST_ENFORCED=1`` on ``hermes-worker`` before
+``hermes-api`` and confirm the worker's ``not_allowlisted`` count is 0 in
+between: flipping the api first, or on an unseeded account, locks a real user
+out with a 403 that no alert will catch. Rollback is
 ``gcloud run services update <service> --remove-env-vars ALLOWLIST_ENFORCED``.
 """
 
@@ -114,21 +75,18 @@ def enforced() -> bool:
 
 
 def _key(email: str | None) -> str:
-    """The document id for an email — the one normalization every caller must
-    share, or a doc written by one casing is invisible to a check under
-    another."""
+    """The document id for an email. Every caller must share this
+    normalization, or a doc written under one casing is invisible to a check
+    under another."""
     return (email or "").strip().casefold()
 
 
 async def is_allowed(db, email: str | None) -> bool:
     """Is ``email`` an active allowlist seat? One read, fully fails closed.
 
-    Every one of these comes back ``False``: no email, no document, a document
-    that is not a mapping, a document whose ``revoked`` is truthy (including a
-    malformed non-bool truthy value — that is still the safe direction to
-    fail), and any exception raised while reading. There is no path in this
-    function that reaches ``return True`` except a document that exists, is a
-    mapping, and says ``revoked`` is falsy.
+    A blank email, a missing or non-mapping document, a truthy ``revoked``,
+    and any read error all return ``False``. The only path to ``True`` is a
+    document that exists, is a mapping, and has a falsy ``revoked``.
     """
     key = _key(email)
     if not key:
@@ -151,12 +109,8 @@ async def is_allowed(db, email: str | None) -> bool:
 async def _active_seats(db, transaction) -> int:
     """How many non-revoked allowlist docs exist, read *inside* ``transaction``.
 
-    A full collection ``stream()`` rather than a ``count()`` aggregation.
-    ``AsyncAggregationQuery.get`` does accept a ``transaction=`` in this
-    client version, but nothing else in this codebase runs one, and at
-    real-world seat counts (tens, not thousands) a stream is exactly as cheap
-    and keeps this module on the pattern every other Firestore reader here
-    already uses.
+    A full ``stream()`` rather than a ``count()`` aggregation: at seat counts
+    in the tens it is just as cheap and matches every other reader here.
     """
     seats = 0
     async for snap in db.collection(COLLECTION).stream(transaction=transaction):
@@ -178,37 +132,18 @@ async def add(
     this returns, ``email`` is an active seat — whether this call created it,
     reactivated it, or it already was one.
 
-    **This is the concurrency point of the whole module**, and the design is
-    lifted deliberately from :func:`tools.matching.budget.reserve`, not from
-    ``tools.applications.state.try_transition``. The state pattern exists for
-    long-lived, cross-process work guarded by an update-time precondition and
-    a TTL lease; this is a millisecond read-modify-write, and Firestore's own
-    transaction retries already serialize it the way a lease would, without a
-    lease's failure modes (an expired lease that never gets reaped, a held
-    lease that blocks a legitimate retry). Read ``budget.reserve``'s docstring
-    for the same argument made about the same shape of problem.
+    The seat count is read *inside* the transaction, like
+    :func:`tools.matching.budget.reserve`. Checking ``count() < max_users``
+    before opening one is a read-then-write with no isolation: two concurrent
+    invites can each see 9 of 10 seats taken and each write the 10th.
 
-    **The seat count is read inside this transaction, not before it opens.**
-    Checking ``count() < max_users`` and then opening a transaction to write
-    is a read-then-write with no isolation between the two — two concurrent
-    invites can each read "9 of 10 seats taken" and each write the 10th,
-    landing 11. That exact bug shape (a check performed outside the
-    transaction that is supposed to make it safe) is one this project has
-    shipped and caught six times already; see :func:`_active_seats`, called
-    from inside the transaction below, for how this one avoids it.
+    Idempotent on an already-active email — a no-op success that does not
+    re-consult the cap, so a retry of a successful invite cannot turn into a
+    spurious "cap reached". A previously revoked email re-checks the cap like
+    any new grant, since its seat was freed when it was revoked.
 
-    Idempotent on an already-active email: re-inviting someone already on the
-    list is a no-op success and does not re-consult the cap, so a slow retry
-    of a successful invite can never be turned into a spurious "seat cap
-    reached" by the cap having filled in between. A previously **revoked**
-    email re-checks the cap like any other new grant — its old seat was
-    already excluded from :func:`_active_seats` while revoked, so this is a
-    real seat being consumed again, not a re-grant of one that was never
-    freed.
-
-    Errors propagate, same reasoning as ``budget.reserve``: a caller that
-    can't check the seat count can't safely grant one either, and guessing in
-    the permissive direction is exactly what a seat cap must not do.
+    Errors propagate: a caller that cannot check the seat count must not grant
+    one anyway.
     """
     key = _key(email)
     if not key:
@@ -248,13 +183,9 @@ async def revoke(db, email: str, *, revoked_by: str) -> bool:
     """Revoke ``email``'s seat, freeing it for the next invite. ``True`` iff a
     document existed to revoke.
 
-    **Not transactional against** :func:`add`'s seat count, unlike ``add``
-    itself — deliberately. Revoking is a single document write with nothing
-    else to isolate it from: the failure mode of a stale read here is "one
-    invite briefly sees a seat as still taken that was in fact just freed",
-    which costs at most a delayed grant, not the over-grant a spend gate
-    exists to prevent. That asymmetry is why :func:`add` needs a transaction
-    and this does not.
+    Not transactional against :func:`add`'s seat count, unlike ``add``: a
+    stale read here only lets one invite briefly see a freed seat as taken,
+    which costs a delayed grant rather than an over-grant.
     """
     key = _key(email)
     if not key:

@@ -10,8 +10,8 @@ hard dependency rather than an optional branch.
 What is pinned here is the pair of properties that make the split worth
 having at all — it asks first, **and** the thing it eventually runs is still
 the same budget-capped scorer it always was. The seam does not grant slots;
-the budget is untouched by this PR and this is where that is checked from the
-HTTP side.
+the budget is untouched by the seam, and this is where that is checked from
+the HTTP side.
 """
 
 from __future__ import annotations

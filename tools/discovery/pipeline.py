@@ -40,26 +40,24 @@ FETCHERS: dict[Platform, Callable[[str, str], Awaitable[list[Job]]]] = {
 }
 
 
-#: Boards fetched at once. ``all_active_companies()`` is ~198 slugs and the
-#: gather below used to start every one of them simultaneously — 198 sockets
-#: opening at once, against a handful of hosts (72 Ashby, 64 Greenhouse, 60
-#: Lever), which is both the shape most likely to earn a 429 and the reason the
-#: shared client in ``tools.ats._http`` had no pool to reuse. Matches the
-#: ``persist_new_jobs`` bound below and ``tools.ats.sweep``'s 10.
+#: Boards fetched at once. ``all_active_companies()`` is ~198 slugs across a
+#: handful of hosts, so an unbounded gather opens 198 sockets at once — the
+#: shape most likely to earn a 429, and one that leaves the shared client in
+#: ``tools.ats._http`` no pool to reuse.
 _FETCH_CONCURRENCY = 20
 
 
 async def _fetch_with_meta(fetcher, slug, user_id, platform, source):
     """One board, from the shared cache if it is warm. Returns metadata alongside.
 
-    The cache is consulted *here* rather than inside the fetchers so that the
-    fetchers stay exactly what they are — a board API and its parse — and so
-    ``html_to_text`` keeps running before anything is cached.
+    The cache is consulted here rather than inside the fetchers, so the
+    fetchers stay a board API plus its parse and ``html_to_text`` still runs
+    before anything is cached.
 
-    ``tools.ats.board_cache`` never raises: a miss, a cold cache, a corrupt
-    payload and a GCS outage all arrive as ``None``, so anything caught below
-    still means the *fetcher* failed. With ``BOARD_CACHE_TTL_SECONDS`` unset
-    (the shipped default) both calls are no-ops and this is the old code path.
+    ``tools.ats.board_cache`` never raises — a miss, a cold cache, a corrupt
+    payload and a GCS outage all arrive as ``None`` — so anything caught below
+    means the fetcher failed. With ``BOARD_CACHE_TTL_SECONDS`` unset, the
+    shipped default, both calls are no-ops.
     """
     cached = await board_cache.load_jobs(platform, slug, user_id)
     if cached is not None:
@@ -78,17 +76,13 @@ async def run_discovery(
 ) -> dict:
     """Fetch all jobs from all sources for all known + unvetted companies.
 
-    The user's company exclusions are read **once**, here, before the fan-out —
-    not per board. Two reasons, and the second is the real one: a lookup per
-    board would be ~198 Firestore reads instead of one, and a write landing
-    mid-cycle would apply to the boards not yet reached and not to the ones
-    already fetched, so a single cycle would run against two different views of
-    the world. One read, one immutable snapshot, the whole cycle.
+    The user's company exclusions are read once, before the fan-out, rather
+    than per board: a write landing mid-cycle would apply to the boards not
+    yet reached and not to the ones already fetched, running one cycle
+    against two views of the world. The snapshot may be slightly stale; the
+    next cycle picks up anything written during this one.
 
-    The snapshot is allowed to be slightly stale; the next cycle picks up
-    anything written during this one. Nothing here is a compare-and-swap.
-
-    Returns a summary dict for SLI tracking later.
+    Returns a summary dict.
     """
     started = time.monotonic()
     db = db or firestore.AsyncClient()
@@ -175,16 +169,14 @@ async def run_discovery(
     }
 
 
-#: Document references per ``get_all`` call. Firestore's BatchGetDocuments RPC
-#: has no documented cap on the *number* of documents per request — unlike
-#: ``in`` queries (30) or batched writes (500) — so the binding constraint is
-#: the request/response size, not a count. 300 stays well inside it even when
-#: every document comes back full, and turns a 300-job cycle's 600 sequential
-#: round trips into 2.
+#: Document references per ``get_all`` call. BatchGetDocuments has no
+#: documented cap on the number of documents per request, so the binding
+#: constraint is request/response size; 300 stays well inside it even when
+#: every document comes back full.
 #:
-#: Note this changes round trips, not billed reads: Firestore bills per document
-#: returned either way. The saving in *reads* comes from the tombstone-first
-#: ordering below, not from the batching.
+#: This changes round trips, not billed reads — Firestore bills per document
+#: returned either way. The saving in reads comes from the tombstone-first
+#: ordering below.
 _GET_ALL_CHUNK = 300
 
 
@@ -210,11 +202,10 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
     to a ``discarded_jobs`` tombstone, and postings stay live on boards for
     weeks — without this check every run would re-persist and re-score them.
 
-    Jobs with an empty ``jd_raw`` never persist: there is nothing to parse or
-    score (Vertex rejects empty input outright), so they would sit pending and
-    re-fail every scoring run until deleted by hand — 13 such docs observed in
-    the 12K backlog. An empty JD usually means the fetcher got no content for
-    that posting, so drops are logged with their provenance.
+    Jobs with an empty ``jd_raw`` never persist: Vertex rejects empty input,
+    so they would sit pending and re-fail every scoring run until deleted by
+    hand. An empty JD usually means the fetcher got no content, so drops are
+    logged with their provenance.
     """
     # De-dupe within this run (a slug can appear in both known + unvetted).
     unique = {j.id: j for j in jobs}
@@ -246,12 +237,9 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
         jobs_col = user_ref.collection("jobs")
         discarded_col = user_ref.collection("discarded_jobs")
 
-        # Tombstones first, then the job docs for whatever survived — the same
-        # precedence the per-job version had (a job that is both tombstoned and
-        # present still resolves as discarded), but expressed as the order of
-        # two batched round trips instead of an if/elif over two reads that
-        # always both happened. Tombstoned jobs are the bulk of a cycle and now
-        # cost one read each instead of two.
+        # Tombstones first, then the job docs for whatever survived, so a job
+        # that is both tombstoned and present still resolves as discarded.
+        # Tombstoned jobs are the bulk of a cycle and cost one read each.
         tombstoned = await _existing_ids(
             db, [discarded_col.document(j.id) for j in user_jobs]
         )

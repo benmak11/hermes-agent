@@ -3,21 +3,20 @@
 """The vetting-decision event log (``users/{uid}/decisions``).
 
 ``decide()`` overwrites ``user_decision`` in place, so the job document holds
-only the latest answer: no timestamp, no history, and no record of the score
-the user was looking at. An undo erases the original choice. None of that can
+only the latest answer — no timestamp, no history, no record of the score the
+user was looking at, and an undo erases the original choice. None of that can
 be used as a training label, which is what these events exist to become.
 
-The three things most likely to be silently wrong, and therefore what is
-pinned hardest here:
+What is pinned hardest is what could be silently wrong:
 
 - the snapshot fields live under the job document's ``match`` key, not at the
   top level. Reading them off the document yields ``None`` for every job ever
-  scored and the label store is worthless without anything failing;
+  scored, and nothing fails;
 - an *unscored* job must get ``score_snapshot: None``, not a dict of nulls —
   "never scored" and "scored, got null" are different facts;
-- ``previous_decision`` has to come from the read taken *before* the update.
-  Taken from the new decision it still produces three plausible-looking
-  events and an unreconstructible chain.
+- ``previous_decision`` has to come from the read taken *before* the update;
+  taken afterwards it still produces plausible events and an unreconstructible
+  chain.
 """
 
 from __future__ import annotations

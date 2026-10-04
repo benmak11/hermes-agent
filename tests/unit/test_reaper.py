@@ -2,22 +2,18 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The reaper: recovering applications whose worker died, without re-applying.
 
-The headline case is ``test_a_clicked_submission_is_never_auto_retried`` and the
-mutation evidence beside it. A crash *after* the Submit click may already have
-filed a real application at a real company, so the one thing this module must
-never do is put such a document back on a queue — that is the same duplicate
-real job application ``tools.applications.state`` exists to prevent, arriving
-from the other direction.
+The headline case is ``test_a_clicked_submission_is_never_auto_retried``. A
+crash *after* the Submit click may already have filed a real application at a
+real company, so this module must never put such a document back on a queue.
 
 Everything else pins the properties that make that hold: a live lease is never
-touched, an unleased ``submitting`` document is ambiguous rather than dead, the
-retry loop is bounded, the dry run writes nothing, and every recovery is a
+touched, an unleased ``submitting`` document is ambiguous rather than dead,
+the retry loop is bounded, the dry run writes nothing, and every recovery is a
 compare-and-swap that a document moving underneath it defeats.
 
 ``_FakeDoc`` is imported from ``test_application_state`` rather than copied: it
 honours the update-time precondition for real, and that behaviour is what half
-of this suite asserts against. A second copy would drift, and the drift would
-silently stop these tests from testing anything.
+of this suite asserts against.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -625,9 +621,8 @@ def test_a_release_that_loses_leaves_the_submission_alone():
 
 
 def test_a_failed_dispatch_is_never_rolled_back():
-    """PR C's lesson, and it bites harder here: an enqueue can report failure
-    and still have created the task, so undoing the claim would clear the lease
-    of a run that may already be going. The document keeps its claim, the
+    """An enqueue can report failure and still have created the task, so
+    undoing the claim would clear the lease of a run that may already be going. The document keeps its claim, the
     counter is already advanced, and the next pass tries again."""
     doc = _app("queued", timeline_age_s=LEASE * 2)
 
@@ -692,8 +687,8 @@ def test_one_bad_document_does_not_abandon_the_pass():
 
 
 def test_the_dry_run_takes_no_lease_writes_nothing_and_dispatches_nothing():
-    """A dry run that acts is how PR B shipped a bug. The whole read path, none
-    of the write path — including the claim, which is a write."""
+    """The whole read path, none of the write path — including the claim,
+    which is a write."""
     docs = [
         _app("queued", timeline_age_s=LEASE * 2, doc_id="a1"),
         _app("tailoring", lease=state.lease_for("tailoring", now=NOW), doc_id="a2"),

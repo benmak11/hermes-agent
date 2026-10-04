@@ -2,27 +2,18 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Company management endpoints: the global pool, and this user's exclusions.
 
-Two different things are visible here and they must not be conflated:
+Two things are visible here and must not be conflated. The **pool** —
+``data/companies/{known,unvetted,blocklist}.yaml`` — is global, git-shipped and
+identical for every user; nothing in a running container writes it. The
+**overlay** — ``users/{uid}/company_prefs`` — is one document per company this
+one user has told us to stop fetching (see :mod:`tools.company_prefs`), and is
+what ``POST /companies/action`` writes. Editing the YAML from a route does not
+work: under ``QUEUE_MODE`` discovery runs on a different service, so the edit
+lands on a filesystem the crawl never reads and is lost on the next deploy.
 
-- **The pool** — ``data/companies/{known,unvetted,blocklist}.yaml``. Global,
-  git-shipped, reviewed, identical for every user. It grows through
-  ``cli.discover_companies`` and shrinks through a pull request; nothing in a
-  running container writes it.
-- **The overlay** — ``users/{uid}/company_prefs``. One document per company this
-  *one* user has told us to stop fetching. See :mod:`tools.company_prefs`.
-
-``POST /companies/action`` used to call ``apply_company_action``, which edited
-the YAML on whichever container happened to serve the request. Under
-``QUEUE_MODE=1`` discovery runs on ``hermes-worker`` and the API runs on
-``hermes-api``, so that edit landed on a filesystem the crawl never reads —
-and was lost on the next deploy regardless. It now writes the overlay.
-
-``GET /companies`` returns the pool *annotated* with the overlay rather than
-filtered by it: an excluded company stays in its ``known``/``unvetted`` group
-carrying ``excluded: true``, so the UI can show the user what they excluded
-instead of the row silently vanishing. ``blocklist`` stays exactly what it was
-— the global list, which applies to everyone — and the user's own exclusions
-are a separate ``excluded`` array.
+``GET /companies`` returns the pool annotated with the overlay rather than
+filtered by it, so an excluded company stays in its group carrying
+``excluded: true`` instead of silently vanishing.
 """
 
 from __future__ import annotations
@@ -45,19 +36,14 @@ from tools.company_prefs import ExclusionAction, load_exclusions, set_exclusion
 router = APIRouter(tags=["companies"])
 log = get_logger("api.companies")
 
-# An async client, unlike the other route modules' sync-client-plus-to_thread
-# pattern, so that the read below is *literally*
-# tools.company_prefs.load_exclusions — the same function the crawl uses. What
-# this endpoint shows a user is then what discovery will actually skip,
-# including its tolerance of a malformed overlay row, rather than a second
-# implementation that agrees until it doesn't. hermes-worker already runs both
-# client flavours in one process (the discovery pipeline is async, its routes
-# are sync), so this is not new ground.
+# An async client, unlike the other route modules' sync-plus-to_thread pattern,
+# so the read below is literally tools.company_prefs.load_exclusions — the same
+# function the crawl uses, down to its tolerance of a malformed overlay row.
+# What this endpoint shows is then what discovery will actually skip.
 #
-# Memoising it is safe for the same reason the sync ones are: nothing in api/
-# calls asyncio.run, so every route runs on the one uvicorn loop for the life of
-# the process, and this client is never handed to a second loop. (That is the
-# failure tools.genai_client memoises per-loop to avoid; the condition differs.)
+# Memoising is safe because nothing in api/ calls asyncio.run: every route runs
+# on the one uvicorn loop for the life of the process, so this client is never
+# handed to a second loop.
 _db: firestore.AsyncClient | None = None
 
 
@@ -90,10 +76,9 @@ async def list_companies(user_id: str = Depends(verify_user)) -> dict:
     """The global company pool as *this* user sees it.
 
     ``known``/``unvetted`` are the global pool with an added per-entry
-    ``excluded`` flag; ``blocklist`` is the global blocklist (everyone's);
-    ``excluded`` is this user's overlay, listed separately because an exclusion
-    can outlive the pool entry it was made against — a company dropped from
-    ``unvetted.yaml`` after the fact would otherwise be invisible.
+    ``excluded`` flag; ``blocklist`` is the global blocklist; ``excluded`` is
+    this user's overlay, listed separately because an exclusion can outlive the
+    pool entry it was made against.
     """
     exclusions = await load_exclusions(_client(), user_id)
     return {
@@ -108,13 +93,10 @@ async def list_companies(user_id: str = Depends(verify_user)) -> dict:
 
 
 class CompanyAction(BaseModel):
-    """``promote`` is deliberately absent.
-
-    It was a global operator action — move a slug from ``unvetted.yaml`` to
-    ``known.yaml`` — and it never changed the fetch set, because
-    ``all_active_companies`` fetches known *and* unvetted. With the YAML
-    mutators gone there is no global write path left for it to use. Promotion
-    is a git edit to ``known.yaml``, reviewed like the rest of the pool.
+    """``promote`` is deliberately absent: it never changed the fetch set
+    (``all_active_companies`` fetches known *and* unvetted), and there is no
+    global write path left for it. Promotion is a reviewed git edit to
+    ``known.yaml``.
     """
 
     platform: Platform
@@ -146,11 +128,10 @@ async def company_action(
             reason=body.reason,
         )
     except ValueError as e:
-        # google_jobs/meta_jobs reuse the slug slot as a free-text search query,
-        # so a '/' in it is reachable user input, not an impossible state. A
-        # slash in a document id addresses a different subcollection rather than
-        # failing, so this is refused outright — as a 422, the same code this
-        # route already returns for a body that fails validation.
+        # google_jobs/meta_jobs reuse the slug slot as a free-text search
+        # query, so a '/' in it is reachable user input. A slash in a document
+        # id addresses a different subcollection rather than failing, so it is
+        # refused as a 422.
         log.warning(
             "company.action.rejected",
             platform=body.platform,

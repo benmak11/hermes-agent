@@ -2,12 +2,10 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Single-use consent tokens for actions that spend money.
 
-**A token is a Firestore document, not an HMAC.** Two Firestore operations are
-free next to a Vertex batch; it works across Cloud Run instances with no
-secret to provision and no key rotation to get wrong; single-use falls out of
-the delete rather than needing a replay cache; and the estimate the user was
-actually shown travels *with* the token, so the route that spends can record
-what was agreed rather than re-deriving it and hoping it matches.
+A token is a Firestore document rather than an HMAC: two reads are free next
+to a Vertex batch, there is no secret to provision or rotate, single-use falls
+out of the delete, and the estimate the user was shown travels with the token
+so the route that spends records what was agreed.
 
 The lifecycle is:
 
@@ -15,17 +13,16 @@ The lifecycle is:
     ... the UI shows the estimate and the user clicks confirm ...
     consume(..., token) -> Estimate    # checked, deleted, returned
 
-Four things are checked, and each one is a way the seam could fail open:
+Four things are checked, and each is a way the seam could fail open:
 
-- the document exists (an invented token is not a yes);
-- it is under **this user's** document — the lookup is a path, never a
+- the document exists;
+- it is under *this* user's document — the lookup is a path, never a
   collection-group query, so one user's token cannot authorise another's spend;
 - the ``action`` matches — a yes to "find jobs" is not a yes to "score 200";
-- it has not expired, **checked here in code**. Firestore's TTL policy is a
-  per-collection-group GCP setting that lives in no file in this repo (see
-  ``tools.run_costs``' Retention note for the same trap); until someone enables
-  it nothing is ever deleted, and even after that TTL collection is best-effort
-  and lags by hours. TTL is garbage collection. This is the expiry.
+- it has not expired, checked here in code. Firestore's TTL policy is a GCP
+  setting that lives in no file in this repo (see ``tools.run_costs``'
+  Retention note), it may never be enabled, and collection lags by hours. TTL
+  is garbage collection; this is the expiry.
 """
 
 from __future__ import annotations
@@ -51,11 +48,9 @@ class ConsentRequired(Exception):
 
 
 def _consents(db, user_id: str):
-    """The user's consent collection. **A path, deliberately.**
-
-    Resolving a token by collection-group query would find it wherever it
-    lives, which is precisely the bug: token scope would then be "anyone who
-    knows the uuid" instead of "the account that minted it".
+    """The user's consent collection. A path, deliberately: a
+    collection-group query would resolve a token wherever it lives, scoping it
+    to "anyone who knows the uuid" rather than to the account that minted it.
     """
     return db.collection("users").document(user_id).collection(COLLECTION)
 
@@ -96,14 +91,12 @@ async def preflight(db, user_id: str, action: str, estimate: Estimate) -> str:
 async def consume(db, user_id: str, action: str, token: str | None) -> Estimate:
     """Spend the token: validate, delete, return the estimate it carried.
 
-    Raises :class:`ConsentRequired` for every failure mode, indistinguishably
-    — an invalid token and a missing one are the same answer to the caller
-    ("ask again"), and telling them apart would let a caller probe which
-    tokens exist.
+    Raises :class:`ConsentRequired` for every failure mode indistinguishably,
+    so a caller cannot probe which tokens exist.
 
-    Deleted **before** the paid work starts, not after. A crash mid-run then
-    costs the user a second confirmation rather than leaving a token that a
-    retry could spend again.
+    The token is deleted before the paid work starts, so a crash mid-run costs
+    the user a second confirmation rather than leaving a token a retry could
+    spend again.
     """
     if not token:
         raise ConsentRequired("no confirmation token")

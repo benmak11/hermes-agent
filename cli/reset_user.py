@@ -3,19 +3,16 @@
 """
 Full data wipe for one user — for resetting a demo account to a clean slate.
 
-Deletes: the `users/{uid}` doc and its `jobs`/`applications`/`discarded_jobs`/
-`runs` (per-run cost ledger) subcollections, that user's `batch_runs` docs
-(top-level collection, matched
-by the `user_id` field), and their GCS resume/screenshot blobs under
-`users/{uid}/` in the resumes bucket. Does NOT touch the Firebase Auth
-account (they can log back in to an empty/onboarding state) or `jd_cache`
-(shared, content-keyed, not user data).
+Dry-run by default; ``--execute`` deletes irreversibly. Deletes the
+`users/{uid}` doc and its `jobs`/`applications`/`discarded_jobs`/`runs`
+subcollections, that user's `batch_runs` docs (top-level, matched by the
+`user_id` field), and their GCS resume/screenshot blobs under `users/{uid}/`.
+Leaves the Firebase Auth account alone, so the persona can log back in to an
+empty onboarding state, and leaves `jd_cache` alone because it is shared and
+content-keyed.
 
-The wipe itself now lives in `tools.account.delete`, which is also what
-`POST /account/delete` runs — this stays the operator's door to it, and the
-operator's door is the one that keeps the Auth account. A user deleting
-themselves does want the login closed; an operator resetting a demo persona
-wants to hand it straight back.
+The wipe itself lives in `tools.account.delete`, shared with
+`POST /account/delete`; that door also closes the login, this one does not.
 
 Usage:
     python -m cli.reset_user --user-id S4nOcOgxTpMjAU6WbOc8MjhBpKD3       # dry run

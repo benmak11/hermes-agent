@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Unit tests for LLM call cost computation (Phase 2 telemetry)."""
+"""Unit tests for LLM call cost computation."""
 
 from google.genai import types
 

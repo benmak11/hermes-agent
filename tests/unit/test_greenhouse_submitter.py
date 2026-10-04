@@ -2,28 +2,23 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """What the Greenhouse submitter decides *before* it touches a form.
 
-The bail reasons are not interchangeable labels — each one sends a different
-fix at a different problem:
+The bail reasons are not interchangeable labels — each sends a different fix
+at a different problem:
 
 - ``fetch_blocked``  transient; the ATS refused us. Retry later.
 - ``posting_gone``   terminal; the listing is down.
 - ``custom_wrapper`` structural; this employer needs a different code path.
 - ``captcha``        needs a human.
 
-They were previously distinguishable only by accident. An error page has no
-email field and no file input, so **every** non-200 response fell through to
-the custom-wrapper branch and was reported as a permanent structural verdict.
-A 50-posting measurement on 2026-09-01 tripped Greenhouse's bot detection and
-produced 48 false ``custom_wrapper`` bails from HTTP 406s — a clean run, an
-entirely wrong conclusion, and no test that would have caught it.
-
-Checking the status closed that hole for error *pages*. It did not close it for
-expired postings, which Greenhouse serves as a 302 to the board index that
-Playwright follows to a clean 200: the 2026-09-04 rerun reported 12
-``custom_wrapper`` bails, all 12 of them redirects to
-``.../{board}?error=true`` and none of them a wrapper. So the final URL is
-checked too, and the table test below pins exactly which redirects mean "gone"
-and which are business as usual.
+Two measured failures shaped this. An error page has no email field and no
+file input, so every non-200 response used to fall through to the
+custom-wrapper branch: a 50-posting run on 2026-09-01 tripped bot detection
+and reported 48 false ``custom_wrapper`` bails from HTTP 406s. Checking the
+status fixed error pages but not expired postings, which Greenhouse serves as
+a 302 to the board index that Playwright follows to a clean 200 — the
+2026-09-04 rerun reported 12 more, all redirects to ``.../{board}?error=true``.
+So the final URL is checked too, and the table test below pins which redirects
+mean "gone" and which are business as usual.
 """
 
 from __future__ import annotations

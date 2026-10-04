@@ -43,39 +43,31 @@ log = get_logger("tools.matching")
 OnResult = Callable[[Job, JobMatch | None, str | None], None]
 
 # Belt and braces. The budget reservation is the real cap, but a run that
-# takes no reservation (``ignore_budget``, or some future caller that reaches
-# this function without passing the gate) must still not stream an unbounded
-# backlog into memory — 13K job docs is what this exists to prevent.
+# takes no reservation (``ignore_budget``, or a caller that reaches this
+# function without passing the gate) must still not stream 13K job docs into
+# memory.
 SCORE_LIMIT_CEILING = 300
 
-# Cache TTL bounds, in seconds. The estimate below (~30s per Pro call per
-# concurrency slot) is what actually sizes the TTL; these only bound it, and
-# both are deliberately generous, because the two failure modes are not
-# symmetric. A TTL shorter than the run means the tail bills the static
-# context block uncached at 10x — real money, on every run that overruns the
-# estimate. A TTL longer than the run costs nothing at all unless the run is
-# killed before its finally-block delete, and ``reap_match_caches`` buries
-# that corpse on the next run. So: err long.
+# Cache TTL bounds, in seconds. ``cache_ttl_seconds`` sizes the TTL; these only
+# bound it, and both err long because the failure modes are asymmetric. A TTL
+# shorter than the run bills the tail's static context block uncached at 10x;
+# a TTL longer than the run costs nothing unless the process is killed before
+# its finally-block delete, and ``reap_match_caches`` buries that on the next
+# run.
 #
-# The floor keeps a two-job run from being sized off a 12-second estimate; it
-# binds under ~600 jobs at concurrency 5, which includes a default-sized cycle
-# — that run gets headroom over its estimate rather than exactly none. (A
-# measured 100-job run took 170s at concurrency 5, so the estimate itself runs
-# well ahead of reality; the floor is what makes that safe rather than tight.)
-# The ceiling is NOT derived from SCORING_BUDGET_PER_CYCLE and sits far enough
-# above it that raising that knob can't silently push runs past it (a cost
-# regression hidden behind a cost knob); it binds only for ``ignore_budget``
-# backlog runs, over ~14,400 jobs at concurrency 5.
+# The floor keeps a two-job run from being sized off a 12-second estimate and
+# binds under ~600 jobs at concurrency 5. The ceiling is deliberately NOT
+# derived from SCORING_BUDGET_PER_CYCLE, so raising that knob cannot silently
+# push runs past it; it binds only for ``ignore_budget`` backlog runs.
 _CACHE_TTL_FLOOR_SECONDS = 3600
 _CACHE_TTL_CEILING_SECONDS = 24 * 3600
 
 
 def unbudgeted_limit(limit: int | None) -> int:
-    """The job cap for a run that took no budget reservation.
-
-    Shared by all three scoring entry points so ``--ignore-budget`` means the
-    same thing on every one of them: an explicit ``--limit`` if the operator
-    gave one, otherwise the ceiling.
+    """The job cap for a run that took no budget reservation: the operator's
+    ``--limit`` if given, otherwise :data:`SCORE_LIMIT_CEILING`. Shared by all
+    three scoring entry points so ``--ignore-budget`` means the same thing on
+    each.
     """
     return limit or SCORE_LIMIT_CEILING
 
@@ -88,8 +80,8 @@ def cache_ttl_seconds(pending: int, concurrency: int) -> int:
 
 # Jobs scoring at or below this never stay in the `jobs` collection: 0 is the
 # out-of-family sentinel and the matching prompt caps geographically
-# ineligible roles at 20, so everything down here is a job the user cannot or
-# would not take. (The UI already hides anything under 60.)
+# ineligible roles at exactly 20, so everything down here is a job the user
+# cannot or would not take. (The UI already hides anything under 60.)
 DISCARD_AT_OR_BELOW = 20
 
 
@@ -100,44 +92,31 @@ def should_discard(match: JobMatch) -> bool:
 
 # ------------------------------------------------------- the exploration sample
 #
-# Every decision this product has ever collected was made on a job the current
-# scorer already liked: the queue hides everything under 60
-# (``api.routes.jobs.list_pending_jobs``'s default ``min_score``), so the
-# labels only ever cover the region the scorer put above its own bar. A model
-# trained on that is graded on its own prior — it can never be shown to be
-# wrong about a job it scored 40, because nobody was ever asked.
-#
-# The fix is the smallest one that works: deterministically surface a slice of
-# the hidden band so some labels come from outside the scorer's belief. It is
-# off by default and costs nothing when off.
+# Every decision this product has collected was made on a job the scorer
+# already liked, because the queue hides everything under 60. Labels therefore
+# only cover the region above the scorer's own bar, and a model trained on them
+# is graded on its own prior. This deterministically surfaces a slice of the
+# hidden band so some labels come from outside that belief. Off by default, and
+# costs nothing when off.
 
-#: The score at and above which the queue already shows a job — the default
-#: ``min_score`` of ``api.routes.jobs.list_pending_jobs``, mirrored here
-#: because the route's default is the user-visible contract and this follows
-#: it, not the reverse. (Not imported from there: ``tools`` must not depend on
-#: ``api``. The band test asserts the two still agree.)
+#: The score at and above which the queue already shows a job: the default
+#: ``min_score`` of ``api.routes.jobs.list_pending_jobs``, which is the
+#: user-visible contract this follows. Mirrored rather than imported because
+#: ``tools`` must not depend on ``api``; the band test asserts they agree.
 #:
-#: Expressed as a strict upper bound rather than a top of 59 because
-#: ``overall_score`` is a **float** and the prompt weights five sub-scores at
-#: 0.30/0.25/0.20/0.15/0.10, so fractions are routine. A job at 59.35 is
-#: hidden by the route (``< 60``) and a band of "<= 59" would leave it out —
-#: a hole sitting exactly on the slice nearest the decision boundary, which is
-#: the most informative part of the band.
+#: Used as a strict upper bound, never a top of 59: ``overall_score`` is a
+#: float, so 59.35 is hidden by the route and ``<= 59`` would miss exactly the
+#: slice nearest the decision boundary.
 QUEUE_DEFAULT_MIN_SCORE = 60
 
 
 def exploration_rate() -> float:
     """``EXPLORATION_RATE`` as a fraction in [0, 1]; default ``0`` — off.
 
-    Default-off and env-gated, the same shape as ``GEO_GATE_ENFORCE``
-    (``pipeline.geo_enforce_enabled``). Unlike ``GEO_GATE_HOLDOUT``, whose
-    default is non-zero because a hold-out of zero destroys its measurement,
-    zero here is the *correct* shipped state: sampling changes what a user is
-    asked to review, so it waits for someone to decide to turn it on.
-
-    Anything unparseable or out of range falls back to zero rather than to a
-    guess — the failure mode of a typo must be "no sampling", never "every
-    hidden job surfaced".
+    Zero is the correct shipped state, unlike ``GEO_GATE_HOLDOUT``: sampling
+    changes what a user is asked to review. Anything unparseable or out of
+    range falls back to zero, so a typo means no sampling rather than every
+    hidden job surfaced.
     """
     raw = os.getenv("EXPLORATION_RATE", "").strip()
     if not raw:
@@ -156,17 +135,12 @@ def exploration_rate() -> float:
 def exploration_sample(job_id: str, rate: float) -> bool:
     """Is this job id in the exploration sample, at ``rate``?
 
-    **SHA-256, never :func:`hash`.** Python salts ``hash(str)`` per process by
-    default, so the same job id answers differently in every worker and after
-    every cold start — the sample would reshuffle continuously while a local
-    test inside one process passed. The acceptance criterion is that sampled
-    jobs *stay* stable across runs, and only a stable digest gives that. Same
-    reasoning, same construction as ``pipeline.geo_holdout``.
+    SHA-256, never :func:`hash`: Python salts ``hash(str)`` per process, so a
+    ``hash()``-based sample reshuffles on every worker cold start while passing
+    a single-process test. Same construction as ``pipeline.geo_holdout``.
 
-    The id is prefixed before hashing so this sample and the geo hold-out are
-    independent draws rather than the identical set of ids at equal rates —
-    two correlated samples would make the exploration labels a subset of the
-    hold-out population instead of a sample of the band.
+    The id is prefixed before hashing so this and the geo hold-out are
+    independent draws rather than the same set of ids at equal rates.
     """
     if rate <= 0.0:
         return False
@@ -179,51 +153,27 @@ def exploration_sample(job_id: str, rate: float) -> bool:
 def should_explore(job: Job, match: JobMatch, geo_gate: dict | None) -> bool:
     """Should this scored job be surfaced out of the hidden band?
 
-    Three conditions, all required.
+    Three conditions, all required: the score is strictly inside
+    (``DISCARD_AT_OR_BELOW``, ``QUEUE_DEFAULT_MIN_SCORE``) — strict at both
+    ends, because the score is a float and 59.35 is in the band; the job is not
+    geo-ineligible; and the id is in :func:`exploration_sample`.
 
-    **It is in the band.** Strictly above ``DISCARD_AT_OR_BELOW`` and strictly
-    below ``QUEUE_DEFAULT_MIN_SCORE`` — exactly what the queue hides. At or
-    below 20 the job is tombstoned and never reaches the queue; at 60 and above
-    it is already shown, and flagging those would be a no-op that still writes
-    a field. The bounds are strict inequalities on purpose: the score is a
-    float, so 59.35 is in the band and ``<= 59`` would miss it.
+    Only the ``geo_gate`` record's ``verdict`` can decide eligibility here. The
+    free gate measured 0 false positives over 1,127 historical scores and again
+    over 117 (``tools.matching.geo``). The alternatives cannot be used:
+    ``pro_capped`` is ``overall_score == 20`` and so always false inside 21-59,
+    and ``pro_geo_flag`` fires on ~1.5% of jobs Pro kept, which would bias the
+    very sample this de-biases.
 
-    **It is not geo-ineligible.** The user cannot take those, so surfacing one
-    spends a decision on a rejection that says nothing about fit — it poisons
-    the labels rather than adding to them. The signal used is the ``geo_gate``
-    record's ``verdict``: it is the only one of the candidates that carries
-    information *in this band*.
+    A missing ``geo_gate`` record is **not** treated as ineligible: Pro caps a
+    geographically ineligible role at exactly 20, so a job that reached 21+ is
+    one Pro already judged eligible.
 
-    - ``verdict == "ineligible"`` is the free gate's own judgement, measured at
-      0 false positives over 1,127 historical scores and again over 117 (see
-      ``tools.matching.geo``). It is the one reliable signal available here.
-    - ``pro_capped`` is defined as ``overall_score == 20`` and is therefore
-      *always false* inside 21-59. It carries exactly zero information at this
-      band and must not be read as "not capped, therefore eligible".
-    - ``pro_geo_flag`` / ``match.red_flags_hit`` are documented above as a
-      disambiguator and not a signal: the regex fires on ~1.5% of jobs Pro
-      *kept*. Gating on it would silently drop eligible jobs from the sample
-      and bias the very thing the sample exists to de-bias.
-
-    A missing ``geo_gate`` record (no profile passed, or no ``jd_parsed``) is
-    **not** treated as ineligible. The structural argument carries it: Rule 6
-    makes Pro cap a geographically ineligible role at exactly 20, which is
-    ``DISCARD_AT_OR_BELOW``, so a job that reached 21+ is one Pro already
-    judged eligible. The gate's verdict is an extra veto on top of Pro's
-    judgement, not a licence the job needs to earn.
-
-    **The id is in the sample**, deterministically — :func:`exploration_sample`.
-
-    **The flag is write-once, and there is no rollback.** Nothing clears
-    ``exploration`` once it is on a job doc. Setting ``EXPLORATION_RATE`` back
-    to 0 stops *new* jobs being sampled; it does not withdraw the ones already
-    flagged, which keep surfacing under the threshold until they are decided.
-    Lowering the rate likewise never shrinks the live sample. So "rate 0 means
-    nothing changed" is a statement about a deployment that has never had the
-    flag on, not about a rollback. Withdrawing a live sample today needs an
-    ad-hoc Firestore write over the user's ``jobs`` collection — there is no
-    CLI for it, deliberately noted here rather than discovered during an
-    incident.
+    The flag is write-once and there is no rollback. Setting
+    ``EXPLORATION_RATE`` back to 0 stops new jobs being sampled but does not
+    withdraw the ones already flagged; those keep surfacing until decided.
+    Withdrawing a live sample needs an ad-hoc Firestore write over the user's
+    ``jobs`` collection — there is no CLI for it.
     """
     if not DISCARD_AT_OR_BELOW < match.overall_score < QUEUE_DEFAULT_MIN_SCORE:
         return False
@@ -235,43 +185,29 @@ def should_explore(job: Job, match: JobMatch, geo_gate: dict | None) -> bool:
 # --------------------------------------------------------- geo gate, in shadow
 #
 # ``tools.matching.geo`` decides for free what Rule 6 of the scoring prompt
-# currently buys a Pro call to decide (69.4% of every Pro call ever made on the
-# main user came back capped at exactly 20 — geographically ineligible). The
-# replay against history proved the gate never *wrongly* rejects, but it could
-# not prove what it would *save*: ``persist_result`` tombstones every capped
-# score out of the `jobs` collection, and ``discard_tombstone`` carried no
-# ``jd_parsed``, so the gate had nothing to replay against exactly where its
-# upside lives. Live recording was the only way to measure it.
+# buys a Pro call to decide (69.4% of every Pro call on the main user came back
+# capped at exactly 20). The historical replay proved the gate never wrongly
+# rejects but could not measure what it would save, because tombstones carried
+# no ``jd_parsed`` to replay against; they do now, so the upside is measurable
+# off them going forward. Live recording stays regardless: it is the only
+# source of the Pro comparison, which a replay cannot reconstruct.
 #
-# **That is no longer true going forward.** ``discard_tombstone`` now carries
-# ``jd_parsed`` (the negatives need features for reasons that have nothing to
-# do with this gate), so tombstones written from here on *are* replayable and
-# the gate's upside can be measured off them directly. Live recording stays —
-# it is the only thing that gives the Pro comparison, which a replay cannot
-# reconstruct — but the historical gap is now a gap in the *history*, not in
-# the mechanism. Note ``cli.geo_replay`` still prints the old claim to the
-# operator; correcting it belongs with the geo report, not here.
-#
-# So the gate runs on every scored job and its verdict is written down next to
-# what Pro said — and nothing else. It skips no call, changes no score, and
-# changes no discard decision. Acting on it is a later phase, and that phase
-# gets to make its case out of this data.
+# The gate runs on every scored job and its verdict is written next to what Pro
+# said, and nothing else. It skips no call, changes no score and changes no
+# discard decision.
 
 # Language Pro reaches for when it rejects a job on geography, matched against
 # ``red_flags_hit`` + ``reasoning``.
 #
-# **This is a disambiguator, not a signal.** It is deliberately loose — it also
-# fires on ~1.5% of jobs Pro *kept* (17 of 1,127 in the historical corpus), so
-# on its own it says almost nothing. Its one job is the ambiguous band: a score
-# strictly between 0 and 20 is neither the out-of-family sentinel nor the geo
-# cap, and 37 historical records sit there. For those, "did Pro's own prose
-# mention geography?" is the only evidence available. Never read it as the
-# primary signal; ``pro_capped`` is that.
+# A disambiguator, not a signal: it is loose enough to fire on ~1.5% of jobs
+# Pro kept, so on its own it says almost nothing. Its only use is the ambiguous
+# 0-20 band, which is neither the out-of-family sentinel nor the geo cap and
+# where Pro's own prose is the only evidence. ``pro_capped`` is the primary
+# signal.
 #
-# It has to be computed *here* or not at all: ``discard_tombstone`` writes a
-# deliberately minimal record with no ``red_flags_hit``, and the discard path is
-# where most geo rejections go — so this is the last moment the full ``JobMatch``
-# still exists.
+# Computed here or not at all: ``discard_tombstone`` keeps no
+# ``red_flags_hit``, and the discard path is where most geo rejections go, so
+# this is the last moment the full ``JobMatch`` exists.
 _PRO_GEO_LANGUAGE = re.compile(
     r"geograph|relocat|time ?zone|ineligib"
     r"|\bvisa\b|work (?:authoriz|permit)"
@@ -293,25 +229,19 @@ def shadow_geo_gate(
 ) -> dict | None:
     """What the geo gate would have said about this job, ready to record.
 
-    ``None`` — record nothing — whenever there is no honest comparison to make:
+    ``None`` — record nothing — whenever there is no honest comparison: no
+    ``profile`` (the caller opted out), no ``jd_parsed`` (no inputs), or
+    ``overall_score == 0``, the ``pipeline.OUT_OF_FAMILY`` sentinel for a job
+    that never reached Pro. That last guard also drops a genuine Pro zero,
+    which under-counts true positives and can never manufacture a false
+    positive.
 
-    - no ``profile``, so the caller opted out (or predates this phase);
-    - no ``jd_parsed``, so the gate has no inputs;
-    - ``overall_score == 0``, the ``pipeline.OUT_OF_FAMILY`` sentinel. That
-      job was rejected by the free family pre-filter and never reached Pro, so
-      there is no Pro decision to agree or disagree with. The same guard also
-      drops a genuine Pro zero, which under-counts true positives and can never
-      manufacture a false positive — the safe direction to be wrong in.
+    Records raw inputs, not a conclusion — no ``agree`` boolean — so the metric
+    can be redefined over data already collected.
 
-    What lands in Firestore is **raw inputs, not a conclusion**: no ``agree``
-    boolean. The (0, 20) band is genuinely ambiguous, and storing the fields
-    rather than a verdict-on-a-verdict lets the metric be redefined over data
-    already collected instead of re-running anything.
-
-    Never raises. A measurement that can break the thing it measures is worse
-    than no measurement: this runs inside ``persist_result``, after a Pro call
-    has already been paid for, so an exception here would throw away work worth
-    real money to record a statistic.
+    Never raises. It runs inside ``persist_result`` after a Pro call has been
+    paid for, so an exception here would throw away work worth real money to
+    record a statistic.
     """
     if profile is None or job.jd_parsed is None or match.overall_score <= 0:
         return None
@@ -337,18 +267,16 @@ def shadow_geo_gate(
 def enforced_geo_gate(decision: geo.GeoDecision | None) -> dict | None:
     """The ``geo_gate`` record for a job the gate *skipped*, not merely watched.
 
-    ``None`` in, ``None`` out: ``pipeline.prefilter`` returns a decision beside
-    its sentinel only when the geo gate is what rejected the job, so a family
-    miss (decision ``None``) produces no record and every caller can pipe the
-    two straight through without branching.
+    ``None`` in, ``None`` out, so callers can pipe ``prefilter``'s decision
+    straight through: a family miss carries no decision and so produces no
+    record.
 
-    The shape deliberately diverges from :func:`shadow_geo_gate`'s in two ways.
-    It carries **no ``pro_*`` keys at all** — not nulls, absent — because no Pro
-    call was made and a null ``pro_score`` sitting next to 7,000 real ones is an
-    invitation to average it in. And it carries ``enforced: True``, which is the
-    *only* thing that distinguishes these tombstones from ``OUT_OF_FAMILY``
-    ones: both score 0 (see :data:`pipeline.GEO_INELIGIBLE`), so score cannot do
-    it. ``cli.geo_resurrect`` selects on exactly this field.
+    The shape diverges from :func:`shadow_geo_gate`'s deliberately. The
+    ``pro_*`` keys are **absent, not null**, because no Pro call was made and a
+    null ``pro_score`` beside thousands of real ones invites averaging it in.
+    And ``enforced: True`` is the only thing distinguishing these tombstones
+    from ``OUT_OF_FAMILY`` ones — both score 0 — so ``cli.geo_resurrect``
+    selects on exactly this field.
     """
     if decision is None:
         return None
@@ -366,92 +294,64 @@ def count_geo_gate(counts: dict, record: dict | None) -> None:
     """Tally one shadow verdict into a scorer's counts dict.
 
     Only the two verdicts that would change anything are counted: ``ineligible``
-    is the Pro call a later phase could skip, ``abstain`` is the coverage this
-    gate leaves on the table. ``eligible`` is reached only by the ``us_remote_ok``
-    exception and would skip nothing, so it has no counter.
+    is a Pro call that could be skipped, ``abstain`` is the coverage the gate
+    leaves on the table. ``eligible`` would skip nothing, so it has no counter.
     """
     if record is not None and record["verdict"] in ("ineligible", "abstain"):
         counts[f"geo_{record['verdict']}"] += 1
 
 
-#: Zeroed geo tallies, spread into every counts dict a scorer can return —
-#: including the ones it returns without scoring anything. A counts contract
-#: whose key set depends on which branch produced it is one KeyError waiting
-#: for whoever reads these numbers next.
+#: Zeroed geo tallies, spread into every counts dict a scorer can return,
+#: including the early-return ones. A counts contract whose key set depends on
+#: the branch that produced it is a KeyError waiting to happen.
 EMPTY_GEO_COUNTS = {"geo_ineligible": 0, "geo_abstain": 0, "geo_skipped": 0}
 
 
 # ------------------------------------------------------- score attribution
 #
-# A score is only comparable to another score if you know what produced it.
-# Until this existed, nothing in Firestore recorded either half of that: the
-# prompts live in git but the documents carry no pointer at git, and
-# ``FLASH_MODEL`` was ``gemini-flash-latest`` — a *moving alias* that could
-# start serving a different model with no commit in this repo at all, which is
-# a model column meaning "whatever Google served that week". That alias is
-# pinned now (``tools.llm_models``), so this record finally names something
-# stable; it does not make the record redundant, because the prompts and the
-# Pro id still move and because a pin is only honest if something wrote down
-# which pin was in force.
+# A score is only comparable to another score if you know what produced it:
+# which model ran and which prompt version it ran under. The model ids are
+# pinned now, but a pin is only honest if something wrote down which pin was in
+# force, and the prompts still move.
 #
-# The one rule that makes this record worth having: **stamp the leg that
-# actually ran in this call, never the constant that names the leg that
-# usually runs.** The batch path parses with ``batch.BATCH_FLASH_MODEL`` and
-# the online path with ``FLASH_MODEL``; both now read ``gemini-2.5-flash``, so
-# a wrong stamp no longer shows up as a wrong *string* — it is invisible until
-# one of the two constants moves, and then every job scored under the mix-up is
-# mis-attributed retroactively. That is a weaker safety net than before, not a
-# reason to relax: the models stay threaded in from the caller, this module
-# still never reaches for one itself, and
-# ``tests/unit/test_scored_with.py`` now pins each path to a sentinel so the
-# tests discriminate by which constant was read rather than by the ids
-# differing.
+# The rule that makes this record worth having: stamp the leg that actually ran
+# in this call, never the constant naming the leg that usually runs. The batch
+# and online paths currently hold the same Flash id, so a wrong stamp is
+# invisible until one of them moves and then retroactively mis-attributes every
+# job scored under the mix-up. The models stay threaded in from the caller,
+# this module never reaches for one itself, and ``tests/unit/test_scored_with``
+# pins each path to a sentinel so the tests discriminate by which constant was
+# read.
 
 
 def scored_with(*, parse_model: str | None, match_model: str | None) -> dict:
     """Provenance for one scoring outcome: what ran, under which prompts, when.
 
-    ``parse_model`` / ``match_model`` are the ids the **caller actually
-    called**, or ``None`` for a leg that did not run in this call. ``None`` is
-    load-bearing in both directions:
+    ``parse_model`` / ``match_model`` are the ids the caller actually called,
+    or ``None`` for a leg that did not run in this call. Both nulls are
+    load-bearing:
 
-    - ``match_model is None`` means **no scoring model ran** — the outcome came
-      from the free pre-filter (``pipeline.OUT_OF_FAMILY`` /
-      ``GEO_INELIGIBLE``), not from Pro. A consumer filtering for "jobs a model
+    - ``match_model is None`` means no scoring model ran — the outcome came
+      from the free pre-filter, not Pro. A consumer filtering for "jobs a model
       scored" tests this key, not the presence of a score.
-    - ``parse_model is None`` means this call did not pay for a parse: the job
-      arrived already parsed (an earlier run, a batch parse leg, a ``jd_cache``
-      hit), and which model produced that parse is not knowable from here.
-      Guessing it from today's constant is exactly the lie this record exists
-      to prevent.
+    - ``parse_model is None`` means this call did not pay for a parse (the job
+      arrived already parsed, or hit ``jd_cache``), and which model produced
+      that parse is not knowable from here. Never guess it from today's
+      constant.
 
     Each prompt version is stamped only beside the model it versions, for the
-    same reason: a ``parse_prompt_version`` next to a ``parse_model: None``
-    would be claiming to know which prompt produced a parse this call never
-    made.
+    same reason.
 
-    **What the absence of the whole record proves is weaker than the above,
-    and says so here rather than in a consumer's head.** A document with no
-    ``scored_with`` is one of three things, and the key alone cannot separate
-    them:
+    The absence of the whole record proves much less: it means nothing ran
+    (``batch_runs._persist_prefiltered``), *or* the job was scored before this
+    field existed, *or* a writer forgot to thread it through. Only the first is
+    separately identifiable, by score, not by this key.
+    ``cli.purge_discarded`` is deliberately not a fourth case — it carries the
+    record over, so a Pro-scored job demoted by a threshold change does not
+    land in ``discarded_jobs`` looking like the first.
 
-    1. nothing ran — ``batch_runs._persist_prefiltered``;
-    2. it was scored before this field existed;
-    3. a gap: some future writer forgot to thread the record through.
-
-    (1) is separately discriminable — those documents score exactly 0 and
-    carry a ``pipeline.OUT_OF_FAMILY`` / ``GEO_INELIGIBLE`` sentinel — so in
-    practice a consumer can get there, but by *joining on the score*, not by
-    reading this key. ``cli.purge_discarded`` used to be a fourth case and is
-    not: it carries the record over (``backfill_tombstone``), because a
-    Pro-scored job demoted by a threshold change would otherwise land in
-    ``discarded_jobs`` looking like case (1), which is the opposite of true.
-
-    ``scored_at`` is a **tz-aware** UTC instant. Naive timestamps from
-    ``utcnow()`` compare wrong against everything else written here (the job
-    doc's own ``scored_at``, ``discarded_at``, the decision log), and a
-    provenance record whose timestamps cannot be ordered against the data they
-    describe is not provenance.
+    ``scored_at`` is a tz-aware UTC instant; naive ``utcnow()`` timestamps
+    compare wrong against every other timestamp written alongside it.
     """
     return {
         "parse_model": parse_model,
@@ -465,28 +365,18 @@ def scored_with(*, parse_model: str | None, match_model: str | None) -> dict:
 def restore_payload(job: Job) -> dict:
     """Everything needed to rebuild this ``Job`` from its tombstone, later.
 
-    **Why a tombstone carries a copy of the job at all.** ``discarded_jobs`` is
-    not a log, it is discovery's dedupe mechanism: ``discovery.pipeline``
-    checks the tombstone *before* the job doc, so a tombstoned posting is never
-    re-persisted and never re-scored while it stays live on a board. Under
-    enforcement a wrong ``ineligible`` verdict is therefore not "one job lost" —
-    it is that posting permanently suppressed, on every future re-discovery,
-    with nothing anywhere recording that a machine decided it.
+    ``discarded_jobs`` is discovery's dedupe mechanism, not a log: a tombstoned
+    posting is never re-persisted or re-scored while it stays live on a board.
+    So a wrong enforced ``ineligible`` verdict suppresses that posting
+    permanently, not once, and this payload is what makes it reversible —
+    ``cli.geo_resurrect`` re-runs the current gate over the stored parse after
+    a ``geo.GATE_VERSION`` bump, offline, for free, and without depending on
+    the posting still being live.
 
-    **Why carry the job rather than just delete the tombstone and let discovery
-    re-find the posting.** A ``geo.GATE_VERSION`` bump has to be resolvable
-    *offline and for free*: stream the enforced tombstones, re-run the current
-    gate over the parse stored here, resurrect exactly the ones whose verdict
-    changed (``cli.geo_resurrect``). That is deterministic and unit-testable,
-    depends on no posting still being live on a board months later, and re-pays
-    for no Flash parse. Deleting the tombstone instead would hand the correction
-    to a crawl we do not control and cannot replay.
-
-    The whole ``Job`` is dumped rather than a hand-picked field list, so
-    restoring is ``Job.model_validate(restore)`` with nothing to keep in sync —
-    and note ``jd_raw`` is *required* by ``models.job.Job``, which is why the
-    minimal tombstone can restore nothing at all. It is the tombstone's one
-    heavy field, and it is written only on enforced tombstones.
+    Dumps the whole ``Job`` rather than a field list, so restoring is
+    ``Job.model_validate(restore)`` with nothing to keep in sync. That includes
+    ``jd_raw``, which ``models.job.Job`` requires and which is the tombstone's
+    one heavy field — hence written only on enforced tombstones.
     """
     return job.model_dump(mode="json")
 
@@ -506,27 +396,18 @@ def discard_tombstone(
     re-persists (and re-pays Flash/Pro to re-score) it while it stays live on
     the board.
 
-    ``scored_run_id`` is explicit rather than read from the ambient context so
-    a backfill (``cli.purge_discarded``) can carry over the run that actually
-    paid to score the job instead of stamping its own free run. ``geo_gate`` is
-    explicit for the same reason — the caller decides whether there was
-    anything worth recording; see :func:`shadow_geo_gate`.
+    ``scored_run_id``, ``geo_gate`` and ``provenance`` are all passed in rather
+    than derived here, because only the caller knows them: a backfill
+    (``cli.purge_discarded``) must carry over the run that actually paid to
+    score the job, not stamp its own free run, and likewise reads the
+    provenance off the doc it is demoting. Each is absent rather than null when
+    there is nothing to say, so "we didn't look" stays distinguishable from "we
+    looked and found nothing".
 
-    ``restore`` is :func:`restore_payload`, and belongs only on tombstones the
-    geo gate issued under enforcement. Every other tombstone is a *Pro*
-    decision: reversing it would need the Pro call re-run, not a stored copy of
-    the job, so carrying the payload there would be pure weight.
-
-    ``provenance`` is :func:`scored_with`, landing under the ``scored_with``
-    key. It is explicit for the same reason the two above are — only the
-    caller knows which models it called — and absent rather than null when
-    there is nothing to say, matching ``geo_gate``'s rule: "we didn't look"
-    and "we looked and found nothing" have to stay distinguishable. Note a
-    backfill is **not** automatically a case of nothing to say:
-    ``cli.purge_discarded`` reads the record off the job doc it is demoting
-    and passes it here. Tombstones carry it as well as job docs
-    because ~71% of everything ever scored ends up here; a provenance record
-    that covers only the survivors cannot date the negatives.
+    ``restore`` is :func:`restore_payload` and belongs only on tombstones the
+    geo gate issued under enforcement. Every other tombstone is a Pro decision,
+    which reversing would need the Pro call re-run, so the payload would be
+    pure weight there.
     """
     stone = {
         "job_id": job.id,
@@ -537,31 +418,27 @@ def discard_tombstone(
         "recommendation": match.recommendation,
         "reasoning": match.reasoning,
         "discarded_at": datetime.now(UTC).isoformat(),
-        # Most of a cycle's Pro spend ends up here rather than in `jobs`
-        # (71% of the 12K backlog tombstoned), so without this the tombstones
-        # are the one place the money went that can't be traced. Same field
-        # name as on the job docs — one query answers "what did this run buy?".
+        # ~71% of a cycle's Pro spend ends up here rather than in `jobs`, so
+        # without this the tombstones are the one place the money went that
+        # cannot be traced. Same field name as on job docs, so one query
+        # answers "what did this run buy?".
         "scored_run_id": scored_run_id,
-        # The negatives' only features. ~71% of everything ever scored lands
-        # here, and without the parse a tombstone records *that* a job was
-        # rejected and nothing about *what* was rejected — so no model can
-        # ever learn what a bad match looks like. Always present, ``None``
-        # when the Flash parse never happened (a geo-enforced skip, a
-        # backfill), because "no parse" and "field not written yet" have to
-        # stay distinguishable when these are counted.
+        # The negatives' only features: ~71% of everything ever scored lands
+        # here, and without the parse a tombstone says that a job was rejected
+        # but nothing about what was rejected. Always present, ``None`` when
+        # the Flash parse never happened (a geo-enforced skip, a backfill), so
+        # "no parse" stays distinguishable from "field not written yet".
         #
-        # ``jd_raw`` deliberately stays out: it is the one heavy field, it is
-        # refetchable from ``url``, and ``restore`` already carries it on the
-        # only tombstones that need to be rebuildable.
+        # ``jd_raw`` stays out: it is the one heavy field, it is refetchable
+        # from ``url``, and ``restore`` carries it on the only tombstones that
+        # need rebuilding.
         "jd_parsed": (job.jd_parsed.model_dump(mode="json") if job.jd_parsed else None),
     }
     if geo_gate is not None:
-        # The one field that earns a place in an otherwise minimal record: the
-        # geo rejections this whole gate exists to skip land *here*, not on job
-        # docs, so a tombstone without it is a measurement that can never be
-        # taken. Absent rather than null when there was nothing to record — the
-        # analysis counts documents that carry a verdict, and "we didn't look"
-        # must stay distinguishable from "we looked and found nothing".
+        # Earns its place in an otherwise minimal record: the geo rejections
+        # the gate exists to skip land here, not on job docs, so a tombstone
+        # without it cannot be measured. Absent rather than null when there
+        # was nothing to record.
         stone["geo_gate"] = geo_gate
     if restore is not None:
         stone["restore"] = restore
@@ -575,9 +452,7 @@ async def load_profile_and_pending(
 ) -> tuple[MasterProfile, list[tuple]]:
     """The user's profile plus their pending, unscored ``(doc_ref, Job)`` pairs.
 
-    Shared by the online scorer below and the batch scorer in
-    ``tools.matching.batch``. Raises ``ValueError`` when the user has no
-    profile to match against.
+    Raises ``ValueError`` when the user has no profile to match against.
     """
     profile_doc = await db.collection("users").document(user_id).get()
     if not profile_doc.exists:
@@ -601,11 +476,9 @@ async def load_profile_and_pending(
 async def persist_jd_parsed(ref, job: Job) -> None:
     """Persist the parse result the moment it exists, ahead of scoring.
 
-    The Flash parse is paid work; until this write it lives only in process
-    memory, so a scoring failure (or a dead process, in batch mode) re-pays it
-    on the next run — 467 such re-pays observed in the 12K backlog. Best-effort
-    by design: scoring can proceed without the write, so a Firestore hiccup
-    here must not fail the job.
+    The Flash parse is paid work that until this write lives only in process
+    memory, so a scoring failure or a dead process re-pays it on the next run.
+    Swallows its own errors: scoring can proceed without the write.
     """
     if job.jd_parsed is None:
         return
@@ -626,41 +499,29 @@ async def persist_result(
 ) -> str:
     """Persist one scoring outcome; returns ``"discarded"`` or ``"scored"``.
 
-    Discarding replaces the job doc with a ``discarded_jobs`` tombstone (see
-    :func:`discard_tombstone`); anything else writes ``match`` + the parsed JD
-    onto the job doc.
+    Deletes the job doc and writes a ``discarded_jobs`` tombstone when the
+    match is at or below :data:`DISCARD_AT_OR_BELOW`; otherwise writes
+    ``match`` + the parsed JD onto the job doc.
 
-    ``profile`` turns on shadow recording of the geo gate: a ``geo_gate`` map
-    goes onto whichever document this call writes. It changes nothing else —
-    same outcome, same score, same discard decision, with it or without it.
-    It is keyword-only and optional so that a caller with no profile to hand
-    (``cli.purge_discarded``, a future backfill) keeps working unchanged.
+    ``profile`` turns on shadow recording of the geo gate, adding a ``geo_gate``
+    map to whichever document this call writes. It changes nothing else — same
+    outcome, same score, same discard decision — and is optional so a caller
+    with no profile to hand keeps working.
 
-    ``geo_gate`` supplies that map *verbatim* instead, and is how an enforced
-    skip travels (:func:`enforced_geo_gate`). It cannot go through the shadow
-    path: :func:`shadow_geo_gate` returns ``None`` for ``overall_score <= 0``,
-    correctly, because there is no Pro decision to compare against — and an
-    enforced skip is exactly a record with no Pro decision. Passing it here also
-    keeps the record and the ``restore`` payload written by the same statement,
-    so a tombstone can never come out carrying one and not the other.
+    ``geo_gate`` supplies that map verbatim instead, and is how an enforced skip
+    travels (:func:`enforced_geo_gate`). It cannot go through the shadow path,
+    which correctly returns ``None`` for ``overall_score <= 0``; passing it here
+    also keeps the record and the ``restore`` payload in one statement, so a
+    tombstone can never carry one without the other.
 
-    ``provenance`` is :func:`scored_with` and lands under ``scored_with`` on
-    whichever document this call writes — job doc beside ``match`` and
-    ``geo_gate``, tombstone beside ``jd_parsed``. It is passed in rather than
-    built here because **this function does not know which models ran**: the
-    batch scorers use ``batch.BATCH_FLASH_MODEL`` / ``BATCH_PRO_MODEL`` and
-    the online one uses ``FLASH_MODEL`` / ``PRO_MODEL``, and the Flash ids are
-    not the same model. Building the record here off an imported constant
-    would stamp every batch-scored job with the online alias — a wrong
-    attribution that is indistinguishable from a right one forever after.
+    ``provenance`` is :func:`scored_with`. It is passed in because this function
+    does not know which models ran — the batch and online scorers call different
+    constants — and building it here off an import would mis-attribute every
+    batch-scored job indistinguishably from a correct record. Absent, not null,
+    when omitted.
 
-    Absent, not null, when omitted, so a caller with nothing to attribute
-    keeps writing exactly the document it wrote before — and see
-    :func:`scored_with` for what that absence does and does not prove.
-
-    This is the seam the recording hangs off rather than ``match_job`` because
-    it is the *one* function all three scorers go through. Instrumenting the
-    scorers individually is how the cheap path ships silently uninstrumented.
+    All three scorers go through this one function, which is why the recording
+    hangs off it rather than off ``match_job``.
     """
     if geo_gate is None:
         geo_gate = shadow_geo_gate(job, match, profile)
@@ -696,9 +557,9 @@ async def persist_result(
     fields = {
         "match": match.model_dump(mode="json"),
         "jd_parsed": (job.jd_parsed.model_dump(mode="json") if job.jd_parsed else None),
-        # Spend attribution: `discovered_at` says when the posting showed
-        # up, which is not when (or by which run) it was paid to be scored
-        # — a backlog scored months later is the normal case.
+        # Spend attribution: `discovered_at` says when the posting showed up,
+        # not when or by which run it was paid to be scored — a backlog scored
+        # months later is the normal case.
         "scored_at": datetime.now(UTC).isoformat(),
         "scored_run_id": current_run_id(),
     }
@@ -707,10 +568,9 @@ async def persist_result(
     if provenance is not None:
         fields["scored_with"] = provenance
     if should_explore(job, match, geo_gate):
-        # Written only when the job is actually sampled — never as ``False``.
-        # At the default rate of 0 this branch never runs, so the job doc, and
-        # therefore ``/jobs/pending``'s payload, is byte-for-byte what it was
-        # before this field existed.
+        # Written only when the job is sampled, never as ``False``, so at the
+        # default rate of 0 the job doc is byte-for-byte what it was before
+        # this field existed.
         fields["exploration"] = True
     await ref.update(fields)
     return "scored"
@@ -719,20 +579,15 @@ async def persist_result(
 async def count_unscored(db, user_id: str) -> int:
     """How many pending jobs still have no ``match`` — the real backlog.
 
-    **The one definition of "waiting to be scored" in this codebase**, and it
-    is deliberately the same filter :func:`load_profile_and_pending` uses, one
-    function above: pending decision, no ``match`` yet. Anything that reports
-    a backlog to the user has to mean exactly this, because the alternative is
-    what shipped first — three call sites reporting three different numbers
-    under one key (jobs newly persisted, jobs a run attempted, jobs a batch
-    reserved), with the UI labelling it as a fourth.
+    The one definition of "waiting to be scored" in this codebase, and
+    deliberately the same filter :func:`load_profile_and_pending` uses.
+    Anything reporting a backlog to the user must mean exactly this.
 
-    Unbudgeted and unlimited on purpose: this is the *backlog*, not a grant.
-    What a click will actually cover is ``min(this, the grant)``, and the
-    grant is the estimate's job — see ``tools.spend.estimate``.
+    Unbudgeted and unlimited on purpose: this is the backlog, not a grant. What
+    a click will cover is ``min(this, the grant)``; the grant is
+    ``tools.spend.estimate``'s job.
 
-    Costs one streamed query over the user's pending jobs, which is what
-    ``GET /jobs/pending`` already pays on every page load. Never called from
+    Costs one streamed query over the user's pending jobs. Never call it from
     the estimate path, which must not query ``jobs`` at all.
     """
     query = (
@@ -759,28 +614,23 @@ async def score_pending_jobs(
 ) -> dict:
     """Score every pending, unscored job against the user's profile.
 
-    Persists ``match`` (and the parsed JD) onto each job doc — unless the job
-    scores at/below ``DISCARD_AT_OR_BELOW``, in which case the doc is replaced
-    by a tombstone in ``discarded_jobs`` so it never reaches the queue but is
-    still deduped on future discovery runs. Returns ``{"scored": n,
-    "discarded": n, "failed": n, "pending": n}`` plus the ``geo_*`` shadow
-    tallies (:func:`count_geo_gate`) and the ``budget_*`` fields of
-    :func:`tools.matching.budget.summary`. Raises ``ValueError`` when the user
-    has no profile to match against.
+    **Spends money.** Persists ``match`` and the parsed JD onto each job doc,
+    unless the job scores at/below ``DISCARD_AT_OR_BELOW``, in which case the
+    doc is replaced by a ``discarded_jobs`` tombstone. Returns ``{"scored",
+    "discarded", "failed", "pending"}`` plus the ``geo_*`` shadow tallies and
+    :func:`tools.matching.budget.summary`'s ``budget_*`` fields. Raises
+    ``ValueError`` when the user has no profile.
 
-    How many jobs this run may score is decided *before* anything is loaded,
-    by one budget reservation (``tools.matching.budget``); what it grants
-    becomes the query's limit. Slots the run doesn't end up drawing on are
-    refunded when it ends. ``cycle_id`` defaults to the ambient run, which
-    opens a new cycle window; pass ``None`` (as the worker's ad-hoc score task
-    does) to draw down the window already open instead — note that an
-    exhausted window then yields zero slots until a discovery cycle opens the
-    next one, since the cycle counter has no time-based rollover.
+    How many jobs the run may score is decided before anything is loaded, by
+    one budget reservation whose grant becomes the query's limit; unused slots
+    are refunded when it ends. ``cycle_id`` defaults to the ambient run, which
+    opens a new cycle window; pass ``None`` to draw down the window already
+    open instead, in which case an exhausted window yields zero slots until a
+    discovery cycle opens the next one.
 
-    ``ignore_budget`` skips the gate entirely and is reachable only from
-    ``cli.run_matching --ignore-budget`` — the operator workflow for
-    hand-scoring a backlog, which is otherwise blocked by its own cap. Such a
-    run is still bounded by ``limit`` or :data:`SCORE_LIMIT_CEILING`.
+    ``ignore_budget`` skips the cap entirely and is reachable only from
+    ``cli.run_matching --ignore-budget``. Such a run is still bounded by
+    ``limit`` or :data:`SCORE_LIMIT_CEILING`.
     """
     db = firestore.AsyncClient()
     reservation = None
@@ -802,11 +652,10 @@ async def score_pending_jobs(
                 **budget.summary(reservation, drawn=0),
             }
 
-    # Counted as jobs finish rather than from the returned counts: the run can
-    # be cancelled out from under us (worker shutdown, the 1800s Cloud Run
-    # timeout) after paying for hundreds of Pro calls, and refunding those
-    # slots because no counts dict came back is the one direction that costs
-    # money. A hard SIGKILL skips the finally entirely, which fails safe.
+    # Counted as jobs finish rather than from the returned counts: a run
+    # cancelled out from under us after paying for hundreds of Pro calls must
+    # not have those slots refunded just because no counts dict came back. A
+    # hard SIGKILL skips the finally entirely, which fails safe.
     progress = {"attempted": 0}
     try:
         counts = await _score_pending(
@@ -836,22 +685,18 @@ async def _score_pending(
 
     started = time.monotonic()
 
-    # One Vertex context cache for the static scoring block (profile + rules),
-    # shared by every job in this run — the block dominates input tokens and
-    # cached input bills at a tenth of the standard rate. TTL is sized to the
-    # backlog by cache_ttl_seconds above. match_job falls back to the uncached
-    # prompt if the cache expires mid-run, and create_match_cache returning
-    # None (e.g. block under the model's minimum cacheable size) just means
-    # the run prices like before.
+    # One Vertex context cache for the static scoring block, shared by every
+    # job in this run: the block dominates input tokens and cached input bills
+    # at a tenth of the standard rate. A mid-run expiry or a None from
+    # create_match_cache just means the run prices like an uncached one.
     cache_name: str | None = None
     if len(pending) >= 2:
         cache_name = await create_match_cache(
             profile, ttl_seconds=cache_ttl_seconds(len(pending), concurrency)
         )
 
-    # Read once per run, not per job: the env cannot change mid-run, and one
-    # value per run is what makes "was this run enforcing?" answerable from the
-    # log line below.
+    # Read once per run, not per job, so "was this run enforcing?" is
+    # answerable from the log line below.
     enforce_geo = geo_enforce_enabled()
     log.info(
         "matching.start",
@@ -872,15 +717,13 @@ async def _score_pending(
     async def _score(ref, job: Job) -> None:
         async with sem:
             # The parse model *this call* paid for, or None when it did not:
-            # a job that arrived already parsed, or whose parse came free out
-            # of jd_cache, was produced by some earlier run under some other
-            # model, and this scorer cannot know which. See
-            # :func:`scored_with`.
+            # an already-parsed job or a jd_cache hit came from an earlier run
+            # under a model this scorer cannot name. See :func:`scored_with`.
             parse_model: str | None = None
             try:
-                # Parse here (not inside match_job) so the result is durable
-                # before the Pro call gets a chance to fail. Cheapest source
-                # first: the cross-user jd_cache, then Flash.
+                # Parse here, not inside match_job, so the result is durable
+                # before the Pro call can fail. Cheapest source first: the
+                # cross-user jd_cache, then Flash.
                 if job.jd_parsed is None:
                     job.jd_parsed = await jd_cache.lookup(db, job.jd_raw)
                     if job.jd_parsed is None:
@@ -897,11 +740,9 @@ async def _score_pending(
                 if skipped is not None:
                     enforced = enforced_geo_gate(decision)
                     if enforced is None:
-                        # The log the pre-filter used to emit from inside
-                        # match_job. It stays a call-site concern: the batch
-                        # paths have never emitted it (they tombstone in bulk
-                        # and report counts), and moving it into prefilter would
-                        # start two new log streams.
+                        # A call-site concern, not prefilter's: the batch
+                        # paths tombstone in bulk and report counts, so moving
+                        # this into prefilter would start two new log streams.
                         log.info(
                             "matching.skip_out_of_family",
                             job_id=job.id,
@@ -919,12 +760,10 @@ async def _score_pending(
                         profile=profile,
                         geo_gate=enforced,
                         # No ``match_model``: the pre-filter is a free local
-                        # rule, and a record claiming Pro ran on a job Pro
-                        # never saw is the worst thing this field could do.
-                        # The parse leg is still attributed when this call is
-                        # what paid for it — the tombstone keeps that parse as
-                        # its only features (see ``discard_tombstone``), so
-                        # the prompt that produced them is worth knowing.
+                        # rule, and this field must never claim Pro ran on a
+                        # job Pro never saw. The parse leg is still attributed
+                        # when this call paid for it, since the tombstone keeps
+                        # that parse as its only features.
                         provenance=scored_with(
                             parse_model=parse_model, match_model=None
                         )
@@ -946,11 +785,9 @@ async def _score_pending(
                     ),
                 )
                 counts[outcome] += 1
-                # Recomputed rather than handed back by persist_result: the
-                # gate is pure and costs microseconds, and one definition of
-                # "is there anything to record here?" beats two. Widening
-                # persist_result's return would also break its callers, who
-                # index a counts dict with it.
+                # Recomputed rather than returned by persist_result: the gate
+                # is pure and costs microseconds, and widening that return
+                # would break callers who index a counts dict with it.
                 count_geo_gate(counts, shadow_geo_gate(job, match, profile))
                 if on_result:
                     on_result(job, match, None)
@@ -960,11 +797,10 @@ async def _score_pending(
                 if on_result:
                     on_result(job, None, str(e))
             finally:
-                # A job that got as far as holding the semaphore has drawn its
-                # slot, whatever happened next — including a cancellation
-                # partway through a (billed) Pro call. Jobs still queued
-                # behind the semaphore when a run is cancelled never run this,
-                # so their slots are correctly refunded.
+                # Holding the semaphore draws the slot, whatever happens next,
+                # including cancellation partway through a billed Pro call.
+                # Jobs still queued behind the semaphore never reach this, so
+                # their slots are correctly refunded.
                 progress["attempted"] += 1
 
     try:

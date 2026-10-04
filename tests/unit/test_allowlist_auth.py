@@ -2,25 +2,20 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The invite gate wired into ``api.deps`` — shipped with enforcement off.
 
-Three things matter more than the rest, and the order is deliberate:
+Three things matter most, in order:
 
 1. **The dev bypass is untouched.** ``_verify_token`` returns for
-   ``dev_mode() and AUTH_DEV_USER`` before this PR's code runs at all — a local
-   process and the ``me`` demo account have to keep working exactly as before,
-   even with ``ALLOWLIST_ENFORCED=1``. Pinned all the way through a real route,
-   not just a function call, and by asserting no Firestore/allowlist call was
-   *reached* — not merely that the request succeeded.
-2. **``ALLOWLIST_ENFORCED`` unset is a full no-op** on the real-token path too
-   — the whole point of this PR (D1) shipping before the one that flips the
-   flag (D2).
-3. **Enforced, it fails closed** — denied on a token with no ``email`` claim
-   (403, not 500), denied on an email the allowlist rejects, and the 5-minute
-   TTL cache (mirrors ``api.routes.discovery._last_tick_check``) both saves the
-   redundant read and expires on schedule.
+   ``dev_mode() and AUTH_DEV_USER`` before any of this runs, so a local process
+   and the ``me`` demo account keep working even with
+   ``ALLOWLIST_ENFORCED=1``. Pinned through a real route, and by asserting no
+   Firestore/allowlist call was reached rather than that the request succeeded.
+2. **``ALLOWLIST_ENFORCED`` unset is a full no-op** on the real-token path too.
+3. **Enforced, it fails closed** — 403 (not 500) on a token with no ``email``
+   claim, denied on an email the allowlist rejects, and the 5-minute TTL cache
+   both saves the redundant read and expires on schedule.
 
-``tools.allowlist`` itself — the predicate's own fail-closed matrix, the
-transactional seat cap — is pinned in ``test_allowlist.py``; this file is only
-about the wiring in ``api.deps``.
+``tools.allowlist`` itself is pinned in ``test_allowlist.py``; this file is
+only about the wiring in ``api.deps``.
 """
 
 from __future__ import annotations

@@ -36,11 +36,10 @@ def no_dev_bypass(monkeypatch):
     every test after that point runs believing it is a developer at a keyboard
     with the production project configured.
 
-    Nothing depended on that, and one thing now refuses to work under it:
-    ``api.routes.discovery.live_runs_refused``. Rather than teach that guard to
-    recognise pytest — a guard with an "unless you are testing" clause is not a
-    guard — the leak is closed here. Unit tests are hermetic: no dev bypass, no
-    ambient permission to drive a live run.
+    ``api.routes.discovery.live_runs_refused`` refuses to work under that, and
+    a guard with an "unless you are testing" clause is not a guard, so the leak
+    is closed here instead. Unit tests are hermetic: no dev bypass, no ambient
+    permission to drive a live run.
     """
     monkeypatch.delenv("AUTH_DEV_MODE", raising=False)
     monkeypatch.delenv("ALLOW_LIVE_RUNS", raising=False)
@@ -162,15 +161,13 @@ def run_ledger_opens(monkeypatch):
     ``state: "running"`` the moment a pipeline starts, and it resolves its
     Firestore client exactly the way ``persist_run_cost`` does — which means it
     is a second way for the leak ``no_production_firestore`` exists to catch to
-    reach the live project, from *every* pipeline at once. Fifteen tests
-    already patch ``persist_run_cost`` by hand; patching its twin fifteen more
-    times is how one gets missed.
+    reach the live project, from every pipeline at once.
 
-    Replaced with a **recorder**, not a no-op: a fixture that silently disables
-    the thing under test is how this project has repeatedly ended up with tests
-    that cannot fail. Ask for this fixture to assert on what a pipeline opened,
-    or override it with ``monkeypatch.setattr(<module>, "open_run", ...)`` in a
-    test that needs its own seam — the later patch wins.
+    Replaced with a **recorder**, not a no-op, so a test can still assert on
+    what a pipeline opened; a fixture that silently disables the thing under
+    test produces tests that cannot fail. Override it with
+    ``monkeypatch.setattr(<module>, "open_run", ...)`` where a test needs its
+    own seam — the later patch wins.
     """
     opened: list[dict] = []
 

@@ -1,15 +1,13 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Resumable batch scoring pipelines (Phase C ops architecture).
+"""Resumable batch scoring pipelines.
 
 ``tools.matching.batch`` runs both Vertex batch legs inside one long-lived
-process — fine for a babysat CLI run, fatal for fire-and-forget: if the
-process dies, a paid batch finishes on Vertex with nobody left to ingest it
-(exactly what forced a hand-written resume script on 2026-07-10). This module
-splits the same pipeline at its natural seams and persists the position in a
-top-level ``batch_runs`` collection (server-only, like ``jd_cache``), so any
-later process can pick a run up — in practice the hermes-worker, whose hourly
-cron tick enqueues a resume pass while runs are in flight:
+process, which is fatal for fire-and-forget: if the process dies, a paid batch
+finishes on Vertex with nobody left to ingest it. This module splits the same
+pipeline at its seams and persists the position in a top-level ``batch_runs``
+collection (server-only, like ``jd_cache``), so any later process — in
+practice the worker's hourly cron tick — can pick a run up:
 
 - :func:`start`  consults the free jd_cache, submits the Flash parse batch,
   records the run. Seconds of work, no polling — safe inside a request.
@@ -18,27 +16,25 @@ cron tick enqueues a resume pass while runs are in flight:
   the Pro score batch goes out; score output persists matches/tombstones and
   the run completes.
 
-Ingestion is stateless by design. Batch output lines echo their request text,
-and request texts are content-derived — ``jd_raw`` for parse, match context +
-job block for score (the context is stashed in the run's GCS dir at submit
-time). Resuming therefore needs nothing from the submitting process's memory:
-it reloads the user's pending jobs and joins on content. Jobs whose lines
-failed simply stay pending for a future run, and jobs persisted by an earlier
-partial ingest drop out of the reload — which is what makes re-ingesting
-after a crash safe.
+Ingestion is stateless by design: batch output lines echo their request text,
+and request texts are content-derived (``jd_raw`` for parse, match context +
+job block for score, the context stashed in the run's GCS dir at submit time).
+Resuming therefore needs nothing from the submitting process's memory — it
+reloads the user's pending jobs and joins on content. Jobs whose lines failed
+stay pending for a future run, and jobs persisted by an earlier partial ingest
+drop out of the reload, which is what makes re-ingesting after a crash safe.
 
 Spend is the one thing statelessness does *not* make safe: re-reading the
 output re-prices the same calls, and the run ledger banks with
-``firestore.Increment``. So each leg's flush is gated on a ``cost_banked_at``
-marker on the run doc, and each leg reaches the ledger exactly once — see the
-flush in :func:`resume` for which way that guard fails.
+``firestore.Increment``. Each leg's flush is therefore gated on a
+``cost_banked_at`` marker so it reaches the ledger exactly once — see the flush
+in :func:`resume` for which way that guard fails.
 
 Runs advance under a claim (update-time precondition + TTL), so a manual
-``--batch-resume`` racing the worker's tick can't double-submit a paid Pro
+``--batch-resume`` racing the worker's tick cannot double-submit a paid Pro
 stage. One window stays open: a crash between ``submit_batch`` returning and
-the run doc recording the job name leaves a paid batch untracked. It's
-milliseconds wide; the job's ``display_name`` carries the run tag, so the
-Vertex console finds it.
+the run doc recording the job name leaves a paid batch untracked. The job's
+``display_name`` carries the run tag, so the Vertex console finds it.
 """
 
 from __future__ import annotations
@@ -97,15 +93,14 @@ log = get_logger("tools.matching")
 
 COLLECTION = "batch_runs"
 
-# Backlogs at/above this size score as a resumable batch run when the queue
-# architecture is available: half-price LLM calls, no long-lived process.
-# Below it, online scoring answers in seconds and the Phase 3.2 context cache
-# keeps it cheap — the scheduler's hourly increments live down here.
+# Backlogs at/above this size score as a resumable batch run: half-price LLM
+# calls, no long-lived process. Below it, online scoring answers in seconds and
+# the context cache keeps it cheap.
 #
-# Coupled to SCORING_BUDGET_PER_CYCLE in a way that doesn't look coupled: the
-# reservation is taken first, so what this threshold sees is min(backlog,
-# grant), not the backlog. Set the per-cycle budget below this and every run
-# routes online no matter how much backlog is waiting.
+# Coupled to SCORING_BUDGET_PER_CYCLE in a way that does not look coupled: the
+# reservation is taken first, so this threshold sees min(backlog, grant). Set
+# the per-cycle budget below this and every run routes online, however much
+# backlog is waiting.
 BATCH_MIN_PENDING = 50
 
 # A claim this old is considered abandoned (its resume pass died) and the run
@@ -115,8 +110,8 @@ BATCH_MIN_PENDING = 50
 _CLAIM_TTL_SECONDS = 45 * 60
 
 #: Run states whose committed estimate may still be un-ingested. ``done`` is
-#: not here: both its legs are banked, so its real cost is already on the
-#: ledger and counting the estimate too would double the same money.
+#: excluded: both its legs are banked, so counting the estimate too would
+#: double the same money.
 OUTSTANDING_STATES = ("running", "failed")
 
 
@@ -127,16 +122,11 @@ def _now() -> datetime:
 def _committed(requests: int, *, leg: str, model: str) -> dict:
     """What this leg has just committed us to paying Google.
 
-    **Committed spend used to be invisible until ingest.** A Vertex batch is
-    billed when Google runs it; our ledger prices it hours later, when a
-    resume pass reads the output. So a run submitted and then abandoned — a
-    failed Vertex job, an orphan, a bucket that went away — was billed and
-    recorded nowhere. On 2026-09-26 the run ledger read ``cost_usd: 0.0,
-    calls: 0`` while a completed batch sat on the invoice. This is the fix:
-    the write that makes the batch trackable is the write that records its
-    price.
+    A Vertex batch is billed when Google runs it but priced by our ledger hours
+    later, at ingest, so an abandoned run was once billed and recorded nowhere.
+    The write that makes a batch trackable therefore also records its price.
 
-    An *estimate*, explicitly, and never mixed with actuals — see
+    An estimate, explicitly, and never mixed with actuals — see
     :func:`outstanding_committed`.
     """
     low, high = rates.committed_usd(requests, leg=leg)
@@ -150,11 +140,8 @@ def _committed(requests: int, *, leg: str, model: str) -> dict:
 
 
 def _log_committed(run_tag: str, user_id: str | None, leg: str, committed: dict):
-    """One line with the dollars on it.
-
-    On its own this closes "invisible until ingest" for anybody reading Cloud
-    Logging, without their needing to know the ``batch_runs`` collection
-    exists.
+    """Log one line with this leg's committed dollars on it, so the spend is
+    visible in Cloud Logging without reading the ``batch_runs`` collection.
     """
     log.info(
         "batch.committed",
@@ -180,20 +167,16 @@ def _parse_iso(value) -> datetime | None:
 def _leg_delta(before: dict, after: dict) -> dict[str, int]:
     """What one ingest leg added to the run's cumulative ``counts``.
 
-    ``run["counts"]`` is a running total across both legs (the parse leg's
-    pre-filter tombstones are still sitting in it when the score leg starts),
-    but ``persist_run_cost`` puts everything under ``jobs`` through
-    ``firestore.Increment`` — so handing it the total would re-add the parse
-    leg's outcomes on the score leg's flush, and the ledger would read roughly
-    double. What an Increment wants is a *delta*, and a delta is only ever
-    correct if it is applied exactly once, which is what the per-leg
-    ``cost_banked_at`` marker in :func:`resume` buys.
+    ``run["counts"]`` is a running total across both legs, but
+    ``persist_run_cost`` applies everything under ``jobs`` with
+    ``firestore.Increment``, so handing it the total would re-add the parse
+    leg's outcomes on the score leg's flush. A delta is only correct applied
+    exactly once, which is what the per-leg ``cost_banked_at`` marker in
+    :func:`resume` buys.
 
-    Keys are whatever the legs actually produced (``scored``, ``discarded``,
-    ``failed``, ``parse_failed``, and ``geo_skipped`` when the gate fired), so
-    a new outcome name flows through without a change here. Deliberately no
-    ``pending``: that is a level, not a delta, and the cycle that ordered the
-    run already banked it.
+    Keys are whatever the legs produced, so a new outcome name flows through
+    without a change here. Deliberately no ``pending``: that is a level, not a
+    delta, and the cycle that ordered the run already banked it.
     """
     return {key: after.get(key, 0) - before.get(key, 0) for key in after}
 
@@ -220,14 +203,15 @@ async def start(
 ) -> dict:
     """Submit a resumable batch run for the user's pending backlog.
 
-    Free work happens inline (jd_cache hits, and — when nothing needs Flash —
-    the family filter and Pro submission); paid batches are submitted but
-    never awaited. Returns ``{"started": False, "pending": n}`` when
-    ``min_pending`` says the backlog is too small to bother.
+    **Commits spend**: the batches are submitted but never awaited, and
+    cancelling the caller does not cancel them. Free work happens inline
+    (jd_cache hits, and the family filter and Pro submission when nothing needs
+    Flash). Returns ``{"started": False, "pending": n}`` when ``min_pending``
+    says the backlog is too small to bother.
 
     Budgeted like the online scorer: the reservation is taken before anything
-    is loaded and caps how much backlog one run may submit, and ``cycle_id``
-    behaves exactly as it does there. See ``tools.matching.budget``.
+    is loaded and caps how much backlog one run may submit; ``cycle_id``
+    behaves as it does there.
     """
     db = db or firestore.AsyncClient()
     reservation = None
@@ -248,22 +232,18 @@ async def start(
     try:
         profile, pending = await load_profile_and_pending(db, user_id, limit)
         if min_pending is not None and len(pending) < min_pending:
-            # Nothing was submitted, so nothing is owed. ``drawn=0`` rather than
-            # ``len(pending)`` for exactly that reason: ``attempted`` is still 0
-            # here, so the ``finally`` below refunds the *whole* grant, and
-            # ``budget.summary`` derives the refund it reports from this number.
-            # Claiming slots this run never charged for would leave the Profile
-            # card under-reporting the budget by the size of the backlog it
-            # declined to touch.
+            # Nothing was submitted, so nothing is owed. ``drawn=0``, not
+            # ``len(pending)``: ``attempted`` is still 0, so the ``finally``
+            # refunds the whole grant and ``budget.summary`` must report that
+            # same refund or the Profile card under-reports the budget.
             return {
                 "started": False,
                 "pending": len(pending),
                 **budget.summary(reservation, drawn=0),
             }
-        # Committed here, before any submission: _start pays for a batch and
-        # only then records its job name, so a Firestore failure on that write
-        # must not hand back slots whose Flash/Pro requests are already in
-        # flight (resume() would later orphan that run, spend and all).
+        # Committed before any submission: _start pays for a batch and only
+        # then records its job name, so a Firestore failure on that write must
+        # not hand back slots whose requests are already in flight.
         attempted = len(pending)
         return await _start(db, user_id, profile, pending, reservation=reservation)
     finally:
@@ -316,16 +296,14 @@ async def _start(
         "counts": counts,
         "created_at": _now().isoformat(),
         "updated_at": _now().isoformat(),
-        # The batch's tokens are only priced when a *later* process ingests
-        # the output, so without this the spend would be attributed to the
-        # worker tick that happened to pick the run up. resume() rebinds it.
+        # The batch's tokens are only priced when a later process ingests the
+        # output, so without this the spend would be attributed to whichever
+        # worker tick picked the run up. resume() rebinds it.
         "origin_run_id": current_run_id(),
-        # The jobs this run reserved budget for — and therefore the only ones
-        # its score stage may submit to Pro. Ingest reloads *all* pending jobs
-        # (the content join needs them) and would otherwise sweep in every
-        # parsed job any earlier run left behind, against this run's grant.
-        # 16-hex-char ids, so even a --ignore-budget backlog run stays far
-        # inside Firestore's 1 MiB document limit.
+        # The jobs this run reserved budget for, and therefore the only ones
+        # its score stage may submit to Pro. Ingest reloads all pending jobs
+        # for the content join and would otherwise sweep in every parsed job
+        # an earlier run left behind, against this run's grant.
         "job_ids": [job.id for _, job in pending],
         # Born claimed: resume must not touch the doc until the submit below
         # has recorded its job name.
@@ -340,11 +318,10 @@ async def _start(
             gcs_dir=f"{gcs_root}/parse",
             display_name=f"hermes-parse-{run_tag}",
         )
-        # The committed estimate rides along with the job name, in the *same*
-        # write. Not a nicety: that write is what makes the batch trackable,
-        # so binding the two means there is no state in which a run is known
-        # and its price is not. A dotted key so the score leg's entry can be
-        # added later without clobbering this one.
+        # The committed estimate rides with the job name in the same write,
+        # so there is no state in which a run is known and its price is not.
+        # Dotted key, so the score leg's entry can be added without clobbering
+        # this one.
         committed = _committed(len(to_parse), leg="parse", model=BATCH_FLASH_MODEL)
         await run_ref.update(
             {
@@ -398,36 +375,18 @@ async def _start(
 async def _persist_prefiltered(ref, job: Job, match, geo_gate: dict | None) -> str:
     """``persist_result`` with the geo record positional, for ``_persist_all``.
 
-    That helper splats whatever tuples it is given at whatever persister it is
-    given, and it stays that dumb on purpose, so a keyword-only argument needs a
-    shim rather than a smarter helper. Deliberately passes no ``profile``: see
-    the note at the call site.
-
-    **Deliberately passes no ``provenance`` either, so these tombstones carry
-    no ``scored_with`` at all.** No scoring model was called: the match is a
-    ``pipeline.OUT_OF_FAMILY`` / ``GEO_INELIGIBLE`` sentinel at score 0 from a
-    free local rule, so ``match_model`` could only ever be ``None``. And the
-    parse is not attributable from here either — ``_submit_score_stage``
-    reaches this function from two entries and
-    ``load_profile_and_pending`` hands it documents, not history:
-
-    - from :func:`resume`'s score-submit path, the parse belongs to an earlier
-      leg in an earlier process, and nothing carries its model across;
-    - from :func:`_ingest_parse`, this *same* process did just parse those
-      jobs with ``BATCH_FLASH_MODEL`` — but that fact lives in the ingest
-      frame, not in the reloaded documents, and the shim cannot see it.
-
+    Passes no ``profile`` (see the note at the call site) and no
+    ``provenance``, so these tombstones carry no ``scored_with`` at all. That
+    is deliberate: no scoring model ran, so ``match_model`` could only be
+    ``None``, and the parse is not attributable from here either — this shim
+    sees reloaded documents, not the frame that knows which model parsed them.
     A record whose only non-null field is ``scored_at`` dates a write, not a
-    score, so the honest answer is no record. Absent rather than a dict of
-    nulls, matching ``geo_gate``'s rule in ``score.discard_tombstone``.
+    score, so the honest answer is no record.
 
-    **Known cost, accepted here:** the same OUT_OF_FAMILY job scored through
-    ``batch.py`` gets ``parse_model: gemini-2.5-flash`` while this path gets
-    nothing. That is information loss, never a wrong attribution — the safe
-    direction. Closing it means threading the parse model through the
-    ``batch_runs`` document so a later leg can read it back, which is a
-    schema change on a live resumable-run record and belongs to its own task,
-    not to this one.
+    Known cost: the same OUT_OF_FAMILY job scored through ``batch.py`` gets a
+    ``parse_model`` while this path gets nothing. Information loss, never a
+    wrong attribution. Closing it needs the parse model threaded through the
+    ``batch_runs`` document, a schema change on a live record.
     """
     return await persist_result(ref, job, match, geo_gate=geo_gate)
 
@@ -442,17 +401,16 @@ async def _submit_score_stage(
     pending,
     counts: dict,
 ) -> str:
-    """Pre-filter parsed pending jobs, then submit the Pro batch.
+    """Pre-filter parsed pending jobs, then submit the Pro batch. **Spends.**
 
-    Whatever the pre-filter rejects tombstones immediately through the same
-    persistence path as every other scorer (free, no LLM). Unparsed jobs are
-    left alone — their parse failed, and a future run retries them. Returns the
-    resulting run stage ("score", or "done" when nothing needs Pro).
+    Whatever the pre-filter rejects is tombstoned immediately through the same
+    persistence path as every other scorer, for free. Unparsed jobs are left
+    alone for a future run to retry. Returns the resulting run stage
+    ("score", or "done" when nothing needs Pro).
 
     ``pending`` must already be narrowed to the jobs this run reserved budget
-    for — see :func:`_owned_pending`. Every entry here that carries a parse
-    becomes a paid Pro request, so handing this function a full reload is how
-    a 300-slot run submits 900 jobs.
+    for (:func:`_owned_pending`): every parsed entry becomes a paid Pro
+    request, so a full reload is how a 300-slot run submits 900 jobs.
     """
     tombstones: list[tuple] = []
     to_score: list[tuple] = []
@@ -468,11 +426,9 @@ async def _submit_score_stage(
             tombstones.append((ref, job, match, enforced))
         else:
             to_score.append((ref, job))
-    # No ``profile``, so no geo *shadow* record: an OUT_OF_FAMILY tombstone was
-    # rejected by the free family test without a Pro call, so there is no
-    # decision for the gate to be measured against. An enforced geo tombstone
-    # carries its record explicitly instead — same reason, opposite direction:
-    # it is the gate's own verdict, not a comparison against one.
+    # No ``profile``, so no geo *shadow* record: these were rejected without a
+    # Pro call, so there is no decision to measure the gate against. An
+    # enforced geo tombstone carries its own record explicitly instead.
     for outcome in await _persist_all(tombstones, _persist_prefiltered):
         counts[outcome] = counts.get(outcome, 0) + 1
 
@@ -494,8 +450,8 @@ async def _submit_score_stage(
     for _, job in to_score:
         by_block.setdefault(build_match_job_block(job), []).append(job)
     # The score output can only be joined with the exact context it was
-    # prompted with, and the profile may change while the batch runs — so the
-    # context travels with the run, not with the profile.
+    # prompted with, and the profile may change while the batch runs, so the
+    # context travels with the run.
     await upload_text(f"{gcs_root}/score/context.txt", context)
     job_name = await submit_batch(
         model=BATCH_PRO_MODEL,
@@ -503,12 +459,11 @@ async def _submit_score_stage(
         gcs_dir=f"{gcs_root}/score",
         display_name=f"hermes-score-{run_tag}",
     )
-    # Same rule as the parse leg: job name and price in one write. **This is
-    # the leg that arrives hours after the user's click**, created by
-    # ``/tasks/batch/resume``, and it is the more expensive of the two. The
-    # consent captured at the click covers it only because the estimate is
-    # quoted per job over the whole grant rather than per leg — if that ever
-    # narrows to one leg, this submission starts spending unasked.
+    # Same rule as the parse leg: job name and price in one write. This is the
+    # more expensive leg and it is submitted hours after the user's click, by
+    # ``/tasks/batch/resume``. The consent captured at the click covers it only
+    # because the estimate is quoted per job over the whole grant rather than
+    # per leg; narrow that to one leg and this submission spends unasked.
     committed = _committed(len(by_block), leg="score", model=BATCH_PRO_MODEL)
     await run_ref.update(
         {
@@ -531,17 +486,15 @@ async def _submit_score_stage(
 
 
 async def _ingest_parse(db, run_ref, run: dict) -> dict[str, int]:
-    """Parse batch finished: feed jd_cache + job docs, then submit scoring.
-
-    Returns this leg's own outcome deltas for the cost ledger — see
-    :func:`_leg_delta`.
+    """Parse batch finished: feed jd_cache + job docs, then submit the paid
+    score batch. Returns this leg's own outcome deltas for the cost ledger.
     """
     run_tag = run_ref.id
     out_lines = await fetch_batch_output(f"{run['gcs_root']}/parse")
     profile, pending = await load_profile_and_pending(db, run["user_id"])
 
     # Join strictly on texts the batch echoed: pending jobs discovered after
-    # submission aren't failures, they're just not part of this run.
+    # submission are not failures, they are just not part of this run.
     texts = {t for t in (_request_text(line) for line in out_lines) if t}
     by_text: dict[str, list[Job]] = {}
     for _, job in pending:
@@ -555,7 +508,7 @@ async def _ingest_parse(db, run_ref, run: dict) -> dict[str, int]:
 
     parsed_jobs = [j for jobs in by_text.values() for j in jobs if j.jd_parsed]
     if parsed_jobs:
-        # Shared property first (any user's future run skips Flash), then the
+        # Shared cache first, so any user's future run skips Flash, then the
         # per-job docs so this run's stage 2 never re-pays either.
         await jd_cache.store_many(
             db,
@@ -582,8 +535,8 @@ async def _ingest_parse(db, run_ref, run: dict) -> dict[str, int]:
         owned=len(owned),
     )
     # Mutates ``counts`` in place with the pre-filter's tombstone outcomes, so
-    # the delta below covers the whole leg — the failed parse lines *and* the
-    # jobs this leg retired for free before Pro ever saw them.
+    # the delta below covers the whole leg: failed parse lines and the jobs
+    # this leg retired for free before Pro saw them.
     await _submit_score_stage(
         db, run_ref, run_tag, run["user_id"], run["gcs_root"], profile, owned, counts
     )
@@ -593,24 +546,18 @@ async def _ingest_parse(db, run_ref, run: dict) -> dict[str, int]:
 def _owned_pending(run: dict, pending: list[tuple], *, fallback: list[Job]) -> list:
     """The reloaded pending pairs this run reserved budget for.
 
-    Ingest has to reload *everything* pending — the content join is what makes
-    resuming stateless, and truncating the reload would silently drop jobs
-    whose responses this run already paid for. But the reload is a superset:
-    it also carries jobs from other runs, and every parsed one of those would
-    become a paid Pro request in the score stage. So the reload is joined, and
-    then narrowed to the ids recorded at submit time.
+    Ingest must reload everything pending, because the content join is what
+    makes resuming stateless and truncating would drop jobs whose responses
+    this run already paid for. But that reload is a superset — jobs from other
+    runs would each become a paid Pro request — so it is narrowed to the ids
+    recorded at submit time.
 
-    ``fallback`` covers the batch_runs docs written before ``job_ids`` existed
-    (there are live ones): those score only the jobs this run's own batch
-    echoed, which is the safe direction — the remainder is picked up by a later
-    ``start()``, whose skip-straight-to-score path is itself budgeted.
-
-    The fallback is *almost* always a subset of what the run reserved. The one
-    leak: ``join_parse_responses`` fans one response out to every reloaded job
-    sharing that ``jd_raw``, so a posting mirrored on a second board and
-    discovered mid-batch joins the echoed set. Costs next to nothing — identical
-    blocks collapse into one Pro request, since ``build_match_job_block``
-    carries no job id — and it expires with the legacy docs.
+    ``fallback`` covers live ``batch_runs`` docs written before ``job_ids``
+    existed: those score only the jobs this run's own batch echoed, and a later
+    ``start()`` picks up the remainder under its own budget. It is almost
+    always a subset of what the run reserved; the one leak is a posting
+    mirrored on a second board and discovered mid-batch, which costs next to
+    nothing because identical blocks collapse into one Pro request.
     """
     recorded = run.get("job_ids")
     owned = set(recorded) if recorded else {job.id for job in fallback}
@@ -620,19 +567,16 @@ def _owned_pending(run: dict, pending: list[tuple], *, fallback: list[Job]) -> l
 async def _ingest_score(db, run_ref, run: dict) -> dict[str, int]:
     """Score batch finished: persist matches/tombstones, complete the run.
 
-    Returns this leg's own outcome deltas for the cost ledger — see
-    :func:`_leg_delta`. This is the leg that makes ``jobs.scored`` non-zero,
-    and therefore the one that makes cost-per-scored-job derivable for a batch
-    run at all.
+    Returns this leg's own outcome deltas for the cost ledger. This is the leg
+    that makes ``jobs.scored`` non-zero, and so the only one that makes
+    cost-per-scored-job derivable for a batch run.
     """
     run_tag = run_ref.id
     context = await download_text(f"{run['gcs_root']}/score/context.txt")
     out_lines = await fetch_batch_output(f"{run['gcs_root']}/score")
-    # The profile is kept (it used to be discarded here) only to feed the geo
-    # shadow recording below. Recomputing the verdict at ingest rather than
-    # carrying it across from submit is deliberate and matches this module's
-    # stateless-ingest design: nothing the submitting process knew has to
-    # survive for a later one to finish the run.
+    # The profile is kept only to feed the geo shadow recording below. The
+    # verdict is recomputed at ingest rather than carried from submit, so
+    # nothing the submitting process knew has to survive.
     profile, pending = await load_profile_and_pending(db, run["user_id"])
 
     # Same restriction as parse ingest: only blocks the batch echoed count,
@@ -662,19 +606,14 @@ async def _ingest_score(db, run_ref, run: dict) -> dict[str, int]:
         for job in jobs
         if job.id in matches
     ]
-    # Bound here rather than inside ``_persist_all``: that helper splats whatever
-    # tuples it is given at whatever persister it is given, and it stays that
-    # dumb on purpose — ``_submit_score_stage`` hands it the same function with
-    # no profile bound at all.
-    # ``BATCH_PRO_MODEL``, because that is the model whose output is being
-    # ingested right here — not ``PRO_MODEL``, even though they are currently
-    # the same string: these are two independently declared constants and the
-    # reason this task exists is that one of them can move without the other.
-    # ``parse_model`` is ``None`` on purpose: the parse leg ran in an earlier
-    # process and this stateless ingest reloads the parsed documents without
-    # any record of what produced them, so naming a model here would be a
-    # guess. One timestamp for the whole ingest is correct — it is one write
-    # pass, and ``scored_at`` dates the record, not each document.
+    # Bound here rather than inside ``_persist_all``, which stays dumb because
+    # ``_submit_score_stage`` hands it the same function with no profile bound.
+    # ``BATCH_PRO_MODEL``, not ``PRO_MODEL``: they hold the same string today,
+    # but they are independent constants and either can move alone.
+    # ``parse_model`` is ``None`` on purpose — the parse leg ran in an earlier
+    # process and this stateless ingest has no record of what produced those
+    # parses. One timestamp for the whole ingest is correct: ``scored_at``
+    # dates the write pass, not each document.
     provenance = scored_with(parse_model=None, match_model=BATCH_PRO_MODEL)
     for outcome in await _persist_all(
         to_persist, partial(persist_result, profile=profile, provenance=provenance)
@@ -697,20 +636,14 @@ async def _ingest_score(db, run_ref, run: dict) -> dict[str, int]:
 async def _ledger_state(run_ref, run_tag: str) -> str:
     """The originating run's ledger state, read back off the ``batch_runs`` doc.
 
-    **The origin run closes when the batch does, not when a leg does.** The
-    cycle (or ``/tasks/batch/start``) that submitted this batch left its ledger
-    doc open, because the work was with Google; the ingest that drives the
-    ``batch_runs`` doc terminal is what closes it. A parse leg that has just
-    submitted the score batch therefore keeps it ``running``.
+    The origin run closes when the batch does, not when a leg does, so a parse
+    leg that has just submitted the score batch keeps it ``running``. Read back
+    rather than inferred from the leg name, because a parse leg with nothing
+    left to score completes the whole run, and inferring would leave that
+    ledger doc open forever.
 
-    Read back rather than inferred from the leg name, because a parse leg with
-    nothing left to score completes the *whole* run (``_submit_score_stage``
-    writes ``done`` and submits nothing) — inferring would leave that run's
-    ledger doc open forever, to be aged into ``stalled``.
-
-    Falls back to ``running`` if the read fails: it is the state the doc already
-    holds, so the fallback changes nothing, and it must never cost the flush
-    this feeds — that one is money.
+    Falls back to ``running`` if the read fails — the state the doc already
+    holds — because this must never cost the flush it feeds, which is money.
     """
     try:
         state = ((await run_ref.get()).to_dict() or {}).get("state")
@@ -731,10 +664,11 @@ async def resume(
 ) -> dict:
     """One pass over in-flight runs: poll Vertex, ingest whatever finished.
 
-    Cheap when nothing is ready (one Vertex GET per running run). Designed to
-    be fired repeatedly — the worker's hourly tick — and safely in parallel
-    with a manual pass: each run is claimed via an update-time precondition
-    before any ingest work, and a claim younger than the TTL is skipped.
+    **Can submit the paid Pro batch** when a parse leg finishes. Cheap when
+    nothing is ready (one Vertex GET per running run), and designed to be fired
+    repeatedly and in parallel with a manual pass: each run is claimed under an
+    update-time precondition before any ingest work, and a claim younger than
+    the TTL is skipped.
     """
     db = db or firestore.AsyncClient()
     query = db.collection(COLLECTION).where(
@@ -785,11 +719,10 @@ async def resume(
             summary["running"] += 1
             continue
 
-        # Ingest under the *originating* cycle's run_id: this is where the
+        # Ingest under the originating cycle's run_id: this is where the
         # batch's calls get priced, and pricing them under this tick's id would
-        # scatter one cycle's spend across whichever worker passes happened to
-        # ingest it. Runs written before origin_run_id existed (one live July
-        # doc) ingest unattributed, exactly as they do today.
+        # scatter one cycle's spend across whichever worker passes ingested it.
+        # Runs written before origin_run_id existed ingest unattributed.
         origin = run.get("origin_run_id")
         rebind = {"run_id": origin, "runner": "batch_resume"} if origin else {}
         leg = "parse" if run.get("stage") == "parse" else "score"
@@ -822,34 +755,26 @@ async def resume(
                             summary["completed"] += 1
                     finally:
                         # In a finally so an ingest that dies after pricing
-                        # its responses banks that spend rather than losing
-                        # it, and so the accumulator entry is always released
-                        # — the bounded-map invariant has to hold on the
-                        # failure path too.
+                        # its responses banks that spend rather than losing it,
+                        # and so the accumulator entry is always released.
                         #
                         # ``Increment`` is not idempotent and the post-TTL
-                        # retry re-reads the same GCS output and re-prices the
-                        # same calls, so the flush is gated on a per-leg
-                        # ``cost_banked_at`` marker: each of a run's two legs
-                        # reaches the ledger exactly once, whichever attempt
-                        # gets there first.
+                        # retry re-prices the same calls, so the flush is gated
+                        # on a per-leg ``cost_banked_at`` marker and each leg
+                        # reaches the ledger exactly once.
                         #
-                        # Bank first, mark second — never the reverse. The
-                        # window between them fails the way this ledger has
-                        # always deliberately failed: a crash (or a failed
-                        # marker write) after the flush leaves the leg
-                        # unmarked, so the retry banks it a second time. Over-
-                        # counting is the conservative direction for the
-                        # budget cap this feeds; marking first would invert
-                        # that into losing real spend.
+                        # Bank first, mark second, never the reverse: a crash
+                        # between them leaves the leg unmarked and the retry
+                        # banks it twice, and over-counting is the safe
+                        # direction for the budget cap this feeds. Marking
+                        # first would instead lose real spend.
                         #
                         # ``leg_counts`` is None when the ingest raised, so
                         # that flush banks the spend without the outcome
-                        # counts, and the retry — correctly seeing the leg as
-                        # already banked — does not supply them later. The
-                        # run doc's own cumulative ``counts`` still records
-                        # them; only the ledger's ``jobs`` breakdown is short,
-                        # which is the price of banking the money once.
+                        # counts and the retry, correctly seeing the leg as
+                        # banked, does not supply them later. The run doc's own
+                        # ``counts`` still records them; only the ledger's
+                        # ``jobs`` breakdown is short.
                         if origin and not banked:
                             await persist_run_cost(
                                 db,
@@ -875,7 +800,7 @@ async def resume(
                             )
         except Exception:
             # Leave the run claimed; after the TTL the next pass retries the
-            # (idempotent) ingest. Never let one bad run kill the whole pass.
+            # idempotent ingest. One bad run must not kill the whole pass.
             log.exception("batch_runs.resume_failed", run=snap.id)
 
     if summary["checked"]:
@@ -887,19 +812,17 @@ async def score_or_start_run(
     user_id: str, *, cycle_id: budget.CycleId = budget.CURRENT_RUN
 ) -> dict:
     """The scoring seam: online for small backlogs, a resumable batch run for
-    big ones.
+    big ones. **Spends either way.**
 
-    Returns the online scorer's counts dict either way; when a batch run was
-    started, the LLM outcomes are zero-so-far (results land when the worker's
-    resume ticks ingest them) and ``batch_run`` carries the run tag.
+    Returns the online scorer's counts dict in both cases; when a batch run was
+    started the LLM outcomes are zero-so-far (results land when a resume tick
+    ingests them) and ``batch_run`` carries the run tag.
 
-    ``cycle_id`` is passed straight through to both arms and means exactly
-    what it means there. The discovery cycle takes the default and **opens** a
-    window under its own ``run_id``; the ad-hoc backlog score
-    (``/tasks/score/backlog``) passes ``None`` and draws down whatever window
-    is already open, so the per-cycle cap cannot be reset by clicking a button
-    twice. Getting this wrong is not a pricing detail — it is the difference
-    between a cap and a suggestion.
+    ``cycle_id`` passes straight through to both arms. The discovery cycle
+    takes the default and opens a window under its own ``run_id``; the ad-hoc
+    backlog score passes ``None`` and draws down whatever window is already
+    open, so the per-cycle cap cannot be reset by clicking a button twice. That
+    is the difference between a cap and a suggestion.
     """
     run = await start(user_id, min_pending=BATCH_MIN_PENDING, cycle_id=cycle_id)
     if not run.get("started"):
@@ -912,14 +835,12 @@ async def score_or_start_run(
         "discarded": counts["discarded"],
         "failed": counts["failed"],
         "pending": run["pending"],
-        # Zero-so-far like the LLM outcomes above, and for the same reason: the
-        # geo verdicts are recorded onto documents by whichever worker tick
-        # ingests this run. Present rather than omitted so both branches of
-        # this function hand back the same key set.
+        # Zero-so-far like the LLM outcomes above: the geo verdicts are
+        # recorded by whichever worker tick ingests this run. Present rather
+        # than omitted so both branches return the same key set.
         **EMPTY_GEO_COUNTS,
-        # ...except the enforced skips, which cost nothing and are already final
-        # whenever ``start`` reached the score stage inline (everything was
-        # cached, so no Flash batch had to run first).
+        # ...except the enforced skips, which cost nothing and are final
+        # whenever ``start`` reached the score stage inline.
         "geo_skipped": counts.get("geo_skipped", 0),
         "batch_run": run["run"],
         **{k: v for k, v in run.items() if k.startswith("budget_")},
@@ -929,34 +850,27 @@ async def score_or_start_run(
 async def outstanding_committed(db=None, user_id: str | None = None) -> dict:
     """Money committed to Google that our ledger has not yet priced.
 
-    **Defined as a query, not as arithmetic**, and that is the whole point.
-    The tempting design — add the estimate to the run ledger at submit and
-    subtract it at ingest — cannot be made correct: ``tools.run_costs`` writes
-    every leaf with ``firestore.Increment``, and the documented "bank first,
-    mark second" window in :func:`resume` means the subtraction may run twice
-    or not at all. That yields negative committed totals or double-counted
-    actuals, silently.
+    Defined as a query, never as arithmetic on the ledger. Adding the estimate
+    at submit and subtracting it at ingest cannot be made correct, because
+    ``tools.run_costs`` writes every leaf with ``firestore.Increment`` and the
+    "bank first, mark second" window in :func:`resume` means the subtraction
+    may run twice or not at all — silently yielding negative committed totals
+    or double-counted actuals.
 
     So committed never touches the ledger doc. It lives on the ``batch_runs``
-    doc under a plain idempotent ``set``, and "outstanding" is simply *the
-    legs that have no ``cost_banked_at`` entry*. Re-running this function is
-    free and re-running an ingest cannot corrupt it.
+    doc under an idempotent ``set``, and "outstanding" is just the legs with no
+    ``cost_banked_at`` entry, so re-running an ingest cannot corrupt it. A
+    failed or orphaned run keeps its committed figure forever, which is the
+    honest record of "Google billed this and we never ingested it".
 
-    A failed or orphaned run keeps its committed figure forever, and that is
-    correct rather than untidy: it is the honest record of "Google billed this
-    and we never ingested it". Those are exactly the dollars that were
-    invisible before.
-
-    ``llm.cost_usd`` on the run ledger keeps its own meaning — **actual,
-    priced, ingested**. The two are never summed in code; a UI that wants both
-    shows two lines.
+    ``llm.cost_usd`` on the run ledger means actual, priced, ingested spend.
+    The two are never summed in code; a UI wanting both shows two lines.
     """
     db = db or firestore.AsyncClient()
     total = {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
-    # ``running`` and ``failed`` both, in one ``in`` query: a failed run's
-    # batch was still paid for. ``done`` is excluded because both its legs
-    # are banked by definition — and the per-leg filter below would drop it
-    # anyway.
+    # ``running`` and ``failed`` both: a failed run's batch was still paid
+    # for. ``done`` is excluded because both its legs are banked by
+    # definition, and the per-leg filter below would drop it anyway.
     query = db.collection(COLLECTION).where(
         filter=FieldFilter("state", "in", list(OUTSTANDING_STATES))
     )

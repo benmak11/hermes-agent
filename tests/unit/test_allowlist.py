@@ -2,28 +2,23 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Who may sign in — the machinery, exercised with enforcement switched on.
 
-``tools.allowlist`` ships inert (``ALLOWLIST_ENFORCED`` unset): every real
-caller checks the flag first and this suite does not re-pin that — the flag
-itself is a one-line ``os.getenv`` read, covered below, and the no-op paths at
-each call site (``api.deps``, ``api.routes.discovery.cron_tick``,
-``tools.account.delete``) are pinned in their own test files.
-
-What is pinned here is the module *as if the flag were on*, because that is
-the only way to know the machinery is correct before Phase 4 D2 ever flips it:
+``tools.allowlist`` ships inert (``ALLOWLIST_ENFORCED`` unset) and every real
+caller checks the flag first; the no-op paths at those call sites are pinned
+in their own test files. What is pinned here is the module as if the flag were
+on, which is the only way to know the machinery is correct before it is
+flipped:
 
 1. **The predicate fails closed.** No email, no doc, a malformed doc, a read
-   error — every one of these is "not allowed", never "allowed by default".
+   error — every one is "not allowed", never "allowed by default".
 2. **The seat cap is enforced by a transaction, not a check-then-write.** Two
-   concurrent ``add()``s for a one-seat-left cap must land exactly one grant,
-   the same property ``tools.matching.budget.reserve`` exists to guarantee for
-   scoring slots.
+   concurrent ``add()``s for the last seat must land exactly one grant.
 3. **Revoking frees a seat**, and re-adding a revoked email re-consults the
-   cap rather than being treated as still-counted.
+   cap rather than counting as still held.
 
-No real Firestore: every fake here is an in-memory stand-in for exactly the
-calls this module makes, modelled on ``test_scoring_budget.py``'s
-``_FakeTransaction`` so the real ``@async_transactional`` decorator (and its
-retry-on-``Aborted``) drives the code under test rather than a stub of it.
+No real Firestore: the in-memory fakes are modelled on
+``test_scoring_budget.py``'s ``_FakeTransaction`` so the real
+``@async_transactional`` decorator and its retry-on-``Aborted`` drive the code
+under test.
 """
 
 from __future__ import annotations
@@ -322,19 +317,14 @@ def test_two_sequential_adds_for_the_last_seat_grant_exactly_one():
 def test_the_seat_count_and_the_grant_travel_through_the_same_transaction(
     monkeypatch,
 ):
-    """The structural property that makes Firestore's own optimistic-
-    concurrency check apply at all: the count read has to be part of the
-    *same* transaction object as the write it gates, not a read taken against
-    a transaction that is opened and then discarded before the real one
-    starts. A fake can't reproduce the server's conflict detection itself —
-    that's what a read-then-write with no isolation actually breaks — but it
-    can pin the one structural fact that determines whether the server-side
-    guarantee has anything to attach to.
+    """The count read must share a transaction object with the write it gates.
 
-    This is the test that catches the bug shape the module's docstring warns
-    about (``count() < MAX`` checked *before* ``db.transaction()`` opens) when
-    the two sequential-call tests around it do not: a stale-but-separate count
-    still happens to add up correctly when nothing else runs in between.
+    That is what gives Firestore's optimistic-concurrency check something to
+    attach to. A fake cannot reproduce the server's conflict detection, but it
+    can pin this structural fact, and it is what catches ``count() < MAX``
+    checked before ``db.transaction()`` opens — the sequential-call tests
+    around it cannot, because a stale-but-separate count still adds up when
+    nothing runs in between.
     """
     seen: dict = {}
     real_active_seats = allowlist._active_seats
