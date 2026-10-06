@@ -60,6 +60,8 @@ def start_server() -> subprocess.Popen[str]:
     # than minting a real Firebase token for a loopback server.
     env["AUTH_DEV_MODE"] = "1"
     env.setdefault("AUTH_DEV_USER", "integration-test-user")
+    # The bypass user named as admin: the admin gate must still refuse it.
+    env["ADMIN_UIDS"] = env["AUTH_DEV_USER"]
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -140,3 +142,16 @@ def test_collect_feedback(server_fixture: subprocess.Popen[str]) -> None:
         FEEDBACK_URL, json=feedback_data, headers=HEADERS, timeout=10
     )
     assert response.status_code == 200
+
+
+def test_the_dev_bypass_is_never_admin(server_fixture: subprocess.Popen[str]) -> None:
+    """``ADMIN_UIDS`` names the bypass user, yet the admin page stays hidden
+    and ``/admin/me`` says no. Touches no Firestore: both answers come before
+    any read."""
+    resp = requests.get(BASE_URL + "/admin/accounts", timeout=10)
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Not Found"}
+
+    resp = requests.get(BASE_URL + "/admin/me", timeout=10)
+    assert resp.status_code == 200
+    assert resp.json() == {"admin": False}

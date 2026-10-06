@@ -9,6 +9,7 @@ from google.cloud import firestore
 
 import api.deps as api_deps
 import api.routes.account as routes_account
+import api.routes.admin as routes_admin
 import api.routes.applications as routes_applications
 import api.routes.companies as routes_companies
 import api.routes.discovery as routes_discovery
@@ -134,6 +135,7 @@ def no_production_firestore(monkeypatch, request):
     for mod in (
         api_deps,
         routes_account,
+        routes_admin,
         routes_discovery,
         routes_applications,
         routes_companies,

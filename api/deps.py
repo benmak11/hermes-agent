@@ -182,8 +182,8 @@ async def _verify_identity(token: str | None) -> Identity:
     )
 
 
-async def _verify_token(token: str | None) -> str:
-    """Verify the token and the allowlist, returning the uid.
+async def _verified_user(token: str | None) -> Identity:
+    """Verify the token and the allowlist, returning the caller's identity.
 
     The allowlist check runs after the dev bypass and is skipped entirely on
     it, so local dev and the ``me`` demo account keep working even with
@@ -193,7 +193,12 @@ async def _verify_token(token: str | None) -> str:
     ident = await _verify_identity(token)
     if _dev_bypass_uid() is None:
         await _check_allowlist(ident.uid, ident.email)
-    return ident.uid
+    return ident
+
+
+async def _verify_token(token: str | None) -> str:
+    """:func:`_verified_user`, returning just the uid."""
+    return (await _verified_user(token)).uid
 
 
 async def verify_identity(
@@ -220,6 +225,13 @@ async def verify_user(authorization: str | None = Header(default=None)) -> str:
     return await _verify_token(_bearer(authorization))
 
 
+async def verify_user_identity(
+    authorization: str | None = Header(default=None),
+) -> Identity:
+    """:func:`verify_user`, returning the whole :class:`Identity` rather than the uid."""
+    return await _verified_user(_bearer(authorization))
+
+
 async def verify_user_query(token: str | None = Query(default=None)) -> str:
     """Like verify_user but reads the token from a ?token= query param.
 
@@ -227,6 +239,81 @@ async def verify_user_query(token: str | None = Query(default=None)) -> str:
     Authorization header.
     """
     return await _verify_token(token)
+
+
+# ---------------------------------------------------------------------------
+# The admin gate
+# ---------------------------------------------------------------------------
+
+
+def admin_uids() -> frozenset[str]:
+    """Firebase uids in ``ADMIN_UIDS`` (comma-separated), read on every call.
+
+    Unset or blank means nobody is admin.
+    """
+    return frozenset(
+        uid.strip() for uid in os.getenv("ADMIN_UIDS", "").split(",") if uid.strip()
+    )
+
+
+def _admin_refusal(ident: Identity) -> str | None:
+    """Why ``ident`` is not the admin, or ``None`` if it is. Matches on uid,
+    never email, because an email can change hands."""
+    if ident.uid not in admin_uids():
+        return "not_admin"
+    if not ident.email_verified:
+        return "email_unverified"
+    return None
+
+
+def is_admin(ident: Identity) -> bool:
+    """Is an already-verified, already-allowlisted caller the admin?
+
+    Always ``False`` in dev mode, so the local bypass can never act as admin.
+    """
+    return not dev_mode() and _admin_refusal(ident) is None
+
+
+def _admin_denied(reason: str) -> None:
+    log.warning("admin.denied", reason=reason)
+
+
+async def _admin_identity(token: str | None) -> Identity | None:
+    """The caller's identity iff they are the admin, else ``None``.
+
+    Refuses in dev mode before looking at the token, so even ``AUTH_DEV_USER``
+    set to an admin uid is not admin. Every refusal logs ``admin.denied``.
+    """
+    if dev_mode():
+        _admin_denied("dev_mode")
+        return None
+    try:
+        ident = await _verify_identity(token)
+    except HTTPException:
+        _admin_denied("missing_token" if not token else "invalid_token")
+        return None
+    reason = _admin_refusal(ident)
+    if reason:
+        _admin_denied(reason)
+        return None
+    try:
+        await _check_allowlist(ident.uid, ident.email)
+    except HTTPException:
+        _admin_denied("not_allowlisted")
+        return None
+    return ident
+
+
+async def verify_admin(authorization: str | None = Header(default=None)) -> Identity:
+    """The admin's identity; anyone else gets the plain 404 an unknown path gets.
+
+    Never 401 or 403, even for a missing token, so a scan cannot tell the
+    route exists.
+    """
+    ident = await _admin_identity(_bearer(authorization))
+    if ident is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return ident
 
 
 # ---------------------------------------------------------------------------

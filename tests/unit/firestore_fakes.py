@@ -9,8 +9,8 @@ them ends up with a transaction that quietly commits nothing.
 
 The query fake (:class:`FakeQueryDB`) honours every constraint a query
 carries — ``where`` filters, ``order_by`` sorts, ``limit`` truncates after
-ordering — because a fake that returns ``self`` from those hides the bugs the
-tests exist to catch. It refuses a query that would need a composite index and
+ordering, ``select`` projects — because a fake that returns ``self`` from those
+hides the bugs the tests exist to catch. It refuses a query that would need a composite index and
 has no write methods.
 
 The transaction fake is driven at the protocol the real
@@ -177,19 +177,21 @@ class _Query:
     """Constraints are collected and applied at ``stream`` in Firestore's
     order — filter, then sort, then limit — whatever order they were chained."""
 
-    def __init__(self, db, path, docs, filters=(), orders=(), limit=None):
+    def __init__(self, db, path, docs, filters=(), orders=(), limit=None, fields=None):
         self._db = db
         self._path = path
         self._docs = docs
         self._filters = tuple(filters)
         self._orders = tuple(orders)
         self._limit = limit
+        self._fields = fields
 
     def _with(self, **kw):
         args = {
             "filters": self._filters,
             "orders": self._orders,
             "limit": self._limit,
+            "fields": self._fields,
         }
         args.update(kw)
         return _Query(self._db, self._path, self._docs, **args)
@@ -203,6 +205,9 @@ class _Query:
 
     def limit(self, count):
         return self._with(limit=count)
+
+    def select(self, field_paths):
+        return self._with(fields=tuple(field_paths))
 
     async def stream(self):
         filtered = {f for f, _ in self._filters}
@@ -225,6 +230,11 @@ class _Query:
             )
         if self._limit is not None:
             rows = rows[: self._limit]
+        if self._fields is not None:
+            # Like Firestore, a projection still returns every matching
+            # document, carrying only the selected fields it actually has.
+            self._db.selects.append((self._path, self._fields))
+            rows = [(i, {f: d[f] for f in self._fields if f in d}) for i, d in rows]
         for doc_id, doc in rows:
             yield _QuerySnap(doc_id, doc)
 
@@ -251,11 +261,13 @@ class _QueryDoc:
 
 class FakeQueryDB:
     """``data`` maps a collection path to ``{doc_id: dict}``. Reads only;
-    ``queries`` and ``gets`` record what was asked, for assertions."""
+    ``queries``, ``selects`` and ``gets`` record what was asked, for
+    assertions."""
 
     def __init__(self, data=None):
         self.data = data or {}
         self.queries: list = []
+        self.selects: list = []
         self.gets: list[str] = []
 
     def collection(self, name):
