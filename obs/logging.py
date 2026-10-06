@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -44,6 +45,11 @@ _NOISY_LOGGERS = (
 )
 
 _configured = False
+
+# Ids that arrive from outside the process (headers) are kept only if they are
+# this conservative shape; anything else is dropped, never truncated.
+_SAFE_ID_CHARS = re.compile(r"[A-Za-z0-9._-]+")
+_SAFE_ID_MAX_LEN = 64
 
 
 def _use_json() -> bool:
@@ -246,6 +252,29 @@ def current_request_id() -> str | None:
     fresh id would correlate with nothing.
     """
     return structlog.contextvars.get_contextvars().get("request_id")
+
+
+def current_origin_request_id() -> str | None:
+    """The enqueuing request's id the worker middleware bound, or None."""
+    return structlog.contextvars.get_contextvars().get("origin_request_id")
+
+
+def current_origin_run_id() -> str | None:
+    """The enqueuing run's id the worker middleware bound, or None."""
+    return structlog.contextvars.get_contextvars().get("origin_run_id")
+
+
+def safe_correlation_id(
+    value: object, *, max_len: int = _SAFE_ID_MAX_LEN
+) -> str | None:
+    """``value`` if it is a string of ``[A-Za-z0-9._-]`` up to ``max_len``, else None.
+
+    For correlation ids that cross a process boundary: they are client-influenced,
+    so anything else is dropped whole rather than logged or stored.
+    """
+    if not isinstance(value, str) or not 0 < len(value) <= max_len:
+        return None
+    return value if _SAFE_ID_CHARS.fullmatch(value) else None
 
 
 def clear_request_context() -> None:

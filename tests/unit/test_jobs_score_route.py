@@ -17,13 +17,17 @@ the HTTP side.
 from __future__ import annotations
 
 import pytest
+import structlog
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from google.cloud import tasks_v2
+from test_queues import _FakeClient
 from test_spend_consent import _DB
 
 import api.deps as deps
 import api.routes.discovery as discovery
 import api.routes.jobs as jobs
+from api.app_utils.middleware import RequestContextMiddleware
 from api.deps import verify_user
 from tools import queues
 from tools.matching import budget
@@ -160,3 +164,58 @@ def test_a_local_process_cannot_score_a_backlog_against_production(client, monke
     # 402 instead.
     monkeypatch.delenv("AUTH_DEV_MODE", raising=False)
     assert http.post("/jobs/score", json={"confirm": token}).status_code == 200
+
+
+def test_the_enqueued_task_carries_the_clicks_request_id_to_the_worker(monkeypatch):
+    """End to end across the Cloud Tasks hop: the click's ``request_id`` rides
+    on the task, and the worker binds it as ``origin_request_id`` beside a
+    ``request_id`` of its own."""
+    spend_db = _DB()
+    monkeypatch.setattr(deps, "spend_client", lambda: spend_db)
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    monkeypatch.delenv("WORKER_MODE", raising=False)
+    monkeypatch.setenv("WORKER_URL", "https://worker.example.run.app")
+    monkeypatch.setenv("TASKS_SA_EMAIL", "tasks@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj")
+    tasks_client = _FakeClient()
+    monkeypatch.setattr(queues, "_client", lambda: (tasks_v2, tasks_client))
+
+    api = FastAPI()
+    api.add_middleware(RequestContextMiddleware)
+    api.include_router(jobs.router)
+    api.dependency_overrides[verify_user] = lambda: "u1"
+    http = TestClient(api)
+    token = http.post("/jobs/score", json={}).json()["detail"]["confirm_token"]
+
+    resp = http.post(
+        "/jobs/score", json={"confirm": token}, headers={"x-request-id": "rid-click-1"}
+    )
+
+    assert resp.status_code == 200 and resp.json()["mode"] == "queued"
+    (created,) = tasks_client.created
+    task_headers = created["task"]["http_request"]["headers"]
+    assert task_headers["X-Origin-Request-Id"] == "rid-click-1"
+    # A click is a request, not a run.
+    assert "X-Origin-Run-Id" not in task_headers
+
+    # The other side of the hop: Cloud Tasks delivers those headers (plus its
+    # own) to the worker.
+    monkeypatch.setenv("WORKER_MODE", "1")
+    worker = FastAPI()
+    worker.add_middleware(RequestContextMiddleware)
+
+    @worker.post(jobs.SCORE_BACKLOG_TASK_PATH)
+    def echo() -> dict:
+        return dict(structlog.contextvars.get_contextvars())
+
+    bound = (
+        TestClient(worker)
+        .post(
+            jobs.SCORE_BACKLOG_TASK_PATH,
+            headers={**task_headers, "X-CloudTasks-TaskRetryCount": "0"},
+        )
+        .json()
+    )
+    assert bound["origin_request_id"] == "rid-click-1"
+    assert bound["request_id"] != "rid-click-1"
+    assert bound["retry_count"] == 0

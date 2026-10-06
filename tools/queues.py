@@ -24,7 +24,12 @@ from __future__ import annotations
 import json
 import os
 
-from obs.logging import get_logger
+from obs.logging import (
+    current_request_id,
+    current_run_id,
+    get_logger,
+    safe_correlation_id,
+)
 
 log = get_logger("tools.queues")
 
@@ -36,6 +41,11 @@ KNOWN_QUEUES = {"extract", "discovery", "score", "tailor", "apply"}
 # this (full-backlog batch scoring) belongs to the Phase C resumable
 # pipelines, not a queue task.
 _DISPATCH_DEADLINE_SECONDS = 1800
+
+# Correlation headers naming the request/run that enqueued a task; the worker
+# middleware binds them as ``origin_request_id`` / ``origin_run_id``.
+ORIGIN_REQUEST_ID_HEADER = "X-Origin-Request-Id"
+ORIGIN_RUN_ID_HEADER = "X-Origin-Run-Id"
 
 
 def enabled() -> bool:
@@ -61,6 +71,18 @@ def worker_url() -> str:
     return url
 
 
+def _origin_headers() -> dict[str, str]:
+    """Current request/run ids as origin headers, each omitted if unbound or unsafe."""
+    headers: dict[str, str] = {}
+    request_id = safe_correlation_id(current_request_id())
+    if request_id:
+        headers[ORIGIN_REQUEST_ID_HEADER] = request_id
+    run_id = safe_correlation_id(current_run_id())
+    if run_id:
+        headers[ORIGIN_RUN_ID_HEADER] = run_id
+    return headers
+
+
 def _client():
     # Lazy import: google-cloud-tasks only has to exist/authenticate on paths
     # that actually enqueue.
@@ -81,7 +103,8 @@ def enqueue(
     ``task_id`` makes the task named: Cloud Tasks refuses a name that exists
     or recently completed (~1h tombstone), which is the overlap guard — e.g.
     ``tick-{user}-{YYYYMMDDHH}`` dedupes to one tick per user per hour no
-    matter how many triggers fire.
+    matter how many triggers fire. The bound request/run ids ride along as
+    origin headers, for log correlation only.
     """
     if queue not in KNOWN_QUEUES:
         raise ValueError(f"Unknown queue {queue!r}; expected one of {KNOWN_QUEUES}")
@@ -102,7 +125,7 @@ def enqueue(
         "http_request": {
             "http_method": tasks_v2.HttpMethod.POST,
             "url": f"{url}{path}",
-            "headers": {"Content-Type": "application/json"},
+            "headers": {"Content-Type": "application/json", **_origin_headers()},
             "body": json.dumps(payload).encode(),
             "oidc_token": {
                 "service_account_email": os.environ["TASKS_SA_EMAIL"],

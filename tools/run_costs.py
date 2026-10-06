@@ -68,7 +68,7 @@ from typing import Any
 from google.cloud import firestore
 
 from obs.llm_cost import reset_run_cost, run_cost_snapshot
-from obs.logging import get_logger
+from obs.logging import current_origin_request_id, current_origin_run_id, get_logger
 
 # The staleness ceiling is defined *against* the dispatch deadline rather than
 # restated, exactly as ``tools.applications.state`` imports it. tools.queues
@@ -149,6 +149,7 @@ async def open_run(
 
     Writes to Firestore with ``set(merge=True)`` so it composes with the
     close, and with a batch ingest's later wave, rather than racing them.
+    Stamps ``origin_request_id`` / ``origin_run_id`` when the worker bound them.
 
     ``db`` resolution and the swallowed Firestore error are
     :func:`persist_run_cost`'s: a liveness record must never fail a pipeline.
@@ -167,6 +168,13 @@ async def open_run(
         }
         if trigger is not None:
             doc["trigger"] = trigger
+        # What enqueued this run, when it arrived through Cloud Tasks.
+        origin_request_id = current_origin_request_id()
+        if origin_request_id:
+            doc["origin_request_id"] = origin_request_id
+        origin_run_id = current_origin_run_id()
+        if origin_run_id:
+            doc["origin_run_id"] = origin_run_id
 
         client = db() if callable(db) else db
         ref = (
