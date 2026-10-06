@@ -69,21 +69,36 @@ class _Collection:
     def __init__(self, store, path):
         self._store = store
         self._path = path
+        self._order: tuple[str, bool] | None = None
+        self._limit: int | None = None
 
     def document(self, doc_id):
         return _Doc(self._store, f"{self._path}/{doc_id}")
 
-    def order_by(self, *a, **kw):
+    def order_by(self, field, direction=None):
+        # Honoured, not swallowed: ``rates.observed_rate``'s window is a
+        # ``limit`` on an ordered stream, and a fake that ignores either one
+        # cannot tell a reachable threshold from an unreachable one.
+        self._order = (field, str(direction).upper().endswith("DESCENDING"))
         return self
 
     def limit(self, n):
+        self._limit = n
         return self
 
     async def stream(self):
+        docs = []
         for path in sorted(self._store):
             head, _, tail = path.rpartition("/")
             if head == self._path and tail:
-                yield _Snap(self._store[path])
+                docs.append(self._store[path])
+        if self._order is not None:
+            field, descending = self._order
+            docs.sort(key=lambda d: d.get(field) or "", reverse=descending)
+        if self._limit is not None:
+            docs = docs[: self._limit]
+        for doc in docs:
+            yield _Snap(doc)
 
 
 class _DB:
@@ -255,21 +270,64 @@ def test_an_observed_rate_needs_enough_jobs_behind_it(db):
     below the threshold the documented constant wins."""
     db.store["users/u1/runs/r1"] = {
         "ended_at": "2026-09-01T00:00:00+00:00",
-        "llm": {"cost_usd": 1.04},
+        "llm": {"cost_usd": 0.10},
         "jobs": {"scored": 5},
     }
     thin = asyncio.run(rates.observed_rate(db, "u1"))
     assert thin is rates.MEASURED_RATED
 
-    db.store["users/u1/runs/r2"] = {
-        "ended_at": "2026-09-02T00:00:00+00:00",
-        "llm": {"cost_usd": 2.00},
-        "jobs": {"scored": 200},
-    }
+    # Five more cycles at the 3-a-day cap clear the threshold — which is the
+    # point of the threshold being 20 and not 100.
+    for i in range(5):
+        db.store[f"users/u1/runs/cap{i}"] = {
+            "ended_at": f"2026-09-{i + 2:02d}T00:00:00+00:00",
+            "llm": {"cost_usd": 0.06},
+            "jobs": {"scored": 3},
+        }
     mine = asyncio.run(rates.observed_rate(db, "u1"))
     assert mine.source == rates.SOURCE_OBSERVED
-    assert mine.sample == 205
-    assert mine.usd_per_job == pytest.approx(3.04 / 205)
+    assert mine.sample == 20
+    assert mine.usd_per_job == pytest.approx(0.40 / 20)
+
+
+def test_the_window_is_wide_enough_to_reach_the_threshold(db):
+    """The window and the threshold have to be satisfiable together under
+    ``budget``'s 3-jobs-a-day cap. A 10-run window over runs this size never
+    reaches 20 scored jobs, so every quote would be the fallback constant and
+    no account could ever be quoted its own rate."""
+    for i in range(30):
+        db.store[f"users/u1/runs/r{i:02d}"] = {
+            "ended_at": f"2026-09-{i + 1:02d}T00:00:00+00:00",
+            "llm": {"cost_usd": 0.02},
+            "jobs": {"scored": 1},
+        }
+
+    mine = asyncio.run(rates.observed_rate(db, "u1"))
+
+    assert mine.source == rates.SOURCE_OBSERVED
+    assert mine.sample == 30
+    assert mine.usd_per_job == pytest.approx(0.02)
+
+
+def test_the_window_is_still_a_window(db):
+    """Newest runs only — the rate moves with prompt and model changes, so an
+    old run outside the window must not be averaged into today's quote."""
+    for i in range(30):
+        db.store[f"users/u1/runs/r{i:02d}"] = {
+            "ended_at": f"2026-09-{i + 1:02d}T00:00:00+00:00",
+            "llm": {"cost_usd": 0.02},
+            "jobs": {"scored": 1},
+        }
+    db.store["users/u1/runs/ancient"] = {
+        "ended_at": "2025-01-01T00:00:00+00:00",
+        "llm": {"cost_usd": 99.0},
+        "jobs": {"scored": 1},
+    }
+
+    mine = asyncio.run(rates.observed_rate(db, "u1"))
+
+    assert mine.sample == 30
+    assert mine.usd_per_job == pytest.approx(0.02)
 
 
 def test_a_run_that_banked_cost_without_counts_is_skipped_not_averaged_in(db):

@@ -462,7 +462,11 @@ def test_the_tick_screen_passes_when_the_cap_is_off(monkeypatch):
     ``None > 0`` is a TypeError and ``not None`` reads as capped, so this is
     the branch where an uncapped user would silently stop being ticked.
     """
-    spent = {discovery_budget.FIELD: {"week": WEEK, "runs_this_week": 14}}
+    # The current week, not the frozen ``WEEK``: ``remaining`` defaults to wall
+    # clock, so a hardcoded key reads as a fresh week once the calendar moves
+    # past it and this test passes for the wrong reason (then fails outright).
+    this_week = week_key(datetime.now(UTC), budget.UTC_TZ)
+    spent = {discovery_budget.FIELD: {"week": this_week, "runs_this_week": 14}}
     monkeypatch.setenv("DISCOVERY_RUNS_PER_WEEK", "14")
     assert discovery._allowance_left("u1", spent) is False
     monkeypatch.setenv("DISCOVERY_RUNS_PER_WEEK", "0")

@@ -16,7 +16,7 @@ which AUC — so it holds **only** `job_id`, `fit`, and corrected parse fields.
 No résumé text, no profile fields, no job-description text. `data/profile.yaml`
 is gitignored and stays that way; nothing from it belongs in this directory.
 
-Rescore output lands in `data/eval/runs/` and is not meant to be committed.
+Rescore output lands in `data/eval/runs/`, which is gitignored.
 
 ## Schema
 

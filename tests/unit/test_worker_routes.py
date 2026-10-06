@@ -3019,3 +3019,117 @@ def test_the_backlog_score_route_is_worker_only(client, monkeypatch):
     assert (
         client.post("/tasks/score/backlog", json={"user_id": "u1"}).status_code == 404
     )
+
+
+# --------------------------------------------------------------------------
+# run_submission's terminal writes: filter outside, swap inside.
+#
+# Each of the three is a compare-and-swap on "this run still owns the
+# document". Without the precondition, a run whose lease expired — reaped,
+# retried by the user, re-tailored — comes back from the browser and flips
+# whatever it finds.
+# --------------------------------------------------------------------------
+
+
+def _taken_over(doc, *, then=None):
+    """What the reaper plus a user retry leave behind while a run is out at
+    the browser: the document is back in ``queued``, owned by nobody."""
+
+    def during():
+        state.try_transition(doc, doc.get(), "failed", lease=state.CLEAR_LEASE)
+        state.try_transition(doc, doc.get(), "queued")
+        if then is not None:
+            then()
+
+    return during
+
+
+def test_a_successful_submission_is_recorded_from_submitting(submission_world):
+    doc = submission_world.doc
+    doc._data["status"] = "submitting"
+    submission_world.hooks.result = {"success": True}
+
+    asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    assert doc.data["status"] == "submitted"
+    assert doc.data["confirmation"]["submitted_at"]
+
+
+def test_a_successful_submission_does_not_overwrite_a_document_that_moved_on(
+    submission_world,
+):
+    """The table alone already refuses ``queued → submitted``; the explicit
+    precondition says so at the call site rather than relying on the edge
+    staying absent."""
+    doc = submission_world.doc
+    doc._data["status"] = "submitting"
+    submission_world.hooks.result = {"success": True}
+    submission_world.hooks.during = _taken_over(doc)
+
+    asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    assert doc.data["status"] == "queued"
+    assert "confirmation" not in doc.data
+
+
+def test_a_failed_submission_is_recorded_from_submitting(submission_world):
+    doc = submission_world.doc
+    doc._data["status"] = "submitting"
+    submission_world.hooks.result = {"success": False, "error": "no apply button"}
+
+    asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    assert doc.data["status"] == "failed"
+    assert doc.data["timeline"][-1]["note"] == "no apply button"
+
+
+def test_a_failed_submission_does_not_fail_a_document_that_moved_on(
+    submission_world,
+):
+    """``failed`` is a legal edge from every submittable status, so this write
+    is the one that really can clobber: a stale run would mark the user's fresh
+    retry failed on the strength of a browser session nobody is waiting for."""
+    doc = submission_world.doc
+    doc._data["status"] = "submitting"
+    submission_world.hooks.result = {"success": False, "error": "no apply button"}
+    submission_world.hooks.during = _taken_over(doc)
+
+    asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    assert doc.data["status"] == "queued"
+    assert "no apply button" not in [e.get("note") for e in doc.data["timeline"]]
+
+
+def test_a_crashed_submission_is_recorded_from_submitting(submission_world):
+    doc = submission_world.doc
+    doc._data["status"] = "submitting"
+
+    def boom():
+        raise RuntimeError("the browser died")
+
+    submission_world.hooks.during = boom
+
+    asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    assert doc.data["status"] == "failed"
+    assert doc.data["timeline"][-1]["note"] == "the browser died"
+
+
+def test_a_crashed_submission_does_not_fail_a_document_that_moved_on(
+    submission_world,
+):
+    """Same clobber as above, reached through the exception handler — the path
+    a Playwright timeout takes, which is the likeliest way a run outlives its
+    own lease."""
+    doc = submission_world.doc
+    doc._data["status"] = "submitting"
+
+    def boom():
+        raise RuntimeError("the browser died")
+
+    submission_world.hooks.during = _taken_over(doc, then=boom)
+
+    asyncio.run(applications.run_submission("u1", "app-job1"))
+
+    assert doc.data["status"] == "queued"
+    assert "the browser died" not in [e.get("note") for e in doc.data["timeline"]]

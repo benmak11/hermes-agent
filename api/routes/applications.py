@@ -800,6 +800,7 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                     ref,
                     "submitted",
                     lease=state.CLEAR_LEASE,
+                    allowed_from={"submitting"},
                     extra={
                         "screenshots": shots,
                         "confirmation": {
@@ -826,6 +827,10 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                 "failed",
                 note=(result.get("error") or "submission failed")[:300],
                 lease=state.CLEAR_LEASE,
+                # The status this run claimed. ``failed`` is legal from the
+                # submittable statuses too, so without it a document another
+                # run has already moved on gets flipped by this one.
+                allowed_from={"submitting"},
                 extra={"screenshots": shots},
             ):
                 task_log.warning(
@@ -855,10 +860,15 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                 )
                 return True
             if not await _transition(
-                ref, "failed", note=str(e)[:300], lease=state.CLEAR_LEASE
+                ref,
+                "failed",
+                note=str(e)[:300],
+                lease=state.CLEAR_LEASE,
+                allowed_from={"submitting"},
             ):
-                # Leaves the document wedged in ``submitting``; cli/unwedge_submitting
-                # is the manual way out until the reaper lands.
+                # Either the document left ``submitting`` under us (someone
+                # else owns its outcome now) or the swap lost; if it is still
+                # wedged there, cli/unwedge_submitting is the manual way out.
                 task_log.warning("submission.failure_not_recorded", error=str(e)[:300])
             log_agent_end(
                 task_log, "submission", started, outcome="failed", error=str(e)[:300]

@@ -497,7 +497,7 @@ def _last_note(app: dict) -> str | None:
     return None
 
 
-async def _open_runs(db, user_id: str, now: datetime) -> dict[str, dict]:
+async def _open_runs(db, user_id: str) -> dict[str, dict]:
     """The user's open ledger docs, newest per leg.
 
     One equality filter on a subcollection — no composite index. An open doc is
@@ -599,7 +599,7 @@ async def get_activity(user_id: str = Depends(verify_user)) -> dict:
         user_doc.get("discovery_settings") or {}
     )
     dstate = user_doc.get("discovery_state") or {}
-    open_runs = await _open_runs(db, user_id, now)
+    open_runs = await _open_runs(db, user_id)
     batches = await _running_batches(db, user_id)
     by_status = await _applications(db, user_id)
     last_batch = await _last_batch_run(

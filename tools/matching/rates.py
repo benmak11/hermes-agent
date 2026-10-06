@@ -72,8 +72,10 @@ SOURCE_MEASURED_RATED = f"measured_rated_{MEASURED_AT.replace('-', '_')}"
 
 #: Ledger docs to read when deriving an observed rate. Recent runs only: the
 #: rate moves with prompt and model changes, so a longer window quotes the
-#: past rather than the present.
-_RECENT_RUNS = 10
+#: past rather than the present. Wide enough that a user scoring at the
+#: ``budget`` caps (3/cycle, 3/day) accumulates the jobs
+#: :func:`observed_rate` asks for inside the window.
+_RECENT_RUNS = 30
 
 
 @dataclass(frozen=True)
@@ -103,14 +105,17 @@ MEASURED = Rate(MEASURED_COST_PER_JOB_USD, SOURCE_MEASURED, 0)
 MEASURED_RATED = Rate(MEASURED_RATED_JOB_USD, SOURCE_MEASURED_RATED, 0)
 
 
-async def observed_rate(db, user_id: str, *, min_jobs: int = 100) -> Rate:
+async def observed_rate(db, user_id: str, *, min_jobs: int = 20) -> Rate:
     """This user's own $/job over their most recent completed runs.
 
     ``sum(llm.cost_usd) / sum(jobs.scored)``, falling back to
     :data:`MEASURED_RATED` below ``min_jobs`` scored in total — a two-job run
-    divides by a number small enough to quote anything. The fallback is the
-    rated constant rather than the blended :data:`MEASURED`, which averages in
-    free rejects and so quotes a fresh account too low.
+    divides by a number small enough to quote anything. 20 smooths over an
+    outlier job while staying reachable: at the 3-jobs-a-day cap in
+    ``tools.matching.budget`` a higher threshold could never be met inside the
+    :data:`_RECENT_RUNS` window, and the function would always fall back. The
+    fallback is the rated constant rather than the blended :data:`MEASURED`,
+    which averages in free rejects and so quotes a fresh account too low.
 
     Docs with ``jobs.scored == 0`` are skipped rather than counted as zero: a
     failed ingest banks a leg's spend without its outcome counts, so such a doc
