@@ -661,7 +661,10 @@ async def score_pending_jobs(
         counts = await _score_pending(
             db, user_id, limit, concurrency, on_result, progress
         )
-        return {**counts, **budget.summary(reservation, drawn=counts["pending"])}
+        # ``progress["attempted"]``, not ``counts["pending"]``: the same
+        # number the refund below subtracts, so what the summary says was
+        # drawn and what the reservation keeps can never disagree.
+        return {**counts, **budget.summary(reservation, drawn=progress["attempted"])}
     finally:
         if reservation is not None:
             await budget.release(

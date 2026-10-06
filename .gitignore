@@ -216,6 +216,9 @@ CLAUDE.md
 # Local Firestore job-data backups (not for VCS)
 data/backups/
 
+# Rescore output from cli/eval_scoring (derived, some of it paid) — not for VCS
+data/eval/runs/
+
 # Terraform state (contains secrets/resource IDs, not for VCS)
 *.tfstate
 *.tfstate.backup

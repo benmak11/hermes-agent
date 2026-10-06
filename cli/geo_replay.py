@@ -296,61 +296,79 @@ def report(r: Replay, *, title: str) -> None:
     print(f"   residence={r.residence}   gate v{geo.GATE_VERSION}")
     print(f"   {r.n} record(s) carrying both jd_parsed and match", end="")
     print(f" ({r.unparseable} unparseable, skipped)" if r.unparseable else "")
-    if not r.n:
-        return
-
-    print(f"\n   {'verdict':<12}{'Pro capped @20':>16}{'Pro kept >20':>14}{'total':>8}")
-    for verdict in VERDICTS:
-        capped, kept = r.cells[(verdict, True)], r.cells[(verdict, False)]
-        total = capped + kept
-        print(f"   {verdict:<12}{capped:>16}{kept:>14}{total:>8}  ({total / r.n:6.1%})")
-
-    fp_rate = r.fp / r.n
-    print(
-        f"\n   false positives : {r.fp:5d}  = {fp_rate:.2%} of n"
-        f"   (95% upper bound {upper_bound_95(r.fp, r.n):.2f}%)"
-    )
-    print(f"   true positives  : {r.tp:5d}  Pro also capped these at 20")
-    print(f"   missed          : {r.missed:5d}  Pro capped at 20, the gate abstained")
-    print(
-        f"\n   projected Pro-call reduction: {r.ineligible}/{r.n} = "
-        f"{r.ineligible / r.n:.1%} of these records"
-    )
-
-    if r.tp + r.missed == 0:
-        # Expected, not a broken gate: `persist_result` tombstones everything
-        # at or below 20, so the geo rejections are the records that are NOT
-        # here. The reduction figure above is a floor, not a measurement.
+    # Every figure in this block divides by ``r.n``. An account whose kept
+    # jobs were all tombstoned has none, and still has a tombstone census
+    # worth printing below.
+    if r.n:
         print(
-            "   ^ this corpus is survivorship-biased: every geo rejection was\n"
-            "     tombstoned out of `jobs`, so 0 is the expected reduction here\n"
-            "     and the FP rate above is the only number this run measures."
+            f"\n   {'verdict':<12}{'Pro capped @20':>16}{'Pro kept >20':>14}{'total':>8}"
+        )
+        for verdict in VERDICTS:
+            capped, kept = r.cells[(verdict, True)], r.cells[(verdict, False)]
+            total = capped + kept
+            print(
+                f"   {verdict:<12}{capped:>16}{kept:>14}{total:>8}"
+                f"  ({total / r.n:6.1%})"
+            )
+
+        fp_rate = r.fp / r.n
+        print(
+            f"\n   false positives : {r.fp:5d}  = {fp_rate:.2%} of n"
+            f"   (95% upper bound {upper_bound_95(r.fp, r.n):.2f}%)"
+        )
+        print(f"   true positives  : {r.tp:5d}  Pro also capped these at 20")
+        print(
+            f"   missed          : {r.missed:5d}  Pro capped at 20, the gate abstained"
+        )
+        print(
+            f"\n   projected Pro-call reduction: {r.ineligible}/{r.n} = "
+            f"{r.ineligible / r.n:.1%} of these records"
         )
 
-    print("\n   rule fired:")
-    for rule, count in r.rules.most_common():
-        print(f"     {count:6d}  {rule}")
+        if r.tp + r.missed == 0:
+            # Expected, not a broken gate: `persist_result` tombstones
+            # everything at or below 20, so the geo rejections are the records
+            # that are NOT here. The reduction figure above is a floor, not a
+            # measurement.
+            print(
+                "   ^ this corpus is survivorship-biased: every geo rejection was\n"
+                "     tombstoned out of `jobs`, so 0 is the expected reduction here\n"
+                "     and the FP rate above is the only number this run measures."
+            )
+
+        print("\n   rule fired:")
+        for rule, count in r.rules.most_common():
+            print(f"     {count:6d}  {rule}")
 
     if r.tombstones:
         # The other half of the denominator, counted rather than replayed.
         # This is where the gate's upside lives and the one place its size
-        # shows. (Tombstones have carried ``jd_parsed`` since the negatives
-        # began storing features, so they are replayable in principle; the
-        # printed note below still says otherwise and is stale.)
+        # shows.
         print(
             f"\n   discarded_jobs tombstones: {r.tombstones}"
             f" ({r.tombstones_free} scored 0 = out-of-family, never a Pro call)"
         )
-        print(
-            f"   Pro calls in this history: {r.pro_calls}, of which "
-            f"{r.tombstones_capped} ({r.tombstones_capped / r.pro_calls:.1%}) were "
-            "capped at exactly 20"
-        )
-        print(
-            "   That share is the ceiling on what this gate can save, and none "
-            "of it\n   is replayable — those docs have no jd_parsed to run the "
-            "gate against."
-        )
+        if r.pro_calls:
+            print(
+                f"   Pro calls in this history: {r.pro_calls}, of which "
+                f"{r.tombstones_capped} "
+                f"({r.tombstones_capped / r.pro_calls:.1%}) were capped at "
+                "exactly 20"
+            )
+            print(
+                "   That share is the ceiling on what this gate can save. "
+                "Tombstones do\n   carry jd_parsed, so that ceiling is "
+                "replayable; this run counts them\n   rather than replaying "
+                "them."
+            )
+        else:
+            # Every record here was a free out-of-family reject, so there is
+            # no denominator and no share to report.
+            print(
+                "   Pro calls in this history: 0 — every record was a free "
+                "out-of-family\n   reject, so there is no saving for this "
+                "gate to measure here."
+            )
 
     if r.false_positives:
         print(f"\n   ── every false positive ({len(r.false_positives)}) ──")
