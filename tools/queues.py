@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 
+from obs import tracing
 from obs.logging import (
     current_request_id,
     current_run_id,
@@ -104,7 +105,8 @@ def enqueue(
     or recently completed (~1h tombstone), which is the overlap guard — e.g.
     ``tick-{user}-{YYYYMMDDHH}`` dedupes to one tick per user per hour no
     matter how many triggers fire. The bound request/run ids ride along as
-    origin headers, for log correlation only.
+    origin headers, for log correlation only; with ``TRACE_REQUESTS`` on, so
+    does the current span's ``traceparent``.
     """
     if queue not in KNOWN_QUEUES:
         raise ValueError(f"Unknown queue {queue!r}; expected one of {KNOWN_QUEUES}")
@@ -125,7 +127,11 @@ def enqueue(
         "http_request": {
             "http_method": tasks_v2.HttpMethod.POST,
             "url": f"{url}{path}",
-            "headers": {"Content-Type": "application/json", **_origin_headers()},
+            "headers": {
+                "Content-Type": "application/json",
+                **_origin_headers(),
+                **tracing.trace_headers(),
+            },
             "body": json.dumps(payload).encode(),
             "oidc_token": {
                 "service_account_email": os.environ["TASKS_SA_EMAIL"],
