@@ -42,21 +42,37 @@ class _Collection:
     def __init__(self, store, path):
         self._store = store
         self._path = path
+        self._order: tuple[str, bool] | None = None
+        self._limit: int | None = None
 
     def document(self, doc_id):
         return _Doc(self._store, f"{self._path}/{doc_id}")
 
-    def order_by(self, *a, **kw):
+    def order_by(self, field, direction=None):
+        # Honoured, not swallowed, exactly as in test_spend_consent.py:
+        # ``observed_rate``'s window is a ``limit`` on an ordered stream, and
+        # a fake that ignores either one cannot tell a reachable threshold
+        # from an unreachable one.
+        self._order = (field, str(direction).upper().endswith("DESCENDING"))
         return self
 
     def limit(self, n):
+        self._limit = n
         return self
 
     async def stream(self):
+        docs = []
         for path in sorted(self._store):
             head, _, tail = path.rpartition("/")
             if head == self._path and tail:
-                yield _Snap(self._store[path])
+                docs.append(self._store[path])
+        if self._order is not None:
+            field, descending = self._order
+            docs.sort(key=lambda d: d.get(field) or "", reverse=descending)
+        if self._limit is not None:
+            docs = docs[: self._limit]
+        for doc in docs:
+            yield _Snap(doc)
 
 
 class _DB:
@@ -70,6 +86,16 @@ class _DB:
 @pytest.fixture
 def db():
     return _DB()
+
+
+def _seed(db, n, *, tailored, usd, month=9, prefix="r"):
+    """``n`` completed tailoring runs, one per day, oldest first."""
+    for i in range(n):
+        db.store[f"users/u1/runs/{prefix}{month}-{i:02d}"] = {
+            "ended_at": f"2026-{month:02d}-{i + 1:02d}T00:00:00+00:00",
+            "llm": {"cost_usd": usd},
+            "jobs": {"tailored": tailored},
+        }
 
 
 def test_estimated_fallback_has_no_sample_behind_it():
@@ -94,14 +120,38 @@ def test_a_thin_sample_falls_back_to_estimated(db):
 
 
 def test_enough_tailored_runs_produce_an_observed_rate(db):
-    for i in range(20):
-        db.store[f"users/u1/runs/r{i}"] = {
-            "ended_at": f"2026-09-{i + 1:02d}T00:00:00+00:00",
-            "llm": {"cost_usd": 0.002},
-            "jobs": {"tailored": 1},
-        }
+    """Two applications per run over the full ``_RECENT_RUNS`` window is the
+    cheapest history that reaches ``_MIN_TAILORED`` — see
+    ``test_the_recent_runs_window_can_starve_the_threshold`` for why one per
+    run cannot, however many runs there are."""
+    _seed(db, 10, tailored=2, usd=0.004)
     mine = asyncio.run(rates.observed_rate(db, "u1"))
     assert mine.source == SOURCE_OBSERVED
+    assert mine.sample == 20
+    assert mine.usd_per_job == pytest.approx(0.002)
+
+
+def test_the_recent_runs_window_can_starve_the_threshold(db):
+    """``_RECENT_RUNS`` is 10 and ``_MIN_TAILORED`` is 20, so an account that
+    tailors one application per run never produces an observed rate, however
+    long its history: the query reads 10 docs and stops.
+
+    Asserted rather than fixed. Raising the window or lowering the threshold
+    is a judgement about how far back a rate may reach, which belongs to
+    whoever owns the quote; what must not happen is this going unnoticed
+    because a fake ignored ``limit`` and the suite reported an observed rate
+    Firestore would never return.
+    """
+    _seed(db, 20, tailored=1, usd=0.002)
+    assert asyncio.run(rates.observed_rate(db, "u1")) is rates.ESTIMATED
+
+
+def test_the_window_reads_the_newest_runs_not_an_arbitrary_ten(db):
+    """The rate moves with prompt and model changes, so a window that drifted
+    onto old docs would quote the past as the present."""
+    _seed(db, 10, tailored=2, usd=0.02, month=8)  # older, and 5x the price
+    _seed(db, 10, tailored=2, usd=0.004, month=9)
+    mine = asyncio.run(rates.observed_rate(db, "u1"))
     assert mine.sample == 20
     assert mine.usd_per_job == pytest.approx(0.002)
 
@@ -111,12 +161,7 @@ def test_a_run_that_spent_without_completing_is_skipped_not_averaged_in(db):
     spend with no ``jobs.tailored`` (api.routes.applications never sets
     ``tailored`` on those paths) — counting it as zero would divide real
     dollars by nothing, same trap matching.rates guards against."""
-    for i in range(20):
-        db.store[f"users/u1/runs/good{i}"] = {
-            "ended_at": f"2026-09-{i + 1:02d}T00:00:00+00:00",
-            "llm": {"cost_usd": 0.002},
-            "jobs": {"tailored": 1},
-        }
+    _seed(db, 12, tailored=3, usd=0.006, prefix="good")
     db.store["users/u1/runs/discarded"] = {
         "ended_at": "2026-09-30T00:00:00+00:00",
         "llm": {"cost_usd": 0.05},
@@ -132,12 +177,7 @@ def test_a_run_that_spent_without_completing_is_skipped_not_averaged_in(db):
 def test_matching_runs_do_not_pollute_the_tailoring_rate(db):
     """A matching-run doc has jobs.scored, not jobs.tailored — it must fall
     out of the <= 0 skip for free, with no runner filter needed."""
-    for i in range(20):
-        db.store[f"users/u1/runs/tailor{i}"] = {
-            "ended_at": f"2026-09-{i + 1:02d}T00:00:00+00:00",
-            "llm": {"cost_usd": 0.002},
-            "jobs": {"tailored": 1},
-        }
+    _seed(db, 12, tailored=3, usd=0.006, prefix="tailor")
     db.store["users/u1/runs/matching9"] = {
         "ended_at": "2026-09-30T00:00:00+00:00",
         "llm": {"cost_usd": 2.00},
