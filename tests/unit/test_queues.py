@@ -5,6 +5,7 @@
 import json
 
 import pytest
+import structlog
 from google.api_core.exceptions import AlreadyExists
 from google.cloud import tasks_v2
 
@@ -94,3 +95,75 @@ def test_enqueue_requires_worker_url(queue_env, monkeypatch):
     monkeypatch.delenv("WORKER_URL")
     with pytest.raises(RuntimeError, match="WORKER_URL"):
         queues.enqueue("discovery", "/tasks/discovery", {})
+
+
+# --- origin correlation headers ----------------------------------------------
+
+
+@pytest.fixture
+def created_headers(queue_env, monkeypatch):
+    """Enqueue one task against a fake client and return its HTTP headers."""
+    structlog.contextvars.clear_contextvars()
+
+    def run() -> dict:
+        client = _FakeClient()
+        monkeypatch.setattr(queues, "_client", lambda: (tasks_v2, client))
+        assert queues.enqueue("score", "/tasks/score", {"user_id": "u1"})
+        return client.created[0]["task"]["http_request"]["headers"]
+
+    yield run
+    structlog.contextvars.clear_contextvars()
+
+
+def test_enqueue_forwards_the_bound_request_and_run_ids(created_headers):
+    structlog.contextvars.bind_contextvars(request_id="rid-click-1", run_id="run.42")
+
+    headers = created_headers()
+
+    assert headers["X-Origin-Request-Id"] == "rid-click-1"
+    assert headers["X-Origin-Run-Id"] == "run.42"
+    assert headers["Content-Type"] == "application/json"
+
+
+def test_enqueue_omits_each_origin_header_when_its_id_is_unbound(created_headers):
+    headers = created_headers()
+    assert "X-Origin-Request-Id" not in headers
+    assert "X-Origin-Run-Id" not in headers
+
+    structlog.contextvars.bind_contextvars(request_id="rid-only")
+    headers = created_headers()
+    assert headers["X-Origin-Request-Id"] == "rid-only"
+    assert "X-Origin-Run-Id" not in headers
+
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(run_id="run-only")
+    headers = created_headers()
+    assert "X-Origin-Request-Id" not in headers
+    assert headers["X-Origin-Run-Id"] == "run-only"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "x" * 65,
+        "rid with spaces",
+        "rid\r\nX-Injected: 1",
+        'rid"}',
+        "rïd",
+        "",
+    ],
+)
+def test_enqueue_drops_a_garbage_or_oversized_origin_id(created_headers, bad):
+    """The API honours a client-supplied ``X-Request-Id``, so this is hostile
+    input by the time it reaches the queue."""
+    structlog.contextvars.bind_contextvars(request_id=bad, run_id=bad)
+
+    headers = created_headers()
+
+    assert "X-Origin-Request-Id" not in headers
+    assert "X-Origin-Run-Id" not in headers
+
+
+def test_enqueue_keeps_an_id_at_the_length_limit(created_headers):
+    structlog.contextvars.bind_contextvars(request_id="a" * 64)
+    assert created_headers()["X-Origin-Request-Id"] == "a" * 64

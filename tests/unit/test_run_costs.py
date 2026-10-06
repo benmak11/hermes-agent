@@ -824,3 +824,39 @@ def test_an_open_doc_with_no_readable_start_is_stalled():
     assert run_costs.run_is_stalled(
         {"state": run_costs.RUNNING, "started_at": "not a date"}, now=now
     )
+
+
+# ------------------------------------------------------------- origin of a run
+
+
+def _open(db: _LedgerDB) -> dict:
+    asyncio.run(
+        run_costs.open_run(
+            db, "u1", "r1", runner="score_task", started_at="2026-10-06T09:00:00Z"
+        )
+    )
+    return db.docs["r1"]
+
+
+def test_open_run_records_what_enqueued_it():
+    """A run found in Firestore can be traced back to the click that caused it."""
+    structlog.contextvars.bind_contextvars(
+        origin_request_id="rid-click-1", origin_run_id="run.42"
+    )
+
+    doc = _open(_LedgerDB())
+
+    assert doc["origin_request_id"] == "rid-click-1"
+    assert doc["origin_run_id"] == "run.42"
+
+
+def test_open_run_writes_no_origin_fields_when_none_are_bound():
+    doc = _open(_LedgerDB())
+
+    assert "origin_request_id" not in doc
+    assert "origin_run_id" not in doc
+    # Nor does the run's own request id stand in for an origin.
+    structlog.contextvars.bind_contextvars(request_id="rid-worker", run_id="r1")
+    doc = _open(_LedgerDB())
+    assert "origin_request_id" not in doc
+    assert "origin_run_id" not in doc
