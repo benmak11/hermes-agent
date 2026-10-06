@@ -75,8 +75,9 @@ def _task_context(headers: Headers) -> dict[str, str | int]:
     )
     if task_name:
         fields["task_name"] = task_name
-    # Retry count includes attempts that never reached the handler; execution
-    # count is only the attempts the handler answered. Both are accurate.
+    # Retry count includes every earlier attempt; execution count leaves out
+    # 5xx failures. An unhandled exception here becomes a 500, so a gap between
+    # them usually means this handler failed, not that the platform did.
     for header, key in (
         ("x-cloudtasks-taskretrycount", "retry_count"),
         ("x-cloudtasks-taskexecutioncount", "execution_count"),
