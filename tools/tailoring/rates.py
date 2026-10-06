@@ -81,13 +81,19 @@ SOURCE_ESTIMATED = "estimated_no_ledger_yet"
 #: same convention as ``matching.rates.MEASURED``.
 ESTIMATED = Rate(ESTIMATED_COST_PER_OBJECTIVE_USD, SOURCE_ESTIMATED, 0)
 
-# Tailoring is usually one job per run, not a batch like matching, so
-# matching's min_jobs=100 would demand 100 approved-and-tailored applications
-# from one account before trusting observed history. 20 smooths over an
-# outlier JD without asking for a sample ordinary usage cannot produce.
+# 20 smooths over an outlier JD without asking for a sample ordinary usage
+# cannot produce.
 _MIN_TAILORED = 20
 
-_RECENT_RUNS = 10
+# Must be wide enough that one tailored job per run — the ordinary case —
+# reaches _MIN_TAILORED. At 10 it was not, so observed_rate could never fire
+# and every quote fell back to ESTIMATED. Kept equal to
+# matching.rates._RECENT_RUNS, which is what the docstring below claims.
+#
+# Not a complete fix: this window counts runs of *every* pipeline, so matching
+# runs crowd tailoring ones out of it. Filtering to runs carrying a `tailored`
+# count would need a composite index.
+_RECENT_RUNS = 30
 
 
 async def observed_rate(db, user_id: str, *, min_tailored: int = _MIN_TAILORED) -> Rate:

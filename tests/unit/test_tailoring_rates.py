@@ -120,10 +120,7 @@ def test_a_thin_sample_falls_back_to_estimated(db):
 
 
 def test_enough_tailored_runs_produce_an_observed_rate(db):
-    """Two applications per run over the full ``_RECENT_RUNS`` window is the
-    cheapest history that reaches ``_MIN_TAILORED`` — see
-    ``test_the_recent_runs_window_can_starve_the_threshold`` for why one per
-    run cannot, however many runs there are."""
+    """Two applications per run reaches ``_MIN_TAILORED`` inside the window."""
     _seed(db, 10, tailored=2, usd=0.004)
     mine = asyncio.run(rates.observed_rate(db, "u1"))
     assert mine.source == SOURCE_OBSERVED
@@ -131,28 +128,35 @@ def test_enough_tailored_runs_produce_an_observed_rate(db):
     assert mine.usd_per_job == pytest.approx(0.002)
 
 
-def test_the_recent_runs_window_can_starve_the_threshold(db):
-    """``_RECENT_RUNS`` is 10 and ``_MIN_TAILORED`` is 20, so an account that
-    tailors one application per run never produces an observed rate, however
-    long its history: the query reads 10 docs and stops.
+def test_one_tailored_job_per_run_reaches_the_threshold(db):
+    """The ordinary case must be able to produce a rate.
 
-    Asserted rather than fixed. Raising the window or lowering the threshold
-    is a judgement about how far back a rate may reach, which belongs to
-    whoever owns the quote; what must not happen is this going unnoticed
-    because a fake ignored ``limit`` and the suite reported an observed rate
-    Firestore would never return.
+    Tailoring is usually one job per run, so a window narrower than
+    ``_MIN_TAILORED`` makes ``observed_rate`` unreachable at any history
+    length and every quote silently falls back to ``ESTIMATED``. That is what
+    a 10-run window did until the window was widened to 30.
     """
-    _seed(db, 20, tailored=1, usd=0.002)
+    _seed(db, 25, tailored=1, usd=0.002)
+    mine = asyncio.run(rates.observed_rate(db, "u1"))
+    assert mine.source == SOURCE_OBSERVED
+    assert mine.sample == 25
+    assert mine.usd_per_job == pytest.approx(0.002)
+
+
+def test_a_history_too_short_to_reach_the_threshold_still_falls_back(db):
+    """Widening the window did not remove the minimum: 15 tailored jobs is
+    still too thin a sample to quote from, however recent."""
+    _seed(db, 15, tailored=1, usd=0.002)
     assert asyncio.run(rates.observed_rate(db, "u1")) is rates.ESTIMATED
 
 
-def test_the_window_reads_the_newest_runs_not_an_arbitrary_ten(db):
+def test_the_window_reads_the_newest_runs_not_an_arbitrary_thirty(db):
     """The rate moves with prompt and model changes, so a window that drifted
     onto old docs would quote the past as the present."""
     _seed(db, 10, tailored=2, usd=0.02, month=8)  # older, and 5x the price
-    _seed(db, 10, tailored=2, usd=0.004, month=9)
+    _seed(db, 30, tailored=2, usd=0.004, month=9)
     mine = asyncio.run(rates.observed_rate(db, "u1"))
-    assert mine.sample == 20
+    assert mine.sample == 60
     assert mine.usd_per_job == pytest.approx(0.002)
 
 
