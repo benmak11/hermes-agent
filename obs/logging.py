@@ -32,6 +32,8 @@ from typing import Any
 
 import structlog
 
+from obs import tracing
+
 # Libraries that log at INFO on every call and drown out the signal. Kept at
 # WARNING unless LOG_LEVEL is explicitly DEBUG.
 _NOISY_LOGGERS = (
@@ -225,10 +227,15 @@ def run_context(runner: str, **kwargs: Any) -> Iterator[str]:
     so a bare ``bind_contextvars`` would leak one run's ``run_id`` into the next
     task. This binds ``run_id`` + ``runner`` (+ extras) only for the ``with``
     block and restores the previous context on exit. Yields the ``run_id``.
+    With ``TRACE_REQUESTS`` on, the block also runs inside a ``run <runner>``
+    span, so spans opened during the run nest under it.
     """
     run_id = new_request_id()
-    with structlog.contextvars.bound_contextvars(
-        run_id=run_id, runner=runner, **kwargs
+    with (
+        structlog.contextvars.bound_contextvars(run_id=run_id, runner=runner, **kwargs),
+        tracing.span(
+            f"run {runner}", **{"hermes.run_id": run_id, "hermes.runner": runner}
+        ),
     ):
         yield run_id
 

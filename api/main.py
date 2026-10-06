@@ -19,7 +19,11 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.app_utils.middleware import RequestContextMiddleware
-from api.app_utils.telemetry import setup_cloud_otel, setup_telemetry
+from api.app_utils.telemetry import (
+    setup_cloud_otel,
+    setup_request_tracing,
+    setup_telemetry,
+)
 from api.app_utils.typing import Feedback
 from api.deps import dev_mode, verify_user
 from api.routes import account as account_routes
@@ -66,6 +70,9 @@ app = FastAPI(
     redoc_url="/redoc" if dev_mode() else None,
 )
 setup_cloud_otel()
+# No-op unless TRACE_REQUESTS is on; wraps every middleware below, so request
+# log lines fall inside the request span.
+setup_request_tracing(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,

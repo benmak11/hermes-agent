@@ -22,6 +22,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from models.job import Job
 from models.match import JobMatch
 from models.profile import MasterProfile
+from obs import tracing
 from obs.logging import current_run_id, get_logger
 from tools.matching import budget, geo, jd_cache
 from tools.matching.pipeline import (
@@ -728,18 +729,20 @@ async def _score_pending(
                 # before the Pro call can fail. Cheapest source first: the
                 # cross-user jd_cache, then Flash.
                 if job.jd_parsed is None:
-                    job.jd_parsed = await jd_cache.lookup(db, job.jd_raw)
-                    if job.jd_parsed is None:
-                        job.jd_parsed = await parse_jd(job)
-                        parse_model = FLASH_MODEL
-                        await jd_cache.store(
-                            db, job.jd_raw, job.jd_parsed, model=FLASH_MODEL
-                        )
-                    await persist_jd_parsed(ref, job)
+                    with tracing.span("score.parse", **{"hermes.job_id": job.id}):
+                        job.jd_parsed = await jd_cache.lookup(db, job.jd_raw)
+                        if job.jd_parsed is None:
+                            job.jd_parsed = await parse_jd(job)
+                            parse_model = FLASH_MODEL
+                            await jd_cache.store(
+                                db, job.jd_raw, job.jd_parsed, model=FLASH_MODEL
+                            )
+                        await persist_jd_parsed(ref, job)
                 # Free rejections before the paid call, in the one place all
                 # three scorers share. A non-None decision beside the sentinel
                 # means the geo gate is what rejected it, not the family test.
-                skipped, decision = prefilter(job, profile, enforce=enforce_geo)
+                with tracing.span("score.prefilter", **{"hermes.job_id": job.id}):
+                    skipped, decision = prefilter(job, profile, enforce=enforce_geo)
                 if skipped is not None:
                     enforced = enforced_geo_gate(decision)
                     if enforced is None:
@@ -756,37 +759,40 @@ async def _score_pending(
                         )
                     else:
                         counts["geo_skipped"] += 1
-                    outcome = await persist_result(
-                        ref,
-                        job,
-                        skipped,
-                        profile=profile,
-                        geo_gate=enforced,
-                        # No ``match_model``: the pre-filter is a free local
-                        # rule, and this field must never claim Pro ran on a
-                        # job Pro never saw. The parse leg is still attributed
-                        # when this call paid for it, since the tombstone keeps
-                        # that parse as its only features.
-                        provenance=scored_with(
-                            parse_model=parse_model, match_model=None
+                    with tracing.span("score.persist", **{"hermes.job_id": job.id}):
+                        outcome = await persist_result(
+                            ref,
+                            job,
+                            skipped,
+                            profile=profile,
+                            geo_gate=enforced,
+                            # No ``match_model``: the pre-filter is a free local
+                            # rule, and this field must never claim Pro ran on
+                            # a job Pro never saw. The parse leg is still
+                            # attributed when this call paid for it, since the
+                            # tombstone keeps that parse as its only features.
+                            provenance=scored_with(
+                                parse_model=parse_model, match_model=None
+                            )
+                            if parse_model
+                            else None,
                         )
-                        if parse_model
-                        else None,
-                    )
                     counts[outcome] += 1
                     if on_result:
                         on_result(job, skipped, None)
                     return
-                match = await match_job(job, profile, cached_content=cache_name)
-                outcome = await persist_result(
-                    ref,
-                    job,
-                    match,
-                    profile=profile,
-                    provenance=scored_with(
-                        parse_model=parse_model, match_model=PRO_MODEL
-                    ),
-                )
+                with tracing.span("score.score", **{"hermes.job_id": job.id}):
+                    match = await match_job(job, profile, cached_content=cache_name)
+                with tracing.span("score.persist", **{"hermes.job_id": job.id}):
+                    outcome = await persist_result(
+                        ref,
+                        job,
+                        match,
+                        profile=profile,
+                        provenance=scored_with(
+                            parse_model=parse_model, match_model=PRO_MODEL
+                        ),
+                    )
                 counts[outcome] += 1
                 # Recomputed rather than returned by persist_result: the gate
                 # is pure and costs microseconds, and widening that return

@@ -38,6 +38,9 @@ dependencies = [
     "structlog",
     "tenacity",  # retry logic
     "google-cloud-tasks>=2.23.0",
+    # Request spans behind TRACE_REQUESTS. Pinned to the installed
+    # opentelemetry-instrumentation; the two move together.
+    "opentelemetry-instrumentation-fastapi==0.62b1",
 ]
 requires-python = ">=3.11,<3.14"
 
