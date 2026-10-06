@@ -1816,6 +1816,7 @@ def test_dry_run_is_worker_only():
         for name in (
             "account",
             "activity",
+            "admin",
             "applications",
             "companies",
             "discovery",

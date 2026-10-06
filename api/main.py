@@ -3,8 +3,8 @@
 """FastAPI gateway for the hermes pipelines.
 
 Serves the web API used by the Next.js frontend: ``/jobs``, ``/profile``,
-``/applications``, ``/journeys``, ``/settings``, ``/companies``, ``/account``
-(all Firebase-authenticated) plus the ``/tasks/*`` worker handlers, which the
+``/applications``, ``/journeys``, ``/settings``, ``/companies``, ``/account``,
+``/admin`` (all Firebase-authenticated) plus the ``/tasks/*`` worker handlers, which the
 same image answers only when deployed with ``WORKER_MODE=1``.
 
 The work itself lives in ``tools/`` (deterministic pipelines) and ``cli/``
@@ -28,6 +28,7 @@ from api.app_utils.typing import Feedback
 from api.deps import dev_mode, verify_user
 from api.routes import account as account_routes
 from api.routes import activity as activity_routes
+from api.routes import admin as admin_routes
 from api.routes import applications as applications_routes
 from api.routes import companies as companies_routes
 from api.routes import discovery as discovery_routes
@@ -98,6 +99,8 @@ app.include_router(profile_routes.router)
 app.include_router(journeys_routes.router)
 app.include_router(discovery_routes.router)
 app.include_router(account_routes.router)
+# Operator-only, view-only; 404s everyone but ADMIN_UIDS (see api/deps.py).
+app.include_router(admin_routes.router)
 # Read-only liveness contract. Registered like any other authenticated route;
 # it takes no BackgroundTasks and schedules nothing (see api/routes/activity.py).
 app.include_router(activity_routes.router)
