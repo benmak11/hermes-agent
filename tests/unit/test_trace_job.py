@@ -2,12 +2,8 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """``cli.trace_job``: one job's records, stitched into one timeline.
 
-The fake below honours every query constraint the tool uses — ``where``
-filters, ``order_by`` sorts in the asked direction, ``limit`` truncates after
-ordering — because a fake that returns ``self`` from those hides exactly the
-bugs these tests exist to catch. It also refuses a ``where`` combined with an
-``order_by`` on a different field, the query production would reject for want
-of a composite index, and it has no write methods at all.
+Runs against :class:`firestore_fakes.FakeQueryDB`, which honours ``where``,
+``order_by`` and ``limit`` and refuses a query needing a composite index.
 """
 
 from __future__ import annotations
@@ -16,112 +12,13 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from firestore_fakes import FakeQueryDB as FakeDB
 from google.cloud import firestore
 
 import cli.trace_job as tj
 
 UID = "u1"
 JOB = "job-1"
-
-# ------------------------------------------------------------------ the fake
-
-
-class _Snap:
-    def __init__(self, doc_id, doc):
-        self.id = doc_id
-        self._doc = doc
-        self.exists = doc is not None
-
-    def to_dict(self):
-        return dict(self._doc) if self._doc is not None else None
-
-
-class _Query:
-    """Constraints are collected and applied at ``stream`` in Firestore's
-    order — filter, then sort, then limit — whatever order they were chained."""
-
-    def __init__(self, db, path, docs, filters=(), orders=(), limit=None):
-        self._db = db
-        self._path = path
-        self._docs = docs
-        self._filters = tuple(filters)
-        self._orders = tuple(orders)
-        self._limit = limit
-
-    def _with(self, **kw):
-        args = {
-            "filters": self._filters,
-            "orders": self._orders,
-            "limit": self._limit,
-        }
-        args.update(kw)
-        return _Query(self._db, self._path, self._docs, **args)
-
-    def where(self, *, filter):
-        assert filter.op_string == "==", filter.op_string
-        return self._with(filters=(*self._filters, (filter.field_path, filter.value)))
-
-    def order_by(self, field_path, direction=firestore.Query.ASCENDING):
-        return self._with(orders=(*self._orders, (field_path, direction)))
-
-    def limit(self, count):
-        return self._with(limit=count)
-
-    async def stream(self):
-        filtered = {f for f, _ in self._filters}
-        ordered = {f for f, _ in self._orders}
-        if filtered and ordered - filtered:
-            raise AssertionError(
-                f"{self._path}: where on {filtered} + order_by on {ordered} "
-                "needs a composite index that does not exist"
-            )
-        self._db.queries.append((self._path, self._filters, self._orders, self._limit))
-        rows = list(self._docs.items())
-        for field_path, value in self._filters:
-            rows = [(i, d) for i, d in rows if d.get(field_path) == value]
-        for field_path, direction in reversed(self._orders):
-            # Firestore drops documents that lack an ordered field.
-            rows = [(i, d) for i, d in rows if field_path in d]
-            rows.sort(
-                key=lambda r, f=field_path: r[1][f],
-                reverse=direction == firestore.Query.DESCENDING,
-            )
-        if self._limit is not None:
-            rows = rows[: self._limit]
-        for doc_id, doc in rows:
-            yield _Snap(doc_id, doc)
-
-
-class _Coll(_Query):
-    def document(self, doc_id):
-        return _Doc(self._db, f"{self._path}/{doc_id}", self._docs.get(doc_id))
-
-
-class _Doc:
-    def __init__(self, db, path, doc):
-        self._db = db
-        self._path = path
-        self._doc = doc
-
-    async def get(self):
-        self._db.gets.append(self._path)
-        return _Snap(self._path.rsplit("/", 1)[-1], self._doc)
-
-    def collection(self, name):
-        path = f"{self._path}/{name}"
-        return _Coll(self._db, path, self._db.data.setdefault(path, {}))
-
-
-class FakeDB:
-    """``data`` maps a collection path to ``{doc_id: dict}``. Reads only."""
-
-    def __init__(self, data=None):
-        self.data = data or {}
-        self.queries: list = []
-        self.gets: list[str] = []
-
-    def collection(self, name):
-        return _Coll(self, name, self.data.setdefault(name, {}))
 
 
 def _path(name):
