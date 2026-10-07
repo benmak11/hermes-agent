@@ -514,3 +514,84 @@ def test_the_decided_shelves_also_strip_the_flag(monkeypatch):
         }
     ]
     assert "exploration" not in json.dumps(body)
+
+
+# --- the slider says it is not a floor -----------------------------------------
+
+
+def test_sampled_counts_only_flagged_jobs_under_the_threshold(monkeypatch):
+    """A flagged job at or above ``min_score`` would have been shown anyway, so
+    it is not one of the "lower matches" the slider owns up to."""
+    docs = [
+        _doc("high", 90, exploration=True),
+        _doc("edge", 60, exploration=True),
+        _doc("mid", 70),
+        _doc("hidden", 35, exploration=True),
+        _doc("alsohidden", 45, exploration=True),
+        _doc("low", 30),
+    ]
+    client = _client(docs, monkeypatch)
+
+    body = client.get("/jobs/pending").json()
+
+    assert body["sampled"] == 2
+    assert [j["id"] for j in body["jobs"]] == [
+        "high",
+        "mid",
+        "edge",
+        "alsohidden",
+        "hidden",
+    ]
+
+
+def test_sampled_is_absent_not_zero_when_nothing_was_sampled(monkeypatch):
+    """Only a flagged job above the bar: nothing was surfaced from under it, so
+    the key is omitted rather than sent as ``0`` — the body must stay what it
+    was before the count existed."""
+    client = _client([_doc("high", 90, exploration=True), _doc("low", 30)], monkeypatch)
+
+    body = client.get("/jobs/pending").json()
+
+    assert "sampled" not in body
+    assert body == {
+        "jobs": [
+            {
+                "id": "high",
+                "user_decision": "pending",
+                "company": "Acme",
+                "match": {"overall_score": 90},
+            }
+        ],
+        "pending_total": 2,
+        "scored_total": 2,
+    }
+
+
+def test_sampled_is_measured_against_the_requested_threshold(monkeypatch):
+    """At ``min_score=40`` a sampled 45 clears the bar on its own and is no
+    longer "lower"; only the sampled 35 is."""
+    docs = [
+        _doc("hidden", 35, exploration=True),
+        _doc("alsohidden", 45, exploration=True),
+    ]
+    client = _client(docs, monkeypatch)
+
+    body = client.get("/jobs/pending?min_score=40").json()
+
+    assert body["sampled"] == 1
+    assert [j["id"] for j in body["jobs"]] == ["alsohidden", "hidden"]
+
+
+def test_the_count_names_no_job(monkeypatch):
+    """The count is response-level only: no job carries ``exploration`` or any
+    other key a normally-surfaced job lacks."""
+    docs = [_doc("high", 90), _doc("hidden", 35, exploration=True)]
+    client = _client(docs, monkeypatch)
+
+    body = client.get("/jobs/pending").json()
+
+    assert body["sampled"] == 1
+    assert "exploration" not in json.dumps(body)
+    assert {frozenset(j) for j in body["jobs"]} == {
+        frozenset({"id", "user_decision", "company", "match"})
+    }

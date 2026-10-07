@@ -15,6 +15,15 @@ function quoted(block: string): string[] {
   return [...block.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
 }
 
+const TS = readFileSync(
+  fileURLToPath(new URL("./adminAccounts.ts", import.meta.url)),
+  "utf8",
+);
+const ROUTES = readFileSync(
+  fileURLToPath(new URL("../../../api/routes/admin.py", import.meta.url)),
+  "utf8",
+);
+
 const sorted = (xs: Iterable<string>) => [...new Set(xs)].sort();
 
 describe("roster.py ↔ adminAccounts.ts", () => {
@@ -34,5 +43,21 @@ describe("roster.py ↔ adminAccounts.ts", () => {
     // An issue added any other way would escape this check.
     expect(PY.match(/issues\.(append|extend|insert)\(/g)?.length).toBe(appended.length);
     expect(sorted(appended)).toEqual(sorted(Object.keys(ISSUE_LABEL)));
+  });
+
+  it("the Summary model's fields match the Summary type", () => {
+    const py = PY.match(/^class Summary\(BaseModel\):\n([\s\S]*?)\n\n/m);
+    const ts = TS.match(/^export type Summary = \{([\s\S]*?)\};/m);
+    expect(py, "class Summary not found").not.toBeNull();
+    expect(ts, "type Summary not found").not.toBeNull();
+    const pyFields = [...py![1].matchAll(/^ {4}([a-z_]+):/gm)].map((m) => m[1]);
+    const tsFields = [...ts![1].matchAll(/^ {2}([a-z_]+):/gm)].map((m) => m[1]);
+    expect(pyFields).toContain("seat_cap");
+    expect(sorted(tsFields)).toEqual(sorted(pyFields));
+  });
+
+  it("the not-configured detail seatError looks for is the one admin.py sends", () => {
+    expect(TS).toContain('detail.startsWith("seat cap not configured")');
+    expect(ROUTES).toContain('"seat cap not configured: ');
   });
 });

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Shared Firestore stand-ins: a transaction-driving user-document fake, and a
-read-only query fake.
+"""Shared Firestore stand-ins: a transaction-driving user-document fake, a
+read-only query fake, and a read-write store built on it.
 
 The transaction fake exists because several test modules reach code that
 charges a budget inside a transaction, and a fake per module is how one of
@@ -11,7 +11,8 @@ The query fake (:class:`FakeQueryDB`) honours every constraint a query
 carries — ``where`` filters, ``order_by`` sorts, ``limit`` truncates after
 ordering, ``select`` projects — because a fake that returns ``self`` from those
 hides the bugs the tests exist to catch. It refuses a query that would need a composite index and
-has no write methods.
+has no write methods. :class:`FakeStoreDB` is the same reader plus document
+writes and transactions, for code that writes several collections.
 
 The transaction fake is driven at the protocol the real
 ``@async_transactional`` / ``@transactional`` decorators drive — begin, buffer, commit, rollback, retry on ``Aborted`` — so
@@ -87,12 +88,15 @@ class FakeTransaction:
     def set(self, reference, document_data, merge=False):
         self._buffered.append((reference, dict(document_data), merge))
 
+    def _write(self, reference, data, merge):
+        reference.set(data, merge=merge)
+
     def _apply(self):
         if self._abort_once:
             self._abort_once = False
             raise Aborted("contended")
         for reference, data, merge in self._buffered:
-            reference.set(data, merge=merge)
+            self._write(reference, data, merge)
         self._buffered = []
         self.commits += 1
         return []
@@ -272,3 +276,79 @@ class FakeQueryDB:
 
     def collection(self, name):
         return _QueryColl(self, name, self.data.setdefault(name, {}))
+
+
+# ------------------------------------------------------- read-write store fake
+
+
+class _StoreDoc(_QueryDoc):
+    """Reads ``db.data`` live, so a write is visible to the next read."""
+
+    def __init__(self, db, coll_path, doc_id):
+        super().__init__(db, f"{coll_path}/{doc_id}", None)
+        self._coll = coll_path
+        self.id = doc_id
+
+    def _docs(self) -> dict:
+        return self._db.data.setdefault(self._coll, {})
+
+    async def get(self, transaction=None):  # type: ignore[override]
+        """Inside a transaction this reads committed state, as Firestore does:
+        buffered writes are not visible until commit."""
+        self._db.gets.append(self._path)
+        if transaction is not None:
+            self._db.transactional_reads.append(self._path)
+        return _QuerySnap(self.id, self._docs().get(self.id))
+
+    def _write(self, data, merge):
+        docs = self._docs()
+        if merge and self.id in docs:
+            docs[self.id] = {**docs[self.id], **data}
+        else:
+            docs[self.id] = dict(data)
+        self._db.writes.append((self._path, dict(data), merge))
+
+    async def set(self, data, merge=False):
+        self._write(data, merge)
+
+    async def delete(self):
+        self._docs().pop(self.id, None)
+        self._db.deletes.append(self._path)
+
+
+class _StoreColl(_QueryColl):
+    def document(self, doc_id):
+        return _StoreDoc(self._db, self._path, doc_id)
+
+    def stream(self, transaction=None):  # type: ignore[override]
+        if transaction is not None:
+            self._db.transactional_reads.append(self._path)
+        return super().stream()
+
+
+class _StoreTransaction(FakeAsyncTransaction):
+    def _write(self, reference, data, merge):
+        reference._write(data, merge)
+
+
+class FakeStoreDB(FakeQueryDB):
+    """:class:`FakeQueryDB` plus ``set`` / ``delete`` on documents and
+    ``transaction()``. ``writes``, ``deletes`` and ``transactional_reads``
+    record what happened, for assertions."""
+
+    def __init__(self, data=None, abort_once=False):
+        super().__init__(data)
+        self.writes: list = []
+        self.deletes: list[str] = []
+        self.transactional_reads: list[str] = []
+        self.transactions: list[FakeTransaction] = []
+        self._abort_once = abort_once
+
+    def collection(self, name):
+        return _StoreColl(self, name, self.data.setdefault(name, {}))
+
+    def transaction(self):
+        txn = _StoreTransaction(abort_once=self._abort_once)
+        self._abort_once = False
+        self.transactions.append(txn)
+        return txn

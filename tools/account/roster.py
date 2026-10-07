@@ -100,6 +100,8 @@ class Summary(BaseModel):
     needs_attention: int
     seats_active: int
     by_status: dict[str, int]
+    #: ``MAX_USERS``; ``None`` when unset or invalid, which refuses grants.
+    seat_cap: int | None = None
 
 
 class Roster(BaseModel):
@@ -349,7 +351,12 @@ def reconcile(
     return rows
 
 
-def summarize(rows: list[AccountRow], seats: Iterable[Mapping[str, Any]]) -> Summary:
+def summarize(
+    rows: list[AccountRow],
+    seats: Iterable[Mapping[str, Any]],
+    *,
+    seat_cap: int | None = None,
+) -> Summary:
     by_status = dict.fromkeys(STATUSES, 0)
     for row in rows:
         by_status[row.status] += 1
@@ -357,6 +364,7 @@ def summarize(rows: list[AccountRow], seats: Iterable[Mapping[str, Any]]) -> Sum
         total=len(rows),
         needs_attention=sum(1 for r in rows if r.issues),
         seats_active=sum(1 for s in seats if _seat_active(s)),
+        seat_cap=seat_cap,
         by_status=by_status,
     )
 
@@ -397,6 +405,6 @@ async def load_roster(db, fb_auth) -> Roster:
     return Roster(
         generated_at=datetime.now(UTC).isoformat(),
         enforced=enforced,
-        summary=summarize(rows, seats),
+        summary=summarize(rows, seats, seat_cap=allowlist.seat_cap()),
         accounts=rows,
     )

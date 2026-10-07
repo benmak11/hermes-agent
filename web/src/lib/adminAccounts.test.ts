@@ -6,12 +6,18 @@ import {
   type Roster,
   STATUS_INFO,
   STATUS_ORDER,
+  CAP_UNCONFIGURED,
   adminView,
+  canGrant,
+  canRevoke,
+  confirmMatches,
   filterAccounts,
   fmtWhen,
   issueLabel,
   showsAdminNav,
   orDash,
+  seatError,
+  seatsValue,
   statusInfo,
 } from "@/lib/adminAccounts";
 import { ApiError } from "@/lib/apiError";
@@ -40,6 +46,7 @@ function roster(accounts: AccountRow[]): Roster {
       total: accounts.length,
       needs_attention: accounts.filter((a) => a.issues.length).length,
       seats_active: 0,
+      seat_cap: 25,
       by_status: {},
     },
     accounts,
@@ -159,5 +166,111 @@ describe("showsAdminNav", () => {
     expect(showsAdminNav({ kind: "unavailable", source: null })).toBe(true);
     expect(showsAdminNav({ kind: "error", message: "m", requestId: null })).toBe(true);
     expect(showsAdminNav({ kind: "empty" })).toBe(true);
+  });
+});
+
+const AUTH = {
+  created_at: "2026-09-01T10:00:00+00:00",
+  last_sign_in_at: null,
+  email_verified: true,
+  disabled: false,
+};
+const SEAT = {
+  revoked: false,
+  added_at: "2026-09-01T10:00:00+00:00",
+  added_by: "op",
+  note: null,
+  revoked_at: null,
+  revoked_by: null,
+};
+const ME = { uid: "admin", email: "Admin@Example.com" };
+
+describe("canGrant", () => {
+  it("offers Grant on a login that is waitlisted, seatless or revoked", () => {
+    for (const status of ["waitlisted", "no_seat", "revoked"]) {
+      const seat = status === "revoked" ? { ...SEAT, revoked: true } : null;
+      expect(canGrant(row({ status, auth: AUTH, seat })), status).toBe(true);
+    }
+  });
+
+  it("never on an active seat, a row without a login, or other statuses", () => {
+    expect(canGrant(row({ status: "active", auth: AUTH, seat: SEAT }))).toBe(false);
+    // An active seat wins over a grantable status.
+    expect(canGrant(row({ status: "waitlisted", auth: AUTH, seat: SEAT }))).toBe(false);
+    expect(canGrant(row({ status: "waitlisted", auth: null, uid: null }))).toBe(false);
+    expect(canGrant(row({ status: "no_seat", auth: AUTH, email: null }))).toBe(false);
+    for (const status of ["deleted", "disabled", "data_without_login", "seat_without_login"]) {
+      expect(canGrant(row({ status, auth: AUTH })), status).toBe(false);
+    }
+  });
+});
+
+describe("canRevoke", () => {
+  it("offers Revoke on any active seat, with or without a login", () => {
+    expect(canRevoke(row({ status: "active", auth: AUTH, seat: SEAT }), ME)).toBe(true);
+    expect(
+      canRevoke(row({ status: "seat_without_login", uid: null, seat: SEAT }), ME),
+    ).toBe(true);
+  });
+
+  it("never on a revoked seat or no seat", () => {
+    expect(canRevoke(row({ seat: { ...SEAT, revoked: true } }), ME)).toBe(false);
+    expect(canRevoke(row({ seat: null }), ME)).toBe(false);
+  });
+
+  it("never on the admin's own row, matched by uid or by email", () => {
+    expect(canRevoke(row({ uid: "admin", email: "other@x.com", seat: SEAT }), ME)).toBe(
+      false,
+    );
+    expect(canRevoke(row({ uid: null, email: " admin@example.COM", seat: SEAT }), ME)).toBe(
+      false,
+    );
+  });
+});
+
+describe("confirmMatches", () => {
+  it("is false until the typed text is the email", () => {
+    expect(confirmMatches("", "a@x.com")).toBe(false);
+    expect(confirmMatches("a@x.co", "a@x.com")).toBe(false);
+    expect(confirmMatches("a@x.comm", "a@x.com")).toBe(false);
+    expect(confirmMatches("a@x.com", "a@x.com")).toBe(true);
+  });
+
+  it("ignores case and surrounding space, like the server, but never matches empty", () => {
+    expect(confirmMatches("  A@X.com ", "a@x.com")).toBe(true);
+    expect(confirmMatches("", "")).toBe(false);
+    expect(confirmMatches("   ", null)).toBe(false);
+  });
+});
+
+describe("seats", () => {
+  const summary = (seat_cap: number | null) => ({
+    total: 9,
+    needs_attention: 0,
+    seats_active: 7,
+    by_status: {},
+    seat_cap,
+  });
+
+  it("reads N / cap, and a dash when the cap is unconfigured", () => {
+    expect(seatsValue(summary(25))).toBe("7 / 25");
+    expect(seatsValue(summary(null))).toBe("7 / —");
+  });
+
+  it("seatError shows the server's detail, and the not-configured message for that 503", () => {
+    const cap = new ApiError(
+      409,
+      JSON.stringify({ detail: "seat cap reached: all 25 seats are in use." }),
+      "r1",
+    );
+    expect(seatError(cap)).toBe("seat cap reached: all 25 seats are in use.");
+    const unset = new ApiError(
+      503,
+      JSON.stringify({ detail: "seat cap not configured: set MAX_USERS" }),
+      "r2",
+    );
+    expect(seatError(unset)).toBe(CAP_UNCONFIGURED);
+    expect(seatError(new ApiError(500, "boom", "r3"))).toBe("500: boom (request r3)");
+    expect(seatError(new Error("offline"))).toBe("Error: offline");
   });
 });

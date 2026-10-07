@@ -289,6 +289,7 @@ def test_flag_on_does_not_change_the_response_either(world, monkeypatch):
         ],
         "pending_total": 2,
         "scored_total": 2,
+        "sampled": 1,
     }
     assert "exploration" not in json.dumps(body)
     assert len(user.exposures.written) == 1
