@@ -750,56 +750,59 @@ def test_allowance_is_whole_even_for_a_user_with_no_budget_state(client):
 def test_allowance_reports_the_grant_the_next_reservation_would_make(
     client, monkeypatch
 ):
-    """The cycle window binds too, and **no clock clears it**.
-
-    The reviewer's case, verbatim: this search's window is rated out, the UTC
-    day has since rolled, and ``auto_discovery`` is off so nothing will open a
-    new cycle. The daily counter says three are free; an ad-hoc score task
-    asking right now would be granted **zero**. Reporting the daily figure
-    here promises ratings the very next reservation refuses.
-    """
+    """A window from a previous UTC day rolls over, here exactly as in the
+    reservation. This is the stored state that froze a real account: a
+    200-slot window never used or released, read days later under a cap of 3.
+    The allowance must report the 3 the next reservation will grant."""
     monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "3")
     monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "3")
-    monkeypatch.setattr(
-        activity, "_now", lambda: datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
-    )
-    cl, _ = client(
-        user={
-            "discovery_settings": {"auto_discovery": False},
-            "scoring_budget": {
-                "day": "2026-09-28",
-                "jobs_scored_today": 3,
-                "cycle_id": "c1",
-                "jobs_scored_this_cycle": 3,
-            },
-        }
-    )
+    later = datetime(2026, 10, 6, 15, 0, tzinfo=UTC)
+    frozen = {
+        "day": "2026-09-26",
+        "jobs_scored_today": 200,
+        "cycle_id": "be40d61d",
+        "jobs_scored_this_cycle": 200,
+        "updated_at": "2026-09-26T19:11:19+00:00",
+    }
+    cl, _ = client(user={"scoring_budget": dict(frozen)})
+    monkeypatch.setattr(activity, "_now", lambda: later)
     ratings = _allowance(cl)["ratings"]
 
-    # The day genuinely rolled — nothing has been rated today.
     assert ratings["used"] == 0
-    assert ratings["limit"] == 3
-    # But the open cycle is spent, so that is what a request would get.
-    assert ratings["remaining"] == 0
-    # And the block says *which* window is binding, because the reset instant
-    # above is not the answer: only a new search opens a new cycle.
-    assert ratings["remaining_cycle"] == 0
+    assert ratings["remaining"] == 3
+    assert ratings["remaining_cycle"] == 3
 
-    # Exactly what a real reservation would grant, asked the same way every
-    # ad-hoc scorer asks (``cycle_id=None`` — draw on the open window).
+    # Exactly what a real reservation would grant, asked the way every ad-hoc
+    # scorer asks (``cycle_id=None`` — draw on the open window).
     _state, res = matching_budget.apply_reservation(
-        {
-            "day": "2026-09-28",
-            "jobs_scored_today": 3,
-            "cycle_id": "c1",
-            "jobs_scored_this_cycle": 3,
-        },
+        dict(frozen),
         3,
-        now=datetime(2026, 9, 29, 12, 0, tzinfo=UTC),
+        now=later,
         cycle_id=None,
         limits=matching_budget.Limits(3, 3),
     )
-    assert res.granted == ratings["remaining"] == 0
+    assert res.granted == ratings["remaining"] == 3
+
+
+def test_allowance_reports_zero_for_a_spent_window_on_the_same_day(client, monkeypatch):
+    """The cycle can still bind within a day: the day has room, the window
+    does not, and ``remaining`` says what a request would get."""
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "10")
+    monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "3")
+    cl, _ = client(
+        user={
+            "scoring_budget": {
+                "day": NOW.date().isoformat(),
+                "jobs_scored_today": 3,
+                "cycle_id": "c1",
+                "jobs_scored_this_cycle": 3,
+            }
+        }
+    )
+    ratings = _allowance(cl)["ratings"]
+    assert ratings["used"] == 3
+    assert ratings["remaining"] == 0
+    assert ratings["remaining_cycle"] == 0
 
 
 def test_allowance_remaining_is_the_day_when_the_day_is_what_binds(client, monkeypatch):

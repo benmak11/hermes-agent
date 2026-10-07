@@ -14,6 +14,7 @@ from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 from pydantic import BaseModel
 
+from api import deps as api_deps
 from api.deps import SpendConfirm, required, verify_user
 from api.routes.applications import application_id, dispatch_tailor
 from api.routes.discovery import refuse_live_runs, tick_user
@@ -22,8 +23,10 @@ from obs.logging import current_request_id, get_logger, run_context
 from tools import decisions, exposures, queues, spend
 from tools.applications import state as app_state
 from tools.ats.validate import check_posting
+from tools.matching import budget as matching_budget
 from tools.matching.score import score_pending_jobs
 from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
+from tools.spend import estimate as spend_estimate
 from tools.spend.estimate import Estimate
 
 router = APIRouter(tags=["jobs"])
@@ -201,7 +204,48 @@ async def run_score_backlog(user_id: str) -> None:
             )
 
 
-@router.post("/jobs/score", dependencies=[Depends(refuse_live_runs)])
+async def refuse_scoring_at_cap(user_id: str = Depends(verify_user)) -> None:
+    """429 when the next backlog reservation would grant nothing.
+
+    A route-level dependency for the same ordering reason as
+    ``refuse_live_runs``: it must run before the consent seam mints or
+    consumes a token. 429, never 402 — a cap is not a price, and a $0 quote
+    with a token would only invite a click that does nothing. Reads through
+    the quote's own budget read, which degrades to "full grant" on error, so a
+    failed read falls through to the 402 rather than refusing.
+    """
+    # Through the module, so it is the same client the seam's quote reads.
+    state = await spend_estimate.budget_state(api_deps.spend_client(), user_id)
+    now = datetime.now(UTC)
+    limits = matching_budget.Limits.from_env()
+    remaining_cycle, remaining_day = spend_estimate.available(
+        state, action=spend.SCORE_BACKLOG, now=now, limits=limits
+    )
+    if min(remaining_cycle, remaining_day) > 0:
+        return
+    # The day is named when both are empty, as the client's zeroGrantReason does.
+    cap = "day" if remaining_day <= 0 else "cycle"
+    log.info("jobs.score_capped", user_id=user_id, cap=cap)
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "reason": "scoring_cap",
+            "cap": cap,
+            "per_cycle": limits.per_cycle,
+            "per_day": limits.per_day,
+            "remaining_cycle": remaining_cycle,
+            "remaining_day": remaining_day,
+            # Both windows roll at the next UTC midnight; an ISO instant the
+            # client renders in local time.
+            "resets_at": matching_budget.resets_at(now),
+        },
+    )
+
+
+@router.post(
+    "/jobs/score",
+    dependencies=[Depends(refuse_live_runs), Depends(refuse_scoring_at_cap)],
+)
 async def score_backlog(
     background_tasks: BackgroundTasks,
     body: SpendConfirm | None = None,
@@ -218,9 +262,10 @@ async def score_backlog(
     from ``tools.matching.budget``, so the per-cycle and per-day caps still
     bound what a yes can cost; the estimate is a reading of that grant.
 
-    Refused from a local process, as a route-level dependency rather than a
-    check in this body so it runs before the seam consumes the single-use
-    token — a 403 must not burn a confirmation.
+    Refused from a local process (403), and at the scoring cap (429), as
+    route-level dependencies rather than checks in this body so they run
+    before the seam mints or consumes a token — a refusal must not burn a
+    confirmation.
     """
     log.info(
         "jobs.score_confirmed",

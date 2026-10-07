@@ -167,19 +167,15 @@ def _allowance(user_doc: dict, now: datetime) -> dict:
     The two ``resets_at`` are independent — searches roll next Monday 00:00
     UTC, ratings next UTC midnight — and coincide only on a Sunday.
 
-    ``ratings.remaining`` is what the next reservation would actually grant,
-    ``min(remaining_day, remaining_cycle)``: the per-cycle counter has no time
-    rollover, only a new ``cycle_id`` clears it, so a user who rated out this
-    search's window and then crossed midnight has a full daily allowance and a
-    grant of zero. ``remaining_cycle`` is carried alongside so a surface can
-    say which window binds — when it is the cycle, waiting for ``resets_at``
-    will not help, only a new search will.
+    ``ratings.remaining`` is what the next ad-hoc reservation would actually
+    grant, ``min(remaining_day, remaining_cycle)``; ``remaining_cycle`` is
+    carried alongside so a surface can say which window binds. Both roll at
+    ``resets_at``.
 
-    Both figures come from ``apply_reservation(..., wanted=0)`` on a discarded
-    copy of the state, rather than a second implementation of its rollover
-    rules, so a display can never promise what the next reservation would
-    refuse. ``used`` is the stored counter, never ``limit - remaining``, which
-    clamps at the cap and would read "3 of 3" over 46 rated jobs.
+    Both figures come from ``matching_budget.remaining``, the reservation's own
+    rollover rules, so a display can never promise what the next reservation
+    would refuse. ``used`` is the stored counter, never ``limit - remaining``,
+    which clamps at the cap and would read "3 of 3" over 46 rated jobs.
     """
     search_limits = discovery_budget.Limits.from_env()
     search_state = user_doc.get(discovery_budget.FIELD)
@@ -187,12 +183,8 @@ def _allowance(user_doc: dict, now: datetime) -> dict:
 
     rating_limits = matching_budget.Limits.from_env()
     rating_state = user_doc.get(matching_budget.FIELD)
-    _discarded, rated = matching_budget.apply_reservation(
-        rating_state,
-        0,
-        now=now,
-        cycle_id=None,
-        limits=rating_limits,
+    remaining_cycle, remaining_day = matching_budget.remaining(
+        rating_state, now=now, limits=rating_limits
     )
     return {
         "searches": {
@@ -206,8 +198,8 @@ def _allowance(user_doc: dict, now: datetime) -> dict:
         "ratings": {
             "used": matching_budget.used(rating_state, now=now),
             "limit": rating_limits.per_day,
-            "remaining": min(rated.remaining_day, rated.remaining_cycle),
-            "remaining_cycle": rated.remaining_cycle,
+            "remaining": min(remaining_day, remaining_cycle),
+            "remaining_cycle": remaining_cycle,
             "resets_at": matching_budget.resets_at(now),
         },
     }

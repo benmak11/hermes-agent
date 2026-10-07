@@ -267,10 +267,9 @@ describe("ActivityPanel — the allowance", () => {
     expect(moves(idle)).toBe(false);
   });
 
-  it("does not promise a reset that will not refill the ratings", () => {
-    // Reviewer's case: the day rolled (0 used of 3) but this search's window
-    // is spent, so a request right now would be granted nothing and midnight
-    // will not change that.
+  it("says none are left until the reset when the window binds", () => {
+    // The day has room (0 used of 3) but this search's window is spent: a
+    // request right now gets nothing, and midnight UTC is when that changes.
     const blocked = renderToStaticMarkup(
       <ActivityPanel
         data={response({
@@ -289,9 +288,12 @@ describe("ActivityPanel — the allowance", () => {
       />,
     );
     expect(blocked).toContain("0 of 3 ratings today");
-    expect(blocked).toContain("a new search frees more");
-    // Exactly one reset line remains — the weekly one, for searches.
-    expect(blocked.match(/resets/g) ?? []).toHaveLength(1);
+    expect(blocked).toContain("none left for now");
+    expect(blocked).not.toContain("new search");
+    // Both reset lines show: the weekly one for searches, the nightly one
+    // for ratings.
+    expect(blocked).toMatch(/none left for now \u00b7 resets at \d?\d:\d\d/);
+    expect(blocked.match(/resets/g) ?? []).toHaveLength(2);
   });
 
   it("renders every leg the server sent, in the order it sent them", () => {

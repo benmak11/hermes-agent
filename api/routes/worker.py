@@ -115,10 +115,9 @@ async def task_score(body: ScoreTask) -> dict:
     Pro calls never reach the ledger and its job docs land with a null
     ``scored_run_id``. That id is for measurement only: ``cycle_id=None`` keeps
     this task drawing down the window discovery opened rather than opening a
-    fresh one, so the per-cycle cap cannot be reset on demand. The cycle
-    counter has no time rollover, so once a window is spent an ad-hoc score
-    task gets nothing until the next discovery cycle, not merely until
-    midnight.
+    fresh one, so the per-cycle cap cannot be reset on demand. Once a window
+    is spent an ad-hoc score task gets nothing until the next discovery cycle
+    or UTC midnight, whichever comes first.
     """
     _require_worker()
     with run_context("score_task", user_id=body.user_id) as run_id:

@@ -88,15 +88,11 @@ export type AllowanceBlock = {
  * week.
  */
 /**
- * Ratings carry a second window the clock never clears.
+ * Ratings carry a second, per-search window.
  *
  * `remaining` is what the next reservation would actually grant, i.e. the
  * smaller of the daily and per-search remainders. `remaining_cycle` is the
- * per-search one on its own, and it is here for one reason: when *it* is what
- * binds, `resets_at` is not the answer. A new UTC day does not open a new
- * search window — only a new search does — so a screen that showed the reset
- * time there would be telling the user to wait for something that will not
- * help them.
+ * per-search one on its own. Both roll at `resets_at`.
  */
 export type RatingsAllowance = AllowanceBlock & { remaining_cycle: number };
 
@@ -332,19 +328,20 @@ export function resetsLine(iso: string, now: number): string {
 }
 
 /**
- * What to say under the ratings figure: the reset instant, or the truth that
- * the reset will not help.
+ * What to say under the ratings figure: always the reset instant.
  *
- * The per-search window binds when it is empty while the day still has room.
- * `used < limit` is that test, and it is why `used` has to be the real stored
- * counter rather than `limit - remaining`.
+ * When the per-search window is empty while the day still has room, the
+ * "N of M today" figure alone would read as ratings left, so the line says
+ * none are. `used < limit` is that test, and it is why `used` has to be the
+ * real stored counter rather than `limit - remaining`.
  */
 export function ratingsResetLine(block: RatingsAllowance, now: number): string {
   const dayHasRoom = block.limit === null || block.used < block.limit;
+  const reset = resetsLine(block.resets_at, now);
   if (block.remaining === 0 && block.remaining_cycle === 0 && dayHasRoom) {
-    return "used up for this search \u00b7 a new search frees more";
+    return reset ? `none left for now \u00b7 ${reset}` : "none left for now";
   }
-  return resetsLine(block.resets_at, now);
+  return reset;
 }
 
 /** Poll cadences, by what can actually change. */

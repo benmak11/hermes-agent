@@ -113,9 +113,8 @@ export function ActivityPanel({
           noun="ratings"
           window="today"
           now={now}
-          // Not always the reset instant: when this search's window is what
-          // is empty, midnight does not refill it and saying so would be a
-          // promise the next reservation refuses.
+          // Says "none left" ahead of the reset when this search's window is
+          // empty though the day figure still shows room.
           note={ratingsResetLine(data.allowance.ratings, now)}
         />
       </div>

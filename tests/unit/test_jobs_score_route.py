@@ -16,6 +16,8 @@ the HTTP side.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 import structlog
 from fastapi import FastAPI
@@ -219,3 +221,87 @@ def test_the_enqueued_task_carries_the_clicks_request_id_to_the_worker(monkeypat
     assert bound["origin_request_id"] == "rid-click-1"
     assert bound["request_id"] != "rid-click-1"
     assert bound["retry_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Nothing grantable: 429, ahead of the seam
+# ---------------------------------------------------------------------------
+
+
+def _today() -> str:
+    return datetime.now(UTC).date().isoformat()
+
+
+def _consents(db) -> set[str]:
+    return {path for path in db.store if "/spend_consents/" in path}
+
+
+@pytest.mark.parametrize(
+    ("per_day", "used_today", "cap"),
+    [
+        # Day spent (and the window with it): the day is named.
+        ("3", 3, "day"),
+        # Day has room, this window does not.
+        ("10", 3, "cycle"),
+    ],
+)
+def test_score_at_the_cap_answers_429_without_minting_or_burning_a_token(
+    client, monkeypatch, per_day, used_today, cap
+):
+    """A $0 quote with a token used to come back here — a click that does
+    nothing. Screened as a route-level dependency, so it runs before the seam
+    either mints a token (no ``confirm``) or consumes one (with it)."""
+    monkeypatch.delenv("QUEUE_MODE", raising=False)
+    monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "3")
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", per_day)
+    http, db, enqueued, scored = client
+    token = http.post("/jobs/score", json={}).json()["detail"]["confirm_token"]
+    db.store["users/u1"] = {
+        "scoring_budget": {
+            "day": _today(),
+            "jobs_scored_today": used_today,
+            "cycle_id": "c1",
+            "jobs_scored_this_cycle": 3,
+        }
+    }
+    minted = _consents(db)
+
+    for body in ({}, {"confirm": token}):
+        before = budget.resets_at(datetime.now(UTC))
+        resp = http.post("/jobs/score", json=body)
+        after = budget.resets_at(datetime.now(UTC))
+
+        assert resp.status_code == 429, resp.text
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "scoring_cap"
+        assert detail["cap"] == cap
+        assert detail["resets_at"] in {before, after}
+        assert "confirm_token" not in detail
+
+    # Nothing minted by the unconfirmed click, nothing burnt by the other.
+    assert _consents(db) == minted
+    assert (enqueued, scored) == ([], [])
+
+
+def test_a_window_left_from_a_previous_day_quotes_the_full_cap(client, monkeypatch):
+    """The stored state that froze a real account. It must now quote the
+    rolled-over grant as a normal 402, not refuse."""
+    monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "3")
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "3")
+    http, db, _enqueued, _scored = client
+    db.store["users/u1"] = {
+        "scoring_budget": {
+            "day": "2026-09-26",
+            "jobs_scored_today": 200,
+            "cycle_id": "be40d61d",
+            "jobs_scored_this_cycle": 200,
+        }
+    }
+
+    resp = http.post("/jobs/score", json={})
+
+    assert resp.status_code == 402, resp.text
+    detail = resp.json()["detail"]
+    assert detail["estimate"]["units"] == 3
+    assert detail["estimate"]["caps"]["remaining_cycle"] == 3
+    assert detail["confirm_token"]

@@ -75,35 +75,16 @@ def available(
 ) -> tuple[int, int]:
     """``(remaining_cycle, remaining_day)`` for ``action``, without reserving.
 
-    Pure, and a *read* of ``budget``'s own counter semantics rather than a
-    reimplementation of them — same day-rollover rule, same floor-at-zero on a
-    hand-edited document. It deliberately does not call
-    :func:`budget.apply_reservation`: that returns the post-debit state, and
-    quoting a price must never move a counter.
+    A read through :func:`budget.remaining`, so the quote applies exactly the
+    rollover the reservation will. Never :func:`budget.apply_reservation`: that
+    returns the post-debit state, and quoting a price must never move a counter.
     """
-    now = now or datetime.now(UTC)
-    limits = limits or budget.Limits.from_env()
-    state = dict(state or {})
-
-    today = now.date().isoformat()
-    day_used = _count(state, "jobs_scored_today") if state.get("day") == today else 0
-    # A fresh cycle starts the cycle counter over; drawing on the open window
-    # sees whatever it has already spent.
-    cycle_used = (
-        0 if action in _OPENS_CYCLE else _count(state, "jobs_scored_this_cycle")
+    return budget.remaining(
+        state,
+        now=now or datetime.now(UTC),
+        limits=limits or budget.Limits.from_env(),
+        opens_cycle=action in _OPENS_CYCLE,
     )
-
-    return (
-        max(limits.per_cycle - cycle_used, 0),
-        max(limits.per_day - day_used, 0),
-    )
-
-
-def _count(state: dict, key: str) -> int:
-    try:
-        return max(int(state.get(key) or 0), 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def quote(
@@ -152,7 +133,7 @@ async def build(db, user_id: str, action: str) -> Estimate:
 
     Neither read touches ``jobs`` — see rule 1 in the module docstring.
     """
-    state = await _budget_state(db, user_id)
+    state = await budget_state(db, user_id)
     rate = await rates.observed_rate(db, user_id)
     remaining_cycle, remaining_day = available(state, action=action)
     return quote(
@@ -163,7 +144,7 @@ async def build(db, user_id: str, action: str) -> Estimate:
     )
 
 
-async def _budget_state(db, user_id: str) -> dict:
+async def budget_state(db, user_id: str) -> dict:
     """The user's ``scoring_budget`` map, or ``{}`` — never an exception.
 
     A quote that cannot be produced must not become a click that spends

@@ -21,8 +21,12 @@ a priced call would let an all-rejection backlog stream without limit; the
 price of not doing so is that draining a large backlog takes longer.
 
 Rollover is lazy, at read time inside the transaction: a stored ``day`` that is
-not today, or a ``cycle_id`` that is not the run asking, means that counter
-starts from zero. No cron, no scheduled reset.
+not today zeroes *both* counters, and a ``cycle_id`` that is not the run asking
+zeroes the cycle counter. No cron, no scheduled reset. The cycle window rolls
+with the day because the per-cycle cap is held equal to the daily one, so the
+rollover hands out nothing the daily reset was not already handing out, and a
+window whose slots were never used or released costs at most the rest of its
+day.
 
 State lives in one map on the user doc, ``users/{uid}.scoring_budget``::
 
@@ -112,8 +116,8 @@ class Limits:
 class Reservation:
     """What one run was granted, and what is left after it.
 
-    ``cycle_id`` is the window the grant was drawn from; pass it back to
-    :func:`release` so a refund cannot credit a different cycle's counter. It
+    ``cycle_id`` and ``day`` name the window the grant was drawn from; pass
+    both back to :func:`release` so a refund cannot credit a successor. It
     is ``None`` only when the reserving run had no ``run_id`` bound and the
     user had no window open yet.
     """
@@ -123,6 +127,8 @@ class Reservation:
     remaining_cycle: int
     remaining_day: int
     cycle_id: str | None
+    #: UTC date the slots were drawn on; pass it back to :func:`release` too.
+    day: str | None = None
 
 
 def _int_env(name: str, default: int) -> int:
@@ -145,6 +151,38 @@ def _count(state: dict, key: str) -> int:
         return 0
 
 
+def _used(state: dict, *, today: str, same_cycle: bool) -> tuple[int, int]:
+    """``(cycle_used, day_used)`` as of ``today``: a stored ``day`` that is not
+    today reads both as zero, and ``same_cycle=False`` zeroes the cycle one."""
+    if state.get("day") != today:
+        return 0, 0
+    cycle_used = _count(state, "jobs_scored_this_cycle") if same_cycle else 0
+    return cycle_used, _count(state, "jobs_scored_today")
+
+
+def remaining(
+    state: dict | None,
+    *,
+    now: datetime,
+    limits: Limits,
+    opens_cycle: bool = False,
+) -> tuple[int, int]:
+    """``(remaining_cycle, remaining_day)`` a reservation would see. Read-only.
+
+    ``opens_cycle`` asks for a run that opens its own window (a discovery
+    cycle); the default draws on whatever window is open, as ad-hoc scoring
+    does. Every display and quote reads through here so none can disagree with
+    :func:`apply_reservation`.
+    """
+    cycle_used, day_used = _used(
+        dict(state or {}), today=now.date().isoformat(), same_cycle=not opens_cycle
+    )
+    return (
+        max(limits.per_cycle - cycle_used, 0),
+        max(limits.per_day - day_used, 0),
+    )
+
+
 def apply_reservation(
     state: dict | None,
     wanted: int,
@@ -163,18 +201,17 @@ def apply_reservation(
     opening a fresh one — otherwise anything that can trigger a scoring run
     could reset the per-cycle cap on demand.
 
-    The cycle counter has no time-based rollover; only a new ``cycle_id``
-    clears it. An ad-hoc task asking against an exhausted window therefore gets
-    zero slots until the next discovery cycle, even after the UTC day has
-    rolled. That is the deliberate, safe direction.
+    The cycle counter also starts over when the UTC day rolls. That cannot be
+    used to reset the cap on demand, because the per-cycle cap equals the daily
+    one and the daily counter resets at the same instant; it does mean a stale
+    or leaked window blocks scoring for the rest of one day, not indefinitely.
+    Within a day, ad-hoc requests share one window and cannot reset it.
     """
     state = dict(state or {})
     today = now.date().isoformat()
-    day_used = _count(state, "jobs_scored_today") if state.get("day") == today else 0
-
     stored_cycle = state.get("cycle_id")
     cycle = cycle_id if cycle_id is not None else stored_cycle
-    cycle_used = _count(state, "jobs_scored_this_cycle") if cycle == stored_cycle else 0
+    cycle_used, day_used = _used(state, today=today, same_cycle=cycle == stored_cycle)
 
     remaining_cycle = max(limits.per_cycle - cycle_used, 0)
     remaining_day = max(limits.per_day - day_used, 0)
@@ -194,37 +231,41 @@ def apply_reservation(
             remaining_cycle=remaining_cycle - granted,
             remaining_day=remaining_day - granted,
             cycle_id=cycle,
+            day=today,
         ),
     )
 
 
 def apply_release(
-    state: dict | None, unused: int, *, now: datetime, cycle_id: str | None
+    state: dict | None,
+    unused: int,
+    *,
+    now: datetime,
+    cycle_id: str | None,
+    day: str | None = None,
 ) -> dict | None:
     """Give ``unused`` slots back; ``None`` when the refund no longer applies.
 
     Pure, like :func:`apply_reservation`. Each counter is credited only while
     it still describes the window the slots were taken from, so a refund
     arriving after midnight UTC or after a new cycle opened is dropped rather
-    than crediting a successor window.
+    than crediting a successor window. ``day`` is the reservation's own date;
+    without it a refund from yesterday could credit a window that reopened
+    today under the same ``cycle_id``.
     """
     if unused <= 0:
         return None
     state = dict(state or {})
+    today = now.date().isoformat()
+    if state.get("day") != today or (day is not None and day != today):
+        # Both counters belong to a day the slots were not taken from.
+        return None
     refunded = dict(state)
-    changed = False
-    if state.get("day") == now.date().isoformat():
-        refunded["jobs_scored_today"] = max(
-            _count(state, "jobs_scored_today") - unused, 0
-        )
-        changed = True
+    refunded["jobs_scored_today"] = max(_count(state, "jobs_scored_today") - unused, 0)
     if state.get("cycle_id") == cycle_id:
         refunded["jobs_scored_this_cycle"] = max(
             _count(state, "jobs_scored_this_cycle") - unused, 0
         )
-        changed = True
-    if not changed:
-        return None
     refunded["updated_at"] = now.isoformat()
     return refunded
 
@@ -254,8 +295,8 @@ def resets_at(now: datetime) -> str:
     different instant from ``tools.discovery.budget.resets_at`` (searches roll
     weekly, ratings nightly), so a surface showing both must show both.
 
-    The cycle counter has no reset instant because it has no time-based
-    rollover at all — only a new ``cycle_id`` clears it.
+    The cycle counter rolls at this same instant (and earlier, if a discovery
+    cycle opens a new window).
     """
     tz = now.tzinfo or UTC
     tomorrow = datetime.combine(now.date() + timedelta(days=1), time.min, tzinfo=tz)
@@ -342,7 +383,9 @@ async def reserve(
     return reservation
 
 
-async def release(db, user_id: str, unused: int, *, cycle_id: str | None) -> None:
+async def release(
+    db, user_id: str, unused: int, *, cycle_id: str | None, day: str | None = None
+) -> None:
     """Hand back slots a run reserved but never drew on. Never raises.
 
     A read-modify-write rather than a blind ``Increment(-unused)``: the
@@ -359,7 +402,7 @@ async def release(db, user_id: str, unused: int, *, cycle_id: str | None) -> Non
             snap = await user_ref.get(transaction=transaction)
             state = (snap.to_dict() or {}).get(FIELD)
             refunded = apply_release(
-                state, unused, now=datetime.now(UTC), cycle_id=cycle_id
+                state, unused, now=datetime.now(UTC), cycle_id=cycle_id, day=day
             )
             if refunded is None:
                 return False
