@@ -33,6 +33,7 @@ DATA_DIR = Path("data/companies")
 
 class CompanyEntry(BaseModel):
     slug: str
+    name: str | None = None  # display name; the company's identity across platforms
     added: date | None = None
     notes: str | None = None
     paused: bool = False  # temporarily excluded from the daily fetch
@@ -62,7 +63,7 @@ def load_unvetted() -> dict[Platform, list[CompanyEntry]]:
 
 
 def load_blocklist() -> set[tuple[Platform, str]]:
-    """Return as a set for O(1) membership checks."""
+    """Return as a set for O(1) membership checks. Slugs keep their spelling."""
     raw = _load(DATA_DIR / "blocklist.yaml")
     return {(e["platform"], e["slug"]) for e in raw.get("blocked", [])}
 
@@ -84,12 +85,18 @@ def append_unvetted(platform: Platform, new_slugs: list[str]) -> int:
     overlay in Firestore (:mod:`tools.company_prefs`).
     """
     raw = _load(DATA_DIR / "unvetted.yaml")
-    existing = {c["slug"] for c in raw.get(platform, [])}
-    known = {c.slug for c in load_known()[platform]}
-    blocked = {slug for plat, slug in load_blocklist() if plat == platform}
+    existing = {c["slug"].casefold() for c in raw.get(platform, [])}
+    known = {c.slug.casefold() for c in load_known()[platform]}
+    blocked = {slug.casefold() for plat, slug in load_blocklist() if plat == platform}
 
+    # Case-insensitive, so a case variant of an existing, known or blocklisted
+    # slug (or of one earlier in this batch) is skipped; the spelling is kept.
     skip = existing | known | blocked
-    to_add = [s for s in new_slugs if s not in skip]
+    to_add: list[str] = []
+    for s in new_slugs:
+        if s.casefold() not in skip:
+            skip.add(s.casefold())
+            to_add.append(s)
     if not to_add:
         return 0
 
@@ -105,23 +112,33 @@ def all_active_companies(
 ) -> list[tuple[Platform, str, Literal["known", "unvetted"]]]:
     """Flat list of (platform, slug, source) tuples to fetch on a daily run.
 
+    Blocklisted boards are dropped (platform exact, slug ignoring case). A slug
+    listed twice on one platform, in any case, composes once with the first
+    spelling seen, ``known`` before ``unvetted``. Slugs are never lowercased:
+    Lever's API is case-sensitive.
+
     ``exclusions`` is the per-user overlay read by
     :func:`tools.company_prefs.load_exclusions`. The pool stays global in
     YAML and one user's exclusions are subtracted here, at compose time, so
     nothing about the shared pool has to know a user exists. It defaults to
     empty, which composes the whole pool.
     """
+    seen = {(plat, slug.casefold()) for plat, slug in load_blocklist()}
     out: list[tuple[Platform, str, Literal["known", "unvetted"]]] = []
-    for plat, entries in load_known().items():
-        out.extend(
-            (plat, e.slug, "known")
-            for e in entries
-            if not e.paused and (plat, e.slug) not in exclusions
-        )
-    for plat, entries in load_unvetted().items():
-        out.extend(
-            (plat, e.slug, "unvetted")
-            for e in entries
-            if (plat, e.slug) not in exclusions
-        )
+    sources: list[
+        tuple[Literal["known", "unvetted"], dict[Platform, list[CompanyEntry]]]
+    ] = [
+        ("known", load_known()),
+        ("unvetted", load_unvetted()),
+    ]
+    for source, groups in sources:
+        for plat, entries in groups.items():
+            for e in entries:
+                key = (plat, e.slug.casefold())
+                if key in seen or (plat, e.slug) in exclusions:
+                    continue
+                if source == "known" and e.paused:
+                    continue
+                seen.add(key)
+                out.append((plat, e.slug, source))
     return out

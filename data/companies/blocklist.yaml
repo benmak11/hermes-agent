@@ -1,4 +1,32 @@
 # Companies you never want to see again. The sweep filters these out before
-# adding to unvetted, and the daily fetch skips them.
+# adding to unvetted, and the daily fetch skips them. Slugs match ignoring case.
 # Format: list of {platform, slug, blocked_at, reason} for an audit trail.
-blocked: []
+blocked:
+  - platform: ashby
+    slug: toggl
+    blocked_at: "2026-10-06"
+    reason: "404 on greenhouse, lever and ashby"
+  - platform: ashby
+    slug: wand
+    blocked_at: "2026-10-06"
+    reason: "404 on greenhouse, lever and ashby"
+  - platform: ashby
+    slug: certn
+    blocked_at: "2026-10-06"
+    reason: "404 on greenhouse, lever and ashby"
+  - platform: lever
+    slug: syw
+    blocked_at: "2026-10-06"
+    reason: "404 on greenhouse, lever and ashby"
+  - platform: greenhouse
+    slug: clarityai
+    blocked_at: "2026-10-06"
+    reason: "404 on greenhouse, lever and ashby"
+  - platform: ashby
+    slug: super
+    blocked_at: "2026-10-06"
+    reason: "slug resolves to a different company on another platform"
+  - platform: ashby
+    slug: forward
+    blocked_at: "2026-10-06"
+    reason: "slug resolves to a different company on another platform; one entry covers both spellings (case-insensitive)"
