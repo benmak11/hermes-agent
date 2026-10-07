@@ -2,11 +2,14 @@
 // Unauthorized copying, distribution, or use is prohibited.
 "use client";
 
+import { useQuery } from "@tanstack/react-query";
 import { signOut } from "firebase/auth";
 import Link from "next/link";
 
 import { UserAvatar } from "@/components/UserAvatar";
 import { SANS } from "@/components/warm/styles";
+import { apiFetch } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { auth } from "@/lib/firebase";
 import { APP_HOME } from "@/lib/nav";
 
@@ -16,7 +19,8 @@ type Section =
   | "applications"
   | "profile"
   | "journeys"
-  | "tracking";
+  | "tracking"
+  | "admin";
 
 const LINKS: { section: Section; href: string; label: string }[] = [
   { section: "review", href: APP_HOME, label: "Review" },
@@ -33,11 +37,12 @@ const SECTION_LABEL: Record<Section, string> = {
   companies: "Companies",
   profile: "Profile",
   applications: "Your application",
+  admin: "Admin",
 };
 
 /**
  * 60px warm app header (design 16): terracotta logo tile + wordmark + section
- * label left; Review · Tracking · Journeys · Companies · Sign out + avatar
+ * label left; Review · Tracking · Journeys · Companies · (Admin) · Sign out + avatar
  * right, the current page's link active-styled (terracotta underline). The
  * avatar opens /app/profile and wears a terracotta ring while there. `center`
  * (session progress) and `pill` (discovery status) are slots for the review
@@ -53,6 +58,17 @@ export function TopNav({
   center?: React.ReactNode;
   pill?: React.ReactNode;
 }) {
+  const { user } = useAuth();
+  // Not in LINKS: only the admin sees it. `/admin/me` answers false, not 404,
+  // for everyone else.
+  const { data: adminMe } = useQuery({
+    queryKey: ["admin", "me", user?.uid],
+    queryFn: () => apiFetch<{ admin: boolean }>("/admin/me"),
+    enabled: !!user,
+    staleTime: Infinity,
+    retry: false,
+  });
+
   return (
     <header
       className="sticky top-0 z-10 flex h-[60px] items-center justify-between border-b px-6"
@@ -97,6 +113,18 @@ export function TopNav({
               {l.label}
             </Link>
           ))}
+          {adminMe?.admin === true && (
+            <Link
+              href="/app/admin"
+              className={
+                section === "admin"
+                  ? "wm-nav-active text-[13px]"
+                  : "wm-muted-link text-[13px] font-medium"
+              }
+            >
+              Admin
+            </Link>
+          )}
           <button
             onClick={() => signOut(auth)}
             className="wm-nav-quiet text-[13px]"
