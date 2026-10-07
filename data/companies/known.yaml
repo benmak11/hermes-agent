@@ -13,11 +13,7 @@ greenhouse:
     added: "2026-06-01"
   - slug: figma
     added: "2026-06-01"
-  - slug: notion
-    added: "2026-06-01"
   - slug: vercel
-    added: "2026-06-01"
-  - slug: linear
     added: "2026-06-01"
 
 lever:
@@ -30,6 +26,14 @@ ashby:
   - slug: replit
     added: "2026-06-01"
   - slug: retool
+    added: "2026-06-01"
+    paused: true
+    notes: "404 on greenhouse, lever and ashby on 2026-10-06; current board needs looking up by hand"
+  - slug: notion
+    name: "Notion"
+    added: "2026-06-01"
+  - slug: linear
+    name: "Linear"
     added: "2026-06-01"
 
 # Single-company career sites: the "slug" is a search query, not a company.
