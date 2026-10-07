@@ -365,9 +365,11 @@ def _resume(db):
     return asyncio.run(batch_runs.resume(db=db))
 
 
-def _patch_vertex_state(monkeypatch, state, error=None):
+def _patch_vertex_state(monkeypatch, state, error=None, completion_stats=None):
     async def fake_get(name):
-        return SimpleNamespace(name=name, state=state, error=error)
+        return SimpleNamespace(
+            name=name, state=state, error=error, completion_stats=completion_stats
+        )
 
     monkeypatch.setattr(batch_runs, "get_batch_job", fake_get)
 
@@ -822,7 +824,10 @@ def test_resume_banks_cost_when_the_ingest_dies_after_pricing(harness, monkeypat
     assert banked["by_step"]["matching.score"]["calls"] == 1
 
 
-def test_resume_does_not_bank_cost_for_a_failed_vertex_job(harness, monkeypatch):
+def test_a_failed_vertex_job_closes_its_origin_ledger_doc(harness, monkeypatch):
+    """The origin run stays ``running`` on the ledger until a resume pass
+    closes it, and a failed run is never resumed again — so the failed path
+    closes it, honestly ``failed``, with no spend banked."""
     store = {}
     ref = _FakeRunRef("r1", store)
     store["r1"] = _running_doc(origin_run_id="cycle-1")
@@ -832,7 +837,81 @@ def test_resume_does_not_bank_cost_for_a_failed_vertex_job(harness, monkeypatch)
     summary = _resume(db)
 
     assert summary["failed"] == 1
-    assert harness.cost_flushes == []
+    assert harness.cost_flushes == [
+        ("u1", "cycle-1", {"batch_run": "r1", "state": "failed"})
+    ]
+    assert harness.banked[0]["cost_usd"] == 0
+    assert store["r1"]["state"] == "failed"
+
+
+def test_the_failed_close_happens_once_across_repeated_passes(harness, monkeypatch):
+    store = {}
+    store["r1"] = _running_doc(origin_run_id="cycle-1")
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_CANCELLED, error="x")
+
+    _resume(_FakeDB(refs=[_FakeRunRef("r1", store)]))
+    _resume(_FakeDB(refs=[_FakeRunRef("r1", store)]))
+
+    assert len(harness.cost_flushes) == 1
+
+
+def test_the_failed_close_comes_before_the_failed_mark(harness, monkeypatch):
+    """Close first, mark second. If the mark is lost, the run is still
+    ``running`` and the next pass closes again — banking nothing."""
+    store = {}
+    store["r1"] = _running_doc(origin_run_id="cycle-1")
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_FAILED, error="quota")
+
+    class _MarkFailsOnce(_FakeRunRef):
+        failed_once = False
+
+        async def update(self, fields, option=None):
+            if fields.get("state") == "failed" and not _MarkFailsOnce.failed_once:
+                _MarkFailsOnce.failed_once = True
+                assert harness.cost_flushes, "marked failed before closing the doc"
+                raise RuntimeError("firestore blip")
+            await super().update(fields, option)
+
+    _resume(_FakeDB(refs=[_MarkFailsOnce("r1", store)]))
+    assert store["r1"]["state"] == "running" and len(harness.cost_flushes) == 1
+
+    # After the claim TTL the next pass closes again and marks it.
+    stale = datetime.now(UTC) - timedelta(seconds=batch_runs._CLAIM_TTL_SECONDS + 60)
+    store["r1"]["claimed_at"] = stale.isoformat()
+    _resume(_FakeDB(refs=[_MarkFailsOnce("r1", store)]))
+
+    assert store["r1"]["state"] == "failed"
+    assert [meta["state"] for _, _, meta in harness.cost_flushes] == [
+        "failed",
+        "failed",
+    ]
+    assert [b["cost_usd"] for b in harness.banked] == [0, 0]
+
+
+def test_an_orphaned_run_closes_its_origin_ledger_doc(harness, monkeypatch):
+    stale = datetime.now(UTC) - timedelta(seconds=batch_runs._CLAIM_TTL_SECONDS + 60)
+    store = {}
+    store["r1"] = _running_doc(
+        job_name=None, claimed_at=stale.isoformat(), origin_run_id="cycle-1"
+    )
+
+    _resume(_FakeDB(refs=[_FakeRunRef("r1", store)]))
+
+    assert harness.cost_flushes == [
+        ("u1", "cycle-1", {"batch_run": "r1", "state": "failed"})
+    ]
+    assert store["r1"]["state"] == "failed"
+
+
+def test_a_failed_run_with_no_origin_closes_nothing(harness, monkeypatch):
+    """Runs written before ``origin_run_id`` existed have no ledger doc."""
+    store = {}
+    store["r1"] = _running_doc()
+    _patch_vertex_state(monkeypatch, types.JobState.JOB_STATE_FAILED, error="quota")
+
+    _resume(_FakeDB(refs=[_FakeRunRef("r1", store)]))
+
+    assert harness.cost_flushes == [] and store["r1"]["state"] == "failed"
 
 
 # ------------------------------------------- per-leg job counts on the ledger
@@ -1294,6 +1373,9 @@ def _dollar_values(meta) -> set:
     return out
 
 
+_NOTHING = {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
+
+
 def test_outstanding_committed_excludes_legs_already_banked(harness, monkeypatch):
     """T13. "Outstanding" is *defined* as the legs with no ``cost_banked_at``
     marker — a query, not arithmetic. That is what makes it safe to re-run and
@@ -1324,10 +1406,11 @@ def test_outstanding_committed_excludes_legs_already_banked(harness, monkeypatch
     assert {leg["leg"] for leg in total["legs"]} == {"score", "parse"}
 
 
-def test_a_failed_run_keeps_its_committed_estimate(harness, monkeypatch):
-    """T14. Google billed it. A failed or orphaned run is precisely the case
-    this exists for — clearing the figure would erase the honest record of
-    money spent and never ingested."""
+def test_a_failed_run_keeps_its_committed_estimate_as_unpriced(harness, monkeypatch):
+    """T14. A failed run's estimate is never dropped — Google may have billed
+    it — but no ingest will ever price it either, so it is reported under
+    ``unpriced`` and not as outstanding. With no completion counts from Vertex
+    the whole estimate stands."""
     store = {}
     ref = _FakeRunRef("r1", store)
     committed = {"parse": {"requests": 9, "usd_low": 0.4, "usd_high": 0.8}}
@@ -1343,11 +1426,96 @@ def test_a_failed_run_keeps_its_committed_estimate(harness, monkeypatch):
     assert store["r1"]["state"] == "failed"
     assert store["r1"]["committed"] == committed
 
-    # And it keeps showing up as outstanding, forever, because it is.
-    outstanding = asyncio.run(
+    total = asyncio.run(
         batch_runs.outstanding_committed(_FakeDB(refs=[_FakeRunRef("r1", store)]))
     )
-    assert outstanding["usd_low"] == pytest.approx(0.4)
+    assert (total["usd_low"], total["usd_high"], total["runs"]) == (0.0, 0.0, 0)
+    unpriced = total["unpriced"]
+    assert unpriced["usd_low"] == pytest.approx(0.4)
+    assert unpriced["usd_high"] == pytest.approx(0.8)
+    assert unpriced["runs"] == 1
+    assert unpriced["legs"][0]["completion"] is None
+
+
+def _completion_stats(successful, failed=0, incomplete=0):
+    return types.CompletionStats(
+        successful_count=successful, failed_count=failed, incomplete_count=incomplete
+    )
+
+
+def test_a_failed_leg_that_processed_nothing_is_not_unpriced(harness, monkeypatch):
+    """Vertex bills per successful request: a leg it records as having
+    completed none contributes nothing, and the counts land on the run doc."""
+    store = {}
+    store["r1"] = _running_doc(
+        stage="parse",
+        committed={"parse": {"requests": 9, "usd_low": 0.4, "usd_high": 0.8}},
+    )
+    db = _FakeDB(refs=[_FakeRunRef("r1", store)])
+    _patch_vertex_state(
+        monkeypatch,
+        types.JobState.JOB_STATE_CANCELLED,
+        error="cancelled",
+        completion_stats=_completion_stats(0, incomplete=9),
+    )
+
+    _resume(db)
+
+    assert store["r1"]["vertex_completion"]["parse"] == {
+        "successful": 0,
+        "failed": 0,
+        "incomplete": 9,
+    }
+    total = asyncio.run(
+        batch_runs.outstanding_committed(_FakeDB(refs=[_FakeRunRef("r1", store)]))
+    )
+    assert total == {**_NOTHING, "unpriced": _NOTHING}
+
+
+def test_a_partly_processed_failed_leg_reports_its_billed_share(harness, monkeypatch):
+    store = {}
+    store["r1"] = _running_doc(
+        stage="parse",
+        committed={"parse": {"requests": 10, "usd_low": 1.0, "usd_high": 2.0}},
+    )
+    db = _FakeDB(refs=[_FakeRunRef("r1", store)])
+    _patch_vertex_state(
+        monkeypatch,
+        types.JobState.JOB_STATE_CANCELLED,
+        error="cancelled",
+        completion_stats=_completion_stats(3, incomplete=7),
+    )
+
+    _resume(db)
+
+    total = asyncio.run(
+        batch_runs.outstanding_committed(_FakeDB(refs=[_FakeRunRef("r1", store)]))
+    )
+    assert total["usd_low"] == 0.0
+    assert total["unpriced"]["usd_low"] == pytest.approx(0.3)
+    assert total["unpriced"]["usd_high"] == pytest.approx(0.6)
+    assert total["unpriced"]["legs"][0]["completion"]["successful"] == 3
+
+
+def test_a_banked_leg_of_a_failed_run_is_not_unpriced(harness):
+    """A score leg that failed after its parse leg was ingested: the parse
+    leg's real cost is on the ledger already."""
+    store = {
+        "r1": {
+            "user_id": "u1",
+            "state": "failed",
+            "committed": {
+                "parse": {"requests": 4, "usd_low": 1.0, "usd_high": 2.0},
+                "score": {"requests": 4, "usd_low": 8.0, "usd_high": 16.0},
+            },
+            "cost_banked_at": {"parse": "2026-09-26T00:00:00+00:00"},
+        }
+    }
+    total = asyncio.run(
+        batch_runs.outstanding_committed(_FakeDB(refs=[_FakeRunRef("r1", store)]))
+    )
+    assert total["unpriced"]["usd_low"] == pytest.approx(8.0)
+    assert [leg["leg"] for leg in total["unpriced"]["legs"]] == ["score"]
 
 
 def test_an_orphaned_run_keeps_its_committed_estimate(harness, monkeypatch):
@@ -1383,7 +1551,7 @@ def test_a_completed_run_is_not_outstanding(harness):
 
     total = asyncio.run(batch_runs.outstanding_committed(db))
 
-    assert total == {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
+    assert total == {**_NOTHING, "unpriced": _NOTHING}
 
 
 def test_outstanding_committed_can_be_scoped_to_one_user(harness):
@@ -1424,5 +1592,5 @@ def test_a_done_run_is_excluded_by_state_even_with_an_unbanked_leg(harness):
 
     total = asyncio.run(batch_runs.outstanding_committed(db))
 
-    assert total == {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
+    assert total == {**_NOTHING, "unpriced": _NOTHING}
     assert "done" not in batch_runs.OUTSTANDING_STATES

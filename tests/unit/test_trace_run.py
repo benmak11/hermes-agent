@@ -22,6 +22,7 @@ import pytest
 from firestore_fakes import FakeQueryDB
 from google.cloud import logging as cloud_logging
 from google.cloud.logging import Resource, StructEntry
+from google.protobuf import json_format, struct_pb2
 
 import cli.trace_run as tr
 
@@ -112,8 +113,23 @@ def _predicate(clause: str):
     raise AssertionError(f"fake logging does not know field {key!r}")
 
 
+def _as_returned(e: StructEntry) -> StructEntry:
+    """``e`` as Cloud Logging hands it back: the payload has been through a
+    protobuf ``Struct``, so every number is a double (``2`` reads ``2.0``)."""
+    struct = struct_pb2.Struct()
+    struct.update(e.payload)
+    return StructEntry(
+        payload=json_format.MessageToDict(struct),
+        timestamp=e.timestamp,
+        severity=e.severity,
+        resource=e.resource,
+        insert_id=e.insert_id,
+    )
+
+
 class FakeLogging:
-    """A Cloud Logging client over a list of real ``StructEntry`` objects.
+    """A Cloud Logging client over a list of real ``StructEntry`` objects,
+    returned with float numbers the way the real client returns them.
     ``calls`` records each ``(filter, max_results)`` asked for."""
 
     def __init__(self, entries=(), project=PROJECT):
@@ -141,7 +157,7 @@ class FakeLogging:
         )
         if max_results is not None:
             rows = rows[:max_results]
-        return iter(rows)
+        return iter([_as_returned(e) for e in rows])
 
 
 _ids = itertools.count()
@@ -453,6 +469,27 @@ def test_retries_are_grouped_by_task_and_dropped_deliveries_called_out():
     assert "task t2: 1 attempt(s) seen" in text
 
 
+def test_float_counts_from_cloud_logging_render_as_ints_and_flag_a_gap():
+    """Real Cloud Logging returns ``2.0`` / ``1.0``; the gap must still fire."""
+    task = {"task_name": "t1"}
+    logs = FakeLogging(
+        [
+            started(0.1, retry_count=2.0, execution_count=1.0, **task),
+            finished(1, retry_count=2.0, execution_count=1.0, **task),
+        ]
+    )
+    text = _text(_db({RUN: run_doc()}), logs)
+    assert "retry_count=2 execution_count=1 on hermes-worker  ! 1 attempt(s)" in text
+    assert "2.0" not in text
+
+
+def test_whole_number_floats_are_coerced_and_fractions_kept():
+    assert tr._whole_numbers(
+        {"a": 2.0, "b": 1.5, "c": [0.0, {"d": 3.0}], "e": True, "f": "2.0"}
+    ) == {"a": 2, "b": 1.5, "c": [0, {"d": 3}], "e": True, "f": "2.0"}
+    assert type(tr._whole_numbers(2.0)) is int
+
+
 def test_no_task_fields_says_so():
     text = _text(_db({RUN: run_doc()}), FakeLogging([started(0.1), finished(1)]))
     assert "no Cloud Tasks fields on any line" in text
@@ -608,6 +645,17 @@ def test_logging_fake_applies_what_it_is_sent():
         )
     )
     assert [e.payload["message"] for e in got] == ["mine"]
+    # Numbers come back as doubles, as they do from the real client — the
+    # fake returning ints is how a float-only bug passed every test.
+    counted = list(
+        FakeLogging([entry(0, "n", retry_count=2, execution_count=0)]).list_entries(
+            resource_names=[f"projects/{PROJECT}"],
+            filter_='resource.type="cloud_run_revision"',
+        )
+    )
+    assert counted[0].payload["retry_count"] == 2.0
+    assert type(counted[0].payload["retry_count"]) is float
+    assert type(counted[0].payload["execution_count"]) is float
     capped = logs.list_entries(
         resource_names=[f"projects/{PROJECT}"],
         filter_='resource.type="cloud_run_revision"',

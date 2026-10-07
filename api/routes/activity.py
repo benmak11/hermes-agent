@@ -395,20 +395,19 @@ def _committed_of(run: dict) -> dict:
 
     Same per-leg rule as ``tools.matching.batch_runs.outstanding_committed``: a
     leg with a ``cost_banked_at`` marker is already priced on the ledger, so
-    counting its estimate too would double the same money.
+    counting its estimate too would double the same money, and a failed run's
+    leg counts only the share Google may have billed.
     """
     committed = run.get("committed") or {}
     banked = run.get("cost_banked_at") or {}
-    low = sum(
-        float(e.get("usd_low") or 0.0)
-        for leg, e in committed.items()
-        if not banked.get(leg)
-    )
-    high = sum(
-        float(e.get("usd_high") or 0.0)
-        for leg, e in committed.items()
-        if not banked.get(leg)
-    )
+    failed = run.get("state") in batch_runs.UNPRICED_STATES
+    low = high = 0.0
+    for leg, e in committed.items():
+        if banked.get(leg):
+            continue
+        share = batch_runs.unpriced_share(run, leg) if failed else 1.0
+        low += float(e.get("usd_low") or 0.0) * share
+        high += float(e.get("usd_high") or 0.0) * share
     return {"committed_usd_low": round(low, 4), "committed_usd_high": round(high, 4)}
 
 
@@ -524,8 +523,8 @@ def _after(a: Any, b: Any) -> bool:
 async def _running_batches(db, user_id: str) -> list[dict]:
     """This user's in-flight batch runs, newest first.
 
-    ``state == "running"`` only: a ``failed`` run is money owed, not liveness,
-    and it surfaces under ``committed`` instead. Two equality filters on
+    ``state == "running"`` only: a ``failed`` run is money, not liveness, and
+    it surfaces under ``unpriced`` instead. Two equality filters on
     ``batch_runs``; verified live to plan without a composite index.
     """
     runs = []
@@ -665,6 +664,13 @@ async def get_activity(user_id: str = Depends(verify_user)) -> dict:
             "usd_low": committed["usd_low"],
             "usd_high": committed["usd_high"],
             "runs": committed["runs"],
+        },
+        # Failed runs' legs: possibly billed by Google, never going to be
+        # priced. Apart from ``committed``, which an ingest will still price.
+        "unpriced": {
+            "usd_low": committed["unpriced"]["usd_low"],
+            "usd_high": committed["unpriced"]["usd_high"],
+            "runs": committed["unpriced"]["runs"],
         },
     }
 

@@ -210,6 +210,21 @@ def _any_message(events: tuple[str, ...]) -> str:
     return "(" + " OR ".join(f'jsonPayload.message="{e}"' for e in events) + ")"
 
 
+def _whole_numbers(value: Any) -> Any:
+    """Whole-number floats as ints, recursively.
+
+    Cloud Logging hands every ``jsonPayload`` number back as a double, so a
+    logged ``retry_count=2`` arrives as ``2.0``.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {k: _whole_numbers(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_whole_numbers(v) for v in value]
+    return value
+
+
 def _to_line(entry: Any) -> LogLine:
     payload = entry.payload
     if not isinstance(payload, dict):
@@ -219,7 +234,7 @@ def _to_line(entry: Any) -> LogLine:
         at=to_utc(entry.timestamp),
         severity=(entry.severity or "DEFAULT").upper(),
         service=labels.get("service_name") or "(unknown service)",
-        payload=dict(payload),
+        payload=_whole_numbers(dict(payload)),
         insert_id=getattr(entry, "insert_id", None),
     )
 

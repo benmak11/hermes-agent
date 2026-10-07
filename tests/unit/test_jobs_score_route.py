@@ -293,7 +293,7 @@ def test_a_window_left_from_a_previous_day_quotes_the_full_cap(client, monkeypat
         "scoring_budget": {
             "day": "2026-09-26",
             "jobs_scored_today": 200,
-            "cycle_id": "be40d61d",
+            "cycle_id": "cycle-stale",
             "jobs_scored_this_cycle": 200,
         }
     }

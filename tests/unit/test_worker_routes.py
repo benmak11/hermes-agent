@@ -209,6 +209,115 @@ def test_task_batch_start_and_resume_call_through(client, monkeypatch, cost_flus
     assert len(cost_flushes) == 1
 
 
+class _AgentLog:
+    """Records ``agent.started`` / ``agent.finished`` off ``worker.log``."""
+
+    def __init__(self):
+        self.events: list[tuple[str, dict]] = []
+
+    def info(self, event, **kw):
+        self.events.append((event, kw))
+
+    def __getattr__(self, level):
+        return lambda event, **kw: None
+
+    def stages(self) -> list[tuple[str, str, str | None]]:
+        return [
+            (event, kw["agent"], kw.get("outcome"))
+            for event, kw in self.events
+            if event in ("agent.started", "agent.finished")
+        ]
+
+
+@pytest.fixture
+def agent_log(monkeypatch):
+    recorder = _AgentLog()
+    monkeypatch.setattr(worker, "log", recorder)
+    return recorder
+
+
+def test_task_score_logs_its_stage(client, monkeypatch, cost_flushes, agent_log):
+    monkeypatch.setenv("WORKER_MODE", "1")
+
+    async def fake_score(user_id, *, limit=None, cycle_id=budget.CURRENT_RUN):
+        return {"scored": 3, "discarded": 1, "failed": 0, "pending": 4}
+
+    monkeypatch.setattr(worker, "score_pending_jobs", fake_score)
+    assert client.post("/tasks/score", json={"user_id": "u1"}).status_code == 200
+
+    assert agent_log.stages() == [
+        ("agent.started", "scoring", None),
+        ("agent.finished", "scoring", "completed"),
+    ]
+    assert agent_log.events[-1][1]["scored"] == 3
+
+
+@pytest.mark.parametrize(
+    ("path", "agent", "seam"),
+    [
+        ("/tasks/score", "scoring", "score"),
+        ("/tasks/score/backlog", "score_backlog", "backlog"),
+        ("/tasks/batch/start", "batch_start", "start"),
+    ],
+)
+def test_a_dying_scoring_task_still_logs_a_failed_finish(
+    client, monkeypatch, cost_flushes, agent_log, path, agent, seam
+):
+    monkeypatch.setenv("WORKER_MODE", "1")
+
+    async def explode(user_id, **kw):
+        raise RuntimeError("pro call died mid-run")
+
+    if seam == "score":
+        monkeypatch.setattr(worker, "score_pending_jobs", explode)
+    elif seam == "backlog":
+        monkeypatch.setattr(worker.batch_runs, "score_or_start_run", explode)
+    else:
+        monkeypatch.setattr(worker.batch_runs, "start", explode)
+    with pytest.raises(RuntimeError):
+        client.post(path, json={"user_id": "u1"})
+
+    assert agent_log.stages() == [
+        ("agent.started", agent, None),
+        ("agent.finished", agent, "failed"),
+    ]
+
+
+def test_task_score_backlog_logs_the_batch_it_handed_off(
+    client, monkeypatch, cost_flushes, agent_log
+):
+    monkeypatch.setenv("WORKER_MODE", "1")
+
+    async def fake_backlog(user_id, *, cycle_id=budget.CURRENT_RUN):
+        return {"scored": 0, "discarded": 0, "failed": 0, "batch_run": "r1"}
+
+    monkeypatch.setattr(worker.batch_runs, "score_or_start_run", fake_backlog)
+    assert (
+        client.post("/tasks/score/backlog", json={"user_id": "u1"}).status_code == 200
+    )
+
+    assert agent_log.stages() == [
+        ("agent.started", "score_backlog", None),
+        ("agent.finished", "score_backlog", "completed"),
+    ]
+    assert agent_log.events[-1][1]["batch_run"] == "r1"
+
+
+def test_task_batch_start_logs_its_stage(client, monkeypatch, cost_flushes, agent_log):
+    monkeypatch.setenv("WORKER_MODE", "1")
+
+    async def fake_start(user_id, *, limit=None, cycle_id=budget.CURRENT_RUN):
+        return {"started": True, "run": "r1", "stage": "parse", "pending": 9}
+
+    monkeypatch.setattr(worker.batch_runs, "start", fake_start)
+    assert client.post("/tasks/batch/start", json={"user_id": "u1"}).status_code == 200
+
+    assert agent_log.stages() == [
+        ("agent.started", "batch_start", None),
+        ("agent.finished", "batch_start", "completed"),
+    ]
+
+
 def test_cron_tick_enqueues_batch_resume_only_when_runs_in_flight(monkeypatch):
     monkeypatch.setenv("WORKER_MODE", "1")
     monkeypatch.setenv("QUEUE_MODE", "1")

@@ -186,6 +186,17 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _state_paths(*fields: str) -> list[str]:
+    """``merge=`` field paths for a ``discovery_state`` success write.
+
+    A path list rather than ``merge=True``: Firestore merges nested maps leaf
+    by leaf, so a run's metrics map would keep every key the previous run
+    wrote and this one did not. Listed paths are replaced whole; every other
+    ``discovery_state`` field is left alone.
+    """
+    return [f"discovery_state.{field}" for field in fields]
+
+
 async def _allowlisted(user_id: str) -> bool:
     """Is this user's Auth email an active allowlist seat?
 
@@ -540,7 +551,7 @@ async def run_discovery_cycle(
     every other way into a live crawl lands here holding nothing but a user id,
     and under ``TestClient`` a background task runs immediately rather than
     later. Both refusals are ahead of every write this function makes, which
-    matters because the success write is a ``set(..., merge=True)`` that would
+    matters because the success write is a merging ``set`` that would
     recreate a deleted user document and ``persist_new_jobs`` would refill the
     subcollection under it. The guard stops a cycle that has not started, not
     one already past this line.
@@ -659,7 +670,9 @@ async def run_discovery_cycle(
                         "discovery_lease": firestore.DELETE_FIELD,
                     }
                 },
-                merge=True,
+                merge=_state_paths(
+                    "last_discovery_at", "last_discovery", "discovery_lease"
+                ),
             )
             # A cycle that handed its scoring to a Vertex batch is not over: the
             # worker's resume ticks ingest the results under this same run_id
@@ -722,7 +735,7 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
     spend, since the sweep buys no LLM calls, but because it writes
     ``user_decision: dismissed`` onto real jobs and moves real applications to
     ``posting_removed``. Refuses on a deleted account too: the success write is
-    a recreating ``set(..., merge=True)``. Both refusals precede
+    a recreating merging ``set``. Both refusals precede
     ``_extend_slot``, so a refused sweep leaves no lease behind either.
     """
     if live_runs_refused():
@@ -758,7 +771,7 @@ async def run_sweep_cycle(user_id: str, *, trigger: str = "scheduled") -> None:
                         "sweep_lease": firestore.DELETE_FIELD,
                     }
                 },
-                merge=True,
+                merge=_state_paths("last_sweep_at", "last_sweep", "sweep_lease"),
             )
             ledger_state = DONE
             log_agent_end(log, "sweep", started, outcome="completed", **counts)
