@@ -253,6 +253,7 @@ async def start(
                 user_id,
                 reservation.granted - attempted,
                 cycle_id=reservation.cycle_id,
+                day=reservation.day,
             )
 
 

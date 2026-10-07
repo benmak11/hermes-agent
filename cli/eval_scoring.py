@@ -597,6 +597,7 @@ async def rescore(
                 user_id,
                 reservation.granted - attempted,
                 cycle_id=reservation.cycle_id,
+                day=reservation.day,
             )
     print(f"\n   Wrote {len(fresh)} rescored job(s) to {out_path}")
     return fresh

@@ -460,6 +460,7 @@ async def batch_score_pending_jobs(
                 user_id,
                 reservation.granted - attempted,
                 cycle_id=reservation.cycle_id,
+                day=reservation.day,
             )
 
 

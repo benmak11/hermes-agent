@@ -162,6 +162,112 @@ def test_limits_are_honored_from_the_passed_limits_object():
     assert res.granted == 50 and res.capped is True
 
 
+# ------------------------------------------ the cycle window rolls with the day
+
+#: The stored state that froze a real account: a discovery window opened under
+#: a 200 cap, never used or released, read days later under a cap of 3.
+FROZEN = {
+    "day": "2026-09-26",
+    "jobs_scored_today": 200,
+    "jobs_scored_this_cycle": 200,
+    "cycle_id": "be40d61d",
+    "updated_at": "2026-09-26T19:11:19+00:00",
+}
+LATER = datetime(2026, 10, 6, 15, 0, tzinfo=UTC)
+CAP_3 = Limits(per_cycle=3, per_day=3)
+
+
+def test_a_window_from_a_previous_utc_day_grants_the_full_per_cycle_cap():
+    new_state, res = _reserve(FROZEN, 3, cycle_id=None, now=LATER, limits=CAP_3)
+
+    assert res.granted == 3 and res.capped is False
+    # Same window id — an ad-hoc request never opens one — but a fresh count.
+    assert new_state["cycle_id"] == "be40d61d"
+    assert new_state["jobs_scored_this_cycle"] == 3
+    assert new_state["day"] == "2026-10-06"
+
+
+def test_the_same_exhausted_window_on_the_same_day_grants_nothing():
+    same_day = datetime(2026, 9, 26, 23, 59, tzinfo=UTC)
+    _new_state, res = _reserve(FROZEN, 3, cycle_id=None, now=same_day, limits=CAP_3)
+
+    assert res.granted == 0 and res.remaining_cycle == 0
+
+
+def test_two_same_day_ad_hoc_reservations_share_one_window():
+    """Day cap above the cycle cap, so only the shared window can stop the
+    second request."""
+    limits = Limits(per_cycle=3, per_day=10)
+    state, first = _reserve(FROZEN, 2, cycle_id=None, now=LATER, limits=limits)
+    state, second = _reserve(state, 2, cycle_id=None, now=LATER, limits=limits)
+    _state3, third = _reserve(state, 2, cycle_id=None, now=LATER, limits=limits)
+
+    assert (first.granted, second.granted, third.granted) == (2, 1, 0)
+    assert third.remaining_day == 7  # the day had room; the window did not
+
+
+def test_a_discovery_cycle_still_opens_a_fresh_window_under_its_own_id():
+    limits = Limits(per_cycle=3, per_day=10)
+    same_day = datetime(2026, 9, 26, 20, 0, tzinfo=UTC)
+    spent = {**FROZEN, "jobs_scored_today": 3, "jobs_scored_this_cycle": 3}
+
+    new_state, res = _reserve(spent, 3, cycle_id="run-2", now=same_day, limits=limits)
+
+    assert res.granted == 3 and res.cycle_id == "run-2"
+    assert new_state["cycle_id"] == "run-2"
+    assert new_state["jobs_scored_today"] == 6
+
+
+def test_a_release_arriving_after_the_day_rolled_is_dropped():
+    """Reserved at 23:59 under window ``c1``; an ad-hoc request after midnight
+    reopens ``c1`` with a fresh count; then the old run's refund lands. It
+    must not credit today's slots back."""
+    before = datetime(2026, 9, 26, 23, 59, tzinfo=UTC)
+    after = datetime(2026, 9, 27, 0, 1, tzinfo=UTC)
+    state, late_run = _reserve(None, 3, cycle_id="c1", now=before, limits=CAP_3)
+    state, _today = _reserve(state, 3, cycle_id=None, now=after, limits=CAP_3)
+    assert (late_run.day, state["day"]) == ("2026-09-26", "2026-09-27")
+
+    assert (
+        apply_release(state, 3, now=after, cycle_id=late_run.cycle_id, day=late_run.day)
+        is None
+    )
+
+
+def test_release_refuses_through_the_transaction_after_the_day_rolled():
+    db = _FakeDB(
+        state=_state(
+            day=datetime.now(UTC).date().isoformat(),
+            jobs_scored_today=3,
+            jobs_scored_this_cycle=3,
+        )
+    )
+    asyncio.run(budget.release(db, "u1", 3, cycle_id="cycle-1", day="2020-01-01"))
+    assert db.budget_state["jobs_scored_this_cycle"] == 3
+
+
+def test_every_reader_reports_the_rolled_over_figure_for_the_frozen_state():
+    """``remaining``, ``summary``, ``used`` and the estimate must all agree
+    with the reservation, or the page and the server disagree."""
+    from tools.spend import estimate
+
+    assert budget.remaining(FROZEN, now=LATER, limits=CAP_3) == (3, 3)
+    assert budget.used(FROZEN, now=LATER) == 0
+    _state1, res = _reserve(FROZEN, 0, cycle_id=None, now=LATER, limits=CAP_3)
+    assert budget.summary(res)["budget_remaining_cycle"] == 3
+    assert budget.summary(res)["budget_remaining_day"] == 3
+    assert estimate.available(
+        FROZEN, action=estimate.SCORE_BACKLOG, now=LATER, limits=CAP_3
+    ) == (3, 3)
+
+    # And on the day it was written, all of them still say zero.
+    same_day = datetime(2026, 9, 26, 22, 0, tzinfo=UTC)
+    assert budget.remaining(FROZEN, now=same_day, limits=CAP_3) == (0, 0)
+    assert estimate.available(
+        FROZEN, action=estimate.SCORE_BACKLOG, now=same_day, limits=CAP_3
+    ) == (0, 0)
+
+
 # ------------------------------------------------------------ apply_release()
 
 
@@ -191,6 +297,9 @@ def test_release_will_not_credit_a_different_cycle():
 def test_release_after_midnight_credits_nothing():
     state = _state(day="2026-08-22", cycle_id="cycle-0", jobs_scored_today=300)
     assert apply_release(state, 300, now=NOW, cycle_id="cycle-1") is None
+    # Not even the cycle counter of the same window: it is yesterday's.
+    same_window = _state(day="2026-08-22", jobs_scored_this_cycle=300)
+    assert apply_release(same_window, 300, now=NOW, cycle_id="cycle-1") is None
 
 
 def test_release_floors_at_zero():
@@ -456,7 +565,7 @@ def test_a_contended_reserve_retries_without_double_debiting():
 def test_release_refunds_through_the_transaction():
     db = _FakeDB(
         state={
-            "day": TODAY,
+            "day": datetime.now(UTC).date().isoformat(),
             "jobs_scored_today": 300,
             "cycle_id": "c",
             "jobs_scored_this_cycle": 300,
@@ -785,6 +894,44 @@ def test_batch_run_start_keeps_its_slots_when_the_submit_is_paid_for(
     assert budgeted.budget_state["jobs_scored_this_cycle"] == 5
 
 
+@pytest.fixture
+def released(monkeypatch):
+    """The real ``release``, recording what each gate hands it."""
+    calls: list[dict] = []
+    real = budget.release
+
+    async def recording(db, user_id, unused, **kw):
+        calls.append(kw)
+        await real(db, user_id, unused, **kw)
+
+    monkeypatch.setattr(budget, "release", recording)
+    return calls
+
+
+def test_every_gate_hands_the_reservation_day_back_to_release(
+    budgeted, monkeypatch, released
+):
+    """Without ``day`` a refund cannot tell yesterday's window from today's."""
+    today = datetime.now(UTC).date().isoformat()
+
+    _patch_pending(monkeypatch, score, [(SimpleNamespace(), _job("j1"))])
+
+    async def fake_match(job, profile, cached_content=None):
+        raise RuntimeError("no LLM in unit tests")
+
+    monkeypatch.setattr(score, "match_job", fake_match)
+    asyncio.run(score.score_pending_jobs("u1"))
+
+    _patch_pending(monkeypatch, batch_runs, [(SimpleNamespace(), _job("j1"))])
+    asyncio.run(batch_runs.start("u1", min_pending=50))
+
+    _patch_pending(monkeypatch, batch, [])
+    monkeypatch.setattr(batch, "batch_bucket_name", lambda: "test-bucket")
+    asyncio.run(batch.batch_score_pending_jobs("u1"))
+
+    assert [call.get("day") for call in released] == [today, today, today]
+
+
 def test_batch_run_start_refunds_when_it_does_not_start(budgeted, monkeypatch):
     """min_pending said the backlog was too small: nothing was submitted, so
     nothing is owed."""
@@ -835,8 +982,8 @@ def test_resets_at_is_not_the_weekly_instant():
 def test_a_zero_wanted_reservation_grants_and_debits_nothing():
     """How a read-only surface asks "what is left?" without paying for it.
 
-    ``/activity``'s allowance block draws its rating figures this way rather
-    than reimplementing the lazy day rollover, so the two can never disagree.
+    :func:`budget.remaining` must report the same figures without moving a
+    counter.
     """
     now = datetime(2026, 9, 27, 12, 30, tzinfo=UTC)
     state = {"day": "2026-09-27", "jobs_scored_today": 2, "cycle_id": "c1"}
@@ -848,6 +995,10 @@ def test_a_zero_wanted_reservation_grants_and_debits_nothing():
     assert res.remaining_day == 1
     assert new_state["jobs_scored_today"] == 2
     assert new_state["cycle_id"] == "c1"
+    assert budget.remaining(state, now=now, limits=budget.Limits(3, 3)) == (
+        res.remaining_cycle,
+        res.remaining_day,
+    )
 
 
 def test_used_reports_the_stored_counter_and_rolls_with_the_day():

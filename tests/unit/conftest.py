@@ -86,7 +86,7 @@ def unlimited_budget(monkeypatch):
             cycle_id=cycle_id,
         )
 
-    async def fake_release(db, user_id, unused, *, cycle_id):
+    async def fake_release(db, user_id, unused, *, cycle_id, day=None):
         pass
 
     monkeypatch.setattr(budget, "reserve", fake_reserve)

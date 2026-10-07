@@ -323,12 +323,12 @@ describe("ratingsResetLine", () => {
     resets_at: "2026-09-30T00:00:00+00:00",
   };
 
-  it("does not offer a reset that would not help", () => {
-    // The day rolled, so the daily counter is empty; this search's window is
-    // not, and no clock clears it. Midnight refills nothing here.
+  it("says none are left and gives the real reset when the window binds", () => {
+    // The day has room but this search's window is spent. Both roll at
+    // midnight UTC, so the reset is the true answer; "a new search" is not.
     const line = ratingsResetLine(base, now);
-    expect(line).toContain("a new search frees more");
-    expect(line).not.toContain("resets");
+    expect(line).toMatch(/^none left for now \u00b7 resets at \d?\d:\d\d/);
+    expect(line).not.toContain("new search");
   });
 
   it("offers the reset when the day is what is actually spent", () => {

@@ -675,6 +675,7 @@ async def score_pending_jobs(
                 user_id,
                 reservation.granted - progress["attempted"],
                 cycle_id=reservation.cycle_id,
+                day=reservation.day,
             )
 
 

@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "@/lib/apiError";
 import {
   rateProvenance,
+  scoringCap,
+  scoringCapMessage,
   spendConfirmation,
   usdRange,
   zeroGrantReason,
@@ -114,15 +116,54 @@ describe("rateProvenance", () => {
 });
 
 describe("zeroGrantReason", () => {
-  it("only promises a reset when the daily cap is what is empty", () => {
-    // The daily counter rolls at midnight UTC. The per-cycle counter does
-    // not roll at all — only a new discovery cycle clears it. Telling a user
-    // whose *cycle* is spent to come back tomorrow sends them away for a day
-    // to find the same zero.
+  it("names the cap that is empty, the day when both are", () => {
     expect(zeroGrantReason({ remaining_cycle: 0, remaining_day: 200 })).toBe("cycle");
     expect(zeroGrantReason({ remaining_cycle: 200, remaining_day: 0 })).toBe("day");
-    // Both empty: the day is the longer wait, so it is the honest one to
-    // name — a new cycle would not help until the day rolls anyway.
     expect(zeroGrantReason({ remaining_cycle: 0, remaining_day: 0 })).toBe("day");
+  });
+});
+
+describe("scoringCap", () => {
+  const CAP = {
+    reason: "scoring_cap",
+    cap: "cycle",
+    per_cycle: 3,
+    per_day: 10,
+    remaining_cycle: 0,
+    remaining_day: 7,
+    resets_at: "2026-10-07T00:00:00+00:00",
+  };
+
+  it("reads the cap and reset out of a 429", () => {
+    const got = scoringCap(err(429, CAP));
+    expect(got?.cap).toBe("cycle");
+    expect(got?.resets_at).toBe(CAP.resets_at);
+  });
+
+  it("is not a confirmation: a 429 never opens the spend sheet", () => {
+    expect(spendConfirmation(err(429, CAP))).toBeNull();
+  });
+
+  it("ignores anything that is not a scoring-cap 429", () => {
+    expect(scoringCap(err(402, CAP))).toBeNull();
+    expect(scoringCap(err(429, { ...CAP, reason: "discovery_cap" }))).toBeNull();
+    expect(scoringCap(err(429, { ...CAP, cap: "week" }))).toBeNull();
+    expect(scoringCap(new ApiError(429, "not json", "req-1"))).toBeNull();
+    expect(scoringCap(new Error("429"))).toBeNull();
+  });
+
+  it("renders the reason and the reset in local time", () => {
+    const now = Date.parse("2026-10-06T15:00:00Z");
+    const local = new Date(CAP.resets_at).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    const cycle = scoringCapMessage(scoringCap(err(429, CAP))!, now);
+    expect(cycle).toContain("This search's scoring budget is used up");
+    expect(cycle).toContain(`resets at ${local}`);
+
+    const day = scoringCapMessage(scoringCap(err(429, { ...CAP, cap: "day" }))!, now);
+    expect(day).toContain("Today's scoring budget is used up");
+    expect(day).toContain(`resets at ${local}`);
   });
 });

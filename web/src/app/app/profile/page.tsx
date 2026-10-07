@@ -14,6 +14,8 @@ import { auth } from "@/lib/firebase";
 import { saveMinScore, useMinScore } from "@/lib/session";
 import {
   rateProvenance,
+  scoringCap,
+  scoringCapMessage,
   spendConfirmation,
   usdRange,
   zeroGrantReason,
@@ -419,13 +421,18 @@ function AutoDiscoveryCard() {
   // refused — the 402 is how the estimate gets here in the first place.
   const [confirmation, setConfirmation] = useState<SpendConfirmation | null>(null);
   const [scoreError, setScoreError] = useState<string | null>(null);
+  // A 429: nothing could be rated, and only the reset changes that.
+  const [scoreCapped, setScoreCapped] = useState<string | null>(null);
   const score = useMutation({
     mutationFn: (confirm?: string) =>
       apiFetch("/jobs/score", {
         method: "POST",
         body: JSON.stringify(confirm ? { confirm } : {}),
       }),
-    onMutate: () => setScoreError(null),
+    onMutate: () => {
+      setScoreError(null);
+      setScoreCapped(null);
+    },
     onSuccess: () => {
       setConfirmation(null);
       refreshSoon();
@@ -434,6 +441,12 @@ function AutoDiscoveryCard() {
       const needed = spendConfirmation(err);
       if (needed) {
         setConfirmation(needed);
+        return;
+      }
+      const capped = scoringCap(err);
+      if (capped) {
+        setConfirmation(null);
+        setScoreCapped(scoringCapMessage(capped, Date.now()));
         return;
       }
       // A token can go stale between the sheet opening and the click; the
@@ -585,6 +598,11 @@ function AutoDiscoveryCard() {
           onConfirm={() => score.mutate(confirmation.confirm_token)}
         />
       )}
+      {scoreCapped && (
+        <p className="mt-2 text-[11.5px]" style={{ color: "var(--ink-2)" }}>
+          {scoreCapped}
+        </p>
+      )}
       {scoreError && (
         <p className="mt-2 text-[11.5px]" style={{ color: "var(--terracotta-d)" }}>
           scoring did not start: {scoreError}
@@ -625,12 +643,8 @@ function SpendConfirmSheet({
 }) {
   const e = confirmation.estimate;
   const nothingToDo = e.units === 0;
-  // **Which cap is actually zero decides what is true**, and they behave
-  // differently. The daily counter rolls at midnight UTC. The per-cycle
-  // counter does not roll at all — only a new discovery cycle clears it (see
-  // budget.apply_reservation: "even after the UTC day has rolled"). Saying
-  // "it resets tomorrow" when the cycle is what is empty sends the user away
-  // for a day to find the same zero.
+  // Which cap is zero decides the wording; both roll at midnight UTC. The
+  // server answers 429 rather than a zero quote, so this is only a race.
   const dayIsSpent = zeroGrantReason(e.caps) === "day";
 
   return (
@@ -645,8 +659,8 @@ function SpendConfirmSheet({
           {dayIsSpent
             ? "Today's scoring budget is used up — nothing would be" +
               " scored right now. It resets after midnight UTC."
-            : "This run's scoring budget is used up — nothing would be" +
-              " scored right now. Finding new jobs again opens a fresh one."}
+            : "This search's scoring budget is used up — nothing would be" +
+              " scored right now. It resets after midnight UTC."}
         </p>
       ) : (
         <>
