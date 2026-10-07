@@ -23,6 +23,7 @@ import {
   type SessionStats,
 } from "@/lib/session";
 import { pollMs, type ActivityResponse } from "@/lib/activity";
+import { emptyQueueState } from "@/lib/emptyState";
 import type { DecideValue, Decision, Job, ProfileResponse } from "@/lib/types";
 import { barColor, initial, recPill, scoreColor } from "@/lib/ui";
 import { ActivityPanel } from "@/components/activity/ActivityPanel";
@@ -754,12 +755,7 @@ function ChipRow({
   );
 }
 
-/**
- * An empty queue has three causes and only one of them is the threshold.
- * Offering "Lower threshold" to an account with no jobs at all — a new invite,
- * or one whose data was wiped — sends them to a control that cannot help,
- * which is what it did before these counts existed.
- */
+/** The empty queue; which state shows is decided by `emptyQueueState`. */
 function EmptyState({
   minScore,
   pendingTotal,
@@ -771,38 +767,7 @@ function EmptyState({
   scoredTotal: number | null;
   onLower: () => void;
 }) {
-  // Null counts mean an older API that doesn't report them; fall back to the
-  // threshold copy rather than inventing a state we can't actually observe.
-  const nothingDiscovered = pendingTotal === 0;
-  const nothingScoredYet =
-    pendingTotal !== null &&
-    pendingTotal > 0 &&
-    scoredTotal !== null &&
-    scoredTotal === 0;
-
-  const { icon, tone, heading, body, action } = nothingDiscovered
-    ? {
-        icon: "◔",
-        tone: "muted" as const,
-        heading: "No jobs yet",
-        body: "Nothing has been discovered for this account yet. Discovery runs on a schedule, or you can start one from Companies.",
-        action: null,
-      }
-    : nothingScoredYet
-      ? {
-          icon: "◔",
-          tone: "muted" as const,
-          heading: "Scoring in progress",
-          body: `${pendingTotal} job${pendingTotal === 1 ? "" : "s"} discovered and waiting to be scored. They'll appear here as the matcher works through them.`,
-          action: null,
-        }
-      : {
-          icon: "✓",
-          tone: "good" as const,
-          heading: "You're all caught up",
-          body: null,
-          action: "lower" as const,
-        };
+  const { icon, tone, heading, body, action } = emptyQueueState(pendingTotal, scoredTotal);
 
   return (
     <div

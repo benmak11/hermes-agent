@@ -472,16 +472,6 @@ function AutoDiscoveryCard() {
   const patch = (next: Partial<DiscoverySettings>) => save.mutate({ ...s, ...next });
   const sweep = data.state.last_sweep;
   const last = data.state.last_discovery;
-  // The unscored backlog, only from a run that actually reported it.
-  //
-  // **Deliberately not put on the button.** How many are waiting and how many
-  // a click will score are different numbers — the second is min(backlog,
-  // today's grant) and only the server knows it. A button reading "Score 60
-  // found jobs…" above a sheet offering "Score up to 200" is two adjacent
-  // controls disagreeing, and neither figure is the backlog. So the button
-  // makes no claim and this renders as its own line, meaning one thing.
-  const waiting =
-    typeof last?.unscored_backlog === "number" ? last.unscored_backlog : null;
   // Only shown once a run has actually reported a budget — pre-cap runs and
   // operator runs have none, and an invented "0 left" would read as broken.
   const budget =
@@ -584,7 +574,6 @@ function AutoDiscoveryCard() {
         </button>
       </div>
       <p className="mt-1.5 text-[11.5px]" style={{ color: "#a3927f" }}>
-        {waiting !== null && `${waiting.toLocaleString()} found and not yet scored. `}
         Finding is free. Scoring uses AI and costs money — we&apos;ll show you
         what it would cost before anything runs.
       </p>
@@ -592,7 +581,6 @@ function AutoDiscoveryCard() {
       {confirmation && (
         <SpendConfirmSheet
           confirmation={confirmation}
-          waiting={waiting}
           pending={score.isPending}
           onCancel={() => setConfirmation(null)}
           onConfirm={() => score.mutate(confirmation.confirm_token)}
@@ -629,14 +617,11 @@ function AutoDiscoveryCard() {
  */
 function SpendConfirmSheet({
   confirmation,
-  waiting,
   pending,
   onCancel,
   onConfirm,
 }: {
   confirmation: SpendConfirmation;
-  /** The unscored backlog, for relating it to what this click covers. */
-  waiting: number | null;
   pending: boolean;
   onCancel: () => void;
   onConfirm: () => void;
@@ -669,12 +654,9 @@ function SpendConfirmSheet({
             {e.units === 1 ? "" : "s"} for about{" "}
             {usdRange(e.usd_low, e.usd_high)}?
           </p>
-          {waiting !== null && waiting > e.units && (
-            <p className="mt-1.5 text-[11.5px]" style={{ color: "#a3927f" }}>
-              {waiting.toLocaleString()} are waiting; today&apos;s budget
-              covers {e.units.toLocaleString()} of them. The rest keep.
-            </p>
-          )}
+          <p className="mt-1.5 text-[11.5px]" style={{ color: "#a3927f" }}>
+            Anything else we found stays saved, to score another time.
+          </p>
           <p className="mt-1.5 text-[11.5px]" style={{ color: "#a3927f" }}>
             An estimate, not a quote —{" "}
             {rateProvenance(e.rate_source, e.rate_sample, e.rate_usd)}.
