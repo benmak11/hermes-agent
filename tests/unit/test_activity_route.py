@@ -335,8 +335,10 @@ def test_a_batch_claim_older_than_the_ingest_ttl_is_stalled(client):
     assert batch["done"] is None and batch["total"] is None
 
 
-def test_a_failed_batch_run_is_never_liveness_only_committed_money(client):
-    """It was billed and never ingested. That is a number, not an activity."""
+def test_a_failed_batch_run_is_never_liveness_only_unpriced_money(client):
+    """It may have been billed and will never be ingested. That is a number,
+    not an activity — and not ``committed``, which an ingest will still price.
+    """
     cl, _ = client(
         user={"discovery_settings": {"auto_discovery": False}},
         batch={
@@ -358,7 +360,37 @@ def test_a_failed_batch_run_is_never_liveness_only_committed_money(client):
 
     assert batch["state"] not in ("running", "waiting_external", "queued")
     assert batch["done"] is None and batch["total"] is None
-    assert body["committed"] == {"usd_low": 1.5, "usd_high": 3.0, "runs": 1}
+    assert body["committed"] == {"usd_low": 0.0, "usd_high": 0.0, "runs": 0}
+    assert body["unpriced"] == {"usd_low": 1.5, "usd_high": 3.0, "runs": 1}
+
+
+def test_a_failed_leg_vertex_says_processed_nothing_carries_no_money(client):
+    cl, _ = client(
+        user={
+            "discovery_state": {"last_discovery": {"batch_run": "dead"}},
+        },
+        batch={
+            "dead": {
+                "user_id": "u1",
+                "state": "failed",
+                "stage": "parse",
+                "committed": {
+                    "parse": {"requests": 9, "usd_low": 0.4, "usd_high": 0.8}
+                },
+                "vertex_completion": {
+                    "parse": {"successful": 0, "failed": 0, "incomplete": 9}
+                },
+                "error": "JOB_STATE_CANCELLED: cancelled",
+            }
+        },
+    )
+    body = cl.get("/activity").json()
+    batch = _items(body)["batch_scoring"]
+
+    assert batch["state"] == "failed"
+    assert batch["detail"]["committed_usd_low"] == 0.0
+    assert batch["detail"]["committed_usd_high"] == 0.0
+    assert body["unpriced"] == {"usd_low": 0.0, "usd_high": 0.0, "runs": 0}
 
 
 # --------------------------------------------------------------------------
@@ -539,7 +571,7 @@ def test_a_half_populated_progress_pair_is_dropped():
 def test_an_uncountable_backlog_is_never_reported_as_up_to_date(client):
     """``unscored_backlog: null`` means the count failed, not that it is zero.
 
-    Live on ED3UV: the last cycle recorded ``unscored_backlog: null`` (``_backlog``
+    Seen live on one account: the last cycle recorded ``unscored_backlog: null`` (``_backlog``
     returns None rather than a fabricated 0 when the query fails) while 9,219
     pending jobs sat unscored — and an earlier version of this endpoint answered
     ``finished``. "Up to date" over a nine-thousand-job backlog is the same bug
@@ -577,17 +609,17 @@ def test_an_uncountable_backlog_is_never_reported_as_up_to_date(client):
 def test_a_batch_the_last_cycle_started_is_not_never_started(client, state, expected):
     """It is terminal, which is a different claim from never having run.
 
-    Live on ED3UV: ``last_discovery.batch_run`` held a real tag from the day
+    Seen live on one account: ``last_discovery.batch_run`` held a real tag from the day
     before and this endpoint answered ``never_started``.
     """
     cl, _ = client(
         user={
             "discovery_state": {
-                "last_discovery": {"batch_run": "20260926-191119-2de232"},
+                "last_discovery": {"batch_run": "20260101-000000-abc123"},
             }
         },
         batch={
-            "20260926-191119-2de232": {
+            "20260101-000000-abc123": {
                 "user_id": "u1",
                 "state": state,
                 "stage": "score",
@@ -599,7 +631,7 @@ def test_a_batch_the_last_cycle_started_is_not_never_started(client, state, expe
     )
     item = _items(cl.get("/activity").json())["batch_scoring"]
     assert item["state"] == expected
-    assert item["ref"] == {"batch_run": "20260926-191119-2de232"}
+    assert item["ref"] == {"batch_run": "20260101-000000-abc123"}
     # Still not liveness, whichever way it ended.
     assert item["done"] is None and item["total"] is None
 
@@ -760,7 +792,7 @@ def test_allowance_reports_the_grant_the_next_reservation_would_make(
     frozen = {
         "day": "2026-09-26",
         "jobs_scored_today": 200,
-        "cycle_id": "be40d61d",
+        "cycle_id": "cycle-stale",
         "jobs_scored_this_cycle": 200,
         "updated_at": "2026-09-26T19:11:19+00:00",
     }

@@ -109,10 +109,15 @@ BATCH_MIN_PENDING = 50
 # double-submit a Pro batch under a slow-but-alive ingest.
 _CLAIM_TTL_SECONDS = 45 * 60
 
-#: Run states whose committed estimate may still be un-ingested. ``done`` is
-#: excluded: both its legs are banked, so counting the estimate too would
-#: double the same money.
-OUTSTANDING_STATES = ("running", "failed")
+#: Run states whose unbanked committed estimate an ingest will still price.
+#: ``done`` is excluded: both its legs are banked, so counting the estimate too
+#: would double the same money.
+OUTSTANDING_STATES = ("running",)
+
+#: Run states whose unbanked legs no ingest will ever price. Google may still
+#: have billed them, so they are reported apart from outstanding money rather
+#: than dropped — see :func:`unpriced_share`.
+UNPRICED_STATES = ("failed",)
 
 
 def _now() -> datetime:
@@ -692,13 +697,16 @@ async def resume(
         if not run.get("job_name"):
             # start() died between submit and recording the name; the Vertex
             # console finds the orphan by display_name hermes-*-{run_tag}.
-            await run_ref.update(
+            await _fail_run(
+                db,
+                run_ref,
+                run,
+                snap.id,
                 {
-                    "state": "failed",
                     "error": "no job_name recorded — check Vertex console for "
-                    f"display_name hermes-*-{snap.id}",
-                    "updated_at": now.isoformat(),
-                }
+                    f"display_name hermes-*-{snap.id}"
+                },
+                now=now,
             )
             summary["failed"] += 1
             log.error("batch_runs.orphaned", run=snap.id)
@@ -731,13 +739,11 @@ async def resume(
         leg_counts: dict[str, int] | None = None
         try:
             if job.state not in _USABLE_STATES:
-                await run_ref.update(
-                    {
-                        "state": "failed",
-                        "error": f"{job.state}: {job.error}",
-                        "updated_at": now.isoformat(),
-                    }
-                )
+                fields: dict = {"error": f"{job.state}: {job.error}"}
+                completion = _completion(job)
+                if completion is not None:
+                    fields[f"vertex_completion.{leg}"] = completion
+                await _fail_run(db, run_ref, run, snap.id, fields, now=now)
                 summary["failed"] += 1
                 log.error(
                     "batch_runs.vertex_failed",
@@ -848,6 +854,51 @@ async def score_or_start_run(
     }
 
 
+def _completion(job) -> dict | None:
+    """Vertex's request counts for a finished job, or ``None`` if it gave none."""
+    stats = getattr(job, "completion_stats", None)
+    if stats is None:
+        return None
+    return {
+        "successful": stats.successful_count,
+        "failed": stats.failed_count,
+        "incomplete": stats.incomplete_count,
+    }
+
+
+def unpriced_share(run: dict, leg: str) -> float:
+    """The fraction of a failed run's ``leg`` estimate Google may have billed.
+
+    Vertex bills a batch per successful request. When the resume pass recorded
+    the job's completion counts, the share is ``successful / requests`` — so a
+    leg that processed nothing contributes nothing. Without them (an orphaned
+    run, a run failed by hand) the whole estimate stands: unknown is not zero.
+    """
+    completion = (run.get("vertex_completion") or {}).get(leg)
+    requests = ((run.get("committed") or {}).get(leg) or {}).get("requests")
+    if not completion or completion.get("successful") is None or not requests:
+        return 1.0
+    return min(1.0, max(0.0, float(completion["successful"]) / float(requests)))
+
+
+async def _fail_run(
+    db, run_ref, run: dict, run_tag: str, fields: dict, *, now: datetime
+) -> None:
+    """Mark a run ``failed``, closing its origin ledger doc first.
+
+    Close first, mark second, as the ingest flush does: a crash between the two
+    leaves the run ``running`` and the retry closes again, which banks nothing
+    — no call was priced under the origin in this pass. Marking first would
+    leave the ledger doc open for good, since ``resume`` skips failed runs.
+    """
+    origin = run.get("origin_run_id")
+    if origin:
+        await persist_run_cost(
+            db, run["user_id"], origin, batch_run=run_tag, state=FAILED
+        )
+    await run_ref.update({"state": "failed", "updated_at": now.isoformat(), **fields})
+
+
 async def outstanding_committed(db=None, user_id: str | None = None) -> dict:
     """Money committed to Google that our ledger has not yet priced.
 
@@ -859,46 +910,64 @@ async def outstanding_committed(db=None, user_id: str | None = None) -> dict:
     or double-counted actuals.
 
     So committed never touches the ledger doc. It lives on the ``batch_runs``
-    doc under an idempotent ``set``, and "outstanding" is just the legs with no
-    ``cost_banked_at`` entry, so re-running an ingest cannot corrupt it. A
-    failed or orphaned run keeps its committed figure forever, which is the
-    honest record of "Google billed this and we never ingested it".
+    doc under an idempotent ``set``, and a leg counts only while it has no
+    ``cost_banked_at`` entry, so re-running an ingest cannot corrupt it.
+
+    The top-level totals are a ``running`` run's unbanked legs: money an ingest
+    will still price. A ``failed`` run's unbanked legs go under ``unpriced``
+    instead, scaled by :func:`unpriced_share` — possibly billed, never going to
+    reach the ledger, so the figure to reconcile against GCP billing. A leg
+    whose share is zero is left out.
 
     ``llm.cost_usd`` on the run ledger means actual, priced, ingested spend.
-    The two are never summed in code; a UI wanting both shows two lines.
+    None of these are ever summed with it in code.
     """
     db = db or firestore.AsyncClient()
-    total = {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
-    # ``running`` and ``failed`` both: a failed run's batch was still paid
-    # for. ``done`` is excluded because both its legs are banked by
-    # definition, and the per-leg filter below would drop it anyway.
+    total: dict = {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
+    unpriced: dict = {"usd_low": 0.0, "usd_high": 0.0, "runs": 0, "legs": []}
     query = db.collection(COLLECTION).where(
-        filter=FieldFilter("state", "in", list(OUTSTANDING_STATES))
+        filter=FieldFilter("state", "in", [*OUTSTANDING_STATES, *UNPRICED_STATES])
     )
     if user_id:
         query = query.where(filter=FieldFilter("user_id", "==", user_id))
     async for snap in query.stream():
         run = snap.to_dict() or {}
+        failed = run.get("state") not in OUTSTANDING_STATES
+        bucket = unpriced if failed else total
         committed = run.get("committed") or {}
         banked = run.get("cost_banked_at") or {}
         counted = False
         for leg, entry in committed.items():
             if banked.get(leg):
                 continue
-            total["usd_low"] += float(entry.get("usd_low") or 0.0)
-            total["usd_high"] += float(entry.get("usd_high") or 0.0)
-            total["legs"].append(
+            share = unpriced_share(run, leg) if failed else 1.0
+            if share <= 0:
+                continue
+            low = float(entry.get("usd_low") or 0.0) * share
+            high = float(entry.get("usd_high") or 0.0) * share
+            bucket["usd_low"] += low
+            bucket["usd_high"] += high
+            bucket["legs"].append(
                 {
                     "run": snap.id,
                     "user_id": run.get("user_id"),
                     "leg": leg,
                     "state": run.get("state"),
                     **entry,
+                    "usd_low": round(low, 4),
+                    "usd_high": round(high, 4),
+                    **(
+                        {"completion": (run.get("vertex_completion") or {}).get(leg)}
+                        if failed
+                        else {}
+                    ),
                 }
             )
             counted = True
         if counted:
-            total["runs"] += 1
-    total["usd_low"] = round(total["usd_low"], 4)
-    total["usd_high"] = round(total["usd_high"], 4)
+            bucket["runs"] += 1
+    for bucket in (total, unpriced):
+        bucket["usd_low"] = round(bucket["usd_low"], 4)
+        bucket["usd_high"] = round(bucket["usd_high"], 4)
+    total["unpriced"] = unpriced
     return total

@@ -25,8 +25,58 @@ from __future__ import annotations
 
 from google.api_core.exceptions import Aborted
 from google.cloud import firestore
+from google.cloud.firestore_v1._helpers import (
+    DocumentExtractor,
+    DocumentExtractorForMerge,
+    get_field_value,
+)
 
 from tools.discovery import budget
+
+
+def _copy(value):
+    if isinstance(value, dict):
+        return {k: _copy(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_copy(v) for v in value]
+    return value
+
+
+def apply_set(current: dict | None, data: dict, merge=False) -> dict:
+    """The document a Firestore ``set(data, merge=...)`` leaves behind.
+
+    The update mask comes from the client library's own extractor, so the
+    semantics are Firestore's rather than a guess: ``merge=True`` writes every
+    *leaf* (nested maps merge key by key, siblings survive), a list of field
+    paths writes exactly those paths as whole values (a listed map replaces
+    the stored one; unlisted keys in ``data`` are dropped), and
+    ``DELETE_FIELD`` removes its path. Transform sentinels (``Increment``,
+    ``SERVER_TIMESTAMP``) are stored as-is, as these fakes always have.
+    """
+    if not merge:
+        if DocumentExtractor(data).deleted_fields:
+            raise ValueError("DELETE_FIELD in a set without merge")
+        return _copy(data)
+    extractor = DocumentExtractorForMerge(data)
+    extractor.apply_merge(merge)
+    doc = _copy(current or {})
+    for path in extractor.merge:
+        *parents, leaf = path.parts
+        node = doc
+        if path in extractor.deleted_fields:
+            for part in parents:
+                node = node.get(part)
+                if not isinstance(node, dict):
+                    break
+            else:
+                node.pop(leaf, None)
+            continue
+        for part in parents:
+            if not isinstance(node.get(part), dict):
+                node[part] = {}
+            node = node[part]
+        node[leaf] = _copy(get_field_value(data, path))
+    return doc
 
 
 class _FakeSnap:
@@ -54,9 +104,9 @@ class _FakeAsyncDoc:
     def set(self, data, merge=False):
         """Sync on purpose: a transaction's writes land at commit, and the
         fake transaction below is what calls this."""
-        if not merge:
-            self._store.clear()
-        self._store.update(data)
+        doc = apply_set(self._store, data, merge)
+        self._store.clear()
+        self._store.update(doc)
 
 
 class _FakeSyncDoc(_FakeAsyncDoc):
@@ -201,8 +251,13 @@ class _Query:
         return _Query(self._db, self._path, self._docs, **args)
 
     def where(self, *, filter):
-        assert filter.op_string == "==", filter.op_string
-        return self._with(filters=(*self._filters, (filter.field_path, filter.value)))
+        assert filter.op_string in ("==", "in"), filter.op_string
+        return self._with(
+            filters=(
+                *self._filters,
+                (filter.field_path, filter.op_string, filter.value),
+            )
+        )
 
     def order_by(self, field_path, direction=firestore.Query.ASCENDING):
         return self._with(orders=(*self._orders, (field_path, direction)))
@@ -214,17 +269,25 @@ class _Query:
         return self._with(fields=tuple(field_paths))
 
     async def stream(self):
-        filtered = {f for f, _ in self._filters}
+        filtered = {f for f, _, _ in self._filters}
         ordered = {f for f, _ in self._orders}
         if filtered and ordered - filtered:
             raise AssertionError(
                 f"{self._path}: where on {filtered} + order_by on {ordered} "
                 "needs a composite index that does not exist"
             )
-        self._db.queries.append((self._path, self._filters, self._orders, self._limit))
+        # Recorded as ``(field, value)`` for equality, ``(field, op, value)``
+        # otherwise.
+        recorded = tuple(
+            (f, v) if op == "==" else (f, op, v) for f, op, v in self._filters
+        )
+        self._db.queries.append((self._path, recorded, self._orders, self._limit))
         rows = list(self._docs.items())
-        for field_path, value in self._filters:
-            rows = [(i, d) for i, d in rows if d.get(field_path) == value]
+        for field_path, op, value in self._filters:
+            if op == "in":
+                rows = [(i, d) for i, d in rows if d.get(field_path) in value]
+            else:
+                rows = [(i, d) for i, d in rows if d.get(field_path) == value]
         for field_path, direction in reversed(self._orders):
             # Firestore drops documents that lack an ordered field.
             rows = [(i, d) for i, d in rows if field_path in d]
@@ -302,10 +365,7 @@ class _StoreDoc(_QueryDoc):
 
     def _write(self, data, merge):
         docs = self._docs()
-        if merge and self.id in docs:
-            docs[self.id] = {**docs[self.id], **data}
-        else:
-            docs[self.id] = dict(data)
+        docs[self.id] = apply_set(docs.get(self.id), data, merge)
         self._db.writes.append((self._path, dict(data), merge))
 
     async def set(self, data, merge=False):

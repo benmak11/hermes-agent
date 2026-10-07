@@ -170,7 +170,7 @@ FROZEN = {
     "day": "2026-09-26",
     "jobs_scored_today": 200,
     "jobs_scored_this_cycle": 200,
-    "cycle_id": "be40d61d",
+    "cycle_id": "cycle-stale",
     "updated_at": "2026-09-26T19:11:19+00:00",
 }
 LATER = datetime(2026, 10, 6, 15, 0, tzinfo=UTC)
@@ -182,7 +182,7 @@ def test_a_window_from_a_previous_utc_day_grants_the_full_per_cycle_cap():
 
     assert res.granted == 3 and res.capped is False
     # Same window id — an ad-hoc request never opens one — but a fresh count.
-    assert new_state["cycle_id"] == "be40d61d"
+    assert new_state["cycle_id"] == "cycle-stale"
     assert new_state["jobs_scored_this_cycle"] == 3
     assert new_state["day"] == "2026-10-06"
 

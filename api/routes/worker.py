@@ -31,7 +31,7 @@ from api.routes.applications import (
     run_tailoring,
 )
 from api.routes.discovery import run_discovery_cycle, run_sweep_cycle
-from obs.logging import get_logger, run_context
+from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools.applications import state
 from tools.matching import batch_runs
 from tools.matching.score import score_pending_jobs
@@ -134,13 +134,24 @@ async def task_score(body: ScoreTask) -> dict:
             trigger="task",
             started_at=started_at,
         )
+        agent_started = log_agent_start(log, "scoring", user_id=body.user_id)
         try:
             counts = await score_pending_jobs(
                 body.user_id, limit=body.limit, cycle_id=None
             )
             ledger_state = DONE
+            log_agent_end(
+                log,
+                "scoring",
+                agent_started,
+                outcome="completed",
+                scored=counts.get("scored"),
+                discarded=counts.get("discarded"),
+                failed=counts.get("failed"),
+            )
         except Exception:
             ledger_state = FAILED
+            log_agent_end(log, "scoring", agent_started, outcome="failed")
             raise
         finally:
             await persist_run_cost(
@@ -186,14 +197,26 @@ async def task_score_backlog(body: ScoreTask) -> dict:
             trigger="manual",
             started_at=started_at,
         )
+        agent_started = log_agent_start(log, "score_backlog", user_id=body.user_id)
         try:
             counts = await batch_runs.score_or_start_run(body.user_id, cycle_id=None)
             # A backlog that went to a Vertex batch is not done: the worker's
             # resume tick closes this doc when it ingests the results, under
             # this same run_id.
             ledger_state = RUNNING if counts.get("batch_run") else DONE
+            log_agent_end(
+                log,
+                "score_backlog",
+                agent_started,
+                outcome="completed",
+                scored=counts.get("scored"),
+                discarded=counts.get("discarded"),
+                failed=counts.get("failed"),
+                batch_run=counts.get("batch_run"),
+            )
         except Exception:
             ledger_state = FAILED
+            log_agent_end(log, "score_backlog", agent_started, outcome="failed")
             raise
         finally:
             await persist_run_cost(
@@ -237,6 +260,7 @@ async def task_batch_start(body: ScoreTask) -> dict:
             trigger="task",
             started_at=started_at,
         )
+        agent_started = log_agent_start(log, "batch_start", user_id=body.user_id)
         try:
             result = await batch_runs.start(
                 body.user_id, limit=body.limit, cycle_id=None
@@ -244,8 +268,18 @@ async def task_batch_start(body: ScoreTask) -> dict:
             # Submitting a batch is the beginning of the work, not the end:
             # the resume tick that ingests it closes this doc.
             ledger_state = RUNNING if result.get("run") else DONE
+            log_agent_end(
+                log,
+                "batch_start",
+                agent_started,
+                outcome="completed",
+                batch_run=result.get("run"),
+                stage=result.get("stage"),
+                pending=result.get("pending"),
+            )
         except Exception:
             ledger_state = FAILED
+            log_agent_end(log, "batch_start", agent_started, outcome="failed")
             raise
         finally:
             await persist_run_cost(
