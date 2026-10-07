@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { AccountsList, AdminAccounts } from "@/components/admin/AdminAccounts";
-import type { AccountRow, AdminView, Roster } from "@/lib/adminAccounts";
+import {
+  AccountsList,
+  AdminAccounts,
+  SeatDialog,
+  type SeatControls,
+} from "@/components/admin/AdminAccounts";
+import type { AccountRow, AdminView, Roster, SeatPanel } from "@/lib/adminAccounts";
 
 const noop = () => {};
 
@@ -69,6 +74,7 @@ const ROSTER: Roster = {
     total: 3,
     needs_attention: 1,
     seats_active: 1,
+    seat_cap: 25,
     by_status: {
       deleted: 0,
       data_without_login: 0,
@@ -162,7 +168,7 @@ describe("AccountsList", () => {
     const t = text(html);
     expect(t).toMatch(/\|Total\|+3\|/);
     expect(t).toMatch(/\|Needs attention\|+1\|/);
-    expect(t).toMatch(/\|Active seats\|+1\|/);
+    expect(t).toMatch(/\|Seats\|+1 \/ 25\|/);
     for (const k of Object.keys(ROSTER.summary.by_status)) {
       expect(html).toContain(`data-status-count="${k}"`);
     }
@@ -217,5 +223,196 @@ describe("AdminAccounts states", () => {
     expect(html).toContain("Accounts");
     expect(html).toContain("seat enforcement on");
     expect(html).toContain("stray@example.com");
+  });
+});
+
+// ------------------------------------------------------------ seat controls
+
+const SEAT = {
+  revoked: false,
+  added_at: "2026-09-01T09:00:00+00:00",
+  added_by: "op",
+  note: null,
+  revoked_at: null,
+  revoked_by: null,
+};
+
+const ME_ROW: AccountRow = {
+  ...FINE,
+  key: "uid:admin",
+  uid: "admin",
+  email: "admin@example.com",
+  seat: SEAT,
+};
+const SEATED: AccountRow = { ...FINE, key: "uid:u3", uid: "u3", email: "seated@example.com", seat: SEAT };
+const WAITING: AccountRow = {
+  ...NEEDS,
+  key: "uid:u4",
+  uid: "u4",
+  email: "waiting@example.com",
+  status: "waitlisted",
+  issues: [],
+  waitlist: { first_seen: "2026-09-20T12:00:00+00:00", last_seen: null, source: "hero" },
+};
+const LAPSED: AccountRow = {
+  ...FINE,
+  key: "uid:u5",
+  uid: "u5",
+  email: "lapsed@example.com",
+  status: "revoked",
+  seat: { ...SEAT, revoked: true, revoked_at: "2026-09-30T00:00:00+00:00", revoked_by: "op" },
+};
+
+const SEAT_ROSTER: Roster = {
+  ...ROSTER,
+  // NEEDS (no_seat + login): grant. ORPHAN (seat, no login): revoke.
+  // FINE (active, enforcement-off style, no seat doc): neither.
+  accounts: [NEEDS, ORPHAN, FINE, ME_ROW, SEATED, WAITING, LAPSED],
+};
+
+function controls(over: Partial<SeatControls> = {}): SeatControls {
+  return {
+    me: { uid: "admin", email: "admin@example.com" },
+    panel: null,
+    pending: false,
+    error: null,
+    notice: null,
+    onPanel: noop,
+    onSubmit: noop,
+    ...over,
+  };
+}
+
+const seatList = (seats: SeatControls, roster: Roster = SEAT_ROSTER) =>
+  renderToStaticMarkup(
+    <AccountsList roster={roster} filter="all" onFilter={noop} seats={seats} />,
+  );
+
+/** The markup for one row in one layout, from its email to the next row. */
+function rowBlock(html: string, which: "wide" | "narrow", email: string): string {
+  const block = layout(html, which);
+  const start = block.indexOf(email);
+  expect(start, `${which} ${email}`).toBeGreaterThan(-1);
+  const rowTag = which === "wide" ? "<tr" : 'class="rounded-[18px] border px-4 py-4"';
+  const next = block.indexOf(rowTag, start);
+  return next > -1 ? block.slice(start, next) : block.slice(start);
+}
+
+describe("seat actions", () => {
+  it("Grant appears only on logins without an active seat", () => {
+    const html = seatList(controls());
+    for (const which of ["wide", "narrow"] as const) {
+      const grants = layout(html, which).match(/data-seat-action="grant"/g) ?? [];
+      expect(grants.length, which).toBe(3);
+      for (const email of ["stray@example.com", "waiting@example.com", "lapsed@example.com"]) {
+        expect(rowBlock(html, which, email), email).toContain('data-seat-action="grant"');
+      }
+    }
+  });
+
+  it("Revoke appears on active seats but never on the admin's own row", () => {
+    const html = seatList(controls());
+    for (const which of ["wide", "narrow"] as const) {
+      const revokes = layout(html, which).match(/data-seat-action="revoke"/g) ?? [];
+      expect(revokes.length, which).toBe(2);
+      expect(rowBlock(html, which, "seated@example.com")).toContain('data-seat-action="revoke"');
+      expect(rowBlock(html, which, "pending@example.com")).toContain('data-seat-action="revoke"');
+      const mine = rowBlock(html, which, "admin@example.com");
+      expect(mine).not.toContain("data-seat-action");
+      expect(mine).toContain("data-seat-self");
+    }
+  });
+
+  it("no actions at all without seat controls", () => {
+    expect(list()).not.toContain("data-seat-action");
+  });
+
+  it("the success notice renders, with the 5-minute lag from the server", () => {
+    const html = seatList(
+      controls({ notice: "Seat revoked. It takes effect within 5 minutes: the API caches…" }),
+    );
+    expect(html).toMatch(/role="status"[^>]*data-seat-notice[^>]*>Seat revoked\. It takes effect within 5 minutes/);
+  });
+});
+
+describe("seat summary", () => {
+  it("shows Seats N / cap", () => {
+    const t = text(seatList(controls()));
+    expect(t).toMatch(/\|Seats\|+1 \/ 25\|/);
+    expect(t).not.toContain("Seat cap not configured");
+  });
+
+  it("says when the cap is unconfigured", () => {
+    const unset = { ...SEAT_ROSTER, summary: { ...SEAT_ROSTER.summary, seat_cap: null } };
+    const html = seatList(controls(), unset);
+    expect(text(html)).toMatch(/\|Seats\|+1 \/ —\|/);
+    expect(html).toContain("data-cap-unconfigured");
+    expect(html).toContain("Seat cap not configured — set MAX_USERS on the API to grant seats.");
+  });
+});
+
+describe("SeatDialog", () => {
+  const dialog = (panel: SeatPanel, over: Partial<SeatControls> = {}, seatCap: number | null = 25) =>
+    renderToStaticMarkup(
+      <SeatDialog
+        seats={controls({ panel, ...over })}
+        panel={panel}
+        summary={{ ...ROSTER.summary, seat_cap: seatCap }}
+      />,
+    );
+  const submit = (html: string) => {
+    const m = html.match(/<button[^>]*data-seat-submit[^>]*>/);
+    expect(m).not.toBeNull();
+    return m![0];
+  };
+  const revoke = (typed: string) => ({ kind: "revoke" as const, row: SEATED, typed });
+
+  it("keeps Revoke disabled until the typed email matches", () => {
+    for (const typed of ["", "seated@", "seated@example.co", "seated@example.comx", "other@example.com"]) {
+      expect(submit(dialog(revoke(typed))), typed).toMatch(/disabled=""/);
+    }
+    expect(submit(dialog(revoke("seated@example.com")))).not.toMatch(/disabled=""/);
+    expect(submit(dialog(revoke(" Seated@Example.com ")))).not.toMatch(/disabled=""/);
+  });
+
+  it("disables Revoke while a request is in flight, even when matched", () => {
+    expect(submit(dialog(revoke("seated@example.com"), { pending: true }))).toMatch(/disabled=""/);
+  });
+
+  it("the revoke dialog asks for the email and says it takes effect within 5 minutes", () => {
+    const html = dialog(revoke(""));
+    expect(html).toContain('role="dialog"');
+    expect(html).toContain("Type <b");
+    expect(html).toContain("A revoke takes effect within 5 minutes.");
+  });
+
+  it("the grant dialog has a note field and the seat count", () => {
+    const html = dialog({ kind: "grant", row: WAITING, note: "" });
+    expect(html).toContain("Note (optional)");
+    expect(html).toContain("Seats in use: 1 / 25");
+    expect(submit(html)).not.toMatch(/disabled=""/);
+    expect(html).not.toContain("Seat cap not configured");
+  });
+
+  it("the grant dialog warns when the cap is unconfigured", () => {
+    const html = dialog({ kind: "grant", row: WAITING, note: "" }, {}, null);
+    expect(html).toContain("Seats in use: 1 / —");
+    expect(html).toContain("Seat cap not configured — set MAX_USERS on the API to grant seats.");
+  });
+
+  it("renders the server's 409 cap message and other errors", () => {
+    const html = dialog(
+      { kind: "grant", row: WAITING, note: "" },
+      { error: "seat cap reached: all 25 seats are in use. Revoke one or raise MAX_USERS first." },
+    );
+    expect(html).toMatch(/role="alert"[^>]*data-seat-error[^>]*>seat cap reached: all 25 seats/);
+    expect(dialog(revoke("x"), { error: "type the email exactly to confirm the revoke" })).toContain(
+      "type the email exactly to confirm the revoke",
+    );
+  });
+
+  it("the list renders the open dialog", () => {
+    const html = seatList(controls({ panel: revoke("") }));
+    expect(html).toContain('data-seat-dialog="revoke"');
   });
 });

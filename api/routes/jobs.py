@@ -72,6 +72,11 @@ def list_pending_jobs(
     the very decision the sample exists to collect. The record below keeps the
     flag, since it is server-side.
 
+    So while sampling is on, ``min_score`` is not a strict floor. ``sampled``
+    counts the jobs returned *only* because they were sampled (flagged and
+    under ``min_score``), so the slider can say so; it names no job and is
+    omitted at zero, leaving the body unchanged whenever nothing was sampled.
+
     Under ``LOG_EXPOSURES`` (default off) the returned list is also written to
     ``users/{uid}/exposures`` — **one document per response, including every 3s
     poll**, so the collection grows with tab-open time. ``rank`` is 0-based and
@@ -91,6 +96,7 @@ def list_pending_jobs(
     log_exposures = exposures.enabled()
     explored_ids: set[str] = set()
     jobs = []
+    sampled = 0
     pending_total = 0
     scored_total = 0
     for snap in snaps:
@@ -101,8 +107,10 @@ def list_pending_jobs(
             continue
         scored_total += 1
         explored = bool(d.pop("exploration", False))
-        if match.get("overall_score", 0) < min_score and not explored:
-            continue
+        if match.get("overall_score", 0) < min_score:
+            if not explored:
+                continue
+            sampled += 1
         if log_exposures and explored:
             explored_ids.add(snap.id)
         jobs.append({"id": snap.id, **d})
@@ -131,11 +139,14 @@ def list_pending_jobs(
     # so with the tick first every tick failure dropped the exposure — a loss
     # correlated with discovery trouble rather than random.
     background_tasks.add_task(tick_user, user_id)
-    return {
+    body: dict = {
         "jobs": jobs,
         "pending_total": pending_total,
         "scored_total": scored_total,
     }
+    if sampled:
+        body["sampled"] = sampled
+    return body
 
 
 async def run_score_backlog(user_id: str) -> None:

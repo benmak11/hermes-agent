@@ -115,9 +115,11 @@ def exploration_rate() -> float:
     """``EXPLORATION_RATE`` as a fraction in [0, 1]; default ``0`` — off.
 
     Zero is the correct shipped state, unlike ``GEO_GATE_HOLDOUT``: sampling
-    changes what a user is asked to review. Anything unparseable or out of
-    range falls back to zero, so a typo means no sampling rather than every
-    hidden job surfaced.
+    changes what a user is asked to review — above zero the review queue's
+    "Min score" slider is no longer a strict floor, and the control says so
+    from ``GET /jobs/pending``'s ``sampled`` count. Anything unparseable or
+    out of range falls back to zero, so a typo means no sampling rather than
+    every hidden job surfaced.
     """
     raw = os.getenv("EXPLORATION_RATE", "").strip()
     if not raw:

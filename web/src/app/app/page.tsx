@@ -31,12 +31,16 @@ import { CompanyTile, tileHue } from "@/components/warm/CompanyTile";
 import { Pill } from "@/components/warm/Pill";
 import { SERIF } from "@/components/warm/styles";
 
+import { liveSampled, MinScoreControl } from "./MinScoreControl";
+
 type PendingResponse = {
   jobs: Job[];
   /** Pending jobs before any filtering — 0 means nothing has been discovered. */
   pending_total?: number;
   /** Pending jobs that have been scored, at any score. */
   scored_total?: number;
+  /** Jobs returned under `min_score` because they were sampled; absent at 0. */
+  sampled?: number;
 };
 
 /** A decision in its 6s soft-commit window (mock 07): undoable until it lands. */
@@ -283,31 +287,15 @@ export default function VettingPage() {
             </div>
           </div>
 
-          <label
-            className="flex h-[38px] items-center gap-2.5 rounded-[11px] border px-3.5"
-            style={{ background: "var(--surface-warm)", borderColor: "#e8dacb" }}
-          >
-            <span
-              className="whitespace-nowrap text-[12px] font-semibold"
-              style={{ color: "var(--ink-4)" }}
-            >
-              Min score
-            </span>
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={minScore}
-              onChange={(e) => saveMinScore(Number(e.target.value))}
-              className="w-[130px] accent-[var(--terracotta)]"
-            />
-            <span
-              className="w-5 text-right text-[13px] font-bold tabular-nums"
-              style={{ color: "var(--ink)" }}
-            >
-              {minScore}
-            </span>
-          </label>
+          <MinScoreControl
+            minScore={minScore}
+            sampled={liveSampled(
+              data?.sampled,
+              jobs.map((j) => j.match.overall_score),
+              minScore,
+            )}
+            onChange={saveMinScore}
+          />
         </div>
 
         {activity && (

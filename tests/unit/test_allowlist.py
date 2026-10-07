@@ -403,3 +403,25 @@ def test_list_entries_carries_the_key_as_email():
 
 def test_list_entries_of_an_empty_allowlist():
     assert asyncio.run(allowlist.list_entries(_FakeDB())) == []
+
+
+# --------------------------------------------------------------------------
+# seat_cap()
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("raw", "cap"), [("25", 25), (" 7 ", 7), ("1", 1)])
+def test_seat_cap_reads_a_positive_max_users(monkeypatch, raw, cap):
+    monkeypatch.setenv("MAX_USERS", raw)
+    assert allowlist.seat_cap() == cap
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "ten", "2.5", "0", "-1"])
+def test_seat_cap_is_none_for_anything_unusable(monkeypatch, raw):
+    monkeypatch.setenv("MAX_USERS", raw)
+    assert allowlist.seat_cap() is None
+
+
+def test_seat_cap_is_none_when_unset(monkeypatch):
+    monkeypatch.delenv("MAX_USERS", raising=False)
+    assert allowlist.seat_cap() is None

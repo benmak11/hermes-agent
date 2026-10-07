@@ -8,16 +8,38 @@ import { SERIF } from "@/components/warm/styles";
 import {
   type AccountRow,
   type AdminView,
+  CAP_UNCONFIGURED,
   DASH,
   type Filter,
+  type Me,
+  REVOKE_LAG,
   type Roster,
   STATUS_ORDER,
+  type SeatPanel,
+  type Summary,
+  canGrant,
+  canRevoke,
+  confirmMatches,
   filterAccounts,
   fmtWhen,
+  isMe,
   issueLabel,
   orDash,
+  seatsValue,
   statusInfo,
 } from "@/lib/adminAccounts";
+
+/** Everything the page owns for granting and revoking: the open dialog, the
+ *  in-flight mutation's state, and the last success message. */
+export type SeatControls = {
+  me: Me;
+  panel: SeatPanel | null;
+  pending: boolean;
+  error: string | null;
+  notice: string | null;
+  onPanel: (panel: SeatPanel | null) => void;
+  onSubmit: () => void;
+};
 
 const MUTED = { color: "var(--ink-4)" };
 const PANEL = "rounded-[18px] border px-6 py-6 text-[13.5px]";
@@ -32,10 +54,12 @@ export function AdminAccounts({
   view,
   filter,
   onFilter,
+  seats,
 }: {
   view: AdminView;
   filter: Filter;
   onFilter: (f: Filter) => void;
+  seats?: SeatControls;
 }) {
   switch (view.kind) {
     case "loading":
@@ -99,7 +123,12 @@ export function AdminAccounts({
     case "list":
       return (
         <Shell roster={view.roster}>
-          <AccountsList roster={view.roster} filter={filter} onFilter={onFilter} />
+          <AccountsList
+            roster={view.roster}
+            filter={filter}
+            onFilter={onFilter}
+            seats={seats}
+          />
         </Shell>
       );
   }
@@ -130,10 +159,12 @@ export function AccountsList({
   roster,
   filter,
   onFilter,
+  seats,
 }: {
   roster: Roster;
   filter: Filter;
   onFilter: (f: Filter) => void;
+  seats?: SeatControls;
 }) {
   const rows = filterAccounts(roster.accounts, filter);
   const s = roster.summary;
@@ -145,8 +176,28 @@ export function AccountsList({
       <div className="flex flex-wrap gap-2.5" data-summary>
         <Stat label="Total" value={s.total} />
         <Stat label="Needs attention" value={s.needs_attention} strong={s.needs_attention > 0} />
-        <Stat label="Active seats" value={s.seats_active} />
+        <Stat label="Seats" value={seatsValue(s)} />
       </div>
+      {s.seat_cap == null && (
+        <p
+          className="mt-2 text-[12.5px] font-semibold"
+          style={{ color: "var(--brick)" }}
+          data-cap-unconfigured
+        >
+          {CAP_UNCONFIGURED}
+        </p>
+      )}
+      {seats?.notice && (
+        <p
+          role="status"
+          className="mt-3 rounded-[12px] px-3 py-2 text-[12.5px] font-semibold"
+          style={{ color: "var(--sage)", background: "var(--sage-tint)" }}
+          data-seat-notice
+        >
+          {seats.notice}
+        </p>
+      )}
+      {seats?.panel && <SeatDialog seats={seats} panel={seats.panel} summary={s} />}
       <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-[12px]" style={MUTED}>
         {[...STATUS_ORDER, ...extra].map((k) => (
           <span key={k} data-status-count={k}>
@@ -177,15 +228,23 @@ export function AccountsList({
         </div>
       ) : (
         <>
-          <WideTable rows={rows} />
-          <NarrowCards rows={rows} />
+          <WideTable rows={rows} seats={seats} />
+          <NarrowCards rows={rows} seats={seats} />
         </>
       )}
     </>
   );
 }
 
-function Stat({ label, value, strong }: { label: string; value: number; strong?: boolean }) {
+function Stat({
+  label,
+  value,
+  strong,
+}: {
+  label: string;
+  value: number | string;
+  strong?: boolean;
+}) {
   return (
     <div
       className="min-w-[120px] rounded-[14px] border px-4 py-3"
@@ -328,7 +387,7 @@ function onboarded(row: AccountRow): string {
 const TH = "px-3 py-2.5 text-left text-[11px] font-bold uppercase tracking-[0.06em]";
 const TD = "px-3 py-3 align-top";
 
-function WideTable({ rows }: { rows: AccountRow[] }) {
+function WideTable({ rows, seats }: { rows: AccountRow[]; seats?: SeatControls }) {
   return (
     <div
       className="hidden overflow-hidden rounded-[18px] border lg:block"
@@ -364,6 +423,7 @@ function WideTable({ rows }: { rows: AccountRow[] }) {
               </td>
               <td className={TD}>
                 <SeatOrWaitlist row={row} />
+                <SeatActions row={row} seats={seats} />
               </td>
               <td className={`${TD} text-[12px]`} style={{ color: "var(--ink-3)" }}>
                 {fmtWhen(row.auth?.last_sign_in_at)}
@@ -379,7 +439,7 @@ function WideTable({ rows }: { rows: AccountRow[] }) {
   );
 }
 
-function NarrowCards({ rows }: { rows: AccountRow[] }) {
+function NarrowCards({ rows, seats }: { rows: AccountRow[]; seats?: SeatControls }) {
   return (
     <div className="flex flex-col gap-3 lg:hidden" data-layout="narrow">
       {rows.map((row) => (
@@ -402,6 +462,7 @@ function NarrowCards({ rows }: { rows: AccountRow[] }) {
             <dt style={MUTED}>Seat</dt>
             <dd className="min-w-0">
               <SeatOrWaitlist row={row} />
+              <SeatActions row={row} seats={seats} />
             </dd>
             <dt style={MUTED}>Last sign-in</dt>
             <dd style={{ color: "var(--ink-3)" }}>{fmtWhen(row.auth?.last_sign_in_at)}</dd>
@@ -410,6 +471,159 @@ function NarrowCards({ rows }: { rows: AccountRow[] }) {
           </dl>
         </div>
       ))}
+    </div>
+  );
+}
+
+const SMALL_BTN = "mt-2 h-[28px] rounded-[10px] px-3 text-[12px] font-semibold";
+
+/** Grant on a login without an active seat; Revoke on an active seat, except
+ *  the admin's own. Nothing at all without `seats`. */
+function SeatActions({ row, seats }: { row: AccountRow; seats?: SeatControls }) {
+  if (!seats) return null;
+  if (canGrant(row)) {
+    return (
+      <button
+        onClick={() => seats.onPanel({ kind: "grant", row, note: "" })}
+        disabled={seats.pending}
+        className={`wm-cta ${SMALL_BTN}`}
+        data-seat-action="grant"
+      >
+        Grant seat
+      </button>
+    );
+  }
+  if (canRevoke(row, seats.me)) {
+    return (
+      <button
+        onClick={() => seats.onPanel({ kind: "revoke", row, typed: "" })}
+        disabled={seats.pending}
+        className={`wm-danger ${SMALL_BTN}`}
+        data-seat-action="revoke"
+      >
+        Revoke seat
+      </button>
+    );
+  }
+  if (row.seat && !row.seat.revoked && isMe(row, seats.me)) {
+    return (
+      <div className="mt-2 text-[11.5px]" style={MUTED} data-seat-self>
+        Your seat — it can&apos;t be revoked from here.
+      </div>
+    );
+  }
+  return null;
+}
+
+/** The grant form or the typed-confirmation revoke, as a modal. */
+export function SeatDialog({
+  seats,
+  panel,
+  summary,
+}: {
+  seats: SeatControls;
+  panel: SeatPanel;
+  summary: Summary;
+}) {
+  const email = panel.row.email ?? "";
+  const revoke = panel.kind === "revoke";
+  const ready = revoke ? confirmMatches(panel.typed, email) : true;
+  const label = revoke ? "Revoke seat" : "Grant seat";
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center px-4"
+      style={{ background: "rgba(40, 28, 18, 0.35)" }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        data-seat-dialog={panel.kind}
+        className="w-full max-w-[440px] rounded-[18px] border p-5 text-[13px]"
+        style={{ background: "#fdf7ee", borderColor: "var(--border-warm-hair)" }}
+      >
+        <h2 className="text-[16px] font-bold" style={{ color: "var(--ink)" }}>
+          {label}
+        </h2>
+        <p className="mt-1 break-all font-semibold" style={{ color: "var(--ink-2)" }}>
+          {email}
+        </p>
+
+        {revoke ? (
+          <>
+            <p className="mt-3 leading-[1.6]" style={{ color: "var(--ink-2)" }}>
+              Type <b className="break-all">{email}</b> to confirm.
+            </p>
+            <input
+              value={panel.typed}
+              onChange={(e) => seats.onPanel({ ...panel, typed: e.target.value })}
+              placeholder={email}
+              autoComplete="off"
+              aria-label="Type the email to confirm"
+              className="wm-input mt-2 h-[38px] w-full rounded-[12px] px-3 text-[13px] outline-none"
+            />
+            <p className="mt-2 text-[11.5px]" style={MUTED} data-revoke-lag>
+              {REVOKE_LAG} Until then they can keep using the app.
+            </p>
+          </>
+        ) : (
+          <>
+            <label className="mt-3 block text-[11.5px] font-semibold" style={MUTED}>
+              Note (optional)
+              <input
+                value={panel.note}
+                onChange={(e) => seats.onPanel({ ...panel, note: e.target.value })}
+                maxLength={500}
+                autoComplete="off"
+                className="wm-input mt-1 h-[38px] w-full rounded-[12px] px-3 text-[13px] font-normal outline-none"
+              />
+            </label>
+            <p className="mt-2 text-[11.5px]" style={MUTED} data-dialog-seats>
+              Seats in use: {seatsValue(summary)}
+            </p>
+            {summary.seat_cap == null && (
+              <p className="mt-1 text-[11.5px] font-semibold" style={{ color: "var(--brick)" }}>
+                {CAP_UNCONFIGURED}
+              </p>
+            )}
+          </>
+        )}
+
+        {seats.error && (
+          <p
+            role="alert"
+            className="mt-3 break-words text-[12px] font-semibold"
+            style={{ color: "var(--brick)" }}
+            data-seat-error
+          >
+            {seats.error}
+          </p>
+        )}
+
+        <div className="mt-4 flex gap-2">
+          <button
+            onClick={() => seats.onPanel(null)}
+            disabled={seats.pending}
+            className="wm-ghost h-[34px] flex-1 rounded-[12px] border text-[12.5px] font-semibold"
+            style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={seats.onSubmit}
+            disabled={!ready || seats.pending}
+            className={
+              revoke
+                ? "h-[34px] flex-1 rounded-[12px] text-[12.5px] font-semibold disabled:opacity-40"
+                : "wm-cta h-[34px] flex-1 rounded-[12px] text-[12.5px] font-semibold"
+            }
+            style={revoke ? { background: "var(--brick)", color: "#fff9f2" } : undefined}
+            data-seat-submit
+          >
+            {seats.pending ? "Working…" : label}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

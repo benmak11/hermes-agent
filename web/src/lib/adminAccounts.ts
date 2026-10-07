@@ -75,6 +75,8 @@ export type Summary = {
   needs_attention: number;
   seats_active: number;
   by_status: Record<string, number>;
+  /** `MAX_USERS` on the API; `null` when unset or invalid, which refuses grants. */
+  seat_cap: number | null;
 };
 
 export type Roster = {
@@ -188,3 +190,86 @@ export function adminView({
 export function showsAdminNav(view: AdminView): boolean {
   return view.kind !== "loading" && view.kind !== "not_found";
 }
+
+// ---------------------------------------------------------------------------
+// Granting and revoking seats
+// ---------------------------------------------------------------------------
+
+/** The signed-in admin, so their own row never offers Revoke. */
+export type Me = { uid: string; email: string | null };
+
+export type GrantResponse = { granted: boolean; email: string; seat_cap: number };
+export type RevokeResponse = { revoked: boolean; already_revoked: boolean; message: string };
+
+/** Statuses a login can be granted from. */
+const GRANTABLE = new Set(["waitlisted", "no_seat", "revoked"]);
+
+const emailKey = (email: string | null | undefined) => (email ?? "").trim().toLowerCase();
+
+function hasActiveSeat(row: AccountRow): boolean {
+  return !!row.seat && !row.seat.revoked;
+}
+
+export function isMe(row: AccountRow, me: Me): boolean {
+  return (
+    (!!row.uid && row.uid === me.uid) ||
+    (emailKey(row.email) !== "" && emailKey(row.email) === emailKey(me.email))
+  );
+}
+
+/** A Firebase Auth login with an email and no active seat. */
+export function canGrant(row: AccountRow): boolean {
+  return (
+    !!row.auth &&
+    !!row.uid &&
+    emailKey(row.email) !== "" &&
+    !hasActiveSeat(row) &&
+    GRANTABLE.has(row.status)
+  );
+}
+
+/** Any active seat except the admin's own: revoking that would lock them out
+ *  of this page. */
+export function canRevoke(row: AccountRow, me: Me): boolean {
+  return hasActiveSeat(row) && emailKey(row.email) !== "" && !isMe(row, me);
+}
+
+/** Does the typed confirmation match? Case- and whitespace-insensitive and
+ *  never on empty, like the server's check (`_confirms`). */
+export function confirmMatches(typed: string, email: string | null): boolean {
+  const a = typed.trim().toLowerCase();
+  return a !== "" && a === emailKey(email);
+}
+
+export const CAP_UNCONFIGURED =
+  "Seat cap not configured — set MAX_USERS on the API to grant seats.";
+
+export const REVOKE_LAG = "A revoke takes effect within 5 minutes.";
+
+/** The Seats stat: "7 / 25", or "7 / —" when `MAX_USERS` is missing. */
+export function seatsValue(s: Summary): string {
+  return `${s.seats_active} / ${s.seat_cap == null ? DASH : s.seat_cap}`;
+}
+
+/** The server's `detail` for a failed grant or revoke (the 409 cap message,
+ *  the not-configured 503, the confirm mismatch), else the raw error. */
+export function seatError(error: unknown): string {
+  if (error instanceof ApiError) {
+    try {
+      const detail = (JSON.parse(error.body) as { detail?: unknown }).detail;
+      if (typeof detail === "string" && detail) {
+        return error.status === 503 && detail.startsWith("seat cap not configured")
+          ? CAP_UNCONFIGURED
+          : detail;
+      }
+    } catch {
+      // fall through to the raw message
+    }
+    return error.message;
+  }
+  return String(error);
+}
+
+export type SeatPanel =
+  | { kind: "grant"; row: AccountRow; note: string }
+  | { kind: "revoke"; row: AccountRow; typed: string };

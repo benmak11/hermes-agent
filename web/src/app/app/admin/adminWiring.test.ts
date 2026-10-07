@@ -24,4 +24,13 @@ describe("/app/admin data fetching", () => {
     expect(CODE).toContain('{showsAdminNav(view) && <TopNav section="admin" />}');
     expect(CODE).not.toMatch(/notFound\s*\(|forbidden\s*\(/);
   });
+
+  it("grants and revokes through the two seat routes and refetches on success", () => {
+    expect(CODE).toContain('apiFetch<GrantResponse>("/admin/seats", {');
+    expect(CODE).toContain('apiFetch<RevokeResponse>("/admin/seats/revoke", {');
+    expect(CODE).toMatch(/invalidateQueries\(\{\s*queryKey:\s*\["admin",\s*"accounts"\]\s*\}\)/);
+    expect((CODE.match(/onSuccess:\s*\(res\)\s*=>\s*done\(/g) ?? []).length).toBe(2);
+    // The revoke sends what was typed, so the server checks it too.
+    expect(CODE).toContain("confirm: panel.typed");
+  });
 });

@@ -46,6 +46,11 @@ Enforcement is a separate flag from the machinery. :func:`enforced` reads
 ``ALLOWLIST_ENFORCED``, unset by default; the module works and is tested with
 it on, and every caller checks the flag first.
 
+The seat cap is ``MAX_USERS``. :func:`seat_cap` reads it for the admin
+page's grant route (``POST /admin/seats`` on ``hermes-api``); the CLI reads it
+itself and also takes ``--max-users``. On the API an unset or invalid value
+refuses every grant rather than meaning "unlimited".
+
 Turning it on is a manual ``gcloud`` step. Seed and verify the real accounts
 first, then set ``ALLOWLIST_ENFORCED=1`` on ``hermes-worker`` before
 ``hermes-api`` and confirm the worker's ``not_allowlisted`` count is 0 in
@@ -72,6 +77,16 @@ COLLECTION = "allowlist"
 def enforced() -> bool:
     """Off unless explicitly switched on. See the module docstring."""
     return os.getenv("ALLOWLIST_ENFORCED", "").strip().lower() in {"1", "true", "on"}
+
+
+def seat_cap() -> int | None:
+    """``MAX_USERS`` as a positive int, else ``None``. ``None`` (unset, not an
+    integer, or below 1) means grants must be refused — never unlimited."""
+    try:
+        cap = int(os.getenv("MAX_USERS", "").strip())
+    except ValueError:
+        return None
+    return cap if cap >= 1 else None
 
 
 def _key(email: str | None) -> str:
@@ -173,9 +188,9 @@ async def add(
 
     granted = await _add(db.transaction())
     if granted:
-        log.info("allowlist.seat_added", email_key=key, added_by=added_by)
+        log.info("allowlist.seat_added", added_by=added_by)
     else:
-        log.warning("allowlist.seat_cap_reached", email_key=key, max_users=max_users)
+        log.warning("allowlist.seat_cap_reached", max_users=max_users)
     return granted
 
 
@@ -202,7 +217,7 @@ async def revoke(db, email: str, *, revoked_by: str) -> bool:
         },
         merge=True,
     )
-    log.info("allowlist.revoked", email_key=key, revoked_by=revoked_by)
+    log.info("allowlist.revoked", revoked_by=revoked_by)
     return True
 
 
