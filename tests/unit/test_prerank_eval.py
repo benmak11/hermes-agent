@@ -10,6 +10,8 @@ rather than the jobs. The gating AUC must not move when those fields appear.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from firestore_fakes import FakeQueryDB, _Query, _QueryColl, _QueryDoc, _QuerySnap
 
@@ -144,21 +146,55 @@ async def test_job_only_fields_cannot_move_the_gating_auc():
 # ------------------------------------------------------- listings, metrics
 
 
-@pytest.mark.asyncio
-async def test_a_buried_positive_and_a_location_falsification_are_listed(capsys):
+async def _foreign_positive_corpus() -> pe.Corpus:
     jobs, tombs = _corpus([GOOD] * 30, [BAD] * 30)
     jobs["job-buried"] = _job(BAD, 90, location="London, UK")
-    corpus = await _load(_db(jobs, tombs))
+    return await _load(_db(jobs, tombs))
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_positive_is_listed_but_does_not_gate(capsys):
+    corpus = await _foreign_positive_corpus()
 
     assert [r.job_id for r in pe.false_buries(corpus.rows)] == ["job-buried"]
+    assert pe.location_falsifications(corpus.rows) == []
+    assert [r.job_id for r in pe.foreign_positives(corpus.rows)] == ["job-buried"]
+    g = pe.report(corpus, half=None)
+    assert g.verdict == "PASS", g.reasons
+    assert g.falsifications == 0
+    out = capsys.readouterr().out
+    assert "3. Location falsifications: 0" in out
+    assert "does not gate: 1 positive(s) carry the foreign location signal" in out
+    assert "4. False buries (positives below the masked median): 1" in out
+    assert out.count("job-buried") == 2
+
+
+@pytest.mark.asyncio
+async def test_a_negative_location_weight_turns_the_gate_back_on(monkeypatch, capsys):
+    monkeypatch.setattr(pr, "W_LOCATION_FOREIGN", -30.0)
+    corpus = await _foreign_positive_corpus()
+
     assert [r.job_id for r in pe.location_falsifications(corpus.rows)] == ["job-buried"]
     g = pe.report(corpus, half=None)
     assert g.verdict == "FAIL"
     assert "1 location falsification(s)" in g.reasons
+    assert "3. Location falsifications: 1" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_foreign_positives_list_at_most_ten_sorted_by_id(capsys):
+    jobs, tombs = _corpus([GOOD] * 30, [BAD] * 30)
+    for i in reversed(range(12)):
+        jobs[f"f{i:02d}"] = _job(GOOD, 80, location="London, UK")
+    corpus = await _load(_db(jobs, tombs))
+
+    foreign = pe.foreign_positives(corpus.rows)
+    assert [r.job_id for r in foreign] == [f"f{i:02d}" for i in range(12)]
+    pe.report(corpus, half=None)
     out = capsys.readouterr().out
-    assert "3. Location falsifications: 1" in out
-    assert "4. False buries (positives below the masked median): 1" in out
-    assert out.count("job-buried") == 2
+    assert "12 positive(s) carry the foreign location signal" in out
+    listed = re.findall(r"^\s+(f\d\d)  Pro ", out, flags=re.MULTILINE)
+    assert listed == [f"f{i:02d}" for i in range(10)]
 
 
 def test_a_tie_at_the_median_is_not_a_bury():
@@ -194,14 +230,52 @@ async def test_feature_stats_report_fires_and_lift():
     stats = pe.feature_stats(corpus.rows)
     assert stats["title_exact"].fires == pytest.approx(0.25)
     assert stats["title_exact"].lift == pytest.approx(4.0)
-    assert isinstance(stats["location"].lift, pe.Undefined)
+    assert "location" not in stats
+
+
+@pytest.mark.asyncio
+async def test_feature_stats_read_family_masked_and_parsed_unmasked(capsys):
+    """An in-family parse zeroes ``family`` in the full prerank; the table must
+    still see the title family on those rows."""
+    jobs = {
+        f"p{i}": _job(
+            GOOD, 80, jd_parsed={"role_family": "engineering", "summary": "x"}
+        )
+        for i in range(10)
+    }
+    tombs = {f"n{i}": _tomb(BAD) for i in range(10)}
+    corpus = await _load(_db(jobs, tombs))
+    assert all(r.full.features["family"] == 0 for r in corpus.rows if r.positive)
+
+    stats = pe.feature_stats(corpus.rows)
+    assert stats["family"].fires == 1.0
+    assert stats["parsed"].fires == pytest.approx(0.5)
+    assert stats["parsed"].lift == pytest.approx(2.0)
+
+    pe.report(corpus, half=None)
+    out = capsys.readouterr().out
+    assert "2. Per feature, masked" in out
+    assert "parsed        * fires" in out
+    assert "family          fires 100.0%" in out
+
+
+@pytest.mark.asyncio
+async def test_location_signal_is_a_weightless_diagnostic_row(capsys):
+    jobs, tombs = _corpus([GOOD] * 3, [BAD] * 5)
+    jobs["p0"]["location"] = "London, UK"
+    corpus = await _load(_db(jobs, tombs))
+    sig = pe.location_signal_stats(corpus.rows)
+    assert (sig.overall, sig.positives) == (pytest.approx(1 / 8), pytest.approx(1 / 3))
+    pe.report(corpus, half=None)
+    out = capsys.readouterr().out
+    assert "signal only, NO WEIGHT: foreign on 12.5% of rows, 33.3% of positives" in out
 
 
 # ---------------------------------------------------------------- backlog
 
 
 @pytest.mark.asyncio
-async def test_backlog_uses_the_scorers_pending_predicate(monkeypatch):
+async def test_backlog_uses_the_scorers_pending_predicate(monkeypatch, capsys):
     monkeypatch.setattr(
         _QuerySnap, "reference", property(lambda s: s.id), raising=False
     )
@@ -245,7 +319,9 @@ async def test_backlog_uses_the_scorers_pending_predicate(monkeypatch):
     corpus = await _load(db)
     assert sorted(corpus.backlog.job_ids) == sorted(j.id for _, j in pending)
     assert sorted(corpus.backlog.job_ids) == ["pending-1", "pending-2"]
-    assert corpus.backlog.location_fires == 1
+    assert corpus.backlog.foreign_signals == 1
+    pe.report(corpus, half=None)
+    assert "foreign location signal on 1 (no weight)" in capsys.readouterr().out
 
 
 def test_tie_mass_at_the_top():

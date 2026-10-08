@@ -12,9 +12,10 @@ Each term abstains (contributes 0) when its input is absent or malformed, and
 every profile-dependent term abstains when there are no preferences. A masked
 term contributes 0 *and* is left out of ``features``.
 
-The ``location`` term is a soft penalty, never a rejection: the freeform
-location line is exactly what ``tools.matching.geo`` refuses to parse, so it
-may lower a job's rank but must never remove it.
+The ``location`` term carries no weight: the freeform location line is what
+``tools.matching.geo`` refuses to parse, and it penalised jobs the geo gate
+keeps. Its classification is still reported in ``Prerank.signals`` so it can
+be judged later; any future weight may lower a rank, never remove a job.
 
 Bump ``PRERANK_VERSION`` on any change to a weight, a rule or a vocabulary.
 """
@@ -36,7 +37,7 @@ from tools import companies
 from tools.discovery.title_filter import classify_title
 from tools.matching import geo, pipeline
 
-PRERANK_VERSION = 1
+PRERANK_VERSION = 2
 
 W_TITLE_EXACT = 40.0
 W_TITLE_OVERLAP = 25.0
@@ -44,8 +45,8 @@ W_FAMILY_IN = 15.0
 W_FAMILY_OUT = -40.0
 W_SENIORITY_IN = 10.0
 W_SENIORITY_OUT = -20.0
-W_LOCATION_FOREIGN = -30.0
-W_LOCATION_HOME = 5.0
+W_LOCATION_FOREIGN = 0.0
+W_LOCATION_HOME = 0.0
 W_CURATED = 5.0
 W_PARSED_IN = 15.0
 W_PARSED_REJECT = -100.0
@@ -64,10 +65,15 @@ FEATURES = (
 @dataclass(frozen=True)
 class Prerank:
     """One job's prerank: the total, each unmasked term's contribution, and
-    the rule version that produced them."""
+    the rule version that produced them.
+
+    ``signals`` holds classifications that are observed but never summed,
+    whatever the mask: ``{"location": "foreign" | "home" | "none"}``.
+    """
 
     score: float
     features: dict[str, float] = field(default_factory=dict)
+    signals: dict[str, str] = field(default_factory=dict)
     version: int = PRERANK_VERSION
 
 
@@ -123,6 +129,15 @@ _SENIORITY_TOKENS: dict[str, frozenset[str]] = {
     "head": frozenset({"vp", "director"}),
 }
 
+# A "manager" right after one of these names a role, not a management level.
+_ROLE_MANAGER_PREFIXES = frozenset({"program", "product", "project"})
+
+# Ordered ladders: a title level one step from a target level is neutral.
+_LADDERS = (
+    ("intern", "junior", "mid", "senior", "staff", "principal"),
+    ("manager", "senior-manager", "director", "vp"),
+)
+
 # IC level words dropped from a target title's "core". Management words stay:
 # in "Engineering Manager" the noun is the role, not a qualifier.
 _LEVEL_WORDS = frozenset(
@@ -175,10 +190,13 @@ def _family(title: str, prefs: JobPreferences) -> float:
 
 def title_levels(title: str) -> frozenset[str]:
     """Every ``target_seniorities`` level a title's seniority words could mean.
-    Empty when the title carries none."""
+    Empty when the title carries none. "Program/product/project manager" adds
+    no ``manager`` level."""
     words = _tokens(title)
     levels: set[str] = set()
-    for word in words:
+    for i, word in enumerate(words):
+        if word == "manager" and i and words[i - 1] in _ROLE_MANAGER_PREFIXES:
+            continue
         levels |= _SENIORITY_TOKENS.get(word, frozenset())
     if "vice" in words and "president" in words:
         levels.add("vp")
@@ -191,12 +209,25 @@ def _norm_level(level: str) -> str:
     return "-".join(_tokens(level.replace("_", " ")))
 
 
+def _adjacent(levels: frozenset[str], targets: set[str]) -> bool:
+    """Whether any level is exactly one step from any target on one ladder.
+    Targets on no ladder never match."""
+    for ladder in _LADDERS:
+        here = {ladder.index(level) for level in levels if level in ladder}
+        wanted = {ladder.index(t) for t in targets if t in ladder}
+        if any(abs(a - b) == 1 for a in here for b in wanted):
+            return True
+    return False
+
+
 def _seniority(title: str, prefs: JobPreferences) -> float:
     targets = {_norm_level(s) for s in prefs.target_seniorities if s.strip()}
     levels = title_levels(title)
     if not targets or not levels:
         return 0.0
-    return W_SENIORITY_IN if levels & targets else W_SENIORITY_OUT
+    if levels & targets:
+        return W_SENIORITY_IN
+    return 0.0 if _adjacent(levels, targets) else W_SENIORITY_OUT
 
 
 # ----------------------------------------------------------------- location
@@ -218,11 +249,23 @@ def location_countries(location: str) -> frozenset[str]:
     return frozenset(found)
 
 
-def _location(location: str, residence: str) -> float:
+def location_signal(location, residence: str | None) -> str:
+    """``"home"`` when the line names the residence country, ``"foreign"``
+    when it names only other countries and not "remote", else ``"none"``."""
+    if not isinstance(location, str) or not residence:
+        return "none"
     countries = location_countries(location)
     if residence in countries:
-        return W_LOCATION_HOME
+        return "home"
     if countries and "remote" not in location.casefold():
+        return "foreign"
+    return "none"
+
+
+def _location(signal: str) -> float:
+    if signal == "home":
+        return W_LOCATION_HOME
+    if signal == "foreign":
         return W_LOCATION_FOREIGN
     return 0.0
 
@@ -290,7 +333,7 @@ def prerank(
     """Score one job from its fields. Never raises on a malformed field.
 
     ``residence`` is a country code (:func:`residence_country`). ``mask`` names
-    terms to leave out. When ``jd_parsed`` is present and the prefilter keeps
+    terms to leave out; it never hides ``signals``. When ``jd_parsed`` is present and the prefilter keeps
     the job, ``parsed`` replaces ``family`` (which then contributes 0).
     ``enforce_geo`` is passed to ``pipeline.prefilter`` as ``enforce``.
     """
@@ -311,13 +354,8 @@ def prerank(
         for name in ("title_exact", "title_overlap", "family", "seniority"):
             put(name, 0.0)
 
-    location = job.get("location")
-    put(
-        "location",
-        _location(location, residence)
-        if isinstance(location, str) and residence
-        else 0.0,
-    )
+    signals = {"location": location_signal(job.get("location"), residence)}
+    put("location", _location(signals["location"]))
 
     company = job.get("company")
     put(
@@ -343,7 +381,7 @@ def prerank(
         if value == W_PARSED_IN and "family" in features:
             features["family"] = 0.0
 
-    return Prerank(score=sum(features.values()), features=features)
+    return Prerank(score=sum(features.values()), features=features, signals=signals)
 
 
 def _timestamp(value) -> float | None:
