@@ -52,7 +52,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from models.job import Job
 from obs.llm_cost import reset_run_cost
 from obs.logging import current_run_id, get_logger
-from tools.matching import budget, jd_cache, rates
+from tools.matching import budget, jd_cache, rates, selection
 from tools.matching.batch import (
     _DONE_STATES,
     _PERSIST_CONCURRENCY,
@@ -212,7 +212,9 @@ async def start(
     cancelling the caller does not cancel them. Free work happens inline
     (jd_cache hits, and the family filter and Pro submission when nothing needs
     Flash). Returns ``{"started": False, "pending": n}`` when ``min_pending``
-    says the backlog is too small to bother.
+    says the backlog is too small to bother; with ``PRERANK_MODE`` not ``off``
+    a grant already below ``min_pending`` returns that before loading, with
+    ``pending`` 0.
 
     Budgeted like the online scorer: the reservation is taken before anything
     is loaded and caps how much backlog one run may submit; ``cycle_id``
@@ -235,6 +237,19 @@ async def start(
 
     attempted = 0
     try:
+        if (
+            min_pending is not None
+            and limit < min_pending
+            and selection.prerank_mode() != selection.OFF
+        ):
+            # The grant alone already decides it, so skip the load: under
+            # selection it would stream the whole pool and log a pick that
+            # the online scorer is about to make again.
+            return {
+                "started": False,
+                "pending": 0,
+                **budget.summary(reservation, drawn=0),
+            }
         profile, pending = await load_profile_and_pending(db, user_id, limit)
         if min_pending is not None and len(pending) < min_pending:
             # Nothing was submitted, so nothing is owed. ``drawn=0``, not
