@@ -64,7 +64,18 @@ def _esc(text: str) -> str:
         ('"https://jobs.ashbyhq.com/acme"', [("ashby", "acme")]),
         ("https://jobs.lever.co/InitechCo", [("lever", "InitechCo")]),
         ("https://jobs.ashbyhq.com/cal.co", [("ashby", "cal.co")]),
-        ("https://apply.workable.com/umbrella/", []),
+        ("https://apply.workable.com/umbrella/", [("workable", "umbrella")]),
+        ("https://apply.workable.com/umbrella", [("workable", "umbrella")]),
+        (
+            "https://apply.workable.com/umbrella/j/1A2B3C4D5E/",
+            [("workable", "umbrella")],
+        ),
+        ("https://apply.workable.com/Umbrella-Co/", [("workable", "Umbrella-Co")]),
+        # A single job's short link names no account: ``j`` is never a slug.
+        ("https://apply.workable.com/j/1A2B3C4D5E", []),
+        ("https://apply.workable.com/j", []),
+        ("https://apply.workable.com/J/1A2B3C4D5E", []),
+        ("https://apply.workable.com/api/v1/widget/accounts/umbrella", []),
         ("https://ats.rippling.com/hooli/jobs", []),
         ("https://boards.greenhouse.io/jobs", []),
         ("", []),
@@ -154,6 +165,7 @@ THREADS = {
             _post(4, "Known Co | https://jobs.lever.co/known-co"),
             _post(5, "Dead Co | https://jobs.ashbyhq.com/deadco"),
             _post(6, "Umbrella | https://apply.workable.com/umbrella"),
+            _post(9, "Wayne | apply at https://apply.workable.com/j/9Z8Y7X6W5V"),
         ],
     ),
     "91": _thread(91, [_post(7, "Initech | https://jobs.lever.co/Initech")]),
@@ -223,11 +235,12 @@ def test_months_out_of_range_is_refused() -> None:
 def test_only_top_level_posts_are_read_and_counted_per_slug() -> None:
     result = _harvest(1)
 
-    assert result.posts == 6
+    assert result.posts == 7
     assert result.slugs == {
         "greenhouse": {"globex": 1},
         "lever": {"known-co": 1},
         "ashby": {"acme": 2, "deadco": 1},
+        "workable": {"umbrella": 1},
     }
     assert "replyco" not in result.slugs["lever"]
 
@@ -265,6 +278,7 @@ ANSWERS = {
     ("ashby", "deadco"): BoardProbe("not_found", 404, None, None),
     ("greenhouse", "globex"): BoardProbe("ok", 200, 0, "Globex"),
     ("lever", "Initech"): BoardProbe("ok", 200, 2, None),
+    ("workable", "umbrella"): BoardProbe("ok", 200, 3, "Umbrella Corp"),
 }
 
 
@@ -307,12 +321,13 @@ def test_dry_run_writes_nothing_and_prints_outcomes(env, capsys) -> None:
     assert _snapshot(d) == before
     out = capsys.readouterr().out
     assert "thread 101: Ask HN: Who is hiring? (October 2026)" in out
-    assert "6 top-level posts scanned" in out
+    assert "7 top-level posts scanned" in out
     assert "already in pool (1): known-co" in out
     assert "+ acme: Acme [2 posts]" in out
     assert "✗ deadco: not_found" in out
     assert "✗ globex: empty" in out
-    assert "1 boards to add, 2 rejected." in out
+    assert "+ umbrella: Umbrella Corp [1 posts]" in out
+    assert "2 boards to add, 2 rejected." in out
     assert "Dry run" in out
 
 
@@ -324,8 +339,11 @@ def test_write_appends_only_vetted_boards_with_names(env, capsys) -> None:
     raw = yaml.safe_load((d / "unvetted.yaml").read_text())
     assert [(e["slug"], e.get("name")) for e in raw["ashby"]] == [("acme", "Acme")]
     assert [(e["slug"], e.get("name")) for e in raw["lever"]] == [("Initech", None)]
+    assert [(e["slug"], e.get("name")) for e in raw["workable"]] == [
+        ("umbrella", "Umbrella Corp")
+    ]
     assert "greenhouse" not in raw
-    assert "Wrote 2 boards to unvetted.yaml." in capsys.readouterr().out
+    assert "Wrote 3 boards to unvetted.yaml." in capsys.readouterr().out
 
 
 def test_slugs_already_in_pool_are_not_probed(env) -> None:
@@ -338,6 +356,7 @@ def test_slugs_already_in_pool_are_not_probed(env) -> None:
         ("ashby", "acme"),
         ("ashby", "deadco"),
         ("greenhouse", "globex"),
+        ("workable", "umbrella"),
     ]
 
 

@@ -49,10 +49,37 @@ def _profile() -> MasterProfile:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["lever", "ashby"])
+@pytest.mark.parametrize("source", ["lever", "ashby", "workable"])
 async def test_router_unsupported_source_fails_gracefully(source: str) -> None:
     res = await submit_application(
         _job(source), _profile(), Path("/tmp/x.docx"), dry_run=True
     )
     assert res["success"] is False
     assert source in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_only_greenhouse_reaches_the_auto_submitter(monkeypatch) -> None:
+    """Workable is manual-apply, like Lever and Ashby: the browser submitter is
+    never driven at it. The spy keeps a misroute from launching Playwright."""
+    import tools.submitters.router as router
+
+    called: list[str] = []
+
+    async def spy(job, *args, **kwargs):
+        called.append(job.source)
+        return {"success": True}
+
+    monkeypatch.setattr(router, "submit_greenhouse", spy)
+
+    workable = await submit_application(
+        _job("workable"), _profile(), Path("/tmp/x.docx"), dry_run=True
+    )
+    assert workable["success"] is False
+    assert "Apply manually" in workable["error"]
+    assert called == []
+
+    await submit_application(
+        _job("greenhouse"), _profile(), Path("/tmp/x.docx"), dry_run=True
+    )
+    assert called == ["greenhouse"]

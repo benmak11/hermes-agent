@@ -22,22 +22,32 @@ from typing import Any
 import httpx
 
 from obs.logging import get_logger
-from tools.ats import ashby, greenhouse, lever
+from tools.ats import ashby, greenhouse, lever, workable
 from tools.ats._http import ERROR, OK, capture_outcome, fetch_board_json
 from tools.ats._http import _get_with_retry as get_with_retry
 
 log = get_logger("tools.ats.probe")
 
-PROBED_PLATFORMS = ("greenhouse", "lever", "ashby")
+PROBED_PLATFORMS = ("greenhouse", "lever", "ashby", "workable")
 
 #: The hosted board pages whose ``<title>`` carries the company name. Lever's
-#: and Ashby's posting APIs have no name field.
+#: and Ashby's posting APIs have no name field; Workable's jobs response does.
 LEVER_PAGE = "https://jobs.lever.co"
 ASHBY_PAGE = "https://jobs.ashbyhq.com"
 
 #: Titles that name the platform or the page, not the company.
 _GENERIC_NAMES = frozenset(
-    {"", "jobs", "careers", "job board", "lever", "ashby", "greenhouse", "error"}
+    {
+        "",
+        "jobs",
+        "careers",
+        "job board",
+        "lever",
+        "ashby",
+        "greenhouse",
+        "workable",
+        "error",
+    }
 )
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.IGNORECASE | re.DOTALL)
@@ -67,6 +77,11 @@ def parse_greenhouse_name(data: Any) -> str | None:
     return _clean_name(data.get("name")) if isinstance(data, dict) else None
 
 
+def parse_workable_name(data: Any) -> str | None:
+    """The ``name`` field of Workable's widget JSON, the same body as its jobs."""
+    return _clean_name(data.get("name")) if isinstance(data, dict) else None
+
+
 def parse_page_title(page: str) -> str | None:
     """The page's ``<title>``, cleaned; ``None`` when absent or generic."""
     match = _TITLE_RE.search(page)
@@ -93,6 +108,9 @@ def _jobs_url(platform: str, slug: str) -> str:
         return f"{greenhouse.BASE}/{slug}/jobs"
     if platform == "lever":
         return f"{lever.BASE}/{slug}?mode=json"
+    if platform == "workable":
+        # No ``details=true``: the count and the name need no descriptions.
+        return f"{workable.BASE}/{slug}"
     return f"{ashby.BASE}/{slug}?includeCompensation=true"
 
 
@@ -130,9 +148,10 @@ async def _fetch_name(platform: str, slug: str) -> str | None:
 async def probe_board(platform: str, slug: str) -> BoardProbe:
     """Fetch a board's jobs and, if it answered, its company name.
 
-    Never raises on an HTTP problem; that comes back as the outcome. A body
-    that is not JSON is ``error``. Raises ``ValueError`` for a platform other
-    than greenhouse, lever or ashby.
+    Workable's name comes from the jobs response itself, so it costs one GET
+    where the others cost two. Never raises on an HTTP problem; that comes
+    back as the outcome. A body that is not JSON is ``error``. Raises
+    ``ValueError`` for a platform not in :data:`PROBED_PLATFORMS`.
     """
     if platform not in PROBED_PLATFORMS:
         raise ValueError(f"cannot probe a {platform!r} board")
@@ -144,9 +163,9 @@ async def probe_board(platform: str, slug: str) -> BoardProbe:
     outcome = seen.outcome or ERROR
     if outcome != OK:
         return BoardProbe(outcome, seen.status, None, None)
-    return BoardProbe(
-        outcome,
-        seen.status,
-        _count_jobs(platform, data),
-        await _fetch_name(platform, slug),
+    name = (
+        parse_workable_name(data)
+        if platform == "workable"
+        else await _fetch_name(platform, slug)
     )
+    return BoardProbe(outcome, seen.status, _count_jobs(platform, data), name)

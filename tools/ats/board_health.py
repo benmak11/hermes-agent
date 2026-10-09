@@ -46,7 +46,7 @@ COLLECTION = "board_health"
 
 #: Board platforms. ``google_jobs`` / ``meta_jobs`` slugs are search queries,
 #: not boards, so they get no record.
-TRACKED_PLATFORMS = frozenset({"greenhouse", "lever", "ashby"})
+TRACKED_PLATFORMS = frozenset({"greenhouse", "lever", "ashby", "workable"})
 
 STATE_OK = "ok"
 STATE_FAILING = "failing"

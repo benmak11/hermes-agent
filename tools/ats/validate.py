@@ -7,7 +7,8 @@ posting still exists so the pipeline can dismiss it instead of tailoring a
 resume for — or driving a browser at — a tombstone page.
 
 The contract is **fail open**: only a definitive "gone" answer (404/410, or a
-verified absence from a successfully fetched Ashby board) returns ``removed``.
+verified absence from a successfully fetched Ashby or Workable board) returns
+``removed``.
 Timeouts, 5xx, rate limits, and malformed responses return ``unknown``, which
 callers must treat as live — a flaky board must never mass-dismiss the
 pipeline; the submitter itself will fail visibly if the page really is gone.
@@ -27,6 +28,7 @@ from tools.ats.google_jobs import HEADERS as GOOGLE_HEADERS
 from tools.ats.google_jobs import extract_ds
 from tools.ats.greenhouse import BASE as GREENHOUSE_BASE
 from tools.ats.lever import BASE as LEVER_BASE
+from tools.ats.workable import BASE as WORKABLE_BASE
 
 log = get_logger("tools.ats")
 
@@ -41,8 +43,8 @@ async def check_posting(
 ) -> Liveness:
     """Ask the job's ATS whether the posting is still up.
 
-    Greenhouse and Lever expose per-posting endpoints; Ashby only lists the
-    whole board, so we refetch it and look for the posting's id. Google
+    Greenhouse and Lever expose per-posting endpoints; Ashby and Workable only
+    list the whole board, so we refetch it and look for the posting's id. Google
     Careers always answers 200, so its detail page's embedded data blob is
     inspected instead. Anything else — including meta_jobs, whose dead
     postings redirect to a real 404 — falls back to probing ``job.url``.
@@ -57,7 +59,11 @@ async def check_posting(
         elif job.source == "lever":
             url = f"{LEVER_BASE}/{job.company}/{job.source_id}"
         elif job.source == "ashby":
-            return await _check_ashby_board(client, job)
+            return await _check_board(client, job, f"{ASHBY_BASE}/{job.company}", "id")
+        elif job.source == "workable":
+            return await _check_board(
+                client, job, f"{WORKABLE_BASE}/{job.company}", "shortcode"
+            )
         elif job.source == "google_jobs":
             return await _check_google_detail(client, job)
         else:
@@ -77,14 +83,16 @@ async def _probe(client: httpx.AsyncClient, job: Job, url: str) -> Liveness:
     return _log_result(job, "unknown", status=response.status_code)
 
 
-async def _check_ashby_board(client: httpx.AsyncClient, job: Job) -> Liveness:
-    """Ashby has no per-posting endpoint — check the board listing instead.
+async def _check_board(
+    client: httpx.AsyncClient, job: Job, url: str, id_key: str
+) -> Liveness:
+    """No per-posting endpoint — look for the posting's ``id_key`` in the board.
 
     A 404 board (org gone) counts as removed; any fetch/parse failure is
     ``unknown`` per the fail-open contract.
     """
     try:
-        response = await client.get(f"{ASHBY_BASE}/{job.company}")
+        response = await client.get(url)
     except httpx.HTTPError as e:
         return _log_result(job, "unknown", error=f"{type(e).__name__}: {e}")
     if response.status_code in _GONE:
@@ -92,7 +100,7 @@ async def _check_ashby_board(client: httpx.AsyncClient, job: Job) -> Liveness:
     if not response.is_success:
         return _log_result(job, "unknown", status=response.status_code)
     try:
-        listed = {str(raw.get("id")) for raw in response.json().get("jobs", [])}
+        listed = {str(raw.get(id_key)) for raw in response.json().get("jobs", [])}
     except (ValueError, AttributeError):
         return _log_result(job, "unknown", error="unparseable board response")
     if job.source_id in listed:

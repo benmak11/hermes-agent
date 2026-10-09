@@ -78,7 +78,7 @@ async def test_gone_status_means_removed(source: str, status: int) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "source", ["greenhouse", "lever", "ashby", "manual", "meta_jobs"]
+    "source", ["greenhouse", "lever", "ashby", "workable", "manual", "meta_jobs"]
 )
 @pytest.mark.parametrize("status", [429, 500, 503])
 async def test_server_errors_fail_open(source: str, status: int) -> None:
@@ -87,7 +87,7 @@ async def test_server_errors_fail_open(source: str, status: int) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["greenhouse", "ashby"])
+@pytest.mark.parametrize("source", ["greenhouse", "ashby", "workable"])
 async def test_transport_errors_fail_open(source: str) -> None:
     res = await check_posting(_job(source), transport=_timeout_transport())
     assert res == "unknown"
@@ -120,3 +120,28 @@ async def test_ashby_unparseable_board_fails_open() -> None:
 
     res = await check_posting(_job("ashby"), transport=httpx.MockTransport(handler))
     assert res == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_workable_posting_still_on_board() -> None:
+    """Workable lists the board, keyed by ``shortcode``; rows have no ``id``."""
+    seen: list[str] = []
+    board = {"name": "Acme Inc", "jobs": [{"shortcode": "1"}, {"shortcode": "2"}]}
+    res = await check_posting(
+        _job("workable"), transport=_transport(200, board, seen=seen)
+    )
+    assert res == "live"
+    assert seen == ["https://apply.workable.com/api/v1/widget/accounts/acme"]
+
+
+@pytest.mark.asyncio
+async def test_workable_posting_absent_from_board() -> None:
+    board = {"name": "Acme Inc", "jobs": [{"shortcode": "2"}]}
+    res = await check_posting(_job("workable"), transport=_transport(200, board))
+    assert res == "removed"
+
+
+@pytest.mark.asyncio
+async def test_workable_account_gone_means_removed() -> None:
+    res = await check_posting(_job("workable"), transport=_transport(404))
+    assert res == "removed"

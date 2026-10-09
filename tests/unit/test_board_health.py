@@ -160,6 +160,44 @@ def test_the_complete_line_carries_the_counts(monkeypatch):
     ]
 
 
+_WORKABLE_BOARD = {
+    "name": "Umbrella Corp",
+    "jobs": [
+        {
+            "shortcode": "1A2B3C4D5E",
+            "title": "Engineer",
+            "url": "https://apply.workable.com/j/1A2B3C4D5E",
+            "city": "",
+            "state": "",
+            "country": "United States",
+            "telecommuting": True,
+            "description": "<p>Build things</p>",
+        }
+    ],
+}
+
+
+def test_workable_boards_are_fetched_and_tracked(monkeypatch):
+    """Discovery fans out to a Workable board through the real fetcher, and
+    both a live and a missing Workable board get a health record."""
+    summary, db = _discover(
+        monkeypatch,
+        [("workable", "umbrella"), ("workable", "gone")],
+        {"umbrella": _WORKABLE_BOARD, "gone": 404},
+    )
+    (job,) = summary["jobs"]
+    assert (job.source, job.company, job.source_id) == (
+        "workable",
+        "umbrella",
+        "1A2B3C4D5E",
+    )
+    assert summary["jobs_by_platform"] == {"workable": 1}
+    assert summary["board_outcomes"] == {"ok": 1, "not_found": 1}
+    health = _health(db)
+    assert health["workable:umbrella"]["state"] == "ok"
+    assert health["workable:gone"]["last_outcome"] == "not_found"
+
+
 def test_each_concurrent_board_gets_its_own_outcome(monkeypatch):
     """The slot is opened inside the per-board task; one opened before the
     gather would be shared, and every board would report the last answer."""
