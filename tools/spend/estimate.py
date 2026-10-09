@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
+from tools.account import plan
 from tools.matching import batch_runs, budget, rates
 
 #: "run discovery now, and score what it finds" — the manual button.
@@ -133,27 +134,29 @@ async def build(db, user_id: str, action: str) -> Estimate:
 
     Neither read touches ``jobs`` — see rule 1 in the module docstring.
     """
-    state = await budget_state(db, user_id)
+    state, limits = await budget_state(db, user_id)
     rate = await rates.observed_rate(db, user_id)
-    remaining_cycle, remaining_day = available(state, action=action)
+    remaining_cycle, remaining_day = available(state, action=action, limits=limits)
     return quote(
         action,
         remaining_cycle=remaining_cycle,
         remaining_day=remaining_day,
         rate=rate,
+        limits=limits,
     )
 
 
-async def budget_state(db, user_id: str) -> dict:
-    """The user's ``scoring_budget`` map, or ``{}`` — never an exception.
+async def budget_state(db, user_id: str) -> tuple[dict, budget.Limits]:
+    """The user's ``scoring_budget`` map and their plan's caps, from one read.
 
-    A quote that cannot be produced must not become a click that spends
-    without one, so a failure here degrades to "full grant, fallback rate":
-    the largest honest quote, which is the safe direction for a number whose
-    job is to make someone hesitate.
+    Never raises. A quote that cannot be produced must not become a click that
+    spends without one, so a failure degrades to "full grant on the paid caps,
+    fallback rate": the largest honest quote, which is the safe direction for a
+    number whose job is to make someone hesitate.
     """
     try:
         snap = await db.collection("users").document(user_id).get()
-        return (snap.to_dict() or {}).get(budget.FIELD) or {}
+        doc = snap.to_dict() or {}
     except Exception:
-        return {}
+        return {}, budget.Limits.from_env(plan.PAID)
+    return doc.get(budget.FIELD) or {}, budget.Limits.for_doc(doc)

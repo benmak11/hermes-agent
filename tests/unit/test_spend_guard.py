@@ -156,6 +156,9 @@ def app_client(monkeypatch):
     # the counter really carries across requests — a fresh store per call is
     # exactly the unlimited stub this comment would otherwise be denying.
     allowance = _AllowanceDB()
+    # Paid: the consent seam is the paid plan's. A trial's run scores within
+    # its daily cap with no consent (test_trial_plan).
+    allowance.store["plan"] = {"tier": "paid"}
     monkeypatch.setattr(discovery, "_async_client", lambda: allowance)
     app = FastAPI()
     app.include_router(discovery.router)
@@ -215,7 +218,9 @@ def run_now(monkeypatch):
 
     monkeypatch.setattr(discovery, "dispatch_cycle", fake_dispatch_cycle)
     # One instance, so a test can spend the week and the next request sees it.
+    # Paid, because the seam is the paid plan's (a trial never meets it).
     allowance = _AllowanceDB()
+    allowance.store["plan"] = {"tier": "paid"}
     monkeypatch.setattr(discovery, "_async_client", lambda: allowance)
     monkeypatch.setenv("QUEUE_MODE", "1")
 

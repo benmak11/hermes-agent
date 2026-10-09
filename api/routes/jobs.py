@@ -215,9 +215,8 @@ async def refuse_scoring_at_cap(user_id: str = Depends(verify_user)) -> None:
     failed read falls through to the 402 rather than refusing.
     """
     # Through the module, so it is the same client the seam's quote reads.
-    state = await spend_estimate.budget_state(api_deps.spend_client(), user_id)
+    state, limits = await spend_estimate.budget_state(api_deps.spend_client(), user_id)
     now = datetime.now(UTC)
-    limits = matching_budget.Limits.from_env()
     remaining_cycle, remaining_day = spend_estimate.available(
         state, action=spend.SCORE_BACKLOG, now=now, limits=limits
     )

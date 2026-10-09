@@ -36,21 +36,23 @@ State lives in one map on the user doc, ``users/{uid}.scoring_budget``::
     jobs_scored_this_cycle: int
     updated_at: iso
 
-Env contract (same shape as ``tools.queues``):
-- ``SCORING_BUDGET_PER_CYCLE`` — slots one cycle may score (default 3).
-- ``SCORING_BUDGET_PER_DAY`` — slots one user may score per UTC day (3).
+Limits depend on the user's plan (:mod:`tools.account.plan`): a trial scores
+3 jobs a UTC day, a paid plan 10. :func:`reserve` reads the plan off the user
+document its transaction already fetches, so the plan costs no extra read. The
+per-cycle cap is held equal to the daily one on both plans.
 
-The defaults are calibrated against the 2026-08-23 measurement, priced on a
-fully rated job: $0.00279 per Flash parse plus $0.01649 per cached Pro score,
-so $0.0193/job rather than the $0.0098 blended average (which includes jobs
-rejected for free and describes a population that no longer exists). Three a
-day is ~$1.74/month per user at the ceiling, against ~$117.60/month for the
-400/day this replaced. The per-cycle cap is held equal to the daily one.
+Env contract (see :meth:`Limits.from_env` for how they combine):
+- ``SCORING_BUDGET_PER_DAY_TRIAL`` / ``SCORING_BUDGET_PER_DAY_PAID`` — the
+  per-plan daily caps (default 3 / 10). The trial cap never exceeds the paid
+  one, and raising it above its default logs a warning.
+- ``SCORING_BUDGET_PER_DAY`` / ``SCORING_BUDGET_PER_CYCLE`` — global
+  *ceilings* over every plan. They can only lower a cap, never raise one.
+- Every cap is held below :data:`MAX_GRANT` + 1, under ``BATCH_MIN_PENDING``.
 
-Changing these defaults does not change a running service: both vars are
-hand-set on Cloud Run and appear in no terraform CI check. They still have to
-be right, because a service recreated from terraform restores whatever they
-say.
+The trial default is calibrated against the 2026-08-23 measurement, priced on
+a fully rated job: $0.00279 per Flash parse plus $0.01649 per cached Pro score,
+so $0.0193/job rather than the $0.0098 blended average. Three a day is ~$1.74
+per user-month at the ceiling; ten is ~$5.80.
 
 Exceeding the budget is a normal outcome, not an error: the run scores what it
 was granted, logs ``matching.budget_capped`` at info, and the rest of the
@@ -67,14 +69,27 @@ from enum import Enum
 from google.cloud import firestore
 
 from obs.logging import current_run_id, get_logger
+from tools.account import plan
 
 log = get_logger("tools.matching")
 
 # The map on users/{uid} holding the counters below.
 FIELD = "scoring_budget"
 
+#: The trial plan's caps — also what every un-planned caller gets.
 DEFAULT_PER_CYCLE = 3
 DEFAULT_PER_DAY = 3
+DEFAULT_PER_DAY_PAID = 10
+
+#: No plan or override can grant more than this per day or per cycle. One below
+#: ``tools.matching.batch_runs.BATCH_MIN_PENDING`` (not imported: that module
+#: imports this one), so a grant can never route a cycle onto a Vertex batch,
+#: whose spend is committed at submit and priced only when it is ingested.
+MAX_GRANT = 49
+
+#: Env warnings already logged, so a misconfiguration is said once per process
+#: rather than on every reservation.
+_warned: set[tuple[str, str]] = set()
 
 
 class _CycleDefault(Enum):
@@ -105,11 +120,41 @@ class Limits:
     per_day: int
 
     @classmethod
-    def from_env(cls) -> Limits:
-        return cls(
-            per_cycle=_int_env("SCORING_BUDGET_PER_CYCLE", DEFAULT_PER_CYCLE),
-            per_day=_int_env("SCORING_BUDGET_PER_DAY", DEFAULT_PER_DAY),
-        )
+    def from_env(cls, tier: str = plan.TRIAL) -> Limits:
+        """The caps for ``tier`` (anything but ``paid`` is the trial).
+
+        The per-plan var sets the daily cap; the trial's is clamped to the paid
+        one. The legacy global vars then apply as ceilings — a global
+        ``SCORING_BUDGET_PER_DAY=10`` meant for paid users cannot lift a trial
+        to 10 — and :data:`MAX_GRANT` caps the result. The per-cycle cap is the
+        daily one, lowered only by ``SCORING_BUDGET_PER_CYCLE``.
+        """
+        paid_day = _int_env("SCORING_BUDGET_PER_DAY_PAID", DEFAULT_PER_DAY_PAID)
+        if tier == plan.PAID:
+            per_day = paid_day
+        else:
+            per_day = _int_env("SCORING_BUDGET_PER_DAY_TRIAL", DEFAULT_PER_DAY)
+            if per_day > paid_day:
+                _warn_once("matching.budget_trial_above_paid", per_day, paid_day)
+                per_day = paid_day
+            if per_day > DEFAULT_PER_DAY:
+                _warn_once("matching.budget_trial_raised", per_day, DEFAULT_PER_DAY)
+        global_day = _opt_int_env("SCORING_BUDGET_PER_DAY")
+        if global_day is not None:
+            per_day = min(per_day, global_day)
+        if per_day > MAX_GRANT:
+            _warn_once("matching.budget_above_max_grant", per_day, MAX_GRANT)
+            per_day = MAX_GRANT
+        per_cycle = per_day
+        global_cycle = _opt_int_env("SCORING_BUDGET_PER_CYCLE")
+        if global_cycle is not None:
+            per_cycle = min(per_cycle, global_cycle)
+        return cls(per_cycle=per_cycle, per_day=per_day)
+
+    @classmethod
+    def for_doc(cls, doc: dict | None) -> Limits:
+        """The caps for the plan on a user document already in hand."""
+        return cls.from_env(plan.tier_of(doc))
 
 
 @dataclass(frozen=True)
@@ -141,6 +186,21 @@ def _int_env(name: str, default: int) -> int:
     except ValueError:
         log.warning("matching.budget_env_invalid", var=name, value=raw[:40])
         return default
+
+
+def _opt_int_env(name: str) -> int | None:
+    """Like :func:`_int_env`, but ``None`` when the var is unset or invalid."""
+    if not os.getenv(name, "").strip():
+        return None
+    value = _int_env(name, -1)
+    return None if value < 0 else value
+
+
+def _warn_once(event: str, value: int, limit: int) -> None:
+    key = (event, f"{value}/{limit}")
+    if key not in _warned:
+        _warned.add(key)
+        log.warning(event, value=value, limit=limit)
 
 
 def _count(state: dict, key: str) -> int:
@@ -347,7 +407,8 @@ async def reserve(
 
     ``wanted=None`` asks for a full cycle's worth. ``cycle_id`` defaults to the
     ambient run, which *opens* a window; pass ``None`` to draw down whatever
-    window is already open instead.
+    window is already open instead. Without ``limits`` the caps come from the
+    plan on the user document the transaction reads anyway.
 
     A plain transaction rather than the TTL-lease pattern ``batch_runs`` uses:
     this is a millisecond read-modify-write that Firestore's own transaction
@@ -355,22 +416,22 @@ async def reserve(
 
     Errors propagate — failing closed is the safe direction for a spend cap.
     """
-    limits = limits or Limits.from_env()
-    wanted = limits.per_cycle if wanted is None else wanted
     cycle = resolve_cycle_id(cycle_id)
     user_ref = db.collection("users").document(user_id)
 
     @firestore.async_transactional
-    async def _reserve(transaction) -> Reservation:
+    async def _reserve(transaction) -> tuple[Reservation, int]:
         snap = await user_ref.get(transaction=transaction)
-        state = (snap.to_dict() or {}).get(FIELD)
+        doc = snap.to_dict() or {}
+        caps = limits or Limits.for_doc(doc)
+        want = caps.per_cycle if wanted is None else wanted
         new_state, reservation = apply_reservation(
-            state, wanted, now=datetime.now(UTC), cycle_id=cycle, limits=limits
+            doc.get(FIELD), want, now=datetime.now(UTC), cycle_id=cycle, limits=caps
         )
         transaction.set(user_ref, {FIELD: new_state}, merge=True)
-        return reservation
+        return reservation, want
 
-    reservation = await _reserve(db.transaction())
+    reservation, wanted = await _reserve(db.transaction())
     if reservation.capped:
         # Info, not a warning: hitting the cap is the design working. The run
         # scores its slice and the remainder waits for the next cycle.

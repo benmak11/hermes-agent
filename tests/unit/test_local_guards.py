@@ -161,21 +161,24 @@ def test_the_same_request_is_honoured_from_a_deployed_service(
 ):
     """Positive control: the guard is the dev bypass, not the endpoint."""
     client, started, allowance = discovery_client
+    allowance.store["plan"] = {"tier": "paid"}
     monkeypatch.setenv("QUEUE_MODE", queue_mode)
 
     assert client.post("/settings/discovery/run").status_code == 200
     assert allowance.budget_state["runs_this_week"] == 1
 
     where = "queued" if queue_mode == "1" else "in_process"
-    # ``score`` is False: the unconfirmed manual click is the *free* verb
-    # since the spend-consent seam landed. Pinned here as well as in
-    # test_discovery_fanout, because this file is where the shape of what the
-    # route dispatches is asserted.
+    # ``score`` is False: for a paid plan the unconfirmed manual click is the
+    # *free* verb since the spend-consent seam landed (a trial's run scores;
+    # see test_trial_plan). Pinned here as well as in test_discovery_fanout,
+    # because this file is where the shape of what the route dispatches is
+    # asserted.
     assert started == [(where, "u1", "manual", False)]
 
 
 def test_the_override_hands_a_developer_the_run_back(discovery_client, monkeypatch):
-    client, started, _allowance = discovery_client
+    client, started, allowance = discovery_client
+    allowance.store["plan"] = {"tier": "paid"}
     monkeypatch.setenv("AUTH_DEV_MODE", "1")
     monkeypatch.setenv(discovery.LIVE_RUN_OVERRIDE, "1")
 

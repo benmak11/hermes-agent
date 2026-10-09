@@ -130,9 +130,24 @@ export type Profile = {
   data_epoch?: string | null;
 };
 
+/**
+ * The user's plan (tools/account/plan.py `view`). `auto_until` is when a
+ * trial's unattended runs stop (null on paid); `auto_active` says whether the
+ * scheduler may still run them.
+ */
+export type PlanView = {
+  tier: "trial" | "paid";
+  trial_started_at: string | null;
+  auto_until: string | null;
+  auto_active: boolean;
+  scoring_per_day: number;
+};
+
 export type ProfileResponse = {
   profile: Profile | null;
   onboarding_complete: boolean;
+  /** Absent from an older API, and when there is no profile yet. */
+  plan?: PlanView;
 };
 
 // ---- Auto-discovery settings (mirrors models/settings.py) ----
@@ -207,6 +222,7 @@ export type DiscoveryState = {
 export type DiscoverySettingsResponse = {
   settings: DiscoverySettings;
   state: DiscoveryState;
+  plan?: PlanView;
   next_discovery_at?: string | null;
   next_sweep_at?: string | null;
 };

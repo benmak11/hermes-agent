@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { discoveryCardCopy, showPaidScoring } from "@/lib/discoveryCard";
 import { auth } from "@/lib/firebase";
 import { saveMinScore, useMinScore } from "@/lib/session";
 import {
@@ -356,24 +357,6 @@ const INTERVALS: { hours: number; label: string }[] = [
   { hours: 72, label: "every 3 days" },
 ];
 
-function relPast(iso?: string | null): string {
-  if (!iso) return "never";
-  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  if (mins < 48 * 60) return `${Math.floor(mins / 60)}h ago`;
-  return `${Math.floor(mins / (24 * 60))}d ago`;
-}
-
-function relNext(iso?: string | null): string {
-  if (!iso) return "on next visit";
-  const mins = Math.floor((new Date(iso).getTime() - Date.now()) / 60_000);
-  if (mins <= 0) return "due now";
-  if (mins < 60) return `in ${mins}m`;
-  if (mins < 48 * 60) return `in ${Math.floor(mins / 60)}h`;
-  return `in ${Math.floor(mins / (24 * 60))}d`;
-}
-
 /**
  * Auto-discovery ("What we do while you're away"): the agents' unattended
  * cadence, regulated from the profile. Two opt-in loops — discover+score new
@@ -390,6 +373,10 @@ function relNext(iso?: string | null): string {
  * The sheet below is *not* the guarantee. The server decides: `POST
  * /jobs/score` answers 402 without a valid token no matter what this
  * component renders, so a bug here costs a confusing screen, not money.
+ *
+ * Trial users never see the paid button or its sheet: their "Find new jobs"
+ * already scores up to the plan's daily cap, for free. The wording that
+ * depends on the plan comes from `discoveryCardCopy`.
  */
 function AutoDiscoveryCard() {
   const queryClient = useQueryClient();
@@ -479,10 +466,24 @@ function AutoDiscoveryCard() {
     typeof last?.budget_granted === "number"
       ? last
       : null;
+  const showPaid = showPaidScoring(data.plan);
+  const copy = discoveryCardCopy({
+    plan: data.plan,
+    settings: s,
+    lastDiscoveryAt: data.state.last_discovery_at,
+    nextDiscoveryAt: data.next_discovery_at,
+    lastSweepAt: data.state.last_sweep_at,
+    nextSweepAt: data.next_sweep_at,
+  });
 
   return (
     <Card>
       <MonoLabel>What we do while you&apos;re away</MonoLabel>
+      {copy.trialNote && (
+        <p className="mt-2 text-[12px]" style={{ color: "var(--ink-2)" }}>
+          {copy.trialNote}
+        </p>
+      )}
 
       <div className="mt-[14px] flex items-center gap-3">
         <span
@@ -503,9 +504,7 @@ function AutoDiscoveryCard() {
         />
       )}
       <div className="mt-2.5 text-[11.5px]" style={{ color: "#a3927f" }}>
-        {s.auto_discovery
-          ? `last ${relPast(data.state.last_discovery_at)} · next ${relNext(data.next_discovery_at)}`
-          : "off — run from the CLI or the button below"}
+        {copy.discoveryStatus}
       </div>
       {budget && (
         <div
@@ -539,9 +538,7 @@ function AutoDiscoveryCard() {
         />
       )}
       <div className="mt-2.5 text-[11.5px]" style={{ color: "#a3927f" }}>
-        {s.liveness_sweep
-          ? `last ${relPast(data.state.last_sweep_at)} · next ${relNext(data.next_sweep_at)}`
-          : "off — taken-down postings stay until acted on"}
+        {copy.sweepStatus}
         {sweep && ` · ${sweep.removed} removed of ${sweep.checked} checked`}
       </div>
 
@@ -563,22 +560,23 @@ function AutoDiscoveryCard() {
           Sweep now
         </button>
       </div>
-      <div className="mt-2 flex flex-wrap items-center gap-2">
-        <button
-          onClick={() => score.mutate(undefined)}
-          disabled={score.isPending}
-          className="wm-ghost h-[34px] flex-1 rounded-[11px] border text-[12px] font-semibold"
-          style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
-        >
-          Score jobs we found…
-        </button>
-      </div>
+      {showPaid && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => score.mutate(undefined)}
+            disabled={score.isPending}
+            className="wm-ghost h-[34px] flex-1 rounded-[11px] border text-[12px] font-semibold"
+            style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
+          >
+            Score jobs we found…
+          </button>
+        </div>
+      )}
       <p className="mt-1.5 text-[11.5px]" style={{ color: "#a3927f" }}>
-        Finding is free. Scoring uses AI and costs money — we&apos;ll show you
-        what it would cost before anything runs.
+        {copy.findNote}
       </p>
 
-      {confirmation && (
+      {showPaid && confirmation && (
         <SpendConfirmSheet
           confirmation={confirmation}
           pending={score.isPending}
