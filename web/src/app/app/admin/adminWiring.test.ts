@@ -49,8 +49,10 @@ describe("/app/admin board health", () => {
     expect(CODE).toContain("{NO_BOARDS}");
   });
 
-  it("is view-only and marks failing rows in brick", () => {
+  it("is view-only and colours each row by its state's tone", () => {
     expect(CODE).not.toMatch(/apiFetch<[^>]*>\("\/admin\/boards",/);
-    expect(CODE).toMatch(/isFailing\(row\)\s*\?\s*"var\(--brick\)"/);
+    expect(CODE).toContain("const tone = stateTone(row);");
+    expect(CODE).toMatch(/style=\{\{\s*color:\s*TONE_COLOR\[tone\]\s*\}\}/);
+    expect(CODE).toContain("{resolutionLabel(row)}");
   });
 });

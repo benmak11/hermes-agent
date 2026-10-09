@@ -86,6 +86,18 @@ async def accounts(
 _NO_STORE = {"Cache-Control": "no-store"}
 
 
+class BoardTarget(BaseModel):
+    platform: str
+    slug: str
+
+
+class BoardCandidate(BaseModel):
+    platform: str
+    slug: str
+    name: str | None
+    job_count: int | None
+
+
 class BoardRow(BaseModel):
     platform: str
     slug: str
@@ -100,12 +112,19 @@ class BoardRow(BaseModel):
     not_found_days: int
     last_ok_at: str | None
     updated_at: str | None
+    #: A ``moved`` board's target.
+    resolves_to: BoardTarget | None = None
+    #: What the last probe round found elsewhere (``quarantined`` / ``moved``).
+    candidates: list[BoardCandidate] = []
 
 
 class BoardTotals(BaseModel):
     total: int
     ok: int
     failing: int
+    quarantined: int
+    dead: int
+    moved: int
     not_found: int
     #: Active tracked boards in the YAML with no ``board_health`` record yet.
     never_checked: int
@@ -146,6 +165,19 @@ def _board_row(
     key = (platform, slug.casefold())
     source, entry = entries.get(key, ("none", None))
     status = rec.get("last_status")
+    to = rec.get("resolves_to")
+    candidates = [
+        BoardCandidate(
+            platform=str(c.get("platform")),
+            slug=str(c.get("slug")),
+            name=c.get("name") if isinstance(c.get("name"), str) else None,
+            job_count=c.get("job_count")
+            if isinstance(c.get("job_count"), int)
+            else None,
+        )
+        for c in rec.get("candidates") or []
+        if isinstance(c, dict)
+    ]
     return key, BoardRow(
         platform=platform,
         slug=slug,
@@ -160,15 +192,26 @@ def _board_row(
         not_found_days=int(rec.get("not_found_days") or 0),
         last_ok_at=rec.get("last_ok_at"),
         updated_at=rec.get("updated_at"),
+        resolves_to=BoardTarget(platform=str(to["platform"]), slug=str(to["slug"]))
+        if isinstance(to, dict) and to.get("platform") and to.get("slug")
+        else None,
+        candidates=candidates,
     )
+
+
+def _state_rank(state: str | None) -> int:
+    """Position in ``board_health.STATE_ORDER``; unknown states sort last."""
+    order = board_health.STATE_ORDER
+    return order.index(state) if state in order else len(order)
 
 
 @router.get("/boards")
 async def boards(
     response: Response, _admin: Annotated[Identity, Depends(verify_admin)]
 ) -> BoardHealth:
-    """Every ``board_health`` record joined with the company YAML, failing
-    first, then most 404 days, then platform and slug. 503 naming the source
+    """Every ``board_health`` record joined with the company YAML, by state
+    (failing, quarantined, dead, moved, ok), then most 404 days, then
+    platform and slug. 503 naming the source
     if either read fails. Never writes."""
     response.headers["Cache-Control"] = "no-store"
     source = board_health.COLLECTION
@@ -195,7 +238,7 @@ async def boards(
         rows.append(row)
     rows.sort(
         key=lambda r: (
-            r.state != board_health.STATE_FAILING,
+            _state_rank(r.state),
             -r.not_found_days,
             r.platform,
             r.slug,
@@ -205,6 +248,9 @@ async def boards(
         total=len(rows),
         ok=sum(r.state == board_health.STATE_OK for r in rows),
         failing=sum(r.state == board_health.STATE_FAILING for r in rows),
+        quarantined=sum(r.state == board_health.STATE_QUARANTINED for r in rows),
+        dead=sum(r.state == board_health.STATE_DEAD for r in rows),
+        moved=sum(r.state == board_health.STATE_MOVED for r in rows),
         not_found=sum(r.last_outcome == NOT_FOUND for r in rows),
         never_checked=len(active - seen),
     )

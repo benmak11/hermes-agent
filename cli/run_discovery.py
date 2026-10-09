@@ -58,6 +58,11 @@ async def main() -> None:
             f"  Boards not found (404): {summary['boards_not_found']},"
             f" failing: {summary['boards_failing']}"
         )
+        print(
+            f"  Dead boards skipped: {summary['boards_skipped_dead']},"
+            f" rerouted: {summary['boards_rerouted']},"
+            f" would reroute: {summary['boards_would_reroute']}"
+        )
 
         preferences = await load_job_preferences(args.user_id)
         jobs, dropped = prefilter_jobs(jobs, preferences)

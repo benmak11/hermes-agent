@@ -160,6 +160,11 @@ export type DiscoveryState = {
      *  (429/5xx/timeout/error). Neither is counted in `empty_boards`. */
     boards_not_found?: number;
     boards_failing?: number;
+    /** Dead boards skipped, moved boards fetched at their target, and moved
+     *  boards a shadow cycle (`BOARD_REROUTE_AUTO` off) would have rerouted. */
+    boards_skipped_dead?: number;
+    boards_rerouted?: number;
+    boards_would_reroute?: number;
     duration_ms?: number;
     run_id?: string;
     trigger?: string;

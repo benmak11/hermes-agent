@@ -3000,6 +3000,33 @@ def test_every_shape_a_stored_timestamp_comes_back_in_is_comparable(stored):
     assert discovery._due(stored, 24, T0 + timedelta(hours=25)) is True
 
 
+def test_a_daily_loop_is_due_at_the_same_hourly_tick_the_next_day():
+    """A run stamps ``last_*_at`` when it ends, after the tick that started it.
+    The next day's same-hour tick must still find it due, or the daily loop
+    slips an hour later every day."""
+    finished = T0 + timedelta(minutes=2, seconds=10)
+    next_tick = T0 + timedelta(hours=24, seconds=34)
+
+    assert discovery._due(finished.isoformat(), 24, next_tick) is True
+
+
+def test_the_due_slack_does_not_let_a_loop_run_an_hour_early():
+    """The slack absorbs run time, not a whole tick: one hour short of the
+    interval is still not due."""
+    finished = T0 + timedelta(minutes=2, seconds=10)
+
+    assert (
+        discovery._due(finished.isoformat(), 24, finished + timedelta(hours=23))
+        is False
+    )
+    assert (
+        discovery._due(
+            finished.isoformat(), 24, finished + timedelta(hours=24, minutes=-11)
+        )
+        is False
+    )
+
+
 def test_a_cycle_re_stamps_its_lease_against_the_run_not_the_queue_wait(
     cycle_world, slot_world
 ):

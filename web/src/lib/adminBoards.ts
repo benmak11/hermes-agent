@@ -20,12 +20,26 @@ export type BoardRow = {
   not_found_days: number;
   last_ok_at: string | null;
   updated_at: string | null;
+  /** A moved board's target. */
+  resolves_to?: { platform: string; slug: string } | null;
+  /** What the last probe round found on other platforms. */
+  candidates?: BoardCandidate[];
+};
+
+export type BoardCandidate = {
+  platform: string;
+  slug: string;
+  name: string | null;
+  job_count: number | null;
 };
 
 export type BoardTotals = {
   total: number;
   ok: number;
   failing: number;
+  quarantined: number;
+  dead: number;
+  moved: number;
   not_found: number;
   never_checked: number;
 };
@@ -38,24 +52,55 @@ export function isFailing(row: BoardRow): boolean {
   return row.state === "failing";
 }
 
-/** Failing first, then most 404 days, then platform and slug — the server's
- *  order, reapplied so the table never depends on it. */
+/** Problem states first; mirrors `board_health.STATE_ORDER`. */
+const STATE_ORDER = ["failing", "quarantined", "dead", "moved", "ok"];
+
+function stateRank(row: BoardRow): number {
+  const i = row.state ? STATE_ORDER.indexOf(row.state) : -1;
+  return i === -1 ? STATE_ORDER.length : i;
+}
+
+/** How a state is shown: brick for a board that needs a human, the accent for
+ *  one that moved, muted otherwise. */
+export type StateTone = "brick" | "accent" | "muted";
+
+export function stateTone(row: BoardRow): StateTone {
+  if (row.state === "failing" || row.state === "quarantined" || row.state === "dead") {
+    return "brick";
+  }
+  if (row.state === "moved") return "accent";
+  return "muted";
+}
+
+export const TONE_COLOR: Record<StateTone, string> = {
+  brick: "var(--brick)",
+  accent: "var(--terracotta-d)",
+  muted: "var(--ink-3)",
+};
+
+/** By state (failing, quarantined, dead, moved, ok, then anything newer),
+ *  then most 404 days, then platform and slug — the server's order,
+ *  reapplied so the table never depends on it. */
 export function sortBoards(rows: BoardRow[]): BoardRow[] {
   return [...rows].sort(
     (a, b) =>
-      Number(isFailing(b)) - Number(isFailing(a)) ||
+      stateRank(a) - stateRank(b) ||
       (b.not_found_days ?? 0) - (a.not_found_days ?? 0) ||
       a.platform.localeCompare(b.platform) ||
       a.slug.localeCompare(b.slug),
   );
 }
 
-/** "12 boards · 9 ok · 3 failing · 2 not found · 4 never checked". */
+/** "12 boards · 6 ok · 3 failing · 1 quarantined · 1 dead · 1 moved ·
+ *  2 not found · 4 never checked". */
 export function boardsSummary(t: BoardTotals): string {
   return [
     `${t.total} ${t.total === 1 ? "board" : "boards"}`,
     `${t.ok} ok`,
     `${t.failing} failing`,
+    `${t.quarantined ?? 0} quarantined`,
+    `${t.dead ?? 0} dead`,
+    `${t.moved ?? 0} moved`,
     `${t.not_found} not found`,
     `${t.never_checked} never checked`,
   ].join(" · ");
@@ -92,10 +137,30 @@ export function listLabel(row: BoardRow): string {
   return parts.join(" · ");
 }
 
+const STATE_LABEL: Record<string, string> = {
+  ok: "OK",
+  failing: "Failing",
+  quarantined: "Quarantined",
+  dead: "Dead",
+  moved: "Moved",
+};
+
 export function stateLabel(row: BoardRow): string {
-  if (row.state === "ok") return "OK";
-  if (row.state === "failing") return "Failing";
-  return row.state ?? DASH;
+  if (!row.state) return DASH;
+  return STATE_LABEL[row.state] ?? row.state;
+}
+
+/** A moved board's target ("→ lever/acme"), a quarantined board's candidate
+ *  names ("Acme Inc, lever/acme"), else `—`. A nameless candidate shows as
+ *  its board. */
+export function resolutionLabel(row: BoardRow): string {
+  if (row.state === "moved" && row.resolves_to) {
+    return `→ ${row.resolves_to.platform}/${row.resolves_to.slug}`;
+  }
+  if (row.state === "quarantined" && row.candidates?.length) {
+    return row.candidates.map((c) => c.name ?? `${c.platform}/${c.slug}`).join(", ");
+  }
+  return DASH;
 }
 
 /** A count of 404 days; `—` for none. */

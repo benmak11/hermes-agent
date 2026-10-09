@@ -375,3 +375,36 @@ def test_board_failure_counts_reach_last_discovery(monkeypatch):
     metrics = written[0]["discovery_state"]["last_discovery"]
     assert metrics["empty_boards"] == 1
     assert (metrics["boards_not_found"], metrics["boards_failing"]) == (3, 2)
+
+
+def test_board_health_compose_counts_reach_last_discovery(monkeypatch):
+    """Dead boards skipped and moved boards rerouted (or not, in shadow)."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    _, written = _cycle_fakes(monkeypatch, jobs=1)
+
+    async def summary(user_id):
+        return {
+            "jobs": [],
+            "jobs_by_platform": {},
+            "failures": [],
+            "empty_boards": [],
+            "boards_cached": 0,
+            "boards_fetched": 6,
+            "boards_not_found": 0,
+            "boards_failing": 0,
+            "boards_skipped_dead": 4,
+            "boards_rerouted": 2,
+            "boards_would_reroute": 3,
+        }
+
+    monkeypatch.setattr(routes_discovery, "run_discovery", summary)
+    asyncio.run(
+        routes_discovery.run_discovery_cycle("u1", trigger="manual", score=False)
+    )
+
+    metrics = written[0]["discovery_state"]["last_discovery"]
+    assert (
+        metrics["boards_skipped_dead"],
+        metrics["boards_rerouted"],
+        metrics["boards_would_reroute"],
+    ) == (4, 2, 3)
