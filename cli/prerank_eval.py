@@ -19,7 +19,9 @@ is at least the queue threshold.
 ``discovered_at``, exist on J but mostly not on T, and J is mostly survivors
 of Pro's own cut, so any feature built on them predicts *which collection a
 row came from* and reads as signal. The gating AUC uses neither and never
-looks at ``discovered_at``. The unmasked terms are reported alongside, marked.
+looks at ``discovered_at``. The per-feature table reads each term from the
+masked prerank, except the J-only ``parsed``, which is reported unmasked and
+marked. ``location`` carries no weight; its signal is reported as a diagnostic.
 
 AUC is per user. With several ``--user-id``\\s the pooled figure sums each
 user's Mann-Whitney U and pair count, so only within-user pairs are compared.
@@ -67,6 +69,12 @@ TOMBSTONES = "discarded_jobs"
 #: Terms built on fields only J carries; the gate must never see them.
 GATE_MASK = frozenset({"location", "parsed"})
 
+#: Terms reported as a signal diagnostic rather than a feature row.
+SIGNAL_ONLY = frozenset({"location"})
+
+#: How many foreign-signal positives section 3 lists.
+FOREIGN_LIST_LIMIT = 10
+
 #: Projections. Neither reads ``jd_raw``, nor a tombstone's ``restore``
 #: payload, which carries the J-only ``location`` and ``discovered_at``.
 JOB_FIELDS = [
@@ -113,7 +121,7 @@ class Backlog:
 
     job_ids: list[str] = field(default_factory=list)
     scores: list[float] = field(default_factory=list)
-    location_fires: int = 0
+    foreign_signals: int = 0
     with_parse: int = 0
     unparsed: int = 0
     cache_hits: int | None = None
@@ -238,7 +246,7 @@ async def load_user(
             result = rank(job_snap.id, doc)
             backlog.job_ids.append(job_snap.id)
             backlog.scores.append(result.score)
-            backlog.location_fires += result.features.get("location", 0.0) < 0
+            backlog.foreign_signals += result.signals.get("location") == "foreign"
             if doc.get("jd_parsed") is not None:
                 backlog.with_parse += 1
             else:
@@ -323,12 +331,40 @@ def false_buries(rows: list[Row]) -> list[Row]:
 
 def location_falsifications(rows: list[Row]) -> list[Row]:
     """J positives the ``location`` term penalises: each one is a job Pro
-    rated worth showing that the term would have pushed down."""
+    rated worth showing that the term would have pushed down. Empty while the
+    term has no weight; it gates again if the weight goes negative."""
     return [
         r
         for r in rows
         if r.source == JOBS and r.positive and r.full.features.get("location", 0.0) < 0
     ]
+
+
+def _foreign(row: Row) -> bool:
+    return row.full.signals.get("location") == "foreign"
+
+
+def foreign_positives(rows: list[Row]) -> list[Row]:
+    """Positives carrying the ``foreign`` location signal, by id. Diagnostic
+    only: it never gates."""
+    return sorted(
+        (r for r in rows if r.positive and _foreign(r)), key=lambda r: r.job_id
+    )
+
+
+@dataclass(frozen=True)
+class SignalStat:
+    overall: float
+    positives: float
+
+
+def location_signal_stats(rows: list[Row]) -> SignalStat:
+    """Share of rows, and of positives, carrying the ``foreign`` signal."""
+    pos = [r for r in rows if r.positive]
+    return SignalStat(
+        overall=sum(map(_foreign, rows)) / len(rows) if rows else 0.0,
+        positives=sum(map(_foreign, pos)) / len(pos) if pos else 0.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -338,14 +374,24 @@ class FeatureStat:
     lift: float | Undefined
 
 
+def _feature_value(row: Row, name: str) -> float:
+    """A term's contribution as the table reports it: from the masked prerank,
+    or the full one for a J-only term the gate masks. Reading ``family`` from
+    the full prerank would hide it wherever a stored parse replaced it."""
+    source = row.full if name in GATE_MASK else row.gate
+    return source.features.get(name, 0.0)
+
+
 def feature_stats(rows: list[Row]) -> dict[str, FeatureStat]:
-    """Each term alone, unmasked: AUC, share of rows where it is non-zero, and
+    """Each weighted term alone: AUC, share of rows where it is non-zero, and
     lift (positive rate where it fires over the base rate)."""
     out: dict[str, FeatureStat] = {}
     base = sum(r.positive for r in rows) / len(rows) if rows else 0.0
     for name in FEATURES:
-        fit, unfit = split_scores(rows, lambda r, n=name: r.full.features.get(n, 0.0))
-        firing = [r for r in rows if r.full.features.get(name, 0.0) != 0]
+        if name in SIGNAL_ONLY:
+            continue
+        fit, unfit = split_scores(rows, lambda r, n=name: _feature_value(r, n))
+        firing = [r for r in rows if _feature_value(r, name) != 0]
         if not firing:
             lift: float | Undefined = Undefined("never fires")
         elif not base:
@@ -473,13 +519,20 @@ def report(corpus: Corpus, *, half: str | None) -> Gate:
         + (f" — {'; '.join(g.reasons)}" if g.reasons else "")
     )
 
-    print("\n   2. Per feature, unmasked  (* = J-only input, leaks the label)")
+    print(
+        "\n   2. Per feature, masked  (* = J-only input, read unmasked, leaks the label)"
+    )
     for name, stat in feature_stats(rows).items():
         mark = "*" if name in GATE_MASK else " "
         print(
             f"     {name:<14}{mark} fires {stat.fires:6.1%}  lift {_num(stat.lift):<8}"
             f"  AUC {_auc_str(stat.auc)}"
         )
+    sig = location_signal_stats(rows)
+    print(
+        f"     location      * signal only, NO WEIGHT: foreign on {sig.overall:.1%} "
+        f"of rows, {sig.positives:.1%} of positives"
+    )
 
     falsified = location_falsifications(rows)
     print(f"\n   3. Location falsifications: {len(falsified)}")
@@ -488,6 +541,17 @@ def report(corpus: Corpus, *, half: str | None) -> Gate:
             f"     {r.job_id}  Pro {r.outcome:g}  {r.doc.get('title')!r} @ "
             f"{r.doc.get('company')!r}  location {r.doc.get('location')!r}  "
             f"[{_features(r.full)}]"
+        )
+    foreign = foreign_positives(rows)
+    print(
+        f"     diagnostic, does not gate: {len(foreign)} positive(s) carry the "
+        f"foreign location signal"
+        + (f"; up to {FOREIGN_LIST_LIMIT} listed by id" if foreign else "")
+    )
+    for r in foreign[:FOREIGN_LIST_LIMIT]:
+        print(
+            f"     {r.job_id}  Pro {r.outcome:g}  {r.doc.get('title')!r} @ "
+            f"{r.doc.get('company')!r}  location {r.doc.get('location')!r}"
         )
 
     buried = false_buries(rows)
@@ -516,7 +580,8 @@ def report(corpus: Corpus, *, half: str | None) -> Gate:
             f"     tie mass at the top: {tie[1]} job(s) share the 3rd-highest score {tie[0]:+g}"
         )
     print(
-        f"     location penalty fires on {b.location_fires}; {b.with_parse} carry jd_parsed"
+        f"     foreign location signal on {b.foreign_signals} (no weight); "
+        f"{b.with_parse} carry jd_parsed"
     )
     if b.cache_hits is not None:
         print(

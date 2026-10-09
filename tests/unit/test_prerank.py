@@ -2,8 +2,9 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """The free prerank: each term's rule, masking, and the ranking sort key.
 
-What matters most is what it must never do: raise on a malformed field, treat
-the freeform location line as a rejection, or report a masked term.
+What matters most is what it must never do: raise on a malformed field, let
+the freeform location line move the score or reject a job, or report a masked
+term.
 """
 
 from __future__ import annotations
@@ -38,6 +39,16 @@ def curated(monkeypatch):
 
 def _f(job: dict, prefs=PREFS, residence: str | None = "US", **kw) -> dict:
     return pr.prerank(job, prefs, residence, **kw).features
+
+
+def _seniority(title: str, *targets: str) -> float:
+    prefs = PREFS.model_copy(update={"target_seniorities": list(targets)})
+    return _f({"title": title}, prefs)["seniority"]
+
+
+def test_this_is_version_two():
+    assert pr.PRERANK_VERSION == 2
+    assert pr.prerank({}, PREFS, "US").version == 2
 
 
 # -------------------------------------------------------------------- title
@@ -85,6 +96,46 @@ def test_seniority_maps_title_words_onto_the_target_vocabulary(title, expected):
     assert _f({"title": title})["seniority"] == expected
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Technical Program Manager, Platform",
+        "Program Manager",
+        "Product Manager",
+        "Project Manager",
+    ],
+)
+def test_a_program_product_or_project_manager_is_not_a_level(title):
+    assert "manager" not in pr.title_levels(title)
+
+
+def test_other_level_words_beside_a_role_manager_still_count():
+    assert pr.title_levels("Senior Product Manager") == {"senior"}
+    assert pr.title_levels("Engineering Manager") == {"manager"}
+    assert pr.title_levels("Product Engineering Manager") == {"manager"}
+
+
+@pytest.mark.parametrize(
+    ("title", "targets", "expected"),
+    [
+        ("Principal Engineer", ("staff",), 0),  # one step up
+        ("Principal Engineer", ("senior",), -20),  # two steps
+        ("Associate Engineer", ("senior",), 0),  # associate -> junior or mid
+        ("Junior Engineer", ("senior",), -20),
+        ("Intern", ("junior",), 0),
+        ("Director of Engineering", ("manager",), -20),  # two steps
+        ("Director of Engineering", ("senior manager",), 0),
+        ("VP Engineering", ("director",), 0),
+        ("Engineering Manager", ("senior",), -20),  # another ladder
+        ("Staff Engineer", ("chief wizard",), -20),  # unknown target
+        ("Staff Engineer", ("chief wizard", "senior"), 0),
+        ("Tech Lead", ("principal",), 0),  # lead -> senior or staff
+    ],
+)
+def test_an_adjacent_level_on_the_same_ladder_is_neutral(title, targets, expected):
+    assert _seniority(title, *targets) == expected
+
+
 def test_seniority_targets_are_normalised_and_senior_manager_is_derived():
     prefs = PREFS.model_copy(update={"target_seniorities": ["Senior Manager"]})
     assert pr.title_levels("Sr Engineering Manager") >= {"senior-manager"}
@@ -96,34 +147,49 @@ def test_seniority_targets_are_normalised_and_senior_manager_is_derived():
 
 
 @pytest.mark.parametrize(
-    ("location", "expected"),
+    ("location", "signal"),
     [
-        ("London, UK", -30),
-        ("Toronto / Canada", -30),
-        ("Remote - United Kingdom", 0),  # "remote" softens it to nothing
-        ("New York, NY, United States", 5),
-        ("U.S.-based or Canada", 5),  # residence present wins
-        ("Berlin", 0),  # no recognised country
-        ("", 0),
+        ("London, UK", "foreign"),
+        ("Toronto / Canada", "foreign"),
+        ("Remote - United Kingdom", "none"),  # "remote" softens it to nothing
+        ("New York, NY, United States", "home"),
+        ("U.S.-based or Canada", "home"),  # residence present wins
+        ("Berlin", "none"),  # no recognised country
+        ("", "none"),
     ],
 )
-def test_location_is_a_soft_country_signal(location, expected):
-    assert _f({"location": location})["location"] == expected
+def test_location_is_observed_but_carries_no_weight(location, signal):
+    job = {"title": "Staff Software Engineer", "location": location}
+    result = pr.prerank(job, PREFS, "US")
+    assert result.signals == {"location": signal}
+    assert result.features["location"] == 0
+    assert result.score == pr.prerank({"title": job["title"]}, PREFS, "US").score
 
 
-def test_location_is_never_a_rejection():
-    """The worst it can do is a fixed -30: a strong title still ranks above
-    zero, and the parse-reject weight is never reached through it."""
+def test_location_is_never_a_rejection_even_when_reweighted(monkeypatch):
+    """Re-weighted, the term only shifts the score by its constant: a strong
+    title still ranks above zero and the parse term is untouched."""
+    monkeypatch.setattr(pr, "W_LOCATION_FOREIGN", -30.0)
     result = pr.prerank(
         {"title": "Staff Software Engineer", "location": "London, UK"}, PREFS, "US"
     )
-    assert result.features["location"] == pr.W_LOCATION_FOREIGN > pr.W_PARSED_REJECT
+    assert result.features["location"] == -30
     assert result.features["parsed"] == 0
     assert result.score > 0
 
 
-def test_location_abstains_without_a_residence():
-    assert _f({"location": "London, UK"}, residence=None)["location"] == 0
+def test_location_signal_survives_the_mask():
+    job = {"location": "London, UK"}
+    masked = pr.prerank(job, PREFS, "US", mask=frozenset({"location"}))
+    assert "location" not in masked.features
+    assert masked.signals == {"location": "foreign"}
+
+
+@pytest.mark.parametrize("residence", [None, ""])
+def test_location_abstains_without_a_residence(residence):
+    result = pr.prerank({"location": "London, UK"}, PREFS, residence)
+    assert result.features["location"] == 0
+    assert result.signals == {"location": "none"}
 
 
 # ------------------------------------------------------------------ curated
@@ -214,6 +280,7 @@ def test_malformed_fields_score_zero_and_never_raise():
     )
     assert result.score == 0
     assert set(result.features) == set(pr.FEATURES)
+    assert result.signals == {"location": "none"}
 
 
 def test_a_masked_term_is_absent_and_contributes_nothing():
@@ -222,7 +289,7 @@ def test_a_masked_term_is_absent_and_contributes_nothing():
     masked = pr.prerank(job, PREFS, "US", mask=frozenset({"title_exact", "location"}))
     assert "title_exact" not in masked.features
     assert "location" not in masked.features
-    assert masked.score == pytest.approx(full.score - 40 + 30)
+    assert masked.score == pytest.approx(full.score - 40)
     assert masked.score == pytest.approx(sum(masked.features.values()))
 
 
