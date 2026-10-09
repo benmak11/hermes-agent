@@ -1280,6 +1280,20 @@ def test_apply_dry_run_only_runs_from_a_submittable_status(client, apply_world):
     assert len(apply_world.submissions) == 1
 
 
+def test_an_operator_dry_run_does_not_need_auto_submit_on(
+    client, apply_world, monkeypatch
+):
+    """``AUTO_SUBMIT_ENABLED`` gates the user's Submit button, not the worker:
+    a rehearsal never clicks Submit, so it stays available with the flag off."""
+    monkeypatch.delenv("AUTO_SUBMIT_ENABLED", raising=False)
+    apply_world.install(_app_doc("ready_for_review"))
+    resp = client.post(
+        "/tasks/apply", json={"user_id": "u1", "app_id": "app-job1", "dry_run": True}
+    )
+    assert resp.json() == {"ok": True, "ran": True, "dry_run": True}
+    assert apply_world.submissions == [("u1", "app-job1", True)]
+
+
 def test_apply_dry_run_is_a_no_op_for_a_missing_application(client, apply_world):
     apply_world.install(_FakeDoc(None))
     resp = client.post(
@@ -3225,6 +3239,7 @@ def test_a_successful_submission_is_recorded_from_submitting(submission_world):
 
     assert doc.data["status"] == "submitted"
     assert doc.data["confirmation"]["submitted_at"]
+    assert doc.data["confirmation"]["method"] == "auto"
 
 
 def test_a_successful_submission_does_not_overwrite_a_document_that_moved_on(

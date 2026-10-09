@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from models.job import Job
@@ -13,6 +14,30 @@ from obs.logging import get_logger
 from .greenhouse import ProgressFn, submit_greenhouse
 
 log = get_logger("tools.submitters")
+
+#: Sources with an automated submitter. Everything else is apply-it-yourself.
+AUTO_SUBMIT_SOURCES = frozenset({"greenhouse"})
+
+#: The failure an unsupported source reports. User-facing: ``web/`` renders
+#: timeline notes verbatim.
+UNSUPPORTED_SOURCE_ERROR = (
+    "Hermes can't send this application for you. Apply on the employer's "
+    "site, then mark it as applied."
+)
+
+
+def auto_submit_enabled() -> bool:
+    """``AUTO_SUBMIT_ENABLED``, read per call. Off unless explicitly switched on."""
+    return os.getenv("AUTO_SUBMIT_ENABLED", "").strip().lower() in {"1", "true", "on"}
+
+
+def auto_submit_available(source: str | None) -> bool:
+    """May a user ask Hermes to submit a job from ``source``?
+
+    The flag gates the user-facing route only. The router below does not read
+    it, so an operator's worker ``dry_run`` rehearsal works with it off.
+    """
+    return auto_submit_enabled() and source in AUTO_SUBMIT_SOURCES
 
 
 async def submit_application(
@@ -26,11 +51,11 @@ async def submit_application(
 ) -> dict:
     """Submit ``job`` via the appropriate path based on ``job.source``.
 
-    Path A (deterministic Greenhouse) is implemented. Path B (Computer Use) for
-    other ATS is deferred — those sources report an unsupported failure rather
-    than auto-submitting through an unverified path.
+    Only :data:`AUTO_SUBMIT_SOURCES` have a submitter; any other source reports
+    a plain-language failure instead of driving an unverified path. The route
+    refuses those sources first, so that branch is a backstop.
     """
-    if job.source == "greenhouse":
+    if job.source in AUTO_SUBMIT_SOURCES:
         return await submit_greenhouse(
             job,
             profile,
@@ -46,10 +71,4 @@ async def submit_application(
         company=job.company,
         source=job.source,
     )
-    return {
-        "success": False,
-        "error": (
-            f"Automated submission for source '{job.source}' is not supported "
-            "yet (Computer Use path deferred). Apply manually for now."
-        ),
-    }
+    return {"success": False, "error": UNSUPPORTED_SOURCE_ERROR}

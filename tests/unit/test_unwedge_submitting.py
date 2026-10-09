@@ -123,10 +123,11 @@ def test_the_release_edge_exists_and_is_not_a_retry():
     """submitting → failed is the only edge this tool uses. It must not be able
     to put an application back into a state that resubmits by itself."""
     assert state.can_transition("submitting", "failed")
-    assert not state.can_transition("failed", "submitted")
-    # Recovery from failed is a deliberate user action (Submit / regenerate).
+    # Recovery from failed is a deliberate user action (Submit / regenerate /
+    # mark-applied). ``→ submitted`` is the user saying they applied themselves;
+    # it sends nothing.
     assert state.TRANSITIONS["failed"] == frozenset(
-        {"submitting", "queued", "posting_removed"}
+        {"submitting", "submitted", "queued", "posting_removed"}
     )
 
 

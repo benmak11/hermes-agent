@@ -84,13 +84,21 @@ TRANSITIONS: dict[str, frozenset[str]] = {
     "queued": frozenset({"tailoring", "failed", "posting_removed"}),
     "tailoring": frozenset({"ready_for_review", "failed", "posting_removed", "queued"}),
     # → queued is "regenerate": the user asks for another tailoring pass.
-    "ready_for_review": frozenset({"submitting", "queued", "posting_removed"}),
-    "failed": frozenset({"submitting", "queued", "posting_removed"}),
+    # → submitted is the user saying they applied themselves (MANUAL_SUBMIT_FROM).
+    "ready_for_review": frozenset(
+        {"submitting", "submitted", "queued", "posting_removed"}
+    ),
+    "failed": frozenset({"submitting", "submitted", "queued", "posting_removed"}),
     "submitting": frozenset({"submitted", "failed", "posting_removed"}),
     "submitted": frozenset({"responded"}),
     "responded": frozenset(),
     "posting_removed": frozenset(),
 }
+
+#: Where the manual "I applied" edge may start. Every caller writing
+#: ``→ submitted`` must pass ``allowed_from``: this set for the manual path,
+#: ``{"submitting"}`` for the automated one, so neither can complete the other.
+MANUAL_SUBMIT_FROM: frozenset[str] = frozenset({"ready_for_review", "failed"})
 
 #: Statuses nothing can leave. Derived, so it cannot drift from the table.
 TERMINAL_STATUSES: frozenset[str] = frozenset(

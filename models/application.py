@@ -22,10 +22,18 @@ ApplicationStatus = Literal[
 ]
 
 
+#: How an application reached ``submitted``: Hermes drove the form (``auto``) or
+#: the user applied on the employer's site and said so (``manual``).
+SubmitMethod = Literal["auto", "manual"]
+
+
 class Confirmation(BaseModel):
     submitted_at: datetime
     confirmation_id: str | None = None
     screenshot_uri: str | None = None
+    # Defaults to ``auto``: every confirmation written before the manual path
+    # existed came from the automated submitter.
+    method: SubmitMethod = "auto"
 
 
 class StatusEvent(BaseModel):
