@@ -40,6 +40,7 @@ import api.routes.worker as worker
 from api.deps import verify_user
 from tools import queues, spend
 from tools.discovery import budget
+from tools.discovery.pipeline import PersistResult
 from tools.matching import batch_runs
 
 #: Comfortably over ``batch_runs.BATCH_MIN_PENDING`` (50), which is the
@@ -92,7 +93,7 @@ def cycle_pipeline(monkeypatch):
         return None
 
     async def fake_persist_new_jobs(items):
-        return len(items)
+        return PersistResult(new=len(items))
 
     async def fake_persist_run_cost(db, user_id, run_id, **meta):
         return None

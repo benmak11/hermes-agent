@@ -27,6 +27,7 @@ from models.match import JobMatch, ScoreBreakdown
 from obs import llm_cost
 from obs.llm_cost import record_llm_call, reset_run_cost, run_cost_snapshot
 from tools import run_costs
+from tools.discovery.pipeline import PersistResult
 from tools.matching import score
 from tools.run_costs import persist_run_cost
 
@@ -465,7 +466,7 @@ def _flush_site_harness(monkeypatch, *, counts: dict, cost_calls: int = 1):
         return None
 
     async def fake_persist_new_jobs(jobs):
-        return 0
+        return PersistResult(new=0)
 
     async def fake_score(user_id):
         return counts

@@ -71,8 +71,13 @@ async def main() -> None:
                 f"  Title pre-filter dropped {sum(dropped.values())}: {dict(dropped)}"
             )
 
-        new = await persist_new_jobs(jobs)
-        print(f"✓ {new} new jobs added to Firestore")
+        persisted = await persist_new_jobs(jobs)
+        print(f"✓ {persisted.new} new jobs added to Firestore")
+        if persisted.capped:
+            print(
+                f"  Capped: {persisted.capped} new jobs left for a later search"
+                f" ({persisted.admitted_explore} of those saved were random picks)"
+            )
         ledger_state = DONE
     except Exception:
         # Re-raised untouched; this clause only records the outcome.

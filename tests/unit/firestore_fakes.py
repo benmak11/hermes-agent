@@ -404,7 +404,8 @@ class _StoreTransaction(FakeAsyncTransaction):
 
 class FakeStoreDB(FakeQueryDB):
     """:class:`FakeQueryDB` plus ``set`` / ``delete`` on documents and
-    ``transaction()``. ``writes``, ``deletes`` and ``transactional_reads``
+    ``transaction()`` and ``get_all``. ``writes``, ``deletes``,
+    ``transactional_reads`` and ``get_all_refs``
     record what happened, for assertions."""
 
     def __init__(self, data=None, abort_once=False):
@@ -413,6 +414,8 @@ class FakeStoreDB(FakeQueryDB):
         self.deletes: list[str] = []
         self.transactional_reads: list[str] = []
         self.transactions: list[FakeTransaction] = []
+        #: One entry per ``get_all`` call: the document paths it asked for.
+        self.get_all_refs: list[list[str]] = []
         self._abort_once = abort_once
 
     def collection(self, name):
@@ -420,6 +423,14 @@ class FakeStoreDB(FakeQueryDB):
 
     def _doc_ref(self, coll_path, doc_id):
         return _StoreDoc(self, coll_path, doc_id)
+
+    async def get_all(self, refs):
+        """A snapshot per ref, missing ones included, in reverse order:
+        ``get_all`` does not promise to answer in the order it was asked."""
+        refs = list(refs)
+        self.get_all_refs.append([r._path for r in refs])
+        for ref in reversed(refs):
+            yield _QuerySnap(ref.id, ref._docs().get(ref.id), reference=ref)
 
     def transaction(self):
         txn = _StoreTransaction(abort_once=self._abort_once)
