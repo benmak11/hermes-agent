@@ -165,6 +165,9 @@ export type DiscoveryState = {
     boards_skipped_dead?: number;
     boards_rerouted?: number;
     boards_would_reroute?: number;
+    /** New jobs `PERSIST_CAP_PER_CYCLE` left unsaved; the next search
+     *  offers them again. 0 with no cap. */
+    jobs_capped?: number;
     duration_ms?: number;
     run_id?: string;
     trigger?: string;

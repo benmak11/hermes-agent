@@ -10,9 +10,12 @@ engine (run via cli/run_discovery.py); it is intentionally not an LLM agent.
 from __future__ import annotations
 
 import asyncio
+import os
+import random
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from google.cloud import firestore
 
@@ -28,6 +31,12 @@ from tools.ats.meta_jobs import fetch_meta_jobs
 from tools.ats.workable import fetch_workable_jobs
 from tools.companies import Platform, all_active_companies, entry_names, load_blocklist
 from tools.company_prefs import load_exclusions
+from tools.matching.prerank import (
+    preferences_from,
+    prerank,
+    residence_country,
+    sort_key,
+)
 
 log = get_logger("tools.discovery")
 
@@ -294,8 +303,128 @@ async def _existing_ids(db, refs: list) -> set[str]:
     return found
 
 
-async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
-    """Write only previously-unseen jobs to Firestore. Returns count of new jobs.
+#: New jobs one search may save per user. Unset, empty or ``0`` means no cap.
+PERSIST_CAP_ENV = "PERSIST_CAP_PER_CYCLE"
+#: How many of the capped admits are drawn at random from below the cut.
+PERSIST_EXPLORE_ENV = "PERSIST_EXPLORE_ADMITS"
+DEFAULT_EXPLORE_ADMITS = 2
+
+_warned_env: set[tuple[str, str]] = set()
+
+
+def _warn_env_once(name: str, raw: str) -> None:
+    if (name, raw) not in _warned_env:
+        _warned_env.add((name, raw))
+        log.warning("discovery.persist_env_invalid", name=name, value=raw[:40])
+
+
+def persist_cap() -> int:
+    """``PERSIST_CAP_PER_CYCLE``, read per call; ``0`` means no cap.
+
+    Anything but a non-negative int also means no cap, with a warning once per
+    process per value.
+    """
+    raw = os.getenv(PERSIST_CAP_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        _warn_env_once(PERSIST_CAP_ENV, raw)
+        return 0
+    return value
+
+
+def explore_admits(cap: int) -> int:
+    """``PERSIST_EXPLORE_ADMITS`` clamped to ``[0, cap]``; default 2.
+
+    Unparseable falls back to the default, not to 0: without random admits the
+    prerank's misses never enter the backlog, so they can never be measured.
+    """
+    raw = os.getenv(PERSIST_EXPLORE_ENV, "").strip()
+    value = DEFAULT_EXPLORE_ADMITS
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            _warn_env_once(PERSIST_EXPLORE_ENV, raw)
+    return min(max(value, 0), cap)
+
+
+@dataclass(frozen=True)
+class PersistResult:
+    """What one ``persist_new_jobs`` call wrote, summed over users.
+
+    ``capped`` counts new jobs the cap left unwritten; ``admitted_explore``
+    counts the written ones drawn at random rather than by prerank.
+    """
+
+    new: int
+    capped: int = 0
+    admitted_explore: int = 0
+
+
+def _prerank_fields(job: Job) -> dict:
+    """The fields prerank reads, without ``jd_parsed``: a fresh posting has
+    none, and leaving it out keeps the ``parsed`` term (and the prefilter
+    behind it) from ever running here."""
+    return {
+        "id": job.id,
+        "title": job.title,
+        "company": job.company,
+        "location": job.location,
+    }
+
+
+def admit_fresh(
+    fresh: list[Job],
+    user_doc: dict | None,
+    cap: int,
+    explore: int,
+    rng: random.Random,
+) -> tuple[list[Job], int]:
+    """The ``cap`` jobs to write out of ``fresh``, and how many were explore picks.
+
+    The top ``cap - explore`` by prerank (ties by :func:`sort_key`: newest,
+    then id), plus ``explore`` drawn uniformly from the rest. Missing
+    preferences score every job 0, so recency and id decide.
+    """
+    if len(fresh) <= cap:
+        return fresh, 0
+    prefs = preferences_from(user_doc)
+    residence = residence_country(user_doc)
+    ranked = sorted(
+        fresh,
+        key=lambda j: sort_key(
+            prerank(_prerank_fields(j), prefs, residence).score,
+            j.discovered_at,
+            j.id,
+        ),
+    )
+    top = ranked[: cap - explore]
+    picks = rng.sample(ranked[cap - explore :], explore)
+    return top + picks, len(picks)
+
+
+async def _user_doc(user_ref) -> dict | None:
+    """The user document, or ``None`` when absent or unreadable — a failed
+    read ranks without preferences rather than failing the search."""
+    try:
+        snap = await user_ref.get()
+    except Exception as e:
+        log.warning(
+            "discovery.persist_user_read_failed", error=f"{type(e).__name__}: {e}"
+        )
+        return None
+    return snap.to_dict() if snap.exists else None
+
+
+async def persist_new_jobs(
+    jobs: list[Job], concurrency: int = 20, *, rng: random.Random | None = None
+) -> PersistResult:
+    """Write only previously-unseen jobs to Firestore.
 
     "Seen" includes discarded jobs: matching moves zero/ineligible-scored jobs
     to a ``discarded_jobs`` tombstone, and postings stay live on boards for
@@ -305,7 +434,15 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
     so they would sit pending and re-fail every scoring run until deleted by
     hand. An empty JD usually means the fetcher got no content, so drops are
     logged with their provenance.
+
+    With ``PERSIST_CAP_PER_CYCLE`` set, at most that many *new* jobs are
+    written per user (see :func:`admit_fresh`); this reads the user document
+    once per user whose new jobs exceed the cap. Jobs the cap leaves out are
+    not written anywhere, so the next search offers them again.
     """
+    rng = rng or random.Random()
+    cap = persist_cap()
+    explore = explore_admits(cap)
     # De-dupe within this run (a slug can appear in both known + unvetted).
     unique = {j.id: j for j in jobs}
     empty_jd = [j for j in unique.values() if not j.jd_raw.strip()]
@@ -330,7 +467,7 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
     for job in unique.values():
         by_user.setdefault(job.user_id, []).append(job)
 
-    new = seen_before = previously_discarded = 0
+    new = seen_before = previously_discarded = capped = admitted_explore = 0
     for user_id, user_jobs in by_user.items():
         user_ref = db.collection("users").document(user_id)
         jobs_col = user_ref.collection("jobs")
@@ -348,6 +485,14 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
         present = await _existing_ids(db, [jobs_col.document(j.id) for j in live])
         fresh = [j for j in live if j.id not in present]
         seen_before += len(live) - len(fresh)
+
+        if cap and len(fresh) > cap:
+            admitted, explored = admit_fresh(
+                fresh, await _user_doc(user_ref), cap, explore, rng
+            )
+            capped += len(fresh) - len(admitted)
+            admitted_explore += explored
+            fresh = admitted
         new += len(fresh)
 
         await asyncio.gather(*(_write(jobs_col.document(j.id), j) for j in fresh))
@@ -357,5 +502,7 @@ async def persist_new_jobs(jobs: list[Job], concurrency: int = 20) -> int:
         new_jobs=new,
         seen_before=seen_before,
         previously_discarded=previously_discarded,
+        capped=capped,
+        admitted_explore=admitted_explore,
     )
-    return new
+    return PersistResult(new=new, capped=capped, admitted_explore=admitted_explore)

@@ -606,7 +606,8 @@ async def run_discovery_cycle(
             # persisted, so they never cost a Flash parse downstream.
             preferences = await load_job_preferences(user_id)
             jobs, title_dropped = prefilter_jobs(summary["jobs"], preferences)
-            new = await persist_new_jobs(jobs)
+            persisted = await persist_new_jobs(jobs)
+            new = persisted.new
             if not score:
                 # The find-only leg. Nothing below this line may reach an LLM;
                 # the counts are zeros-because-nothing-ran, not zeros-so-far.
@@ -648,6 +649,9 @@ async def run_discovery_cycle(
                 "boards_rerouted": summary.get("boards_rerouted", 0),
                 "boards_would_reroute": summary.get("boards_would_reroute", 0),
                 "new_jobs": new,
+                # New jobs PERSIST_CAP_PER_CYCLE left unwritten; 0 with no cap.
+                # They were not marked seen, so the next search re-offers them.
+                "jobs_capped": persisted.capped,
                 # The backlog and nothing else: jobs the user has not decided on
                 # that nothing has scored, counted the same way by every branch
                 # from the one definition in

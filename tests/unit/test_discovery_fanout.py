@@ -18,6 +18,7 @@ from test_company_prefs import _FakeDB
 
 import tools.discovery.pipeline as discovery
 from tools.ats import _http
+from tools.discovery.pipeline import PersistResult
 
 
 def _companies(n: int) -> list[tuple[str, str, str]]:
@@ -176,7 +177,7 @@ def _cycle_fakes(monkeypatch, *, jobs=60):
         }
 
     async def fake_persist_new_jobs(items):
-        return len(items)
+        return PersistResult(new=len(items))
 
     async def fake_score_or_start_run(user_id):
         scoring.append("batch")
@@ -408,3 +409,20 @@ def test_board_health_compose_counts_reach_last_discovery(monkeypatch):
         metrics["boards_rerouted"],
         metrics["boards_would_reroute"],
     ) == (4, 2, 3)
+
+
+def test_jobs_capped_reaches_last_discovery(monkeypatch):
+    """New jobs the persist cap left for a later search."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    _, written = _cycle_fakes(monkeypatch, jobs=1)
+
+    async def capped(items):
+        return PersistResult(new=10, capped=37, admitted_explore=2)
+
+    monkeypatch.setattr(routes_discovery, "persist_new_jobs", capped)
+    asyncio.run(
+        routes_discovery.run_discovery_cycle("u1", trigger="manual", score=False)
+    )
+
+    metrics = written[0]["discovery_state"]["last_discovery"]
+    assert (metrics["new_jobs"], metrics["jobs_capped"]) == (10, 37)

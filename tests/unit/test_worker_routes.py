@@ -36,6 +36,7 @@ from api.deps import verify_user
 from obs.logging import current_run_id
 from tools import queues
 from tools.applications import reaper, state
+from tools.discovery.pipeline import PersistResult
 from tools.matching import budget
 from tools.queues import KNOWN_QUEUES
 from tools.submitters import SUBMIT_CLICKED
@@ -2482,7 +2483,7 @@ def cycle_world(monkeypatch, slot_world):
         return None
 
     async def fake_persist_new_jobs(jobs):
-        return 0
+        return PersistResult(new=0)
 
     async def fake_score(user_id):
         return {"scored": 0, "discarded": 0, "failed": 0, "pending": 0}
