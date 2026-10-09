@@ -7,23 +7,30 @@
 #   jobs.ashbyhq.com/{slug}/...      -> ashby
 greenhouse:
   - slug: stripe
+    name: Stripe
     added: "2026-06-01"
     notes: "Payments infra"
   - slug: airbnb
+    name: Airbnb
     added: "2026-06-01"
   - slug: figma
+    name: Figma
     added: "2026-06-01"
   - slug: vercel
+    name: Vercel
     added: "2026-06-01"
 
 lever:
   - slug: spotify
+    name: Spotify
     added: "2026-06-01"
 
 ashby:
   - slug: ramp
+    name: Ramp
     added: "2026-06-01"
   - slug: replit
+    name: Replit
     added: "2026-06-01"
   - slug: retool
     added: "2026-06-01"
