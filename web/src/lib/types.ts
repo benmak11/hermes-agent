@@ -278,6 +278,8 @@ export type Confirmation = {
   submitted_at: string;
   confirmation_id?: string | null;
   screenshot_uri?: string | null;
+  /** Absent on documents written before manual apply existed: treat as auto. */
+  method?: "auto" | "manual";
 };
 
 export type Screenshot = { name: string; uri: string };
@@ -299,6 +301,8 @@ export type Application = {
   screenshots?: Screenshot[];
   confirmation?: Confirmation | null;
   timeline: StatusEvent[];
+  /** Response-only: Hermes can submit this one itself. Absent means no. */
+  auto_submit?: boolean;
 };
 
 // ---- Journeys (mirrors models/journey.py) ----

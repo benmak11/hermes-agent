@@ -9,7 +9,17 @@ import { useEffect, useState } from "react";
 import { apiFetch, newRequestId } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { auth } from "@/lib/firebase";
-import type { Application, ApplicationStatus, RoleBullets } from "@/lib/types";
+import {
+  failedMessage,
+  isSubmitUnavailable,
+  loadErrorMessage,
+  markAppliedErrorMessage,
+  objectiveErrorMessage,
+  reviewActions,
+  submitErrorMessage,
+  type ReviewActions,
+} from "@/lib/reviewActions";
+import type { Application, RoleBullets } from "@/lib/types";
 import { TopNav } from "@/components/TopNav";
 import { MonoLabel } from "@/components/warm/Editable";
 import { SERIF } from "@/components/warm/styles";
@@ -68,6 +78,17 @@ export default function ReviewPage() {
 
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey });
+  // The tracking list shows status too, so a change here refreshes it as well.
+  const invalidateAll = () =>
+    Promise.all([
+      invalidate(),
+      queryClient.invalidateQueries({ queryKey: ["applications"] }),
+    ]);
+
+  const [objectiveError, setObjectiveError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitUnavailable, setSubmitUnavailable] = useState(false);
+  const [markError, setMarkError] = useState<string | null>(null);
 
   // Live submission progress via SSE. EventSource can't set headers, so both
   // the Firebase token and the correlation id ride as query params (the token
@@ -104,7 +125,9 @@ export default function ReviewPage() {
         method: "PUT",
         body: JSON.stringify({ objective_text }),
       }),
-    onSuccess: invalidate,
+    onMutate: () => setObjectiveError(null),
+    onSuccess: invalidateAll,
+    onError: (err) => setObjectiveError(objectiveErrorMessage(err)),
   });
 
   const regenerate = useMutation({
@@ -116,7 +139,20 @@ export default function ReviewPage() {
   const submit = useMutation({
     mutationFn: () =>
       apiFetch(`/applications/${id}/submit`, { method: "POST" }),
-    onSuccess: invalidate,
+    onMutate: () => setSubmitError(null),
+    onSuccess: invalidateAll,
+    onError: (err) => {
+      if (isSubmitUnavailable(err)) setSubmitUnavailable(true);
+      setSubmitError(submitErrorMessage(err));
+    },
+  });
+
+  const markApplied = useMutation({
+    mutationFn: () =>
+      apiFetch(`/applications/${id}/mark-applied`, { method: "POST" }),
+    onMutate: () => setMarkError(null),
+    onSuccess: invalidateAll,
+    onError: (err) => setMarkError(markAppliedErrorMessage(err)),
   });
 
   if (loading || !user || isLoading) {
@@ -135,13 +171,16 @@ export default function ReviewPage() {
       <>
         <TopNav section="applications" />
         <main className="p-8 text-[13.5px]" style={{ color: "var(--brick)" }}>
-          Failed to load application: {String(error)}
+          {loadErrorMessage(error)}
         </main>
       </>
     );
   }
 
   const pill = statusPill(app.status);
+  const actions = reviewActions(app, { submitUnavailable });
+  const company = app.job_company || "the employer";
+  const site = app.job_company ? `${app.job_company}'s site` : "the employer's site";
 
   return (
     <>
@@ -197,14 +236,26 @@ export default function ReviewPage() {
         {/* "queued" belongs on the banner side, not here: there is no objective
             or resume variant yet, so this branch would render a blank editor
             whose contents the tailoring result overwrites when it lands. */}
-        {app.status !== "queued" && app.status !== "tailoring" && (
+        {actions.showObjective && (
           <>
-            <ObjectiveEditor
-              key={app.objective_text ?? ""}
-              initial={app.objective_text ?? ""}
-              saving={saveObjective.isPending}
-              onSave={(t) => saveObjective.mutate(t)}
-            />
+            {actions.objectiveEditable ? (
+              <ObjectiveEditor
+                key={app.objective_text ?? ""}
+                initial={app.objective_text ?? ""}
+                saving={saveObjective.isPending}
+                error={objectiveError}
+                onSave={(t) => saveObjective.mutate(t)}
+              />
+            ) : (
+              <Section title={OBJECTIVE_TITLE}>
+                <p
+                  className="whitespace-pre-wrap text-[13.5px] leading-[1.65]"
+                  style={{ color: "var(--ink-2)" }}
+                >
+                  {app.objective_text || "No objective for this one."}
+                </p>
+              </Section>
+            )}
 
             <Section title="What we changed on your resume">
               <p
@@ -224,39 +275,54 @@ export default function ReviewPage() {
                 />
               ))}
             </Section>
-
-            {app.resume_variant_uri && (
-              <p
-                className="mt-2 break-all text-[11px]"
-                style={{ color: "#a3927f" }}
-              >
-                Resume: {app.resume_variant_uri}
-              </p>
-            )}
           </>
         )}
 
-        <SubmissionPanel app={app} />
+        <SubmissionPanel app={app} title={actions.panelTitle} />
 
-        <div className="mt-[22px] flex flex-wrap items-center gap-3">
-          <button
-            onClick={() => {
-              const verb = app.status === "failed" ? "Retry submitting" : "Submit";
+        {actions.showManual && (
+          <ManualApply
+            app={app}
+            actions={actions}
+            marking={markApplied.isPending}
+            error={markError}
+            onMarkApplied={() => {
               if (
                 window.confirm(
-                  `${verb} a real application to ${app.job_company ?? "this company"} for "${app.job_title ?? app.job_id}"? This cannot be undone.`,
+                  `Mark this as applied? Do this after you've submitted on ${site}.`,
                 )
               )
-                submit.mutate();
+                markApplied.mutate();
             }}
-            disabled={
-              !(app.status === "ready_for_review" || app.status === "failed") ||
-              submit.isPending
-            }
-            className="wm-cta inline-flex h-[46px] items-center gap-2 rounded-[13px] px-[22px] text-[14px] font-semibold"
-          >
-            ✓ {app.status === "failed" ? "Retry Submit" : "Approve & Submit"}
-          </button>
+          />
+        )}
+
+        {submitError && (
+          <p className="mt-4 text-[13px]" style={{ color: "var(--brick)" }}>
+            {submitError}
+          </p>
+        )}
+
+        <div className="mt-[22px] flex flex-wrap items-center gap-3">
+          {actions.showSubmit && (
+            <button
+              onClick={() => {
+                const verb =
+                  app.status === "failed" ? "Retry submitting" : "Submit";
+                if (
+                  window.confirm(
+                    `${verb} a real application to ${company} for "${app.job_title ?? app.job_id}"? This cannot be undone.`,
+                  )
+                )
+                  submit.mutate();
+              }}
+              disabled={submit.isPending}
+              className="wm-ghost inline-flex h-[42px] items-center gap-2 rounded-[13px] border px-[18px] text-[13.5px] font-semibold disabled:opacity-40"
+              style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
+            >
+              ✓ {actions.submitLabel}
+            </button>
+          )}
           <button
             onClick={() => regenerate.mutate()}
             disabled={
@@ -264,14 +330,11 @@ export default function ReviewPage() {
               app.status === "submitting" ||
               regenerate.isPending
             }
-            className="wm-ghost inline-flex h-[46px] items-center gap-1.5 rounded-[13px] border px-[18px] text-[14px] font-semibold disabled:opacity-40"
+            className="wm-ghost inline-flex h-[42px] items-center gap-1.5 rounded-[13px] border px-[18px] text-[13.5px] font-semibold disabled:opacity-40"
             style={{ borderColor: "#e8dacb", color: "var(--ink-2)" }}
           >
             ↻ Regenerate
           </button>
-          <span className="text-[12.5px]" style={{ color: "#a3927f" }}>
-            We&apos;ll ask you to confirm first. Nothing is sent until you say so.
-          </span>
         </div>
       </main>
     </>
@@ -322,19 +385,23 @@ function Section({
   );
 }
 
+const OBJECTIVE_TITLE = "Why you want this job — in your words";
+
 function ObjectiveEditor({
   initial,
   saving,
+  error,
   onSave,
 }: {
   initial: string;
   saving: boolean;
+  error: string | null;
   onSave: (text: string) => void;
 }) {
   const [text, setText] = useState(initial);
   const dirty = text !== initial;
   return (
-    <Section title="Why you want this job — in your words">
+    <Section title={OBJECTIVE_TITLE}>
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
@@ -355,35 +422,29 @@ function ObjectiveEditor({
           </span>
         )}
       </div>
+      {error && (
+        <p className="mt-2.5 text-[12.5px]" style={{ color: "var(--brick)" }}>
+          {error}
+        </p>
+      )}
     </Section>
   );
 }
 
-/** Panel heading per post-review status (design 13 for `failed`). */
-const PANEL_TITLE: Partial<Record<ApplicationStatus, string>> = {
-  submitting: "Sending it in…",
-  submitted: "Application sent ✓",
-  responded: "They replied",
-  failed: "That one didn't go through",
-};
-
-function SubmissionPanel({ app }: { app: Application }) {
+function SubmissionPanel({
+  app,
+  title,
+}: {
+  app: Application;
+  title: string | null;
+}) {
+  if (title === null) return null;
   const failed = app.status === "failed";
-  if (
-    app.status === "ready_for_review" ||
-    app.status === "tailoring" ||
-    app.status === "queued"
-  ) {
-    return null;
-  }
 
-  // Submission progress notes, oldest→newest among the submission lifecycle.
+  // User-facing progress notes. Failure notes are raw errors, so they stay out.
   const notes = app.timeline.filter(
-    (e) => e.note && ["submitting", "submitted", "failed"].includes(e.status),
+    (e) => e.note && ["submitting", "submitted"].includes(e.status),
   );
-  const lastFailed = [...app.timeline]
-    .reverse()
-    .find((e) => e.status === "failed");
 
   return (
     <section
@@ -394,41 +455,16 @@ function SubmissionPanel({ app }: { app: Application }) {
       }}
     >
       <h2 className="mb-2 text-[16px] font-bold" style={{ color: "var(--ink)" }}>
-        {PANEL_TITLE[app.status]}
+        {title}
       </h2>
 
-      {app.status === "failed" && (
-        <>
-          <p
-            className="mb-[18px] text-[13.5px] leading-[1.6]"
-            style={{ color: "var(--ink-3)" }}
-          >
-            {lastFailed?.note ?? "Unknown error."} We can try again, or you can
-            send it yourself with the resume we wrote.
-          </p>
-          <div className="flex flex-wrap items-center gap-2.5">
-            {app.job_url && (
-              <a
-                href={app.job_url}
-                target="_blank"
-                rel="noreferrer"
-                className="wm-ghost inline-flex h-[40px] items-center gap-1.5 rounded-[12px] border px-[18px] text-[13.5px] font-semibold"
-                style={{ borderColor: "#e8dacb", color: "var(--ink)" }}
-              >
-                I&apos;ll do this one myself ↗
-              </a>
-            )}
-            <button
-              onClick={() =>
-                downloadResume(app.id, app.job_company ?? "company")
-              }
-              className="wm-ghost inline-flex h-[40px] items-center gap-1.5 rounded-[12px] border px-[18px] text-[13.5px] font-semibold"
-              style={{ borderColor: "#e8dacb", color: "var(--ink)" }}
-            >
-              ↓ Download my resume for this job
-            </button>
-          </div>
-        </>
+      {failed && (
+        <p
+          className="text-[13.5px] leading-[1.6]"
+          style={{ color: "var(--ink-3)" }}
+        >
+          {failedMessage(app)}
+        </p>
       )}
 
       {notes.length > 0 && (
@@ -453,6 +489,99 @@ function SubmissionPanel({ app }: { app: Application }) {
           style={{ color: "#a3927f" }}
         >
           Confirmation screenshot: {app.confirmation.screenshot_uri}
+        </p>
+      )}
+    </section>
+  );
+}
+
+/** The trial's primary path: the user applies on the employer's site. */
+function ManualApply({
+  app,
+  actions,
+  marking,
+  error,
+  onMarkApplied,
+}: {
+  app: Application;
+  actions: ReviewActions;
+  marking: boolean;
+  error: string | null;
+  onMarkApplied: () => void;
+}) {
+  const [copied, setCopied] = useState<"ok" | "failed" | null>(null);
+  const objective = app.objective_text ?? "";
+
+  const copyObjective = async () => {
+    try {
+      await navigator.clipboard.writeText(objective);
+      setCopied("ok");
+    } catch {
+      setCopied("failed");
+    }
+    window.setTimeout(() => setCopied(null), 2500);
+  };
+
+  const ghost =
+    "wm-ghost inline-flex h-[42px] items-center gap-1.5 rounded-[12px] border px-[16px] text-[13.5px] font-semibold disabled:opacity-40";
+
+  return (
+    <section
+      className="mt-6 rounded-[18px] border p-[22px]"
+      style={{ background: "var(--surface-warm)", borderColor: "var(--border-warm-hair)" }}
+    >
+      <h2 className="mb-1.5 text-[16px] font-bold" style={{ color: "var(--ink)" }}>
+        Send it yourself
+      </h2>
+      <p className="mb-[18px] text-[13px] leading-[1.6]" style={{ color: "var(--ink-4)" }}>
+        Open the posting, attach the résumé we wrote, paste your objective if
+        they ask for one, then come back and mark it as applied.
+      </p>
+      <div className="flex flex-wrap items-center gap-2.5">
+        {app.job_url && (
+          <a
+            href={app.job_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="wm-cta inline-flex h-[42px] items-center gap-1.5 rounded-[12px] px-[18px] text-[13.5px] font-semibold"
+          >
+            Apply on {app.job_company || "the employer's site"} ↗
+          </a>
+        )}
+        {actions.showDownload && (
+          <button
+            onClick={() => downloadResume(app.id, app.job_company ?? "company")}
+            className={ghost}
+            style={{ borderColor: "#e8dacb", color: "var(--ink)" }}
+          >
+            ↓ Download résumé
+          </button>
+        )}
+        <button
+          onClick={copyObjective}
+          disabled={!objective}
+          className={ghost}
+          style={{ borderColor: "#e8dacb", color: "var(--ink)" }}
+        >
+          {copied === "ok" ? "Copied ✓" : "Copy objective"}
+        </button>
+        <button
+          onClick={onMarkApplied}
+          disabled={marking}
+          className={ghost}
+          style={{ borderColor: "#cfe0c8", color: "var(--sage)" }}
+        >
+          {marking ? "Saving…" : "I applied ✓"}
+        </button>
+      </div>
+      {copied === "failed" && (
+        <p className="mt-2.5 text-[12.5px]" style={{ color: "var(--brick)" }}>
+          Could not copy. Select the objective above and copy it yourself.
+        </p>
+      )}
+      {error && (
+        <p className="mt-2.5 text-[12.5px]" style={{ color: "var(--brick)" }}>
+          {error}
         </p>
       )}
     </section>
