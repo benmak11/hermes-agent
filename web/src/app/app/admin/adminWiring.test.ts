@@ -34,3 +34,23 @@ describe("/app/admin data fetching", () => {
     expect(CODE).toContain("confirm: panel.typed");
   });
 });
+
+describe("/app/admin board health", () => {
+  it("fetches /admin/boards only once the accounts call shows the admin", () => {
+    expect(CODE).toMatch(/queryKey:\s*\["admin",\s*"boards"\]/);
+    expect(CODE).toContain('apiFetch<BoardHealth>("/admin/boards")');
+    expect(CODE).toMatch(/enabled:\s*!!user\s*&&\s*showsAdminNav\(view\)/);
+    expect((CODE.match(/retry:\s*false/g) ?? []).length).toBe(2);
+  });
+
+  it("decides its state with boardsView and renders only beside the admin view", () => {
+    expect(CODE).toContain("boardsView(");
+    expect(CODE).toContain("{showsAdminNav(view) && <BoardHealthSection view={boardView} />}");
+    expect(CODE).toContain("{NO_BOARDS}");
+  });
+
+  it("is view-only and marks failing rows in brick", () => {
+    expect(CODE).not.toMatch(/apiFetch<[^>]*>\("\/admin\/boards",/);
+    expect(CODE).toMatch(/isFailing\(row\)\s*\?\s*"var\(--brick\)"/);
+  });
+});

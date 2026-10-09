@@ -137,28 +137,152 @@ def _unvetted_slugs(d, platform: str) -> list[str]:
 def test_append_skips_a_case_variant_of_an_existing_unvetted_slug(data_dir) -> None:
     _write(data_dir, unvetted={"ashby": [{"slug": "forward"}]})
 
-    assert tc.append_unvetted("ashby", ["Forward", "newco"]) == 1
+    assert tc.append_unvetted("ashby", [("Forward", None), ("newco", None)]) == 1
     assert _unvetted_slugs(data_dir, "ashby") == ["forward", "newco"]
 
 
 def test_append_skips_a_case_variant_of_a_known_slug(data_dir) -> None:
     _write(data_dir, known={"lever": [{"slug": "spotify"}]})
 
-    assert tc.append_unvetted("lever", ["Spotify"]) == 0
+    assert tc.append_unvetted("lever", [("Spotify", "Spotify")]) == 0
 
 
 def test_append_skips_a_case_variant_of_a_blocklisted_slug(data_dir) -> None:
     _write(data_dir, blocked=[_block("ashby", "forward")])
 
-    assert tc.append_unvetted("ashby", ["Forward", "newco"]) == 1
+    assert tc.append_unvetted("ashby", [("Forward", None), ("newco", None)]) == 1
     assert _unvetted_slugs(data_dir, "ashby") == ["newco"]
 
 
 def test_append_adds_one_of_two_case_variants_in_a_batch(data_dir) -> None:
     _write(data_dir)
 
-    assert tc.append_unvetted("lever", ["BestEgg", "bestegg"]) == 1
+    assert tc.append_unvetted("lever", [("BestEgg", None), ("bestegg", None)]) == 1
     assert _unvetted_slugs(data_dir, "lever") == ["BestEgg"]
+
+
+def test_append_writes_the_name_only_when_known(data_dir) -> None:
+    _write(data_dir)
+
+    assert tc.append_unvetted("ashby", [("acme", "Acme"), ("globex", None)]) == 2
+
+    raw = yaml.safe_load((data_dir / "unvetted.yaml").read_text())
+    acme, globex = raw["ashby"]
+    assert list(acme) == ["slug", "name", "added"]
+    assert acme["name"] == "Acme"
+    assert list(globex) == ["slug", "added"]
+
+
+def test_append_keeps_the_name_of_the_spelling_it_keeps(data_dir) -> None:
+    _write(data_dir, known={"lever": [{"slug": "globex"}]})
+
+    added = tc.append_unvetted(
+        "lever", [("Acme", "Acme"), ("acme", "Other"), ("Globex", "Globex Corp")]
+    )
+
+    assert added == 1
+    raw = yaml.safe_load((data_dir / "unvetted.yaml").read_text())
+    assert [(c["slug"], c["name"]) for c in raw["lever"]] == [("Acme", "Acme")]
+
+
+def test_new_unvetted_slugs_matches_what_append_adds(data_dir) -> None:
+    _write(
+        data_dir,
+        known={"lever": [{"slug": "spotify"}]},
+        unvetted={"lever": [{"slug": "forward"}]},
+        blocked=[_block("lever", "deadco")],
+    )
+    batch = ["Spotify", "FORWARD", "DeadCo", "acme", "Acme", "globex"]
+
+    assert tc.new_unvetted_slugs("lever", batch) == ["acme", "globex"]
+    assert tc.append_unvetted("lever", [(s, None) for s in batch]) == 2
+
+
+# ---------------------------------------------------------------------------
+# fill_missing_names
+# ---------------------------------------------------------------------------
+_KNOWN_TEXT = """# Hand-written header comment.
+greenhouse:
+  - slug: acme
+    added: "2026-06-01"
+    notes: "keeps its quotes"
+  - slug: globex
+    name: "Globex Corp"
+    added: "2026-06-01"
+
+# A comment between sections.
+ashby:
+  - slug: Initech  # trailing comment
+    paused: true
+"""
+
+
+def test_fill_inserts_names_and_keeps_comments_quotes_and_order(data_dir) -> None:
+    (data_dir / "known.yaml").write_text(_KNOWN_TEXT)
+
+    n = tc.fill_missing_names(
+        "known.yaml",
+        {("greenhouse", "acme"): "Acme & Co", ("ashby", "Initech"): "Initech"},
+    )
+
+    assert n == 2
+    assert (data_dir / "known.yaml").read_text() == _KNOWN_TEXT.replace(
+        "  - slug: acme\n", "  - slug: acme\n    name: Acme & Co\n"
+    ).replace(
+        "  - slug: Initech  # trailing comment\n",
+        "  - slug: Initech  # trailing comment\n    name: Initech\n",
+    )
+
+
+def test_fill_never_overwrites_an_existing_name(data_dir) -> None:
+    (data_dir / "known.yaml").write_text(_KNOWN_TEXT)
+
+    n = tc.fill_missing_names(
+        "known.yaml", {("greenhouse", "globex"): "Something Else"}
+    )
+
+    assert n == 0
+    assert (data_dir / "known.yaml").read_text() == _KNOWN_TEXT
+
+
+def test_fill_matches_the_slug_exactly_on_its_platform(data_dir) -> None:
+    (data_dir / "known.yaml").write_text(_KNOWN_TEXT)
+
+    n = tc.fill_missing_names(
+        "known.yaml",
+        {("greenhouse", "Acme"): "Wrong case", ("ashby", "acme"): "Wrong platform"},
+    )
+
+    assert n == 0
+    assert (data_dir / "known.yaml").read_text() == _KNOWN_TEXT
+
+
+def test_fill_on_a_dumped_file_matches_a_safe_dump_round_trip(data_dir) -> None:
+    """unvetted.yaml is machine-written; the insertion must equal re-dumping it."""
+    _write(data_dir)
+    tc.append_unvetted("lever", [("acme", None), ("globex", "Globex")])
+    tc.append_unvetted("ashby", [("initech", None)])
+
+    tc.fill_missing_names(
+        "unvetted.yaml",
+        {("lever", "acme"): "Acme: The Company", ("ashby", "initech"): "Ïnitech"},
+    )
+
+    text = (data_dir / "unvetted.yaml").read_text()
+    raw = yaml.safe_load(text)
+    assert raw["lever"][0]["name"] == "Acme: The Company"
+    assert raw["ashby"][0]["name"] == "Ïnitech"
+    assert yaml.safe_dump(raw, sort_keys=False, allow_unicode=True) == text
+
+
+def test_fill_refuses_a_layout_it_cannot_edit_and_writes_nothing(data_dir) -> None:
+    text = "greenhouse:\n  - {slug: acme, added: '2026-06-01'}\n"
+    (data_dir / "known.yaml").write_text(text)
+
+    with pytest.raises(RuntimeError):
+        tc.fill_missing_names("known.yaml", {("greenhouse", "acme"): "Acme"})
+
+    assert (data_dir / "known.yaml").read_text() == text
 
 
 # ---------------------------------------------------------------------------
