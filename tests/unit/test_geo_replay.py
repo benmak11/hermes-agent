@@ -19,6 +19,7 @@ from cli.geo_replay import (
     Replay,
     ShadowTally,
     readiness_user,
+    replay_user,
     report,
     report_readiness,
 )
@@ -319,3 +320,36 @@ def test_readiness_counts_both_collections_and_records_with_no_verdict():
 def test_readiness_on_a_missing_user_returns_none_rather_than_empty_counts():
     """An empty report for a typo'd uid reads as "zero false positives"."""
     assert asyncio.run(readiness_user(_DB({}), "nope")) is None
+
+
+def test_pruned_tombstones_stay_out_of_the_pro_call_denominator():
+    """A prune is not a Pro call; counting it would shrink the capped share."""
+    profile = {
+        "user_id": "u1",
+        "full_name": "Test Candidate",
+        "email": "test@example.com",
+        "location": "Somewhere",
+        "objective_template": "{role} at {company}",
+        "experience": [],
+        "education": [],
+        "skills": {},
+        "preferences": {
+            "target_role_families": ["engineering"],
+            "target_titles": ["Staff Software Engineer"],
+            "target_seniorities": ["staff"],
+        },
+        "residence": {"country": "US"},
+    }
+    db = _DB(
+        {
+            "users/u1": profile,
+            "users/u1/discarded_jobs/a": {"score": 20},
+            "users/u1/discarded_jobs/b": {"score": 0},
+            "users/u1/discarded_jobs/c": {"score": 55},
+            "users/u1/discarded_jobs/d": {"pruned": {"by": "prerank"}},
+        }
+    )
+    r = asyncio.run(replay_user(db, "u1", with_discarded=True))
+    assert r is not None
+    assert (r.tombstones, r.tombstones_capped, r.tombstones_free) == (3, 1, 1)
+    assert r.pro_calls == 2

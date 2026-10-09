@@ -253,3 +253,21 @@ async def test_replay_user_never_writes(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(_Coll, name, _boom, raising=False)
     db = _DB(_user_doc(), {"jobs": [{"title": "Playable Ads Editor"}]})
     assert await replay_user(db, "u1", with_discarded=True) is not None
+
+
+@pytest.mark.asyncio
+async def test_pruned_tombstones_are_not_counted_as_pro_rejections():
+    """A prune spent no parse and no Pro call, so a drop there saves nothing."""
+    db = _DB(
+        _user_doc(),
+        {
+            "jobs": [],
+            "discarded_jobs": [
+                {"title": "Amazon PPC Specialist", "score": 0},
+                {"title": "Amazon PPC Specialist", "pruned": {"by": "prerank"}},
+            ],
+        },
+    )
+    r = await replay_user(db, "u1", with_discarded=True)
+    assert r is not None
+    assert (r.tombstones, r.tombstones_dropped) == (1, 1)

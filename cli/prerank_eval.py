@@ -10,7 +10,8 @@ calls no model. ``--with-cache`` adds batched reads of the top-level
 Corpus, per user:
 
 - **J** — every ``users/{uid}/jobs`` doc carrying a ``match``, any decision.
-- **T** — every ``users/{uid}/discarded_jobs`` tombstone.
+- **T** — every ``users/{uid}/discarded_jobs`` tombstone a model scored.
+  Tombstones ``cli.prune_backlog`` wrote carry no score and are never labels.
 
 ``y = 1`` iff the outcome score (``match.overall_score`` on J, ``score`` on T)
 is at least the queue threshold.
@@ -26,8 +27,13 @@ marked. ``location`` carries no weight; its signal is reported as a diagnostic.
 AUC is per user. With several ``--user-id``\\s the pooled figure sums each
 user's Mann-Whitney U and pair count, so only within-user pairs are compared.
 
+Section 7 tabulates prune cutoffs: per cutoff, the labelled rows at or below
+it by the masked prerank, and the backlog jobs at or below it by the unmasked
+prerank ``cli.prune_backlog`` uses.
+
 Usage:
     python -m cli.prerank_eval --user-id <uid>
+    python -m cli.prerank_eval --user-id <uid> --cutoff -25 --cutoff -15
     TITLE_FILTER_WIDE=1 python -m cli.prerank_eval --user-id <uid>
     python -m cli.prerank_eval --user-id <uid> --half even --with-cache
 """
@@ -58,7 +64,7 @@ from tools.matching.prerank import (
     prerank,
     residence_country,
 )
-from tools.matching.score import QUEUE_DEFAULT_MIN_SCORE
+from tools.matching.score import QUEUE_DEFAULT_MIN_SCORE, is_pruned
 
 # Pins GOOGLE_CLOUD_PROJECT; ``firestore_client`` asserts it is set.
 load_dotenv()
@@ -86,13 +92,16 @@ JOB_FIELDS = [
     "match",
     "user_decision",
 ]
-TOMBSTONE_FIELDS = ["title", "company", "score", "jd_parsed"]
+TOMBSTONE_FIELDS = ["title", "company", "score", "jd_parsed", "pruned"]
 
 PASS_AUC = 0.70
 PASS_LO = 0.60
 MIN_PER_CLASS = 30
 TOP_FRACTION = 0.10
 CACHE_CHUNK = 300
+
+#: Section 7's default prune cutoffs; ``--cutoff`` replaces them.
+PRUNE_CUTOFFS = (-40.0, -30.0, -20.0, -10.0, -5.0, 0.0, 5.0)
 
 
 # ------------------------------------------------------------------- corpus
@@ -253,7 +262,9 @@ async def load_user(
                 backlog.unparsed += 1
 
     async for tomb in user_ref.collection(TOMBSTONES).select(TOMBSTONE_FIELDS).stream():
-        add(tomb.id, tomb.to_dict() or {}, TOMBSTONES)
+        doc = tomb.to_dict() or {}
+        if not is_pruned(doc):
+            add(tomb.id, doc, TOMBSTONES)
 
     if with_cache:
         await _cache_backlog(db, jobs_ref, backlog, rank)
@@ -455,6 +466,48 @@ def tie_mass_at_top(scores: list[float]) -> tuple[float, int] | None:
     return third, sum(1 for s in scores if s == third)
 
 
+@dataclass(frozen=True)
+class CutoffRow:
+    """One prune cutoff: what pruning at or below it would remove."""
+
+    cutoff: float
+    positives: int
+    negatives: int
+    lost: float | Undefined
+    backlog: int
+    backlog_share: float | Undefined
+
+
+def cutoff_table(
+    rows: list[Row], backlog_scores: list[float], cutoffs=PRUNE_CUTOFFS
+) -> list[CutoffRow]:
+    """Per cutoff, labelled rows with masked prerank ``<= cutoff``, the share of
+    all positives that is, and backlog jobs with unmasked prerank ``<= cutoff``.
+    A score equal to the cutoff counts as pruned, as ``cli.prune_backlog``
+    prunes it."""
+    n_pos = sum(r.positive for r in rows)
+    out = []
+    for cutoff in sorted(cutoffs):
+        below = [r for r in rows if r.gate.score <= cutoff]
+        pos = sum(r.positive for r in below)
+        backlog = sum(1 for s in backlog_scores if s <= cutoff)
+        out.append(
+            CutoffRow(
+                cutoff=cutoff,
+                positives=pos,
+                negatives=len(below) - pos,
+                lost=pos / n_pos if n_pos else Undefined("no positives"),
+                backlog=backlog,
+                backlog_share=(
+                    backlog / len(backlog_scores)
+                    if backlog_scores
+                    else Undefined("empty backlog")
+                ),
+            )
+        )
+    return out
+
+
 def histogram(scores: list[float], width: int = 10) -> list[tuple[int, int]]:
     """``(bin floor, count)``, highest bin first."""
     counts = Counter(math.floor(s / width) * width for s in scores)
@@ -493,7 +546,11 @@ def header(enforce_geo: bool) -> str:
     )
 
 
-def report(corpus: Corpus, *, half: str | None) -> Gate:
+def _pct(value: float | Undefined) -> str:
+    return "undefined" if isinstance(value, Undefined) else f"{value:.1%}"
+
+
+def report(corpus: Corpus, *, half: str | None, cutoffs=PRUNE_CUTOFFS) -> Gate:
     """Print one user's report. Pure output."""
     rows = corpus.rows
     n_j = sum(r.source == JOBS for r in rows)
@@ -588,6 +645,22 @@ def report(corpus: Corpus, *, half: str | None) -> Gate:
             f"     jd_cache: {b.cache_hits} of {b.unparsed} unparsed hit; "
             f"the prefilter would reject {b.cache_rejects} of those"
         )
+
+    print("\n   7. Prune cutoffs (prune = prerank <= cutoff)")
+    print(
+        "     labelled: masked prerank; backlog: unmasked, as prune_backlog "
+        "scores it\n     (the backlog also carries the parsed term the mask "
+        f"hides; a prefilter reject sits\n     at {W_PARSED_REJECT:+g})"
+    )
+    print(
+        f"     {'cutoff':>7}{'pos <=':>9}{'neg <=':>9}{'pos lost':>10}"
+        f"{'backlog <=':>12}{'of backlog':>12}"
+    )
+    for row in cutoff_table(rows, b.scores, cutoffs):
+        print(
+            f"     {row.cutoff:>+7g}{row.positives:>9}{row.negatives:>9}"
+            f"{_pct(row.lost):>10}{row.backlog:>12}{_pct(row.backlog_share):>12}"
+        )
     return g
 
 
@@ -609,6 +682,7 @@ async def run(
     half: str | None,
     enforce_geo: bool,
     with_cache: bool,
+    cutoffs=PRUNE_CUTOFFS,
 ) -> list[Corpus]:
     print(header(enforce_geo))
     corpora: list[Corpus] = []
@@ -619,7 +693,7 @@ async def run(
         if corpus is None:
             print(f"\n── users/{user_id}: no such user, skipped")
             continue
-        report(corpus, half=half)
+        report(corpus, half=half, cutoffs=cutoffs)
         corpora.append(corpus)
     if len(corpora) > 1:
         report_pooled(corpora)
@@ -640,6 +714,13 @@ async def main() -> None:
         action="store_true",
         help="Also count jd_cache hits on the backlog (reads every pending jd_raw)",
     )
+    parser.add_argument(
+        "--cutoff",
+        type=float,
+        action="append",
+        default=None,
+        help="A prune cutoff for section 7 (repeatable; replaces the defaults)",
+    )
     args = parser.parse_args()
     bind_run_context("prerank_eval", user_id=",".join(args.user_id))
     await run(
@@ -648,6 +729,7 @@ async def main() -> None:
         half=args.half,
         enforce_geo=geo_enforce_enabled(),
         with_cache=args.with_cache,
+        cutoffs=tuple(args.cutoff) if args.cutoff else PRUNE_CUTOFFS,
     )
 
 

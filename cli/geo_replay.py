@@ -61,7 +61,7 @@ from models.job import ParsedJD
 from models.profile import MasterProfile
 from obs.logging import bind_run_context, get_logger
 from tools.matching import geo, jd_cache, rates
-from tools.matching.score import DISCARD_AT_OR_BELOW
+from tools.matching.score import DISCARD_AT_OR_BELOW, is_pruned
 
 load_dotenv()
 
@@ -204,8 +204,13 @@ async def replay_user(
 
     if with_discarded:
         async for tomb in user_ref.collection("discarded_jobs").stream():
+            doc = tomb.to_dict() or {}
+            if is_pruned(doc):
+                # Pruned unscored by prerank: no Pro call, so not part of the
+                # Pro-call denominator below.
+                continue
             result.tombstones += 1
-            score = float((tomb.to_dict() or {}).get("score", -1))
+            score = float(doc.get("score", -1))
             if score == GEO_CAP_SCORE:
                 result.tombstones_capped += 1
             elif score == 0.0:
