@@ -11,6 +11,7 @@ import asyncio
 import re
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -18,7 +19,9 @@ import httpx
 import yaml
 
 from obs.logging import get_logger
-from tools.companies import PLATFORMS, Platform, append_unvetted
+from tools.ats._http import NOT_FOUND, OK, board_client
+from tools.ats.probe import BoardProbe, probe_board
+from tools.companies import PLATFORMS, Platform, append_unvetted, new_unvetted_slugs
 
 log = get_logger("tools.discovery.sweep")
 
@@ -130,17 +133,85 @@ def extract_slugs(urls: list[str], platform: Platform) -> set[str]:
     return slugs
 
 
-async def run_sweep(backend: SearchBackend) -> dict[Platform, int]:
+#: Boards probed at once while vetting a sweep's new slugs.
+_PROBE_CONCURRENCY = 10
+
+#: Why a new slug was not added. ``failing`` is any other non-ok outcome.
+REJECT_REASONS = ("not_found", "empty", "failing")
+
+
+@dataclass
+class SweepResult:
+    """Per platform: slugs added, and slugs rejected by reason."""
+
+    added: dict[Platform, int] = field(default_factory=dict)
+    rejected: dict[Platform, dict[str, int]] = field(default_factory=dict)
+
+
+def _reject_reason(probe: BoardProbe) -> str | None:
+    """``None`` when the board may be added: it answered ok with jobs."""
+    if probe.outcome == NOT_FOUND:
+        return "not_found"
+    if probe.outcome != OK or probe.job_count is None:
+        return "failing"
+    if probe.job_count < 1:
+        return "empty"
+    return None
+
+
+async def vet_slugs(
+    platform: Platform, slugs: list[str]
+) -> tuple[list[tuple[str, str | None]], dict[str, int]]:
+    """Probe ``slugs``; return the ``(slug, name)`` pairs to add and rejections.
+
+    At most :data:`_PROBE_CONCURRENCY` boards are probed at once, through one
+    pooled client. Order of the accepted pairs follows ``slugs``.
+    """
+    rejected = dict.fromkeys(REJECT_REASONS, 0)
+    if not slugs:
+        return [], rejected
+    sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
+
+    async def one(slug: str) -> BoardProbe:
+        async with sem:
+            return await probe_board(platform, slug)
+
+    async with board_client():
+        probes = await asyncio.gather(*(one(s) for s in slugs))
+
+    accepted: list[tuple[str, str | None]] = []
+    for slug, probe in zip(slugs, probes, strict=True):
+        reason = _reject_reason(probe)
+        if reason is None:
+            accepted.append((slug, probe.name))
+            continue
+        rejected[reason] += 1
+        log.info(
+            "sweep.slug_rejected",
+            platform=platform,
+            slug=slug,
+            reason=reason,
+            outcome=probe.outcome,
+            status=probe.status,
+        )
+    return accepted, rejected
+
+
+async def run_sweep(backend: SearchBackend) -> SweepResult:
     """Run all configured queries against all three platforms.
 
-    Returns {platform: new_slugs_added}.
+    A slug new to the pool is probed first and added only if its board answers
+    ok with at least one job, carrying the company name when the board has one.
     """
     queries_file = Path("data/companies/sweep_queries.yaml")
     config = yaml.safe_load(queries_file.read_text())
     queries: list[str] = config.get("queries", [])
     exclude: list[str] = config.get("exclude_keywords", [])
 
-    added: dict[Platform, int] = dict.fromkeys(PLATFORMS, 0)
+    result = SweepResult(
+        added=dict.fromkeys(PLATFORMS, 0),
+        rejected={p: dict.fromkeys(REJECT_REASONS, 0) for p in PLATFORMS},
+    )
 
     for platform in PLATFORMS:
         # Single-company career sites (google_jobs, meta_jobs) have no company
@@ -164,13 +235,18 @@ async def run_sweep(backend: SearchBackend) -> dict[Platform, int]:
                     continue
                 platform_slugs.update(extract_slugs(urls, platform))
 
-        n = append_unvetted(platform, sorted(platform_slugs))
-        added[platform] = n
+        candidates = new_unvetted_slugs(platform, sorted(platform_slugs))
+        accepted, rejected = await vet_slugs(platform, candidates)
+        n = append_unvetted(platform, accepted)
+        result.added[platform] = n
+        result.rejected[platform] = rejected
         log.info(
             "sweep.platform_done",
             platform=platform,
             slugs_found=len(platform_slugs),
+            probed=len(candidates),
             new_unvetted=n,
+            **{f"rejected_{r}": c for r, c in rejected.items()},
         )
 
-    return added
+    return result

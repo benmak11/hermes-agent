@@ -77,3 +77,13 @@ def test_no_active_slug_is_blocklisted() -> None:
     ]
     hits = [a for a in active if (a[1], a[2].casefold()) in blocked]
     assert hits == []
+
+
+def test_every_name_is_a_non_empty_trimmed_string() -> None:
+    """``name`` is the company's identity across platforms; a blank one is no name."""
+    for name, platform, entry in _pool():
+        if "name" not in entry:
+            continue
+        value = entry["name"]
+        assert isinstance(value, str), (name, platform, entry)
+        assert value.strip() == value != "", (name, platform, entry)

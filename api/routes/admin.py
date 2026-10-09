@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Baynham Makusha. All rights reserved.
 # Unauthorized copying, distribution, or use is prohibited.
-"""Operator-only routes: the accounts roster, and granting and revoking seats.
+"""Operator-only routes: the accounts roster, board health, and granting and
+revoking seats.
 
 Everything but ``/admin/me`` sits behind :func:`api.deps.verify_admin`, which
 answers anyone but the admin with a plain 404. ``/admin/me`` is on the normal
@@ -34,7 +35,10 @@ from api.deps import (
 from api.routes.account import _confirms
 from obs.logging import get_logger
 from tools import allowlist
+from tools import companies as company_lists
 from tools.account.roster import Roster, RosterSourceError, load_roster
+from tools.ats import board_health
+from tools.ats._http import NOT_FOUND
 
 router = APIRouter(prefix="/admin", tags=["admin"], include_in_schema=False)
 log = get_logger("api.admin")
@@ -80,6 +84,139 @@ async def accounts(
 
 
 _NO_STORE = {"Cache-Control": "no-store"}
+
+
+class BoardRow(BaseModel):
+    platform: str
+    slug: str
+    name: str | None
+    list: str  # known | unvetted | none
+    paused: bool
+    blocklisted: bool
+    state: str | None
+    last_outcome: str | None
+    last_status: int | None
+    failing_since: str | None
+    not_found_days: int
+    last_ok_at: str | None
+    updated_at: str | None
+
+
+class BoardTotals(BaseModel):
+    total: int
+    ok: int
+    failing: int
+    not_found: int
+    #: Active tracked boards in the YAML with no ``board_health`` record yet.
+    never_checked: int
+
+
+class BoardHealth(BaseModel):
+    totals: BoardTotals
+    boards: list[BoardRow]
+
+
+def _company_index() -> tuple[dict, set, set]:
+    """The YAML, keyed ``(platform, slug.casefold())``: list entries (known
+    wins over unvetted), blocklisted boards, and active tracked boards. Reads
+    only."""
+    entries: dict[tuple[str, str], tuple[str, company_lists.CompanyEntry]] = {}
+    for source, groups in (
+        ("known", company_lists.load_known()),
+        ("unvetted", company_lists.load_unvetted()),
+    ):
+        for plat, group in groups.items():
+            for e in group:
+                entries.setdefault((plat, e.slug.casefold()), (source, e))
+    blocked = {(p, s.casefold()) for p, s in company_lists.load_blocklist()}
+    active = {
+        (p, s.casefold())
+        for p, s, _ in company_lists.all_active_companies()
+        if p in board_health.TRACKED_PLATFORMS
+    }
+    return entries, blocked, active
+
+
+def _board_row(
+    doc_id: str, rec: dict, entries: dict, blocked: set
+) -> tuple[tuple[str, str], BoardRow]:
+    id_platform, _, id_slug = doc_id.partition(":")
+    platform = str(rec.get("platform") or id_platform)
+    slug = str(rec.get("slug") or id_slug)
+    key = (platform, slug.casefold())
+    source, entry = entries.get(key, ("none", None))
+    status = rec.get("last_status")
+    return key, BoardRow(
+        platform=platform,
+        slug=slug,
+        name=entry.name if entry else None,
+        list=source,
+        paused=bool(entry and entry.paused),
+        blocklisted=key in blocked,
+        state=rec.get("state"),
+        last_outcome=rec.get("last_outcome"),
+        last_status=status if isinstance(status, int) else None,
+        failing_since=rec.get("failing_since"),
+        not_found_days=int(rec.get("not_found_days") or 0),
+        last_ok_at=rec.get("last_ok_at"),
+        updated_at=rec.get("updated_at"),
+    )
+
+
+@router.get("/boards")
+async def boards(
+    response: Response, _admin: Annotated[Identity, Depends(verify_admin)]
+) -> BoardHealth:
+    """Every ``board_health`` record joined with the company YAML, failing
+    first, then most 404 days, then platform and slug. 503 naming the source
+    if either read fails. Never writes."""
+    response.headers["Cache-Control"] = "no-store"
+    source = board_health.COLLECTION
+    try:
+        records = {
+            snap.id: snap.to_dict() or {}
+            async for snap in _client().collection(board_health.COLLECTION).stream()
+        }
+        source = "company lists"
+        entries, blocked, active = await asyncio.to_thread(_company_index)
+    except Exception as e:
+        log.error("admin.boards_failed", source=source, error_type=type(e).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail=f"could not read {source}",
+            headers=_NO_STORE,
+        ) from e
+
+    rows: list[BoardRow] = []
+    seen: set[tuple[str, str]] = set()
+    for doc_id, rec in records.items():
+        key, row = _board_row(doc_id, rec, entries, blocked)
+        seen.add(key)
+        rows.append(row)
+    rows.sort(
+        key=lambda r: (
+            r.state != board_health.STATE_FAILING,
+            -r.not_found_days,
+            r.platform,
+            r.slug,
+        )
+    )
+    totals = BoardTotals(
+        total=len(rows),
+        ok=sum(r.state == board_health.STATE_OK for r in rows),
+        failing=sum(r.state == board_health.STATE_FAILING for r in rows),
+        not_found=sum(r.last_outcome == NOT_FOUND for r in rows),
+        never_checked=len(active - seen),
+    )
+    log.info(
+        "admin.boards_viewed",
+        rows=totals.total,
+        failing=totals.failing,
+        never_checked=totals.never_checked,
+    )
+    return BoardHealth(totals=totals, boards=rows)
+
+
 _REVOKE_LAG_MINUTES = int(_ALLOWLIST_CHECK_EVERY.total_seconds() // 60)
 
 
