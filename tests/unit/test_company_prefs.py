@@ -308,7 +308,9 @@ def test_the_overlay_is_read_before_the_fan_out(monkeypatch) -> None:
 
     class _WatchedDB(_FakeDB):
         def collection(self, name):
-            order.append("read")
+            # The shared board_health read is also before the fan-out, by design.
+            if name != "board_health":
+                order.append("read")
             return super().collection(name)
 
     async def fetcher(slug: str, user_id: str):

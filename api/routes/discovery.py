@@ -273,10 +273,16 @@ def _lease_held(lease, now: datetime) -> bool:
     return expiry is not None and expiry > now
 
 
+#: How early a loop counts as due. ``last_*_at`` is stamped when a run ends, a
+#: minute or two after the hourly tick that started it, so without slack a
+#: daily loop misses the same tick the next day and drifts an hour later daily.
+_DUE_SLACK = timedelta(minutes=10)
+
+
 def _due(
     last_iso: str | None, interval_hours: int, now: datetime, *, lease=None
 ) -> bool:
-    """Is this loop's interval up *and* its slot free?
+    """Is this loop's interval up (less :data:`_DUE_SLACK`) *and* its slot free?
 
     A live lease is not-due however old ``last_iso`` is: a cycle is in flight
     that has not yet written its ``last_*_at``. Advisory at the call sites —
@@ -288,7 +294,7 @@ def _due(
     last = _parse_ts(last_iso)
     if last is None:
         return True
-    return now - last >= timedelta(hours=interval_hours)
+    return now - last >= timedelta(hours=interval_hours) - _DUE_SLACK
 
 
 def _next_iso(
@@ -635,6 +641,12 @@ async def run_discovery_cycle(
                 # ``empty_boards``.
                 "boards_not_found": summary["boards_not_found"],
                 "boards_failing": summary["boards_failing"],
+                # Board health applied at compose time: dead boards skipped,
+                # moved boards fetched at their target (BOARD_REROUTE_AUTO),
+                # and those a shadow cycle would have rerouted.
+                "boards_skipped_dead": summary.get("boards_skipped_dead", 0),
+                "boards_rerouted": summary.get("boards_rerouted", 0),
+                "boards_would_reroute": summary.get("boards_would_reroute", 0),
                 "new_jobs": new,
                 # The backlog and nothing else: jobs the user has not decided on
                 # that nothing has scored, counted the same way by every branch

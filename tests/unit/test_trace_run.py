@@ -758,3 +758,60 @@ def test_parse_since():
     assert tr.parse_since("7d") == timedelta(days=7)
     with pytest.raises(Exception, match="use a number"):
         tr.parse_since("week")
+
+
+def test_a_board_move_names_its_target_and_a_quarantine_its_candidates():
+    logs = FakeLogging(
+        [
+            entry(
+                1,
+                "board_health.changed",
+                severity="WARNING",
+                platform="greenhouse",
+                slug="acme",
+                from_state="failing",
+                to_state="moved",
+                outcome="not_found",
+                status=404.0,
+                resolves_to={"platform": "lever", "slug": "acme"},
+            ),
+            entry(
+                2,
+                "board_health.changed",
+                severity="WARNING",
+                platform="ashby",
+                slug="globex",
+                from_state="failing",
+                to_state="quarantined",
+                outcome="not_found",
+                status=404.0,
+                candidates=["Globex Labs", None],
+            ),
+        ]
+    )
+    problems = _problems(_text(_db({RUN: run_doc()}), logs))
+    assert (
+        "greenhouse/acme: failing → moved (not_found, status 404) → lever/acme"
+        in problems
+    )
+    assert (
+        "ashby/globex: failing → quarantined (not_found, status 404) "
+        "candidates: Globex Labs, None" in problems
+    )
+
+
+def test_skipped_and_rerouted_boards_show_beside_the_board_counts():
+    logs = FakeLogging(
+        [
+            _discovery_complete(
+                2,
+                boards_not_found=0.0,
+                boards_failing=0.0,
+                boards_skipped_dead=3.0,
+                boards_rerouted=0.0,
+                boards_would_reroute=2.0,
+            )
+        ]
+    )
+    problems = _problems(_text(_db({RUN: run_doc()}), logs))
+    assert "dead skipped: 3, rerouted: 0, would reroute: 2" in problems

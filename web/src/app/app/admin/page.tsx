@@ -26,13 +26,15 @@ import {
   type BoardRow,
   type BoardsView,
   NO_BOARDS,
+  TONE_COLOR,
   boardsSummary,
   boardsView,
-  isFailing,
   listLabel,
   notFoundDays,
   outcomeLabel,
+  resolutionLabel,
   stateLabel,
+  stateTone,
 } from "@/lib/adminBoards";
 import { apiFetch } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -145,7 +147,7 @@ const TH = "px-3 py-2.5 text-left text-[11px] font-bold uppercase tracking-[0.06
 const TD = "px-3 py-3 align-top text-[12px]";
 const ROW_RULE = { borderBottom: "1px solid #f0e3d3" };
 
-/** Shared per-board fetch health, view-only, failing boards first. */
+/** Shared per-board fetch health, view-only, problem boards first. */
 function BoardHealthSection({ view }: { view: BoardsView }) {
   if (view.kind === "hidden") return null;
   return (
@@ -214,13 +216,14 @@ function BoardHealthBody({ view }: { view: BoardsView }) {
 function BoardTable({ rows }: { rows: BoardRow[] }) {
   return (
     <div className="overflow-x-auto rounded-[18px] border" style={PANEL_STYLE}>
-      <table className="w-full min-w-[860px] border-collapse">
+      <table className="w-full min-w-[960px] border-collapse">
         <thead>
           <tr style={{ color: "#a3927f", ...ROW_RULE }}>
             <th className={TH}>Board</th>
             <th className={TH}>Name</th>
             <th className={TH}>List</th>
             <th className={TH}>State</th>
+            <th className={TH}>Resolution</th>
             <th className={TH}>Last outcome</th>
             <th className={TH}>404 days</th>
             <th className={TH}>Failing since</th>
@@ -228,47 +231,52 @@ function BoardTable({ rows }: { rows: BoardRow[] }) {
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
-            <tr
-              key={`${row.platform}:${row.slug}`}
-              data-failing={isFailing(row) ? "true" : undefined}
-              style={{
-                ...ROW_RULE,
-                ...(isFailing(row) ? { boxShadow: "inset 3px 0 0 var(--brick)" } : {}),
-              }}
-            >
-              <td className={TD}>
-                <div style={MUTED}>{row.platform}</div>
-                <div className="break-all font-semibold" style={{ color: "var(--ink)" }}>
-                  {row.slug}
-                </div>
-              </td>
-              <td className={TD} style={{ color: "var(--ink-3)" }}>
-                {orDash(row.name)}
-              </td>
-              <td className={TD} style={{ color: "var(--ink-3)" }}>
-                {listLabel(row)}
-              </td>
-              <td
-                className={`${TD} font-semibold`}
-                style={{ color: isFailing(row) ? "var(--brick)" : "var(--ink-3)" }}
+          {rows.map((row) => {
+            const tone = stateTone(row);
+            return (
+              <tr
+                key={`${row.platform}:${row.slug}`}
+                data-tone={tone}
+                style={{
+                  ...ROW_RULE,
+                  ...(tone === "muted"
+                    ? {}
+                    : { boxShadow: `inset 3px 0 0 ${TONE_COLOR[tone]}` }),
+                }}
               >
-                {stateLabel(row)}
-              </td>
-              <td className={TD} style={{ color: "var(--ink-3)" }}>
-                {outcomeLabel(row)}
-              </td>
-              <td className={TD} style={{ color: "var(--ink-3)" }}>
-                {notFoundDays(row)}
-              </td>
-              <td className={TD} style={{ color: "var(--ink-3)" }}>
-                {fmtWhen(row.failing_since)}
-              </td>
-              <td className={TD} style={{ color: "var(--ink-3)" }}>
-                {fmtWhen(row.last_ok_at)}
-              </td>
-            </tr>
-          ))}
+                <td className={TD}>
+                  <div style={MUTED}>{row.platform}</div>
+                  <div className="break-all font-semibold" style={{ color: "var(--ink)" }}>
+                    {row.slug}
+                  </div>
+                </td>
+                <td className={TD} style={{ color: "var(--ink-3)" }}>
+                  {orDash(row.name)}
+                </td>
+                <td className={TD} style={{ color: "var(--ink-3)" }}>
+                  {listLabel(row)}
+                </td>
+                <td className={`${TD} font-semibold`} style={{ color: TONE_COLOR[tone] }}>
+                  {stateLabel(row)}
+                </td>
+                <td className={`${TD} break-words`} style={{ color: "var(--ink-3)" }}>
+                  {resolutionLabel(row)}
+                </td>
+                <td className={TD} style={{ color: "var(--ink-3)" }}>
+                  {outcomeLabel(row)}
+                </td>
+                <td className={TD} style={{ color: "var(--ink-3)" }}>
+                  {notFoundDays(row)}
+                </td>
+                <td className={TD} style={{ color: "var(--ink-3)" }}>
+                  {fmtWhen(row.failing_since)}
+                </td>
+                <td className={TD} style={{ color: "var(--ink-3)" }}>
+                  {fmtWhen(row.last_ok_at)}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

@@ -21,6 +21,7 @@ from firestore_fakes import FakeStoreDB
 import tools.discovery.pipeline as discovery
 from models.job import Job
 from tools.ats import _http, board_cache, board_health
+from tools.ats.probe import BoardProbe
 
 DAY1 = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
 
@@ -39,10 +40,17 @@ _GH_JOB = {
 
 @pytest.fixture(autouse=True)
 def quiet_world(monkeypatch):
-    """Instant retries, the board cache off, and no real HTTP client."""
+    """Instant retries, the board cache off, no real HTTP client, and every
+    other-platform probe answering 404."""
     monkeypatch.setattr(_http, "_RETRY_INITIAL_WAIT", 0)
     monkeypatch.setattr(_http, "_RETRY_MAX_WAIT", 0)
     monkeypatch.delenv("BOARD_CACHE_TTL_SECONDS", raising=False)
+    monkeypatch.delenv(board_health.REROUTE_FLAG, raising=False)
+
+    async def not_found(platform, slug):
+        return BoardProbe("not_found", 404, None, None)
+
+    monkeypatch.setattr(board_health, "probe_board", not_found)
 
 
 def _answers(monkeypatch, answers: dict[str, object]) -> None:
@@ -502,5 +510,6 @@ def test_records_hold_no_user_fields(monkeypatch):
         "failing_since",
         "not_found_days",
         "last_not_found_day",
+        "first_not_found_day",
         "updated_at",
     }

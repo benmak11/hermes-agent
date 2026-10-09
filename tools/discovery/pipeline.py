@@ -25,7 +25,7 @@ from tools.ats.google_jobs import fetch_google_jobs
 from tools.ats.greenhouse import fetch_greenhouse_jobs
 from tools.ats.lever import fetch_lever_jobs
 from tools.ats.meta_jobs import fetch_meta_jobs
-from tools.companies import Platform, all_active_companies
+from tools.companies import Platform, all_active_companies, entry_names, load_blocklist
 from tools.company_prefs import load_exclusions
 
 log = get_logger("tools.discovery")
@@ -98,6 +98,12 @@ async def run_discovery(
     failed to answer — 404 included — is counted in ``boards_not_found`` /
     ``boards_failing``, not in ``empty_boards``.
 
+    The records are read once, before the fan-out: a ``dead`` board not yet due
+    a re-check is skipped, and under ``BOARD_REROUTE_AUTO`` a ``moved`` board is
+    fetched at its target instead (logged as ``board_health.would_reroute``
+    while the flag is off). The same read then takes this cycle's outcomes and
+    feeds the probe round.
+
     Returns a summary dict.
     """
     started = time.monotonic()
@@ -105,6 +111,25 @@ async def run_discovery(
     exclusions = await load_exclusions(db, user_id)
     companies = all_active_companies(exclusions)
     log.info("discovery.start", company_count=len(companies), excluded=len(exclusions))
+
+    now = board_health.now()
+    health = (
+        await board_health.load_records(db)
+        if any(p in board_health.TRACKED_PLATFORMS for p, _, _ in companies)
+        else None
+    )
+    skip = {(p, s.casefold()) for p, s in load_blocklist()} | {
+        (p, s.casefold()) for p, s in exclusions
+    }
+    plan = board_health.plan_fetches(
+        companies,
+        health or {},
+        now,
+        reroute=board_health.reroute_enabled(),
+        skip=skip,
+    )
+    for origin, target in plan.would_reroute:
+        log.info("board_health.would_reroute", board=origin, target=target)
 
     sem = asyncio.Semaphore(concurrency)
 
@@ -118,7 +143,7 @@ async def run_discovery(
     # fetch_board_json, and each was building and tearing down its own.
     async with board_client():
         results = await asyncio.gather(
-            *(_fetch_bounded(p, s, src) for p, s, src in companies),
+            *(_fetch_bounded(p, s, src) for p, s, src in plan.boards),
             return_exceptions=True,
         )
 
@@ -136,7 +161,7 @@ async def run_discovery(
     board_outcomes: Counter[str] = Counter()
     unhealthy: list[str] = []
 
-    for (platform, slug, source), result in zip(companies, results, strict=True):
+    for (platform, slug, source), result in zip(plan.boards, results, strict=True):
         # gather(return_exceptions=True) can hand back BaseExceptions too;
         # narrowing to Exception would leave those to crash the unpack below.
         if isinstance(result, BaseException):
@@ -180,12 +205,27 @@ async def run_discovery(
         jobs_by_platform[platform] += len(fetched)
         jobs.extend(fetched)
 
-    # Never fails the search: record_outcomes swallows its own errors, and
-    # this guard covers anything it missed.
-    try:
-        await board_health.record_outcomes(db, observations)
-    except Exception as e:
-        log.warning("board_health.failed", error=f"{type(e).__name__}: {e}")
+    # Never fails the search: both steps swallow their own errors, and this
+    # guard covers anything they missed. A failed read writes nothing.
+    if health is not None:
+        try:
+            await board_health.record_outcomes(
+                db, observations, now, existing=health, reroutes=plan.reroutes
+            )
+            await board_health.probe_due(
+                db,
+                health,
+                observed={board_health.doc_id(p, s) for p, s, _, _ in observations},
+                active={
+                    board_health.doc_id(p, s)
+                    for p, s, _ in companies
+                    if p in board_health.TRACKED_PLATFORMS
+                },
+                names=entry_names,
+                now=now,
+            )
+        except Exception as e:
+            log.warning("board_health.failed", error=f"{type(e).__name__}: {e}")
 
     boards_not_found = board_outcomes[NOT_FOUND]
     boards_failing = sum(
@@ -203,6 +243,9 @@ async def run_discovery(
         boards_not_found=boards_not_found,
         boards_failing=boards_failing,
         board_outcomes=dict(board_outcomes),
+        boards_skipped_dead=len(plan.skipped_dead),
+        boards_rerouted=len(plan.reroutes),
+        boards_would_reroute=len(plan.would_reroute),
         unhealthy_boards=unhealthy[:_UNHEALTHY_LOGGED],
         duration_ms=duration_ms,
     )
@@ -216,6 +259,9 @@ async def run_discovery(
         "boards_not_found": boards_not_found,
         "boards_failing": boards_failing,
         "board_outcomes": dict(board_outcomes),
+        "boards_skipped_dead": len(plan.skipped_dead),
+        "boards_rerouted": len(plan.reroutes),
+        "boards_would_reroute": len(plan.would_reroute),
         "duration_ms": duration_ms,
     }
 

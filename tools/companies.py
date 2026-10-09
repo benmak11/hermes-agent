@@ -6,8 +6,10 @@ This module is the only thing in the codebase that touches the company YAML
 files. Everything else goes through it.
 
 It is read-only apart from :func:`append_unvetted`, which the offline sweep
-(``cli.discover_companies``) uses to grow the pool from a laptop, and
-:func:`fill_missing_names`, which ``cli.board_names`` uses to backfill names. Nothing here
+(``cli.discover_companies``) uses to grow the pool from a laptop,
+:func:`fill_missing_names`, which ``cli.board_names`` uses to backfill names,
+and :func:`move_entries`, which ``cli.board_health`` uses to apply a board
+that moved platform. Nothing here
 mutates the YAML on behalf of a request: an edit inside the container serving
 the request is invisible to the crawl under ``QUEUE_MODE=1`` and is replaced
 by the next deploy. Per-user exclusions are a Firestore overlay
@@ -201,6 +203,136 @@ def fill_missing_names(
         )
     path.write_text(new_text)
     return len(wanted)
+
+
+def entry_names() -> dict[tuple[str, str], str]:
+    """``(platform, slug.casefold())`` → recorded name; known wins over unvetted."""
+    out: dict[tuple[str, str], str] = {}
+    for groups in (load_known(), load_unvetted()):
+        for plat, entries in groups.items():
+            for e in entries:
+                if e.name:
+                    out.setdefault((plat, e.slug.casefold()), e.name)
+    return out
+
+
+_HEADER_RE = re.compile(r"^([A-Za-z_]+):\s*(\[\])?\s*(?:#.*)?$")
+_ITEM_RE = re.compile(r"^(\s*)-\s")
+
+
+def _sections(lines: list[str]) -> dict[str, tuple[int, int]]:
+    """Top-level key → ``(header line, end)``, end exclusive."""
+    starts = [
+        (i, m.group(1)) for i, line in enumerate(lines) if (m := _HEADER_RE.match(line))
+    ]
+    out: dict[str, tuple[int, int]] = {}
+    for n, (i, name) in enumerate(starts):
+        end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+        out[name] = (i, end)
+    return out
+
+
+def _entry_block(lines: list[str], start: int, end: int) -> int:
+    """End (exclusive) of the list item starting at ``lines[start]``: every
+    following line indented deeper than its dash, blank lines excluded."""
+    dash = len(lines[start]) - len(lines[start].lstrip(" "))
+    i = start + 1
+    while i < end:
+        line = lines[i]
+        if not line.strip() or len(line) - len(line.lstrip(" ")) <= dash:
+            break
+        i += 1
+    return i
+
+
+def _reindent(block: list[str], shift: int) -> list[str]:
+    if shift >= 0:
+        return [" " * shift + line for line in block]
+    return [line[-shift:] if line.startswith(" " * -shift) else line for line in block]
+
+
+def move_entries(
+    filename: Literal["known.yaml", "unvetted.yaml"],
+    moves: dict[tuple[str, str], tuple[str, str]],
+) -> int:
+    """Move entries to another platform with a new slug. Returns count moved.
+
+    ``moves`` maps ``(platform, slug)`` to ``(new platform, new slug)``; slugs
+    match ignoring case. Each entry's lines (``name``, ``added``, notes and
+    any comments inside it) are cut from their section and appended to the
+    end of the target section, re-indented to match it, with only the
+    ``slug`` line rewritten. Comments outside the moved entries are untouched.
+    An entry whose ``slug`` is not on its ``-`` line, or a target section in
+    flow style, is not handled: the result is re-parsed and nothing is
+    written unless it equals the original with just those moves.
+    """
+    path = DATA_DIR / filename
+    text = path.read_text()
+    raw = yaml.safe_load(text) or {}
+    wanted = {(p, s.casefold()): to for (p, s), to in moves.items()}
+    if not text.endswith("\n"):
+        text += "\n"
+    lines = text.splitlines(keepends=True)
+
+    cut: list[tuple[int, int, str, str, str, str]] = []
+    for section, (head, end) in _sections(lines).items():
+        i = head + 1
+        while i < end:
+            m = _SLUG_LINE_RE.match(lines[i])
+            if m is None or not _ITEM_RE.match(lines[i]):
+                i += 1
+                continue
+            slug = str(yaml.safe_load(m.group(2)))
+            stop = _entry_block(lines, i, end)
+            if (section, slug.casefold()) in wanted:
+                new_plat, new_slug = wanted[(section, slug.casefold())]
+                cut.append((i, stop, section, slug, new_plat, new_slug))
+            i = stop
+    if not cut:
+        return 0
+
+    removed = {n for start, stop, *_ in cut for n in range(start, stop)}
+    out = [line for n, line in enumerate(lines) if n not in removed]
+    for start, stop, section, _, new_plat, new_slug in cut:
+        block = lines[start:stop]
+        m = _SLUG_LINE_RE.match(block[0])
+        assert m is not None
+        block[0] = f"{m.group(1)}slug: {_yaml_scalar(new_slug)}\n"
+        dash = len(block[0]) - len(block[0].lstrip(" "))
+        sections = _sections(out)
+        if new_plat in sections:
+            head, end = sections[new_plat]
+            items = [n for n in range(head + 1, end) if _ITEM_RE.match(out[n])]
+            if out[head].rstrip("\n").rstrip().endswith("[]"):
+                out[head] = f"{new_plat}:\n"
+            if items:
+                last = items[-1]
+                target_dash = len(out[last]) - len(out[last].lstrip(" "))
+                at = _entry_block(out, last, end)
+            else:
+                target_dash, at = dash, head + 1
+            out[at:at] = _reindent(block, target_dash - dash)
+        else:
+            if out and out[-1].strip():
+                out.append("\n")
+            out.append(f"{new_plat}:\n")
+            out.extend(block)
+        # A section emptied by the move would load as null.
+        head, end = _sections(out)[section]
+        if not any(_ITEM_RE.match(out[n]) for n in range(head + 1, end)):
+            out[head] = f"{section}: []\n"
+
+    expected: dict = {k: list(v) if v else [] for k, v in raw.items()}
+    for _, _, section, slug, new_plat, new_slug in cut:
+        entry = next(e for e in expected[section] if str(e["slug"]) == slug)
+        expected[section].remove(entry)
+        expected.setdefault(new_plat, []).append({**entry, "slug": new_slug})
+    new_text = "".join(out)
+    parsed = {k: v or [] for k, v in (yaml.safe_load(new_text) or {}).items()}
+    if parsed != expected:
+        raise RuntimeError(f"{filename}: entry move did not round-trip; not written")
+    path.write_text(new_text)
+    return len(cut)
 
 
 def all_active_companies(

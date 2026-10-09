@@ -238,6 +238,9 @@ def test_totals_count_states_404s_and_never_checked_boards(monkeypatch, client):
         "total": 4,
         "ok": 2,
         "failing": 2,
+        "quarantined": 0,
+        "dead": 0,
+        "moved": 0,
         "not_found": 1,
         "never_checked": 2,  # neverco, unseen
     }
@@ -255,6 +258,9 @@ def test_an_empty_collection_counts_every_active_board_as_never_checked(
             "total": 0,
             "ok": 0,
             "failing": 0,
+            "quarantined": 0,
+            "dead": 0,
+            "moved": 0,
             "not_found": 0,
             "never_checked": 5,
         },
@@ -323,3 +329,116 @@ def test_boards_logs_one_count_only_audit_line(monkeypatch, client):
         "never_checked": 4,
     }
     assert "acme" not in str(viewed)
+
+
+# ------------------------------------------- reroute / quarantine / prune
+
+
+def _probed_records() -> dict:
+    return _records(
+        _record("greenhouse", "acme"),
+        _record(
+            "greenhouse",
+            "pausedco",
+            "moved",
+            not_found_days=2,
+            resolves_to={"platform": "lever", "slug": "pausedco"},
+            candidates=[
+                {
+                    "platform": "lever",
+                    "slug": "pausedco",
+                    "name": "Paused Co",
+                    "job_count": 4,
+                    "probed_at": "2026-10-05T00:00:00+00:00",
+                }
+            ],
+        ),
+        _record("lever", "Beta", "dead", not_found_days=3),
+        _record(
+            "ashby",
+            "gamma",
+            "quarantined",
+            not_found_days=2,
+            candidates=[
+                {
+                    "platform": "greenhouse",
+                    "slug": "gamma",
+                    "name": "Gamma Labs",
+                    "job_count": 7,
+                    "probed_at": "2026-10-05T00:00:00+00:00",
+                },
+                {
+                    "platform": "lever",
+                    "slug": "gamma",
+                    "name": None,
+                    "job_count": 1,
+                    "probed_at": "2026-10-05T00:00:00+00:00",
+                },
+            ],
+        ),
+        _record("greenhouse", "neverco", "failing", not_found_days=1),
+        _record("ashby", "unseen", "quarantined", not_found_days=5, candidates=[]),
+    )
+
+
+def test_new_states_sort_failing_quarantined_dead_moved_ok(monkeypatch, client):
+    _use(monkeypatch, _probed_records())
+    _as_admin(monkeypatch)
+    rows = client.get("/admin/boards", headers=AUTH).json()["boards"]
+    assert [(r["state"], r["slug"]) for r in rows] == [
+        ("failing", "neverco"),
+        ("quarantined", "unseen"),
+        ("quarantined", "gamma"),
+        ("dead", "Beta"),
+        ("moved", "pausedco"),
+        ("ok", "acme"),
+    ]
+
+
+def test_an_unknown_state_sorts_after_ok(monkeypatch, client):
+    _use(
+        monkeypatch,
+        _records(_record("greenhouse", "acme", "brand_new"), _record("lever", "Beta")),
+    )
+    _as_admin(monkeypatch)
+    rows = client.get("/admin/boards", headers=AUTH).json()["boards"]
+    assert [r["state"] for r in rows] == ["ok", "brand_new"]
+
+
+def test_totals_count_the_new_states(monkeypatch, client):
+    _use(monkeypatch, _probed_records())
+    _as_admin(monkeypatch)
+    totals = client.get("/admin/boards", headers=AUTH).json()["totals"]
+    assert {
+        k: totals[k] for k in ("total", "ok", "failing", "quarantined", "dead", "moved")
+    } == {
+        "total": 6,
+        "ok": 1,
+        "failing": 1,
+        "quarantined": 2,
+        "dead": 1,
+        "moved": 1,
+    }
+
+
+def test_moved_rows_carry_the_target_and_quarantined_rows_the_candidates(
+    monkeypatch, client
+):
+    _use(monkeypatch, _probed_records())
+    _as_admin(monkeypatch)
+    rows = {
+        r["slug"]: r for r in client.get("/admin/boards", headers=AUTH).json()["boards"]
+    }
+    assert rows["pausedco"]["resolves_to"] == {"platform": "lever", "slug": "pausedco"}
+    assert rows["gamma"]["resolves_to"] is None
+    assert rows["gamma"]["candidates"] == [
+        {
+            "platform": "greenhouse",
+            "slug": "gamma",
+            "name": "Gamma Labs",
+            "job_count": 7,
+        },
+        {"platform": "lever", "slug": "gamma", "name": None, "job_count": 1},
+    ]
+    assert rows["acme"]["candidates"] == []
+    assert rows["acme"]["resolves_to"] is None

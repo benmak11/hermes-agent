@@ -498,10 +498,16 @@ def _detail(line: LogLine) -> str:
     health change, which board moved and how."""
     if line.message == "board_health.changed":
         p = line.payload
-        return (
+        detail = (
             f"{p.get('platform')}/{p.get('slug')}: {p.get('from_state')} → "
             f"{p.get('to_state')} ({p.get('outcome')}, status {p.get('status')})"
         )
+        to = p.get("resolves_to")
+        if isinstance(to, dict):
+            detail += f" → {to.get('platform')}/{to.get('slug')}"
+        if p.get("candidates"):
+            detail += f" candidates: {', '.join(str(c) for c in p['candidates'])}"
+        return detail
     for key in ("exception", "error"):
         value = line.payload.get(key)
         if value:
@@ -522,12 +528,20 @@ def board_lines(lines: list[LogLine]) -> list[str]:
             continue
         not_found = line.payload.get("boards_not_found") or 0
         failing = line.payload.get("boards_failing") or 0
-        if not (not_found or failing):
+        dead = line.payload.get("boards_skipped_dead") or 0
+        rerouted = line.payload.get("boards_rerouted") or 0
+        would = line.payload.get("boards_would_reroute") or 0
+        if not (not_found or failing or dead or rerouted or would):
             continue
         out.append(
             f"{_short(line.at)}  boards not found (404): {not_found}, "
             f"failing (429/5xx/timeout/error): {failing}"
         )
+        if dead or rerouted or would:
+            out.append(
+                f"{' ' * 12}dead skipped: {dead}, rerouted: {rerouted}, "
+                f"would reroute: {would}"
+            )
         named = line.payload.get("unhealthy_boards") or []
         if named:
             out.append(f"{' ' * 12}{', '.join(str(b) for b in named)}")

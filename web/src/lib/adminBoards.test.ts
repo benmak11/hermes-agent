@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  TONE_COLOR,
   type BoardHealth,
   type BoardRow,
   boardsSummary,
@@ -9,8 +10,10 @@ import {
   listLabel,
   notFoundDays,
   outcomeLabel,
+  resolutionLabel,
   sortBoards,
   stateLabel,
+  stateTone,
 } from "@/lib/adminBoards";
 import { ApiError } from "@/lib/apiError";
 
@@ -33,7 +36,16 @@ function board(over: Partial<BoardRow>): BoardRow {
   };
 }
 
-const TOTALS = { total: 0, ok: 0, failing: 0, not_found: 0, never_checked: 3 };
+const TOTALS = {
+  total: 0,
+  ok: 0,
+  failing: 0,
+  quarantined: 0,
+  dead: 0,
+  moved: 0,
+  not_found: 0,
+  never_checked: 3,
+};
 
 describe("sortBoards", () => {
   it("puts failing first, then most 404 days, then platform and slug", () => {
@@ -55,6 +67,29 @@ describe("sortBoards", () => {
     ]);
   });
 
+  it("orders states failing, quarantined, dead, moved, ok, then unknown", () => {
+    const rows = [
+      board({ slug: "a-ok" }),
+      board({ slug: "b-new", state: "brand_new" }),
+      board({ slug: "c-moved", state: "moved", not_found_days: 9 }),
+      board({ slug: "d-dead", state: "dead", not_found_days: 3 }),
+      board({ slug: "e-quar", state: "quarantined", not_found_days: 2 }),
+      board({ slug: "f-fail", state: "failing", not_found_days: 0 }),
+      board({ slug: "g-quar", state: "quarantined", not_found_days: 5 }),
+      board({ slug: "h-null", state: null }),
+    ];
+    expect(sortBoards(rows).map((r) => r.slug)).toEqual([
+      "f-fail",
+      "g-quar",
+      "e-quar",
+      "d-dead",
+      "c-moved",
+      "a-ok",
+      "b-new",
+      "h-null",
+    ]);
+  });
+
   it("does not reorder its input", () => {
     const rows = [board({ slug: "b" }), board({ slug: "a", state: "failing" })];
     sortBoards(rows);
@@ -65,10 +100,21 @@ describe("sortBoards", () => {
 describe("formatting", () => {
   it("summarises the totals in one line", () => {
     expect(
-      boardsSummary({ total: 12, ok: 9, failing: 3, not_found: 2, never_checked: 4 }),
-    ).toBe("12 boards · 9 ok · 3 failing · 2 not found · 4 never checked");
+      boardsSummary({
+        total: 12,
+        ok: 6,
+        failing: 3,
+        quarantined: 1,
+        dead: 1,
+        moved: 1,
+        not_found: 2,
+        never_checked: 4,
+      }),
+    ).toBe(
+      "12 boards · 6 ok · 3 failing · 1 quarantined · 1 dead · 1 moved · 2 not found · 4 never checked",
+    );
     expect(boardsSummary({ ...TOTALS, total: 1, ok: 1, never_checked: 0 })).toBe(
-      "1 board · 1 ok · 0 failing · 0 not found · 0 never checked",
+      "1 board · 1 ok · 0 failing · 0 quarantined · 0 dead · 0 moved · 0 not found · 0 never checked",
     );
   });
 
@@ -92,6 +138,46 @@ describe("formatting", () => {
     expect(listLabel(board({ list: "none", blocklisted: true }))).toBe(
       "Not listed · blocklisted",
     );
+  });
+
+  it("labels and tones the new states", () => {
+    expect(stateLabel(board({ state: "quarantined" }))).toBe("Quarantined");
+    expect(stateLabel(board({ state: "dead" }))).toBe("Dead");
+    expect(stateLabel(board({ state: "moved" }))).toBe("Moved");
+    expect(stateLabel(board({ state: "brand_new" }))).toBe("brand_new");
+    for (const state of ["failing", "quarantined", "dead"]) {
+      expect(stateTone(board({ state }))).toBe("brick");
+    }
+    expect(stateTone(board({ state: "moved" }))).toBe("accent");
+    expect(stateTone(board({ state: "ok" }))).toBe("muted");
+    expect(stateTone(board({ state: null }))).toBe("muted");
+    expect(TONE_COLOR).toEqual({
+      brick: "var(--brick)",
+      accent: "var(--terracotta-d)",
+      muted: "var(--ink-3)",
+    });
+  });
+
+  it("shows a moved board's target and a quarantined board's candidates", () => {
+    expect(
+      resolutionLabel(
+        board({ state: "moved", resolves_to: { platform: "lever", slug: "acme" } }),
+      ),
+    ).toBe("→ lever/acme");
+    expect(
+      resolutionLabel(
+        board({
+          state: "quarantined",
+          candidates: [
+            { platform: "lever", slug: "acme", name: "Acme Inc", job_count: 3 },
+            { platform: "ashby", slug: "acme", name: null, job_count: 1 },
+          ],
+        }),
+      ),
+    ).toBe("Acme Inc, ashby/acme");
+    expect(resolutionLabel(board({ state: "quarantined", candidates: [] }))).toBe("—");
+    expect(resolutionLabel(board({ state: "ok" }))).toBe("—");
+    expect(resolutionLabel(board({ state: "moved" }))).toBe("—");
   });
 
   it("labels the state and 404 days", () => {

@@ -2,8 +2,8 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Probe one ATS board: does it answer, how many jobs, and the company's name.
 
-Used offline (the company sweep and ``cli.board_names``), never on the request
-path. The jobs fetch goes through :func:`tools.ats._http.fetch_board_json`
+Used offline (the company sweep and ``cli.board_names``) and by the board
+health probe round at the end of a discovery cycle, never on the request path. The jobs fetch goes through :func:`tools.ats._http.fetch_board_json`
 inside a :func:`~tools.ats._http.capture_outcome` scope, so the outcome is
 classified exactly as discovery classifies it. Both GETs use the pooled
 client when the caller has opened a :func:`~tools.ats._http.board_client`.
