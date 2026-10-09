@@ -937,6 +937,7 @@ _NOT_USER_SUBCOLLECTIONS = {
     "jd_cache": "cross-user content-keyed parse cache — shared, not the user's",
     "allowlist": "top-level access seats, keyed by email, outlive the account",
     "batch_runs": "top-level, per-user; wiped by _delete_batch_runs's query",
+    "board_health": "top-level, one doc per job board — shared, no user fields",
 }
 
 

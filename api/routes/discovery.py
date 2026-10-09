@@ -630,6 +630,11 @@ async def run_discovery_cycle(
                 # where the effect becomes visible per cycle.
                 "boards_cached": summary["boards_cached"],
                 "boards_fetched": summary["boards_fetched"],
+                # Board-platform fetches that did not answer: 404s apart from
+                # every other failure (429/5xx/timeout/error). Neither is in
+                # ``empty_boards``.
+                "boards_not_found": summary["boards_not_found"],
+                "boards_failing": summary["boards_failing"],
                 "new_jobs": new,
                 # The backlog and nothing else: jobs the user has not decided on
                 # that nothing has scored, counted the same way by every branch

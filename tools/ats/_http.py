@@ -21,9 +21,10 @@ discovery cycle:
 from __future__ import annotations
 
 import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -75,6 +76,65 @@ async def board_client() -> AsyncIterator[httpx.AsyncClient]:
             _client.reset(token)
 
 
+#: Fetch outcomes, as recorded by :func:`fetch_board_json`.
+OK = "ok"
+NOT_FOUND = "not_found"
+RATE_LIMITED = "rate_limited"
+SERVER_ERROR = "server_error"
+TIMEOUT = "timeout"
+ERROR = "error"
+
+
+@dataclass
+class FetchOutcome:
+    """What the last board fetch inside a :func:`capture_outcome` scope saw.
+
+    ``outcome`` stays ``None`` when nothing went through
+    :func:`fetch_board_json`; ``status`` is the HTTP status when there was one.
+    """
+
+    outcome: str | None = None
+    status: int | None = None
+
+
+_outcome: ContextVar[FetchOutcome | None] = ContextVar(
+    "ats_fetch_outcome", default=None
+)
+
+
+@contextmanager
+def capture_outcome() -> Iterator[FetchOutcome]:
+    """Record the outcome of every :func:`fetch_board_json` call inside.
+
+    Enter it inside the per-board coroutine, not around a ``gather``: tasks
+    copy the context they were created in, so a slot opened before the
+    fan-out would be one object shared by every board.
+    """
+    slot = FetchOutcome()
+    token = _outcome.set(slot)
+    try:
+        yield slot
+    finally:
+        _outcome.reset(token)
+
+
+def _record(outcome: str, status: int | None) -> None:
+    slot = _outcome.get()
+    if slot is not None:
+        slot.outcome, slot.status = outcome, status
+
+
+def classify_status(status: int) -> str:
+    """The outcome for a non-2xx answer that survived the retries."""
+    if status == 404:
+        return NOT_FOUND
+    if status == 429:
+        return RATE_LIMITED
+    if 500 <= status < 600:
+        return SERVER_ERROR
+    return ERROR
+
+
 #: Bounded retry for 429/5xx. tenacity waits
 #: ``min(initial * 2**(n-1) + jitter, max)`` per retry with jitter < 1, so three
 #: attempts means two waits of at most 1.5s and 2.0s — roughly 3.5s for a board
@@ -114,12 +174,15 @@ async def fetch_board_json(platform: str, slug: str, url: str) -> Any | None:
       logged at warning only once the retries are spent.
     - any other HTTP status / transport error (timeout, DNS) → logged at
       warning: these are the real failure points to watch.
+
+    Inside a :func:`capture_outcome` scope the outcome is also recorded there.
     """
     start = time.perf_counter()
     try:
         response = await _get_with_retry(url)
     except httpx.HTTPStatusError as e:
         status = e.response.status_code
+        _record(classify_status(status), status)
         level = log.info if status == 404 else log.warning
         level(
             "ats.fetch.failed",
@@ -130,6 +193,7 @@ async def fetch_board_json(platform: str, slug: str, url: str) -> Any | None:
         )
         return None
     except httpx.HTTPError as e:
+        _record(TIMEOUT if isinstance(e, httpx.TimeoutException) else ERROR, None)
         log.warning(
             "ats.fetch.failed",
             platform=platform,
@@ -140,6 +204,7 @@ async def fetch_board_json(platform: str, slug: str, url: str) -> Any | None:
         return None
 
     data = response.json()
+    _record(OK, response.status_code)
     log.debug(
         "ats.fetch.ok",
         platform=platform,

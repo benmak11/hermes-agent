@@ -84,6 +84,8 @@ def cycle_pipeline(monkeypatch):
             "empty_boards": [],
             "boards_cached": 0,
             "boards_fetched": 1,
+            "boards_not_found": 0,
+            "boards_failing": 0,
         }
 
     async def fake_load_job_preferences(user_id):

@@ -18,8 +18,8 @@ from google.cloud import firestore
 
 from models.job import Job
 from obs.logging import get_logger
-from tools.ats import board_cache
-from tools.ats._http import board_client
+from tools.ats import board_cache, board_health
+from tools.ats._http import ERROR, NOT_FOUND, OK, board_client, capture_outcome
 from tools.ats.ashby import fetch_ashby_jobs
 from tools.ats.google_jobs import fetch_google_jobs
 from tools.ats.greenhouse import fetch_greenhouse_jobs
@@ -46,6 +46,10 @@ FETCHERS: dict[Platform, Callable[[str, str], Awaitable[list[Job]]]] = {
 #: ``tools.ats._http`` no pool to reuse.
 _FETCH_CONCURRENCY = 20
 
+#: Unhealthy boards named on the ``discovery.complete`` line; the counts beside
+#: it are always complete.
+_UNHEALTHY_LOGGED = 30
+
 
 async def _fetch_with_meta(fetcher, slug, user_id, platform, source):
     """One board, from the shared cache if it is warm. Returns metadata alongside.
@@ -58,17 +62,24 @@ async def _fetch_with_meta(fetcher, slug, user_id, platform, source):
     payload and a GCS outage all arrive as ``None`` — so anything caught below
     means the fetcher failed. With ``BOARD_CACHE_TTL_SECONDS`` unset, the
     shipped default, both calls are no-ops.
+
+    The last element is the fetch outcome for a board platform's fresh fetch
+    (``None`` on a cache hit, a search-query source, or a fetcher that never
+    reached ``fetch_board_json``). The outcome slot is opened here, inside the
+    per-board task, so each board gets its own.
     """
     cached = await board_cache.load_jobs(platform, slug, user_id)
     if cached is not None:
-        return (platform, slug, source, cached, True)
-    try:
-        jobs = await fetcher(slug, user_id)
-    except Exception as e:
-        # Re-raise so gather captures it; we only get here on programmer errors.
-        raise RuntimeError(f"{platform}/{slug}: {e}") from e
+        return (platform, slug, source, cached, True, None)
+    with capture_outcome() as seen:
+        try:
+            jobs = await fetcher(slug, user_id)
+        except Exception as e:
+            # Re-raise so gather captures it; we only get here on programmer errors.
+            raise RuntimeError(f"{platform}/{slug}: {e}") from e
     await board_cache.store_jobs(platform, slug, jobs)
-    return (platform, slug, source, jobs, False)
+    tracked = platform in board_health.TRACKED_PLATFORMS and seen.outcome is not None
+    return (platform, slug, source, jobs, False, seen if tracked else None)
 
 
 async def run_discovery(
@@ -81,6 +92,11 @@ async def run_discovery(
     yet reached and not to the ones already fetched, running one cycle
     against two views of the world. The snapshot may be slightly stale; the
     next cycle picks up anything written during this one.
+
+    Each board platform's fresh fetch outcome is folded into the shared
+    ``board_health`` records (see :mod:`tools.ats.board_health`). A board that
+    failed to answer — 404 included — is counted in ``boards_not_found`` /
+    ``boards_failing``, not in ``empty_boards``.
 
     Returns a summary dict.
     """
@@ -114,6 +130,11 @@ async def run_discovery(
     # reported so the pair adds up to the boards attempted — a lone hit count
     # cannot tell "the cache is off" from "the cache is cold".
     boards_cached = boards_fetched = 0
+    # Fresh fetch outcomes of board platforms, for the health records and the
+    # per-outcome counts. Cache hits and search-query sources add nothing.
+    observations: list[tuple[str, str, str, int | None]] = []
+    board_outcomes: Counter[str] = Counter()
+    unhealthy: list[str] = []
 
     for (platform, slug, source), result in zip(companies, results, strict=True):
         # gather(return_exceptions=True) can hand back BaseExceptions too;
@@ -132,12 +153,24 @@ async def run_discovery(
                 error=str(result),
             )
             failures.append({"platform": platform, "slug": slug, "error": str(result)})
+            if platform in board_health.TRACKED_PLATFORMS:
+                observations.append((platform, slug, ERROR, None))
+                board_outcomes[ERROR] += 1
+                unhealthy.append(f"{platform}/{slug}:{ERROR}")
             continue
-        platform, slug, source, fetched, from_cache = result
+        platform, slug, source, fetched, from_cache, seen = result
         if from_cache:
             boards_cached += 1
         else:
             boards_fetched += 1
+        if seen is not None:
+            observations.append((platform, slug, seen.outcome, seen.status))
+            board_outcomes[seen.outcome] += 1
+            if seen.outcome != OK:
+                unhealthy.append(f"{platform}/{slug}:{seen.outcome}")
+                if not fetched:
+                    # Not an empty board: it did not answer.
+                    continue
         if not fetched:
             empty_boards.append({"platform": platform, "slug": slug, "source": source})
             continue
@@ -147,6 +180,17 @@ async def run_discovery(
         jobs_by_platform[platform] += len(fetched)
         jobs.extend(fetched)
 
+    # Never fails the search: record_outcomes swallows its own errors, and
+    # this guard covers anything it missed.
+    try:
+        await board_health.record_outcomes(db, observations)
+    except Exception as e:
+        log.warning("board_health.failed", error=f"{type(e).__name__}: {e}")
+
+    boards_not_found = board_outcomes[NOT_FOUND]
+    boards_failing = sum(
+        n for outcome, n in board_outcomes.items() if outcome not in (OK, NOT_FOUND)
+    )
     duration_ms = int((time.monotonic() - started) * 1000)
     log.info(
         "discovery.complete",
@@ -156,6 +200,10 @@ async def run_discovery(
         jobs_by_platform=dict(jobs_by_platform),
         boards_cached=boards_cached,
         boards_fetched=boards_fetched,
+        boards_not_found=boards_not_found,
+        boards_failing=boards_failing,
+        board_outcomes=dict(board_outcomes),
+        unhealthy_boards=unhealthy[:_UNHEALTHY_LOGGED],
         duration_ms=duration_ms,
     )
     return {
@@ -165,6 +213,9 @@ async def run_discovery(
         "jobs_by_platform": dict(jobs_by_platform),
         "boards_cached": boards_cached,
         "boards_fetched": boards_fetched,
+        "boards_not_found": boards_not_found,
+        "boards_failing": boards_failing,
+        "board_outcomes": dict(board_outcomes),
         "duration_ms": duration_ms,
     }
 

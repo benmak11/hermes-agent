@@ -590,6 +590,92 @@ def test_service_is_shown_per_problem_line():
     assert "hermes-api  api.warn" in text and "hermes-worker  worker.warn" in text
 
 
+def _problems(text: str) -> str:
+    return text.split("\n   problems")[1].split("\n   retries")[0]
+
+
+def _discovery_complete(minutes, **counts):
+    return entry(minutes, "discovery.complete", **counts)
+
+
+def test_board_404s_and_failures_are_problems_though_logged_at_info():
+    """A 404 is logged at info per board, so the WARNING read never sees it;
+    the counts on ``discovery.complete`` are how it reaches the summary."""
+    logs = FakeLogging(
+        [
+            _discovery_complete(
+                2,
+                boards_not_found=2.0,
+                boards_failing=1.0,
+                unhealthy_boards=[
+                    "greenhouse/acme:not_found",
+                    "lever/globex:not_found",
+                    "ashby/initech:rate_limited",
+                ],
+            )
+        ]
+    )
+    problems = _problems(_text(_db({RUN: run_doc()}), logs))
+    assert "none at WARNING or above" in problems
+    assert (
+        "10:02:00Z  boards not found (404): 2, failing (429/5xx/timeout/error): 1"
+        in problems
+    )
+    assert "greenhouse/acme:not_found, lever/globex:not_found" in problems
+
+
+def test_board_counts_show_beside_other_warnings():
+    logs = FakeLogging(
+        [
+            entry(1, "fetch.retry", severity="WARNING"),
+            _discovery_complete(2, boards_not_found=0.0, boards_failing=4.0),
+        ]
+    )
+    problems = _problems(_text(_db({RUN: run_doc()}), logs))
+    assert "fetch.retry" in problems
+    assert "boards not found (404): 0, failing (429/5xx/timeout/error): 4" in problems
+
+
+def test_a_clean_discovery_run_adds_no_board_line():
+    logs = FakeLogging(
+        [_discovery_complete(2, boards_not_found=0.0, boards_failing=0.0)]
+    )
+    problems = _problems(_text(_db({RUN: run_doc()}), logs))
+    assert "boards not found" not in problems
+
+
+def test_the_board_counts_survive_a_capped_main_read():
+    logs = FakeLogging(
+        [entry(i * 0.1, "chatter") for i in range(20)]
+        + [_discovery_complete(3.5, boards_not_found=1.0, boards_failing=0.0)]
+    )
+    text = _text(_db({RUN: run_doc()}), logs, max_entries=5)
+    assert "boards not found (404): 1" in _problems(text)
+
+
+def test_a_board_health_change_names_the_board():
+    logs = FakeLogging(
+        [
+            entry(
+                1,
+                "board_health.changed",
+                severity="WARNING",
+                platform=p,
+                slug=s,
+                from_state="ok",
+                to_state="failing",
+                outcome="not_found",
+                status=404.0,
+            )
+            for p, s in (("greenhouse", "acme"), ("lever", "globex"))
+        ]
+    )
+    problems = _problems(_text(_db({RUN: run_doc()}), logs))
+    assert "WARNING  hermes-worker  board_health.changed" in problems
+    assert "greenhouse/acme: ok → failing (not_found, status 404)" in problems
+    assert "lever/globex: ok → failing (not_found, status 404)" in problems
+
+
 def test_exit_status_and_both_clients_are_pinned_to_the_project(monkeypatch, capsys):
     built = {}
 

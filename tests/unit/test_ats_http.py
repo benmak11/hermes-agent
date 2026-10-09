@@ -232,3 +232,60 @@ def test_retries_reuse_the_scoped_client(monkeypatch):
     assert asyncio.run(main()) == {"ok": 1}
     assert calls[0] == 2
     assert built[0] == 1
+
+
+# ------------------------------------------------------- the fetch outcome
+
+
+def _outcome_of(monkeypatch, transport) -> tuple:
+    """Fetch once inside a capture scope; return (result, outcome, status)."""
+    _count_clients(monkeypatch, transport)
+
+    async def main():
+        with _http.capture_outcome() as seen:
+            result = await _http.fetch_board_json("greenhouse", "acme", _URL)
+        return result, seen.outcome, seen.status
+
+    return asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    ("responses", "outcome", "status"),
+    [
+        ([httpx.Response(200, json={"jobs": []})], _http.OK, 200),
+        ([httpx.Response(404)], _http.NOT_FOUND, 404),
+        ([httpx.Response(429)], _http.RATE_LIMITED, 429),
+        ([httpx.Response(503)], _http.SERVER_ERROR, 503),
+        ([httpx.Response(403)], _http.ERROR, 403),
+        # Recovered after a retry: the outcome is the final answer.
+        ([httpx.Response(429), httpx.Response(200, json={})], _http.OK, 200),
+    ],
+)
+def test_each_http_answer_is_classified(monkeypatch, responses, outcome, status):
+    transport, _ = _counting_transport(responses)
+    _, seen, code = _outcome_of(monkeypatch, transport)
+    assert (seen, code) == (outcome, status)
+
+
+def test_a_timeout_is_classified_without_a_status(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("too slow")
+
+    result, seen, code = _outcome_of(monkeypatch, httpx.MockTransport(handler))
+    assert (result, seen, code) == (None, _http.TIMEOUT, None)
+
+
+def test_other_transport_errors_are_classified_as_error(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route")
+
+    _, seen, code = _outcome_of(monkeypatch, httpx.MockTransport(handler))
+    assert (seen, code) == (_http.ERROR, None)
+
+
+def test_without_a_capture_scope_nothing_is_recorded(monkeypatch):
+    """The liveness sweep and other callers open no scope and must be unaffected."""
+    transport, _ = _counting_transport([httpx.Response(404)])
+    _count_clients(monkeypatch, transport)
+    assert asyncio.run(_http.fetch_board_json("greenhouse", "acme", _URL)) is None
+    assert _http._outcome.get() is None

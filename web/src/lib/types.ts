@@ -156,6 +156,10 @@ export type DiscoveryState = {
     jobs_by_platform?: Record<string, number>;
     boards_failed?: number;
     empty_boards?: number;
+    /** Board fetches that answered 404, and that failed any other way
+     *  (429/5xx/timeout/error). Neither is counted in `empty_boards`. */
+    boards_not_found?: number;
+    boards_failing?: number;
     duration_ms?: number;
     run_id?: string;
     trigger?: string;
