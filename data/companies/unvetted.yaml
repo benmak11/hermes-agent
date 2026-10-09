@@ -155,6 +155,33 @@ greenhouse:
 - slug: yipitdatajobs
   name: YipitData (Alternative)
   added: '2026-06-20'
+- slug: blackcanyonconsulting
+  name: Black Canyon Consulting
+  added: '2026-10-09'
+- slug: givedirectly
+  name: GiveDirectly
+  added: '2026-10-09'
+- slug: relativity
+  name: Relativity Space
+  added: '2026-10-09'
+- slug: oklo
+  name: Oklo
+  added: '2026-10-09'
+- slug: k2spacecorporation
+  name: K2 Space
+  added: '2026-10-09'
+- slug: mattermost
+  name: Mattermost
+  added: '2026-10-09'
+- slug: cloudflare
+  name: Cloudflare
+  added: '2026-10-09'
+- slug: manifest
+  name: Manifest
+  added: '2026-10-09'
+- slug: coast
+  name: Coast
+  added: '2026-10-09'
 lever:
 - slug: BestEgg
   name: Best Egg
@@ -323,6 +350,12 @@ lever:
 - slug: yuno
   name: Yuno
   added: '2026-06-20'
+- slug: shieldai
+  name: Shield AI
+  added: '2026-10-09'
+- slug: curai
+  name: Curai
+  added: '2026-10-09'
 ashby:
 - slug: DeepL
   name: DeepL
@@ -524,3 +557,78 @@ ashby:
 - slug: maintainx
   name: MaintainX
   added: '2026-06-20'
+- slug: checkly
+  name: Checkly
+  added: '2026-10-09'
+- slug: thundercompute
+  name: Thunder Compute
+  added: '2026-10-09'
+- slug: smarkets
+  name: Smarkets
+  added: '2026-10-09'
+- slug: river
+  name: River
+  added: '2026-10-09'
+- slug: Solace
+  name: Solace
+  added: '2026-10-09'
+- slug: duck-duck-go
+  name: DuckDuckGo
+  added: '2026-10-09'
+- slug: sheerhealth
+  name: Sheer Health
+  added: '2026-10-09'
+- slug: charge-robotics
+  name: Charge Robotics
+  added: '2026-10-09'
+- slug: growfig
+  name: Fig AI
+  added: '2026-10-09'
+- slug: hiya
+  name: Hiya
+  added: '2026-10-09'
+- slug: runway-ml
+  name: Runway
+  added: '2026-10-09'
+- slug: jupus
+  name: JUPUS
+  added: '2026-10-09'
+- slug: proxima-fusion
+  name: Proxima Fusion
+  added: '2026-10-09'
+- slug: rebar
+  name: Rebar
+  added: '2026-10-09'
+- slug: somana.tech
+  name: Somana
+  added: '2026-10-09'
+- slug: prior-labs
+  name: Prior Labs
+  added: '2026-10-09'
+- slug: voladynamics
+  name: Vola Dynamics
+  added: '2026-10-09'
+- slug: middesk
+  name: Middesk
+  added: '2026-10-09'
+- slug: krakentech
+  name: Kraken
+  added: '2026-10-09'
+- slug: menlo
+  name: Menlo
+  added: '2026-10-09'
+- slug: footprint
+  name: Footprint
+  added: '2026-10-09'
+- slug: luxor
+  name: Luxor Technology Corporation
+  added: '2026-10-09'
+- slug: mastra
+  name: Mastra
+  added: '2026-10-09'
+- slug: livekit
+  name: LiveKit
+  added: '2026-10-09'
+- slug: iceye
+  name: ICEYE
+  added: '2026-10-09'
