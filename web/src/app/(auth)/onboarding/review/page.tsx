@@ -264,19 +264,27 @@ export default function OnboardingReviewPage() {
           </p>
         )}
 
-        <p
-          className="mt-3 text-center text-[11.5px] font-medium"
-          style={{ color: "#a3927f" }}
-        >
-          edits saved to profiles/{"{uid}"}
-          {fieldsCorrected > 0 &&
-            ` · ${fieldsCorrected} field${fieldsCorrected === 1 ? "" : "s"} corrected`}
-          {skillsRemoved > 0 &&
-            ` · ${skillsRemoved} skill${skillsRemoved === 1 ? "" : "s"} removed`}
-        </p>
+        {editNote(fieldsCorrected, skillsRemoved) && (
+          <p
+            className="mt-3 text-center text-[11.5px] font-medium"
+            style={{ color: "#a3927f" }}
+          >
+            {editNote(fieldsCorrected, skillsRemoved)}
+          </p>
+        )}
       </div>
     </main>
   );
+}
+
+/** "2 fields corrected · 1 skill removed", or null when nothing was edited. */
+function editNote(fieldsCorrected: number, skillsRemoved: number): string | null {
+  const parts: string[] = [];
+  if (fieldsCorrected > 0)
+    parts.push(`${fieldsCorrected} field${fieldsCorrected === 1 ? "" : "s"} corrected`);
+  if (skillsRemoved > 0)
+    parts.push(`${skillsRemoved} skill${skillsRemoved === 1 ? "" : "s"} removed`);
+  return parts.length ? parts.join(" · ") : null;
 }
 
 function ExperienceRows({

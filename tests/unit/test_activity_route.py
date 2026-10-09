@@ -240,6 +240,49 @@ def test_the_same_backlog_under_auto_discovery_is_idle_scheduled(client):
     assert scoring["next_at"] is not None
 
 
+def _trial_user(started_days_ago: float, tier: str = "trial") -> dict:
+    return {
+        "plan": {
+            "tier": tier,
+            "trial_started_at": (NOW - timedelta(days=started_days_ago)).isoformat(),
+        },
+        "discovery_settings": {"auto_discovery": True, "liveness_sweep": True},
+        "discovery_state": {
+            "last_discovery_at": _iso(600),
+            "last_discovery": {"unscored_backlog": 412},
+            "last_sweep_at": _iso(600),
+        },
+    }
+
+
+def test_a_trial_past_its_first_week_advertises_no_scheduled_run(client):
+    """The tick runs nothing for a trial after day 7, whatever the toggles
+    say, so the panel must not promise a next search, sweep or scoring."""
+    cl, _ = client(user=_trial_user(8))
+    items = _items(cl.get("/activity").json())
+
+    for kind in ("discovery", "sweep", "scoring"):
+        assert items[kind]["state"] == "idle_unscheduled", kind
+        assert items[kind]["next_at"] is None, kind
+
+
+@pytest.mark.parametrize("days, tier", [(3, "trial"), (30, "paid")])
+def test_a_trial_in_its_first_week_or_a_paid_plan_stays_scheduled(client, days, tier):
+    cl, _ = client(user=_trial_user(days, tier))
+    items = _items(cl.get("/activity").json())
+
+    for kind in ("discovery", "sweep", "scoring"):
+        assert items[kind]["state"] == "idle_scheduled", kind
+
+
+def test_the_ratings_allowance_follows_the_plan(client):
+    """3 a day on a trial, 10 on paid, read off the document already fetched."""
+    cl, _ = client(user={"plan": {"tier": "paid"}})
+    assert cl.get("/activity").json()["allowance"]["ratings"]["limit"] == 10
+    cl, _ = client(user={})
+    assert cl.get("/activity").json()["allowance"]["ratings"]["limit"] == 3
+
+
 # --------------------------------------------------------------------------
 # waiting_external — the batch is with Google and we are doing nothing
 # --------------------------------------------------------------------------

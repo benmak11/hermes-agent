@@ -43,6 +43,7 @@ from models.settings import DiscoverySettings
 from obs.llm_cost import run_cost_snapshot
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import allowlist, queues, spend
+from tools.account import plan
 from tools.account.delete import is_deleted
 from tools.applications import reaper
 from tools.ats.sweep import sweep_postings
@@ -50,6 +51,7 @@ from tools.discovery import budget as discovery_budget
 from tools.discovery.pipeline import persist_new_jobs, run_discovery
 from tools.discovery.title_filter import load_job_preferences, prefilter_jobs
 from tools.matching import batch_runs
+from tools.matching import budget as matching_budget
 from tools.matching.score import count_unscored, score_pending_jobs
 from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 
@@ -253,6 +255,15 @@ def _lease(now: datetime) -> dict:
         "acquired_at": now.isoformat(),
         "expires_at": (now + timedelta(seconds=_LEASE_SECONDS)).isoformat(),
     }
+
+
+def kickoff_lease(now: datetime) -> dict:
+    """The discovery lease the onboarding kickoff is written with.
+
+    The kickoff takes no slot, so without it a page load moments after
+    onboarding finds a new account's loop due and dispatches a second cycle.
+    """
+    return _lease(now)
 
 
 def _lease_at(lease, key: str) -> datetime | None:
@@ -873,6 +884,25 @@ async def dispatch_cycle(
     return True
 
 
+async def _auto_runs_allowed(user_id: str, doc: dict, now: datetime) -> bool:
+    """Does this user's plan let the scheduler run their loops unattended?
+
+    Paid always; a trial for its first :data:`plan.TRIAL_AUTO_DAYS`. An
+    onboarded trial with no stored start (it predates plans) is stamped
+    "now" here, once — the only write, and only reached with a toggle on. A
+    stamp that fails raises, so the tick dispatches nothing.
+    """
+    current = plan.plan_of(doc)
+    if current.tier == plan.PAID:
+        return True
+    if current.trial_started_at is None and plan.is_onboarded(doc):
+        started = await plan.ensure_trial_start(_async_client(), user_id, now=now)
+        if started is None:
+            return False
+        doc = {**doc, plan.FIELD: {"tier": plan.TRIAL, "trial_started_at": started}}
+    return plan.auto_allowed(doc, now=now)
+
+
 async def tick_user(
     user_id: str, *, force_check: bool = False, doc: dict | None = None
 ) -> None:
@@ -906,6 +936,14 @@ async def tick_user(
     state = doc.get("discovery_state") or {}
 
     trigger = _CRON_TRIGGER if force_check else _OPPORTUNISTIC_TRIGGER
+
+    if (settings.auto_discovery or settings.liveness_sweep) and not (
+        await _auto_runs_allowed(user_id, doc, now)
+    ):
+        # The trial's unattended week is over. The toggles stay as stored, so
+        # a move to paid brings the loops straight back.
+        log.info("tick.trial_auto_ended", user_id=user_id)
+        return
 
     if (
         settings.auto_discovery
@@ -981,9 +1019,18 @@ def get_discovery_settings(
     state = doc.get("discovery_state") or {}
     # Opportunistic tick: opening the Profile page keeps the loops honest.
     background_tasks.add_task(tick_user, user_id)
+    now = _now()
+    plan_view = plan.view(
+        doc,
+        now=now,
+        scoring_per_day=matching_budget.Limits.for_doc(doc).per_day,
+    )
+    # A trial past its unattended week has no next run, whatever the toggles.
+    auto = plan_view["auto_active"]
     return {
         "settings": settings.model_dump(),
         "state": state,
+        "plan": plan_view,
         # The lease goes in: ``last_*_at`` now moves only on success, so a run
         # in flight would otherwise leave the card advertising a next run in
         # the past.
@@ -993,7 +1040,7 @@ def get_discovery_settings(
                 settings.discovery_interval_hours,
                 lease=state.get("discovery_lease"),
             )
-            if settings.auto_discovery
+            if settings.auto_discovery and auto
             else None
         ),
         "next_sweep_at": (
@@ -1002,7 +1049,7 @@ def get_discovery_settings(
                 settings.sweep_interval_hours,
                 lease=state.get("sweep_lease"),
             )
-            if settings.liveness_sweep
+            if settings.liveness_sweep and auto
             else None
         ),
     }
@@ -1037,6 +1084,12 @@ async def run_discovery_now(
     or "in_process" (a background task on this instance, which scale-down can
     kill).
 
+    **A trial user's run always scores, with no consent step.** It is free to
+    them, and what it can cost is bounded by the scoring reservation the cycle
+    takes (the trial's daily cap) and by the weekly search cap here, so there
+    is nothing to quote; any ``confirm`` they send is ignored, not consumed.
+    Every other plan keeps the seam exactly as above.
+
     Refuses from a local process (see :func:`live_runs_refused`) as the very
     first thing, ahead of the consent seam and the QUEUE_MODE branch, because
     every arm spends the same money. Answers 429, not 402, once the week's
@@ -1052,15 +1105,17 @@ async def run_discovery_now(
     adb = _async_client()
     limits = discovery_budget.Limits.from_env()
     snap = await adb.collection("users").document(user_id).get()
-    state = (snap.to_dict() or {}).get(discovery_budget.FIELD) or {}
+    doc = snap.to_dict() or {}
+    state = doc.get(discovery_budget.FIELD) or {}
     left = discovery_budget.remaining(state, limits=limits)
     # ``None`` means the cap is off — never 429 in that case.
     if left is not None and left <= 0:
         log.info("discovery.run_now_capped", user_id=user_id)
         raise _cap_429(discovery_budget.used(state), limits)
 
-    score = False
-    if body is not None and body.confirm:
+    trial = plan.tier_of(doc) == plan.TRIAL
+    score = trial
+    if not trial and body is not None and body.confirm:
         db = spend_client()
         try:
             await spend.consume(db, user_id, spend.DISCOVERY_SCAN, body.confirm)

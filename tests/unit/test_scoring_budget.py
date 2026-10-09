@@ -403,10 +403,17 @@ def test_cap_drop_mid_day_grants_zero(monkeypatch):
     assert new_state["jobs_scored_today"] == 246
 
 
-def test_limits_read_the_env(monkeypatch):
+def test_the_global_vars_are_ceilings(monkeypatch):
+    """``SCORING_BUDGET_PER_DAY`` / ``_PER_CYCLE`` lower a cap and never raise
+    one: 40 a day leaves the trial at 3, and 2 brings it down to 2."""
     monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "25")
     monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "40")
-    assert Limits.from_env() == Limits(per_cycle=25, per_day=40)
+    assert Limits.from_env() == Limits(per_cycle=3, per_day=3)
+    assert Limits.from_env("paid") == Limits(per_cycle=10, per_day=10)
+    monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "1")
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "2")
+    assert Limits.from_env() == Limits(per_cycle=1, per_day=2)
+    assert Limits.from_env("paid") == Limits(per_cycle=1, per_day=2)
 
 
 def test_unparseable_limits_fall_back_to_the_defaults(monkeypatch):
@@ -539,6 +546,7 @@ def test_reserve_defaults_to_a_full_cycles_worth(monkeypatch):
     monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "7")
     monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "1000")
     db = _FakeDB()
+    db.store["plan"] = {"tier": "paid"}
     res = asyncio.run(budget.reserve(db, "u1", cycle_id="c"))
     assert res.granted == 7  # "however much this cycle is allowed"
 
@@ -632,10 +640,14 @@ def _job(job_id: str, *, parsed: bool = True) -> Job:
 
 @pytest.fixture
 def budgeted(monkeypatch):
-    """A real budget against a fake Firestore, shared by every gate below."""
+    """A real budget against a fake Firestore, shared by every gate below.
+
+    On the paid plan (10 a day) so the global per-cycle ceiling of 5 is the
+    cap that binds."""
     monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "5")
     monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "1000")
     db = _FakeDB()
+    db.store["plan"] = {"tier": "paid"}
     for module in (score, batch, batch_runs):
         monkeypatch.setattr(module.firestore, "AsyncClient", lambda: db, raising=False)
     return db
@@ -772,7 +784,7 @@ def test_online_scorer_stops_when_the_budget_is_spent(budgeted, monkeypatch):
         "geo_skipped": 0,
         "budget_granted": 0,
         "budget_remaining_cycle": 0,
-        "budget_remaining_day": 995,
+        "budget_remaining_day": 5,  # the paid plan's 10, less 5
         "budget_capped": True,
     }
 
@@ -786,7 +798,7 @@ def test_ignore_budget_skips_the_gate_but_keeps_a_ceiling(budgeted, monkeypatch)
     # No reservation was taken, so nothing was debited — but the operator
     # still doesn't get to stream an unbounded backlog into memory.
     assert loaded == [score.SCORE_LIMIT_CEILING]
-    assert budgeted.store == {}
+    assert budget.FIELD not in budgeted.store
 
 
 def test_ignore_budget_honors_an_explicit_limit(budgeted, monkeypatch):
@@ -795,7 +807,7 @@ def test_ignore_budget_honors_an_explicit_limit(budgeted, monkeypatch):
     asyncio.run(score.score_pending_jobs("u1", limit=5000, ignore_budget=True))
 
     assert loaded == [5000]  # the documented 12-13K backlog workflow
-    assert budgeted.store == {}
+    assert budget.FIELD not in budgeted.store
 
 
 def test_batch_scorer_reserves_too(budgeted, monkeypatch):
@@ -829,7 +841,7 @@ def test_batch_scorer_honors_ignore_budget(budgeted, monkeypatch):
     asyncio.run(batch.batch_score_pending_jobs("u1", limit=9000, ignore_budget=True))
 
     assert loaded == [9000]
-    assert budgeted.store == {}
+    assert budget.FIELD not in budgeted.store
 
 
 def test_batch_run_start_reserves(budgeted, monkeypatch):

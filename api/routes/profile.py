@@ -27,9 +27,12 @@ from google.cloud import firestore
 
 from api.deps import verify_user
 from models.profile import MasterProfile
+from models.settings import DiscoverySettings
 from obs.logging import get_logger, log_agent_end, log_agent_start, run_context
 from tools import queues
+from tools.account import plan
 from tools.discovery import budget as discovery_budget
+from tools.matching import budget as matching_budget
 from tools.profile.extract import extract_profile, read_resume_text
 from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 
@@ -92,7 +95,35 @@ def get_profile(user_id: str = Depends(verify_user)) -> dict:
     return {
         "profile": data,
         "onboarding_complete": data.get("onboarding_complete", True),
+        "plan": plan.view(
+            data,
+            now=datetime.now(UTC),
+            scoring_per_day=matching_budget.Limits.for_doc(data).per_day,
+        ),
     }
+
+
+def _new_account_fields(existing: dict, now: datetime) -> dict:
+    """What the first onboarding completion adds beside the profile.
+
+    The plan's trial start, once (see :func:`plan.onboarding_fields`). And, only
+    when the account has no ``discovery_settings`` at all, both loops on at
+    24h, with a discovery lease so an opportunistic tick in the minutes after
+    onboarding does not dispatch a second cycle on top of the kickoff — the
+    kickoff's success write clears it, and it expires on its own otherwise.
+    """
+    fields = plan.onboarding_fields(existing, now=now)
+    if "discovery_settings" not in existing:
+        from api.routes.discovery import kickoff_lease
+
+        fields["discovery_settings"] = DiscoverySettings(
+            auto_discovery=True,
+            discovery_interval_hours=24,
+            liveness_sweep=True,
+            sweep_interval_hours=24,
+        ).model_dump()
+        fields["discovery_state"] = {"discovery_lease": kickoff_lease(now)}
+    return fields
 
 
 @router.post("/profile/extract")
@@ -197,10 +228,11 @@ def save_profile(
     """Persist the reviewed/edited profile and mark onboarding complete.
 
     **The first completion kicks off a discovery cycle (fetch + score), which
-    commits real Gemini spend**, with no separate button: nothing else in the
-    app fires an initial run and ``auto_discovery`` defaults to off. Later
-    edits to an already-complete profile do not repeat it, and the run is
-    charged against the weekly search allowance here, at dispatch.
+    commits real Gemini spend**, with no separate button. Later edits to an
+    already-complete profile do not repeat it, and the run is charged against
+    the weekly search allowance here, at dispatch. The same write starts the
+    trial and, for an account with no discovery settings, turns both loops on
+    (see :func:`_new_account_fields`).
 
     The body is validated as a full :class:`MasterProfile`; ``user_id`` is
     forced to the authenticated user so a client cannot write someone else's
@@ -218,8 +250,10 @@ def save_profile(
     first_completion = not existing.get("onboarding_complete")
 
     body.user_id = user_id
+    extra = _new_account_fields(existing, datetime.now(UTC)) if first_completion else {}
     _user_ref(user_id).set(
-        {**body.model_dump(mode="json"), "onboarding_complete": True}, merge=True
+        {**body.model_dump(mode="json"), "onboarding_complete": True, **extra},
+        merge=True,
     )
     log.info(
         "profile.saved",

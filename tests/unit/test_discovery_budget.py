@@ -428,7 +428,10 @@ def dispatched(monkeypatch):
 
 @pytest.fixture
 def run_now(monkeypatch, adb, dispatched):
-    """``POST /settings/discovery/run`` with every seam past the cap faked."""
+    """``POST /settings/discovery/run`` with every seam past the cap faked.
+
+    On the paid plan, so an unconfirmed click is the find-only verb."""
+    adb.store["plan"] = {"tier": "paid"}
     monkeypatch.setenv("QUEUE_MODE", "1")
     app = FastAPI()
     app.include_router(discovery.router)

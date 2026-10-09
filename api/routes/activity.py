@@ -40,6 +40,7 @@ from api.deps import verify_user
 from api.routes.discovery import _lease_at, _lease_held, _next_iso, _parse_ts
 from models.settings import DiscoverySettings
 from obs.logging import get_logger
+from tools.account import plan
 from tools.applications import state as app_state
 from tools.discovery import budget as discovery_budget
 from tools.matching import batch_runs
@@ -181,7 +182,7 @@ def _allowance(user_doc: dict, now: datetime) -> dict:
     search_state = user_doc.get(discovery_budget.FIELD)
     tz = discovery_budget.UTC_TZ
 
-    rating_limits = matching_budget.Limits.from_env()
+    rating_limits = matching_budget.Limits.for_doc(user_doc)
     rating_state = user_doc.get(matching_budget.FIELD)
     remaining_cycle, remaining_day = matching_budget.remaining(
         rating_state, now=now, limits=rating_limits
@@ -590,6 +591,9 @@ async def get_activity(user_id: str = Depends(verify_user)) -> dict:
         user_doc.get("discovery_settings") or {}
     )
     dstate = user_doc.get("discovery_state") or {}
+    # A trial past its unattended week has its loops off as far as the
+    # scheduler is concerned, whatever the stored toggles say.
+    auto = plan.auto_allowed(user_doc, now=now)
     open_runs = await _open_runs(db, user_id)
     batches = await _running_batches(db, user_id)
     by_status = await _applications(db, user_id)
@@ -601,7 +605,7 @@ async def get_activity(user_id: str = Depends(verify_user)) -> dict:
     items = [
         _loop_item(
             "discovery",
-            enabled=settings.auto_discovery,
+            enabled=settings.auto_discovery and auto,
             last_at=dstate.get("last_discovery_at"),
             lease=dstate.get("discovery_lease"),
             interval_hours=settings.discovery_interval_hours,
@@ -611,7 +615,7 @@ async def get_activity(user_id: str = Depends(verify_user)) -> dict:
         ),
         _loop_item(
             "sweep",
-            enabled=settings.liveness_sweep,
+            enabled=settings.liveness_sweep and auto,
             last_at=dstate.get("last_sweep_at"),
             lease=dstate.get("sweep_lease"),
             interval_hours=settings.sweep_interval_hours,
@@ -620,7 +624,7 @@ async def get_activity(user_id: str = Depends(verify_user)) -> dict:
             now=now,
         ),
         _scoring_item(
-            auto_discovery=settings.auto_discovery,
+            auto_discovery=settings.auto_discovery and auto,
             last_discovery=dstate.get("last_discovery"),
             open_doc=open_runs.get("scoring"),
             now=now,

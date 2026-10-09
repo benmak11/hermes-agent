@@ -101,15 +101,16 @@ def test_the_score_route_is_gated_and_budget_capped(client, monkeypatch):
 def test_the_quote_never_exceeds_the_per_day_cap(client, monkeypatch):
     """The number shown is a reading of the grant, so it cannot promise more
     work than the budget will allow."""
-    monkeypatch.setenv("SCORING_BUDGET_PER_CYCLE", "200")
-    monkeypatch.setenv("SCORING_BUDGET_PER_DAY", "400")
-    http, _db, _enqueued, _scored = client
+    monkeypatch.setenv("SCORING_BUDGET_PER_DAY_PAID", "40")
+    http, db, _enqueued, _scored = client
+    db.store["users/u1"] = {"plan": {"tier": "paid"}}
 
     quote = http.post("/jobs/score", json={}).json()["detail"]["estimate"]
 
-    assert quote["units"] <= budget.Limits.from_env().per_cycle
-    assert quote["units"] <= budget.Limits.from_env().per_day
-    assert quote["caps"]["per_cycle"] == 200 and quote["caps"]["per_day"] == 400
+    assert quote["units"] <= budget.Limits.from_env("paid").per_cycle
+    assert quote["units"] <= budget.Limits.from_env("paid").per_day
+    # The paid plan's caps, read off the same user document as the counters.
+    assert quote["caps"]["per_cycle"] == 40 and quote["caps"]["per_day"] == 40
 
 
 def test_a_confirmed_click_goes_to_the_batch_capable_worker_route(client, monkeypatch):
@@ -257,12 +258,14 @@ def test_score_at_the_cap_answers_429_without_minting_or_burning_a_token(
     http, db, enqueued, scored = client
     token = http.post("/jobs/score", json={}).json()["detail"]["confirm_token"]
     db.store["users/u1"] = {
+        # Paid, so a global per-day ceiling of 10 is not clamped to the trial's 3.
+        "plan": {"tier": "paid"},
         "scoring_budget": {
             "day": _today(),
             "jobs_scored_today": used_today,
             "cycle_id": "c1",
             "jobs_scored_this_cycle": 3,
-        }
+        },
     }
     minted = _consents(db)
 

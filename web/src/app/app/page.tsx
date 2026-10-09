@@ -23,7 +23,7 @@ import {
   type SessionStats,
 } from "@/lib/session";
 import { pollMs, type ActivityResponse } from "@/lib/activity";
-import { emptyQueueState } from "@/lib/emptyState";
+import { emptyQueueState, queueContext, type QueueContext } from "@/lib/emptyState";
 import type { DecideValue, Decision, Job, ProfileResponse } from "@/lib/types";
 import { barColor, initial, recPill, scoreColor } from "@/lib/ui";
 import { ActivityPanel } from "@/components/activity/ActivityPanel";
@@ -321,6 +321,7 @@ export default function VettingPage() {
             minScore={minScore}
             pendingTotal={data?.pending_total ?? null}
             scoredTotal={data?.scored_total ?? null}
+            context={queueContext(activity?.items ?? [], profileData?.plan ?? null)}
             onLower={() => saveMinScore(0)}
           />
         )}
@@ -760,14 +761,20 @@ function EmptyState({
   minScore,
   pendingTotal,
   scoredTotal,
+  context,
   onLower,
 }: {
   minScore: number;
   pendingTotal: number | null;
   scoredTotal: number | null;
+  context: QueueContext;
   onLower: () => void;
 }) {
-  const { icon, tone, heading, body, action } = emptyQueueState(pendingTotal, scoredTotal);
+  const { icon, tone, heading, body, action } = emptyQueueState(
+    pendingTotal,
+    scoredTotal,
+    context,
+  );
 
   return (
     <div
