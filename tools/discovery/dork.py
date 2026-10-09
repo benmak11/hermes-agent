@@ -159,17 +159,17 @@ def _reject_reason(probe: BoardProbe) -> str | None:
     return None
 
 
-async def vet_slugs(
+async def vet_slugs_detailed(
     platform: Platform, slugs: list[str]
-) -> tuple[list[tuple[str, str | None]], dict[str, int]]:
-    """Probe ``slugs``; return the ``(slug, name)`` pairs to add and rejections.
+) -> tuple[list[tuple[str, str | None]], list[tuple[str, str]]]:
+    """Probe ``slugs``; return the ``(slug, name)`` pairs to add and the
+    ``(slug, reason)`` pairs rejected, both in ``slugs`` order.
 
     At most :data:`_PROBE_CONCURRENCY` boards are probed at once, through one
-    pooled client. Order of the accepted pairs follows ``slugs``.
+    pooled client.
     """
-    rejected = dict.fromkeys(REJECT_REASONS, 0)
     if not slugs:
-        return [], rejected
+        return [], []
     sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
 
     async def one(slug: str) -> BoardProbe:
@@ -180,12 +180,13 @@ async def vet_slugs(
         probes = await asyncio.gather(*(one(s) for s in slugs))
 
     accepted: list[tuple[str, str | None]] = []
+    rejected: list[tuple[str, str]] = []
     for slug, probe in zip(slugs, probes, strict=True):
         reason = _reject_reason(probe)
         if reason is None:
             accepted.append((slug, probe.name))
             continue
-        rejected[reason] += 1
+        rejected.append((slug, reason))
         log.info(
             "sweep.slug_rejected",
             platform=platform,
@@ -194,6 +195,17 @@ async def vet_slugs(
             outcome=probe.outcome,
             status=probe.status,
         )
+    return accepted, rejected
+
+
+async def vet_slugs(
+    platform: Platform, slugs: list[str]
+) -> tuple[list[tuple[str, str | None]], dict[str, int]]:
+    """:func:`vet_slugs_detailed` with rejections counted by reason."""
+    accepted, rejections = await vet_slugs_detailed(platform, slugs)
+    rejected = dict.fromkeys(REJECT_REASONS, 0)
+    for _, reason in rejections:
+        rejected[reason] += 1
     return accepted, rejected
 
 
