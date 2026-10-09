@@ -171,6 +171,8 @@ def _cycle_fakes(monkeypatch, *, jobs=60):
             "empty_boards": [],
             "boards_cached": 0,
             "boards_fetched": 1,
+            "boards_not_found": 0,
+            "boards_failing": 0,
         }
 
     async def fake_persist_new_jobs(items):
@@ -346,3 +348,30 @@ def test_the_find_only_task_goes_to_its_own_worker_route(monkeypatch):
     # Different ids, or the free click and the paid click in the same minute
     # would dedupe into each other.
     assert scan[2] != scored[2]
+
+
+def test_board_failure_counts_reach_last_discovery(monkeypatch):
+    """404s and other failed board fetches are their own counts, not empty boards."""
+    monkeypatch.setenv("QUEUE_MODE", "1")
+    _, written = _cycle_fakes(monkeypatch, jobs=1)
+
+    async def summary(user_id):
+        return {
+            "jobs": [],
+            "jobs_by_platform": {},
+            "failures": [],
+            "empty_boards": [{"platform": "greenhouse", "slug": "acme"}],
+            "boards_cached": 0,
+            "boards_fetched": 6,
+            "boards_not_found": 3,
+            "boards_failing": 2,
+        }
+
+    monkeypatch.setattr(routes_discovery, "run_discovery", summary)
+    asyncio.run(
+        routes_discovery.run_discovery_cycle("u1", trigger="manual", score=False)
+    )
+
+    metrics = written[0]["discovery_state"]["last_discovery"]
+    assert metrics["empty_boards"] == 1
+    assert (metrics["boards_not_found"], metrics["boards_failing"]) == (3, 2)

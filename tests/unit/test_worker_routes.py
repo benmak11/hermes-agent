@@ -2442,6 +2442,8 @@ def cycle_world(monkeypatch, slot_world):
             "empty_boards": [],
             "boards_cached": 0,
             "boards_fetched": 0,
+            "boards_not_found": 0,
+            "boards_failing": 0,
         }
 
     async def fake_load_prefs(user_id):

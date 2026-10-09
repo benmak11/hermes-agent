@@ -57,6 +57,10 @@ WINDOW_MARGIN = timedelta(minutes=5)
 LOG_RETENTION_DAYS = 30
 
 STAGE_EVENTS = ("agent.started", "agent.finished")
+#: Info-level summary lines read alongside the stages, so a capped main read
+#: cannot lose them. ``discovery.complete`` carries the board 404 / failure
+#: counts, which are logged below WARNING per board.
+SUMMARY_EVENTS = ("discovery.complete",)
 #: Events a child run logs once near its start; matching on them keeps the
 #: children read small enough that one chatty child cannot exhaust the cap.
 CHILD_EVENTS = ("run.opened", "agent.started")
@@ -287,7 +291,7 @@ async def load_run_trace(
     trace.main = read()
     # Read separately so a capped main read can lose neither a stage's end
     # (which would fake a death) nor a late error.
-    trace.stage_read = read(_any_message(STAGE_EVENTS))
+    trace.stage_read = read(_any_message(STAGE_EVENTS + SUMMARY_EVENTS))
     trace.problem_read = read("severity>=WARNING")
     # A child can start after this run ends, as late as a queued dispatch.
     trace.child_read = read(
@@ -490,7 +494,14 @@ def stage_lines(stages: list[Stage]) -> list[str]:
 
 
 def _detail(line: LogLine) -> str:
-    """The last line of an attached error or traceback, if any."""
+    """The last line of an attached error or traceback, if any; for a board
+    health change, which board moved and how."""
+    if line.message == "board_health.changed":
+        p = line.payload
+        return (
+            f"{p.get('platform')}/{p.get('slug')}: {p.get('from_state')} → "
+            f"{p.get('to_state')} ({p.get('outcome')}, status {p.get('status')})"
+        )
     for key in ("exception", "error"):
         value = line.payload.get(key)
         if value:
@@ -499,8 +510,34 @@ def _detail(line: LogLine) -> str:
     return ""
 
 
+def board_lines(lines: list[LogLine]) -> list[str]:
+    """Boards a discovery run could not fetch, from ``discovery.complete``.
+
+    A 404 is logged at info per board, so it never reaches the WARNING read;
+    the counts on the summary line are how it shows up here.
+    """
+    out = []
+    for line in lines:
+        if line.message != "discovery.complete":
+            continue
+        not_found = line.payload.get("boards_not_found") or 0
+        failing = line.payload.get("boards_failing") or 0
+        if not (not_found or failing):
+            continue
+        out.append(
+            f"{_short(line.at)}  boards not found (404): {not_found}, "
+            f"failing (429/5xx/timeout/error): {failing}"
+        )
+        named = line.payload.get("unhealthy_boards") or []
+        if named:
+            out.append(f"{' ' * 12}{', '.join(str(b) for b in named)}")
+    return out
+
+
 def problem_lines(lines: list[LogLine]) -> list[str]:
-    """Lines at WARNING or above, identical ones collapsed with a count."""
+    """Lines at WARNING or above, identical ones collapsed with a count, then
+    any boards a discovery run could not fetch."""
+    boards = board_lines(lines)
     groups: dict[tuple, list[LogLine]] = {}
     for line in lines:
         if _SEVERITY_RANK.get(line.severity, 0) < _WARNING:
@@ -508,7 +545,7 @@ def problem_lines(lines: list[LogLine]) -> list[str]:
         key = (line.severity, line.service, line.message, _detail(line))
         groups.setdefault(key, []).append(line)
     if not groups:
-        return ["none at WARNING or above"]
+        return ["none at WARNING or above", *boards]
     out = []
     for (severity, service, message, detail), group in groups.items():
         first, last = group[0].at, group[-1].at
@@ -518,7 +555,7 @@ def problem_lines(lines: list[LogLine]) -> list[str]:
         out.append(line)
         if detail:
             out.append(f"{' ' * 12}{detail}")
-    return out
+    return out + boards
 
 
 # ------------------------------------------------------------------ retries
