@@ -25,6 +25,7 @@ from tools.ats.google_jobs import fetch_google_jobs
 from tools.ats.greenhouse import fetch_greenhouse_jobs
 from tools.ats.lever import fetch_lever_jobs
 from tools.ats.meta_jobs import fetch_meta_jobs
+from tools.ats.workable import fetch_workable_jobs
 from tools.companies import Platform, all_active_companies, entry_names, load_blocklist
 from tools.company_prefs import load_exclusions
 
@@ -35,6 +36,7 @@ FETCHERS: dict[Platform, Callable[[str, str], Awaitable[list[Job]]]] = {
     "greenhouse": fetch_greenhouse_jobs,
     "lever": fetch_lever_jobs,
     "ashby": fetch_ashby_jobs,
+    "workable": fetch_workable_jobs,
     "google_jobs": fetch_google_jobs,
     "meta_jobs": fetch_meta_jobs,
 }

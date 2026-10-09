@@ -31,6 +31,7 @@ PLATFORM_DOMAINS: dict[Platform, list[str]] = {
     "greenhouse": ["boards.greenhouse.io", "job-boards.greenhouse.io"],
     "lever": ["jobs.lever.co"],
     "ashby": ["jobs.ashbyhq.com"],
+    "workable": ["apply.workable.com"],
 }
 
 # URL patterns to extract company slug. Tested against real URLs from each
@@ -41,10 +42,12 @@ SLUG_REGEXES: dict[Platform, re.Pattern] = {
     ),
     "lever": re.compile(r"jobs\.lever\.co/([a-zA-Z0-9_-]+)"),
     "ashby": re.compile(r"jobs\.ashbyhq\.com/([a-zA-Z0-9_-]+)"),
+    "workable": re.compile(r"apply\.workable\.com/([a-zA-Z0-9_-]+)"),
 }
 
 # Platform-internal paths that look like slugs but aren't real companies.
-_NON_SLUGS = {"jobs", "search", "api", "v1", "boards"}
+# ``j`` is Workable's single-job short link (apply.workable.com/j/{shortcode}).
+_NON_SLUGS = {"jobs", "search", "api", "v1", "boards", "j"}
 
 
 class SearchBackend(ABC):
@@ -210,7 +213,7 @@ async def vet_slugs(
 
 
 async def run_sweep(backend: SearchBackend) -> SweepResult:
-    """Run all configured queries against all three platforms.
+    """Run all configured queries against every platform in :data:`PLATFORM_DOMAINS`.
 
     A slug new to the pool is probed first and added only if its board answers
     ok with at least one job, carrying the company name when the board has one.

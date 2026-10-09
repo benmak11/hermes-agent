@@ -42,6 +42,17 @@ def test_extract_slugs_per_platform() -> None:
     assert extract_slugs(urls, "ashby") == {"ramp"}
 
 
+def test_extract_slugs_workable_accounts_never_the_short_link() -> None:
+    urls = [
+        "https://apply.workable.com/acme/",
+        "https://apply.workable.com/globex/j/1A2B3C4D5E/",
+        "https://apply.workable.com/j/9Z8Y7X6W5V",  # one job, no account
+        "https://apply.workable.com/api/v1/widget/accounts/initech",
+        "https://jobs.lever.co/spotify/abc",  # wrong platform -> ignored
+    ]
+    assert extract_slugs(urls, "workable") == {"acme", "globex"}
+
+
 def test_extract_slugs_filters_platform_internal_paths() -> None:
     urls = [
         "https://boards.greenhouse.io/search",
@@ -108,6 +119,7 @@ def test_sweep_adds_only_ok_boards_with_jobs_carrying_their_names(sweep_env):
             ("greenhouse", "busyco"): _probe("rate_limited", 429, None, None),
             ("greenhouse", "oddco"): _probe(_OK, 200, None, "Odd"),
             ("lever", "initech"): _probe(_OK, 200, 2, "Initech"),
+            ("workable", "umbrella"): _probe(_OK, 200, 3, "Umbrella Corp"),
         }
     )
     gh = [
@@ -121,6 +133,10 @@ def test_sweep_adds_only_ok_boards_with_jobs_carrying_their_names(sweep_env):
                 "https://boards.greenhouse.io/known-co/jobs/2",
             ],
             "jobs.lever.co": ["https://jobs.lever.co/initech/abc"],
+            "apply.workable.com": [
+                "https://apply.workable.com/umbrella/j/1A2B3C4D5E/",
+                "https://apply.workable.com/j/9Z8Y7X6W5V",
+            ],
         }
     )
 
@@ -132,11 +148,15 @@ def test_sweep_adds_only_ok_boards_with_jobs_carrying_their_names(sweep_env):
         ("globex", None),
     ]
     assert [(c["slug"], c["name"]) for c in raw["lever"]] == [("initech", "Initech")]
+    assert [(c["slug"], c["name"]) for c in raw["workable"]] == [
+        ("umbrella", "Umbrella Corp")
+    ]
     assert "ashby" not in raw
     assert result.added == {
         "greenhouse": 2,
         "lever": 1,
         "ashby": 0,
+        "workable": 1,
         "google_jobs": 0,
         "meta_jobs": 0,
     }

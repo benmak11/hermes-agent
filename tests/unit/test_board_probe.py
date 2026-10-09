@@ -287,6 +287,51 @@ def test_a_name_fetch_timeout_keeps_the_ok_outcome(monkeypatch) -> None:
     assert _probe("ashby") == pr.BoardProbe(_http.OK, 200, 1, None)
 
 
+# ------------------------------------------------------------- workable
+
+WORKABLE_BOARD = {
+    "name": "Acme Inc",
+    "description": "<p>We build things.</p>",
+    "jobs": [
+        {"shortcode": "1A2B3C4D5E", "title": "Engineer", "telecommuting": True},
+        {"shortcode": "6F7G8H9I0J", "title": "Designer", "telecommuting": False},
+    ],
+}
+
+
+def test_workable_name_is_the_widget_name_field() -> None:
+    assert pr.parse_workable_name(WORKABLE_BOARD) == "Acme Inc"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [{"jobs": []}, {"name": ""}, {"name": "  "}, {"name": "Workable"}, [], None],
+)
+def test_workable_json_without_a_usable_name_is_none(data) -> None:
+    assert pr.parse_workable_name(data) is None
+
+
+def test_a_workable_board_counts_and_names_from_one_get(monkeypatch) -> None:
+    seen = _route(monkeypatch, lambda r: httpx.Response(200, json=WORKABLE_BOARD))
+
+    assert _probe("workable") == pr.BoardProbe(_http.OK, 200, 2, "Acme Inc")
+    assert seen == ["https://apply.workable.com/api/v1/widget/accounts/acme"]
+
+
+def test_a_workable_board_with_a_generic_name_has_no_name(monkeypatch) -> None:
+    body = {**WORKABLE_BOARD, "name": "workable"}
+    _route(monkeypatch, lambda r: httpx.Response(200, json=body))
+
+    assert _probe("workable") == pr.BoardProbe(_http.OK, 200, 2, None)
+
+
+def test_a_missing_workable_account_is_not_found(monkeypatch) -> None:
+    seen = _route(monkeypatch, lambda r: httpx.Response(404))
+
+    assert _probe("workable") == pr.BoardProbe(_http.NOT_FOUND, 404, None, None)
+    assert len(seen) == 1
+
+
 @pytest.mark.parametrize("platform", ["google_jobs", "meta_jobs", "workday", ""])
 def test_other_platforms_are_refused(platform) -> None:
     with pytest.raises(ValueError):

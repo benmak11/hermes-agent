@@ -32,6 +32,20 @@ def test_live_ids_lever_bare_array() -> None:
     assert live_ids("lever", [{"id": "x1"}, {"id": "x2"}]) == {"x1", "x2"}
 
 
+def test_live_ids_workable_reads_the_shortcode() -> None:
+    """Workable rows carry no ``id``; read under it, every posting looks dead."""
+    data = {
+        "name": "Acme Inc",
+        "jobs": [
+            {"shortcode": "1A2B3C4D5E", "title": "Engineer"},
+            {"shortcode": "6F7G8H9I0J", "title": "Designer"},
+            {"id": "not-a-shortcode", "title": "no shortcode"},
+        ],
+    }
+    assert live_ids("workable", data) == {"1A2B3C4D5E", "6F7G8H9I0J"}
+    assert live_ids("workable", None) == set()
+
+
 def test_live_ids_empty_or_missing() -> None:
     assert live_ids("greenhouse", {}) == set()
     assert live_ids("greenhouse", None) == set()
@@ -42,6 +56,10 @@ def test_board_urls_cover_board_platforms() -> None:
     assert BOARD_URLS["greenhouse"]("acme").endswith("/acme/jobs")
     assert "acme?mode=json" in BOARD_URLS["lever"]("acme")
     assert BOARD_URLS["ashby"]("acme").endswith("/acme")
+    assert (
+        BOARD_URLS["workable"]("acme")
+        == "https://apply.workable.com/api/v1/widget/accounts/acme"
+    )
 
 
 def test_discovery_settings_defaults_off() -> None:
@@ -255,6 +273,81 @@ async def test_a_sweep_that_dismisses_nothing_writes_no_event(swept, monkeypatch
     assert counts["removed"] == 0
     assert jobs.docs["j1"].stored["user_decision"] == "approved"
     assert swept.events.written == []
+
+
+def _workable_job_doc() -> dict:
+    return Job(
+        id="j1",
+        user_id="u1",
+        source="workable",
+        source_id="1A2B3C4D5E",
+        company="acme",
+        title="Staff Software Engineer",
+        url="https://apply.workable.com/j/1A2B3C4D5E",
+        jd_raw="Build things.",
+        discovered_at=datetime.now(UTC),
+        user_decision="approved",
+    ).model_dump(mode="json")
+
+
+@pytest.fixture
+def swept_workable(swept, monkeypatch):
+    """One approved Workable job; the board answers ``board``. The per-posting
+    fallback raises, so a Workable job that missed the board path fails loudly."""
+
+    def build(board):
+        jobs, apps = swept("ready_for_review", _workable_job_doc())
+        fetched: list[tuple[str, str, str]] = []
+
+        async def fetch(platform, slug, url):
+            fetched.append((platform, slug, url))
+            return board
+
+        async def no_single_probe(job):
+            raise AssertionError("workable must be swept by board, not per posting")
+
+        monkeypatch.setattr(sweep, "fetch_board_json", fetch)
+        monkeypatch.setattr(sweep, "check_posting", no_single_probe)
+        return jobs, apps, fetched
+
+    return build
+
+
+@pytest.mark.asyncio
+async def test_a_workable_posting_still_on_its_board_is_kept(swept_workable):
+    board = {"name": "Acme Inc", "jobs": [{"shortcode": "1A2B3C4D5E"}]}
+    jobs, apps, fetched = swept_workable(board)
+
+    counts = await sweep.sweep_postings("u1")
+
+    assert fetched == [
+        ("workable", "acme", "https://apply.workable.com/api/v1/widget/accounts/acme")
+    ]
+    assert (counts["checked"], counts["removed"]) == (1, 0)
+    assert jobs.docs["j1"].stored["user_decision"] == "approved"
+    assert apps.docs["app-j1"].stored["status"] == "ready_for_review"
+
+
+@pytest.mark.asyncio
+async def test_a_workable_posting_gone_from_its_board_is_dismissed(swept_workable):
+    board = {"name": "Acme Inc", "jobs": [{"shortcode": "ZZZZZZZZZZ"}]}
+    jobs, apps, _ = swept_workable(board)
+
+    counts = await sweep.sweep_postings("u1")
+
+    assert counts["removed"] == 1
+    assert jobs.docs["j1"].stored["user_decision"] == "dismissed"
+    assert apps.docs["app-j1"].stored["status"] == "posting_removed"
+
+
+@pytest.mark.asyncio
+async def test_a_workable_board_that_fails_to_fetch_dismisses_nothing(swept_workable):
+    jobs, _, _ = swept_workable(None)
+
+    counts = await sweep.sweep_postings("u1")
+
+    assert (counts["boards_failed"], counts["removed"]) == (1, 0)
+    assert jobs.docs["j1"].stored["user_decision"] == "approved"
 
 
 @pytest.mark.asyncio

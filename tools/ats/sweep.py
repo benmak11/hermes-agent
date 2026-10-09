@@ -35,6 +35,7 @@ from tools.ats.ashby import BASE as ASHBY_BASE
 from tools.ats.greenhouse import BASE as GREENHOUSE_BASE
 from tools.ats.lever import BASE as LEVER_BASE
 from tools.ats.validate import check_posting
+from tools.ats.workable import BASE as WORKABLE_BASE
 from tools.tailoring.pipeline import application_id
 
 log = get_logger("tools.ats")
@@ -53,16 +54,22 @@ BOARD_URLS = {
     "greenhouse": lambda slug: f"{GREENHOUSE_BASE}/{slug}/jobs",
     "lever": lambda slug: f"{LEVER_BASE}/{slug}?mode=json",
     "ashby": lambda slug: f"{ASHBY_BASE}/{slug}",
+    "workable": lambda slug: f"{WORKABLE_BASE}/{slug}",
 }
+
+#: The key each board's rows carry their posting id under. Workable's rows have
+#: no ``id``: read under ``id`` every Workable posting would look dead.
+_ID_KEYS = {"workable": "shortcode"}
 
 
 def live_ids(platform: str, data: Any) -> set[str]:
     """Extract the set of live posting ids from a board API response."""
     if platform == "lever":  # lever returns a bare JSON array
         rows = data or []
-    else:  # greenhouse + ashby wrap the list in {"jobs": [...]}
+    else:  # greenhouse, ashby and workable wrap the list in {"jobs": [...]}
         rows = (data or {}).get("jobs", [])
-    return {str(r.get("id")) for r in rows if r.get("id") is not None}
+    key = _ID_KEYS.get(platform, "id")
+    return {str(r.get(key)) for r in rows if r.get(key) is not None}
 
 
 async def sweep_postings(user_id: str) -> dict:

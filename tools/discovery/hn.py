@@ -2,9 +2,9 @@
 # Unauthorized copying, distribution, or use is prohibited.
 """Board links mined from Hacker News "Ask HN: Who is hiring?" threads.
 
-Not a job feed: only the greenhouse / lever / ashby board slugs linked from
-each thread's top-level posts are harvested, for ``cli.hn_boards`` to vet and
-append to unvetted.yaml. Reads the public HN Algolia API (no key, no spend).
+Not a job feed: only the greenhouse / lever / ashby / workable board slugs
+linked from each thread's top-level posts are harvested, for ``cli.hn_boards``
+to vet and append to unvetted.yaml. Reads the public HN Algolia API (no key, no spend).
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ log = get_logger("tools.discovery.hn")
 
 ALGOLIA = "https://hn.algolia.com/api/v1"
 HIRING_PREFIX = "Ask HN: Who is hiring?"
-HN_PLATFORMS: tuple[Platform, ...] = ("greenhouse", "lever", "ashby")
+HN_PLATFORMS: tuple[Platform, ...] = ("greenhouse", "lever", "ashby", "workable")
 MAX_MONTHS = 6
 
 _TIMEOUT = 20.0
@@ -51,11 +51,13 @@ _PATTERNS: tuple[tuple[Platform, re.Pattern[str]], ...] = (
     ),
     ("lever", re.compile(r"jobs\.lever\.co/" + _SLUG, re.IGNORECASE)),
     ("ashby", re.compile(r"jobs\.ashbyhq\.com/" + _SLUG, re.IGNORECASE)),
+    ("workable", re.compile(r"apply\.workable\.com/" + _SLUG, re.IGNORECASE)),
 )
 
 #: Platform paths that are not companies (``embed`` is greenhouse's embed
-#: board, whose slug is in ``?for=``).
-_NON_SLUGS = {"jobs", "search", "api", "v1", "boards", "embed"}
+#: board, whose slug is in ``?for=``; ``j`` is a Workable single-job short
+#: link, ``apply.workable.com/j/{shortcode}``, which names no account).
+_NON_SLUGS = {"jobs", "search", "api", "v1", "boards", "embed", "j"}
 _TRAILING = ".,;:!?)]}'\"*"
 
 

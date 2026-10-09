@@ -74,6 +74,7 @@ class Job(BaseModel):
         "greenhouse",
         "lever",
         "ashby",
+        "workable",
         "workday",
         "google_jobs",
         "meta_jobs",

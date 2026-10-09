@@ -3,15 +3,16 @@
 """
 Backfill company names into known.yaml and unvetted.yaml from each board.
 
-Probes every greenhouse / lever / ashby board in the pool (public GETs, no
-spend) and reads the company name the board publishes. Dry run by default:
+Probes every greenhouse / lever / ashby / workable board in the pool (public
+GETs, no spend) and reads the company name the board publishes. Dry run by default:
 prints the proposed name per board and writes nothing. ``--write`` sets
 ``name`` only on entries that have none — an existing name is never
 overwritten, blocklisted boards are skipped and blocklist.yaml is never
 touched. Boards whose probe is not ok are listed for a human, never removed.
 
 Usage:
-    python -m cli.board_names [--platform greenhouse|lever|ashby] [--limit N]
+    python -m cli.board_names [--platform greenhouse|lever|ashby|workable]
+                              [--limit N]
     python -m cli.board_names --write
 """
 

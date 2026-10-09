@@ -31,6 +31,7 @@ _HOSTS = {
     "boards-api.greenhouse.io": "greenhouse",
     "api.lever.co": "lever",
     "api.ashbyhq.com": "ashby",
+    "apply.workable.com": "workable",
 }
 
 _GH_JOB = {
@@ -46,6 +47,21 @@ _LEVER_JOB = {
     "hostedUrl": "https://example.com/l1",
     "categories": {"location": "Remote"},
     "descriptionPlain": "Build things",
+}
+_WORKABLE_BOARD = {
+    "name": "Acme",
+    "jobs": [
+        {
+            "shortcode": "AB12CD34EF",
+            "title": "Engineer",
+            "url": "https://apply.workable.com/j/AB12CD34EF",
+            "city": "",
+            "state": "",
+            "country": "United States",
+            "telecommuting": True,
+            "description": "<p>Build things</p>",
+        }
+    ],
 }
 
 NOT_FOUND = BoardProbe("not_found", 404, None, None)
@@ -241,7 +257,11 @@ def test_an_inactive_board_is_never_probed():
 
 def test_the_probe_targets_the_other_platforms():
     rec = _failing(2, "2026-09-30", "2026-10-01")
-    assert board_health.probe_targets(rec) == [("lever", "acme"), ("ashby", "acme")]
+    assert board_health.probe_targets(rec) == [
+        ("lever", "acme"),
+        ("ashby", "acme"),
+        ("workable", "acme"),
+    ]
     moved = {**rec, "state": "moved"}
     assert board_health.probe_targets(moved) == [("greenhouse", "acme")]
 
@@ -450,7 +470,11 @@ def test_probing_starts_on_the_second_404_day_and_finds_a_move(monkeypatch):
 
     with structlog.testing.capture_logs() as logs:
         summary = w.cycle([ACME, OTHER], DAY1 + timedelta(days=1))
-    assert sorted(w.probed) == [("ashby", "acme"), ("lever", "acme")]
+    assert sorted(w.probed) == [
+        ("ashby", "acme"),
+        ("lever", "acme"),
+        ("workable", "acme"),
+    ]
     rec = w.record("greenhouse:acme")
     assert rec["state"] == "moved"
     assert rec["resolves_to"] == {"platform": "lever", "slug": "acme"}
@@ -465,11 +489,11 @@ def test_at_most_one_probe_round_per_board_per_day(monkeypatch):
     w = World(monkeypatch)
     w.cycle([ACME], DAY1)
     w.cycle([ACME], DAY1 + timedelta(days=1))
-    assert len(w.probed) == 2
+    assert len(w.probed) == 3
     w.cycle([ACME], DAY1 + timedelta(days=1, hours=5))
     assert w.probed == []
     w.cycle([ACME], DAY1 + timedelta(days=2))
-    assert len(w.probed) == 2, "a new 404 day earns a new round"
+    assert len(w.probed) == 3, "a new 404 day earns a new round"
 
 
 def test_a_failed_probe_leaves_the_record_and_completes_the_search(monkeypatch):
@@ -538,7 +562,11 @@ def test_a_dead_recheck_still_404_is_probed_and_stays_dead(monkeypatch):
     )
     w.cycle([ACME], DAY1)
     assert ACME in w.fetched
-    assert sorted(w.probed) == [("ashby", "acme"), ("lever", "acme")]
+    assert sorted(w.probed) == [
+        ("ashby", "acme"),
+        ("lever", "acme"),
+        ("workable", "acme"),
+    ]
     rec = w.record("greenhouse:acme")
     assert rec["state"] == "dead"
     assert rec["next_check_at"] == (DAY1 + timedelta(days=14)).isoformat()
@@ -558,6 +586,27 @@ def test_flag_off_fetches_the_original_and_logs_would_reroute(monkeypatch):
     (complete,) = [e for e in logs if e["event"] == "discovery.complete"]
     assert complete["boards_would_reroute"] == 1
     assert w.record("greenhouse:acme")["state"] == "moved"
+
+
+def test_a_board_that_moved_to_workable_is_found_and_rerouted(monkeypatch):
+    """Workable is a probed platform: a 404ing board whose slug answers there
+    under the same name moves, and the flag then fetches the Workable board."""
+    monkeypatch.setenv(board_health.REROUTE_FLAG, "1")
+    w = World(monkeypatch)
+    w.names[ACME] = "Acme"
+    w.probes[("workable", "acme")] = jobs(1, "Acme")
+    w.answers[("workable", "acme")] = _WORKABLE_BOARD
+    w.cycle([ACME], DAY1)
+    w.cycle([ACME], DAY1 + timedelta(days=1))
+    assert ("workable", "acme") in w.probed
+    rec = w.record("greenhouse:acme")
+    assert rec["state"] == "moved"
+    assert rec["resolves_to"] == {"platform": "workable", "slug": "acme"}
+
+    summary = w.cycle([ACME], DAY1 + timedelta(days=2))
+    assert w.fetched == [("workable", "acme")]
+    assert [j.source for j in summary["jobs"]] == ["workable"]
+    assert w.record("workable:acme")["state"] == "ok"
 
 
 @pytest.mark.parametrize("value", ["1", "true", "on", "ON "])

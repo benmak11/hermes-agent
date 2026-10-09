@@ -632,3 +632,16 @@ ashby:
 - slug: iceye
   name: ICEYE
   added: '2026-10-09'
+workable:
+- slug: portswigger
+  name: PortSwigger
+  added: '2026-10-09'
+- slug: seeq
+  name: Seeq
+  added: '2026-10-09'
+- slug: longshot-systems-ltd
+  name: Longshot Systems Ltd
+  added: '2026-10-09'
+- slug: modash
+  name: Modash
+  added: '2026-10-09'

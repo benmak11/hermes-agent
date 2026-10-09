@@ -29,8 +29,17 @@ from pydantic import BaseModel
 
 # Multi-tenant ATS platforms use a company slug; the single-company career
 # sites (google_jobs, meta_jobs) reuse the slot as a *search query* instead.
-Platform = Literal["greenhouse", "lever", "ashby", "google_jobs", "meta_jobs"]
-PLATFORMS: list[Platform] = ["greenhouse", "lever", "ashby", "google_jobs", "meta_jobs"]
+Platform = Literal[
+    "greenhouse", "lever", "ashby", "workable", "google_jobs", "meta_jobs"
+]
+PLATFORMS: list[Platform] = [
+    "greenhouse",
+    "lever",
+    "ashby",
+    "workable",
+    "google_jobs",
+    "meta_jobs",
+]
 
 DATA_DIR = Path("data/companies")
 

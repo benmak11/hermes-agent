@@ -4,11 +4,11 @@
 Mine Hacker News "Who is hiring?" threads for new company boards.
 
 Reads the newest thread(s) through the public HN Algolia API, pulls the
-greenhouse / lever / ashby board slugs linked from top-level posts, and probes
-each slug new to the pool (public board GETs, no spend). Dry run by default:
-prints what was found, what is already in the pool, and which boards would be
-added (with name) or rejected (with reason). ``--write`` appends the accepted
-boards to unvetted.yaml; nothing else is ever written.
+greenhouse / lever / ashby / workable board slugs linked from top-level posts,
+and probes each slug new to the pool (public board GETs, no spend). Dry run by
+default: prints what was found, what is already in the pool, and which boards
+would be added (with name) or rejected (with reason). ``--write`` appends the
+accepted boards to unvetted.yaml; nothing else is ever written.
 
 Usage:
     python -m cli.hn_boards [--months N]
