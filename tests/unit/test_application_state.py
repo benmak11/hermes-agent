@@ -30,7 +30,7 @@ import api.routes.jobs as jobs
 import api.routes.worker as worker
 import tools.ats.sweep as sweep
 from api.deps import verify_user
-from models.application import ApplicationStatus
+from models.application import Application, ApplicationStatus, Confirmation
 from tools.applications import reaper, state
 from tools.queues import _DISPATCH_DEADLINE_SECONDS
 
@@ -665,10 +665,22 @@ def test_append_note_does_not_resurrect_a_deleted_document():
 # --------------------------------------------------------------------------
 
 
+def _auto_submit_on(monkeypatch, source: str | None = "greenhouse") -> None:
+    """Switch ``AUTO_SUBMIT_ENABLED`` on and give every job ``source``."""
+    monkeypatch.setenv("AUTO_SUBMIT_ENABLED", "1")
+    monkeypatch.setattr(
+        applications,
+        "_job_sources",
+        lambda user_id, job_ids: dict.fromkeys(job_ids, source),
+    )
+
+
 @pytest.fixture
 def submit_client(monkeypatch):
     """The real submit() route over a fake collection, with run_submission
-    replaced by a recorder so 'did we submit twice?' is directly observable."""
+    replaced by a recorder so 'did we submit twice?' is directly observable.
+    Auto-submit is switched on for a greenhouse job, the one case it serves."""
+    _auto_submit_on(monkeypatch)
     doc = _ready()
     monkeypatch.setattr(applications, "_apps", lambda user_id: _FakeCollection(doc))
 
@@ -836,6 +848,7 @@ def queued_submit(monkeypatch):
     see. That snapshot is the ordering assertion.
     """
     monkeypatch.setenv("QUEUE_MODE", "1")
+    _auto_submit_on(monkeypatch)
     doc = _ready()
     monkeypatch.setattr(applications, "_apps", lambda user_id: _FakeCollection(doc))
 
@@ -1100,3 +1113,458 @@ def test_a_regenerate_that_loses_its_race_resets_nothing(monkeypatch):
     assert TestClient(app).post("/applications/app-job1/regenerate").status_code == 409
     assert doc.data["status"] == "submitting"
     assert doc.data[reaper.ATTEMPTS_FIELD] == 2
+
+
+# --------------------------------------------------------------------------
+# Manual apply: the user submits, Hermes records it
+# --------------------------------------------------------------------------
+
+
+def test_submitted_is_reachable_from_review_and_failed_and_submitting_only():
+    for status in ALL_STATUSES:
+        expected = status in {"ready_for_review", "failed", "submitting"}
+        assert state.can_transition(status, "submitted") is expected, status
+    assert state.MANUAL_SUBMIT_FROM == {"ready_for_review", "failed"}
+    assert state.MANUAL_SUBMIT_FROM == {
+        s for s, nxt in state.TRANSITIONS.items() if "submitted" in nxt
+    } - {"submitting"}
+
+
+def test_the_manual_edges_change_no_set_derived_from_the_table():
+    """Every consumer of TRANSITIONS keys on an edge other than ``→ submitted``,
+    so the new edges must leave each of them exactly where it was."""
+    assert applications.SUBMITTABLE == {"ready_for_review", "failed"}
+    assert applications.OBJECTIVE_EDITABLE == {"ready_for_review", "failed"}
+    assert state.TERMINAL_STATUSES == {"responded", "posting_removed"}
+    assert sweep.ACTIVE_APP_STATUSES == {
+        "queued",
+        "tailoring",
+        "ready_for_review",
+        "failed",
+    }
+    assert reaper.REAPABLE == ["queued", "tailoring", "submitting"]
+    assert set(state.IN_PROGRESS) == {"queued", "tailoring", "submitting"}
+
+
+def _manually_submitted() -> _FakeDoc:
+    return _ready(
+        status="submitted",
+        confirmation={"submitted_at": "2026-08-02T00:00:00+00:00", "method": "manual"},
+    )
+
+
+def test_the_sweep_cannot_remove_a_manually_submitted_application():
+    """The sweep's own swap, with its own allowlist."""
+    doc = _manually_submitted()
+    assert not state.try_transition(
+        doc,
+        doc.get(),
+        "posting_removed",
+        allowed_from=sweep.ACTIVE_APP_STATUSES,
+        lease=state.CLEAR_LEASE,
+    )
+    assert doc.data["status"] == "submitted"
+    assert doc.updates == []
+
+
+def test_the_reaper_leaves_a_manually_submitted_application_alone():
+    now = datetime.now(UTC)
+    doc = {**_manually_submitted().data, "timeline": []}
+    assert reaper.classify(doc, now=now + timedelta(days=30)) == "alive"
+
+
+def test_the_auto_path_cannot_complete_a_document_nobody_claimed():
+    """``run_submission``'s terminal write names ``submitting``, so the new
+    ``ready_for_review → submitted`` edge is not a way in for it."""
+    doc = _ready()
+    assert not state.try_transition(
+        doc, doc.get(), "submitted", allowed_from={"submitting"}
+    )
+    assert doc.data["status"] == "ready_for_review"
+
+
+@pytest.fixture
+def manual_client(monkeypatch):
+    """The real mark-applied and submit routes over one fake document, with
+    run_submission and the queue both recorded so any dispatch is visible."""
+    monkeypatch.delenv("AUTO_SUBMIT_ENABLED", raising=False)
+    doc = _ready(job_url="https://boards.example.com/acme/1")
+    monkeypatch.setattr(applications, "_apps", lambda user_id: _FakeCollection(doc))
+    dispatched: list[tuple] = []
+
+    async def fake_run_submission(user_id, app_id, *, dry_run=False):
+        dispatched.append(("background", app_id, dry_run))
+
+    def fake_enqueue(queue, path, payload, *, task_id=None):
+        dispatched.append(("queue", path, task_id))
+        return True
+
+    monkeypatch.setattr(applications, "run_submission", fake_run_submission)
+    monkeypatch.setattr(applications.queues, "enqueue", fake_enqueue)
+    app = FastAPI()
+    app.include_router(applications.router)
+    app.dependency_overrides[verify_user] = lambda: "u1"
+    return SimpleNamespace(client=TestClient(app), doc=doc, dispatched=dispatched)
+
+
+def _mark(client):
+    return client.post("/applications/app-job1/mark-applied")
+
+
+@pytest.mark.parametrize("start", ["ready_for_review", "failed"])
+@pytest.mark.parametrize("flag", [None, "1"])
+def test_mark_applied_records_a_manual_submission(
+    manual_client, monkeypatch, start, flag
+):
+    """Works whatever ``AUTO_SUBMIT_ENABLED`` says: applying yourself is the
+    default path, not the fallback."""
+    if flag:
+        monkeypatch.setenv("AUTO_SUBMIT_ENABLED", flag)
+    doc = manual_client.doc
+    doc.set({**doc.data, "status": start, "submit_attempts": 2})
+
+    resp = _mark(manual_client.client)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "changed": True}
+    data = doc.data
+    assert data["status"] == "submitted"
+    assert data["confirmation"]["method"] == "manual"
+    submitted_at = datetime.fromisoformat(data["confirmation"]["submitted_at"])
+    assert submitted_at.tzinfo is not None
+    assert abs(datetime.now(UTC) - submitted_at) < timedelta(minutes=1)
+    assert data["timeline"][-1]["status"] == "submitted"
+    assert data["timeline"][-1]["note"] == applications.MANUAL_APPLY_NOTE
+    # Nothing about the automated path moves: no claim, no counter, no task.
+    assert data["submit_attempts"] == 2
+    assert "last_submitted_at" not in data and "lease" not in data
+    assert manual_client.dispatched == []
+    # One write, and it is the compare-and-swap.
+    ((fields, option),) = doc.updates
+    assert option is not None and fields["status"] == "submitted"
+    parsed = Application.model_validate(data)
+    assert parsed.confirmation is not None
+    assert parsed.confirmation.method == "manual"
+
+
+@pytest.mark.parametrize(
+    "start", ["queued", "tailoring", "submitting", "responded", "posting_removed"]
+)
+def test_mark_applied_is_refused_from_every_other_status(manual_client, start):
+    doc = manual_client.doc
+    doc.set({**doc.data, "status": start})
+    writes = len(doc.updates)
+
+    resp = _mark(manual_client.client)
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {"reason": "cannot_mark_applied", "current": start}
+    assert doc.data["status"] == start
+    assert "confirmation" not in doc.data
+    assert len(doc.updates) == writes
+
+
+def test_mark_applied_twice_changes_nothing_the_second_time(manual_client):
+    client, doc = manual_client.client, manual_client.doc
+    assert _mark(client).json() == {"ok": True, "changed": True}
+    before = doc.data
+    writes = len(doc.updates)
+
+    resp = _mark(client)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "changed": False}
+    assert doc.data == before
+    assert len(doc.updates) == writes
+
+
+@pytest.mark.parametrize(
+    "confirmation",
+    [
+        # Written before ``method`` existed: auto by definition.
+        {"submitted_at": "2026-08-02T00:00:00+00:00", "screenshot_uri": "gs://b/c.png"},
+        {"submitted_at": "2026-08-02T00:00:00+00:00", "method": "auto"},
+    ],
+)
+def test_mark_applied_will_not_relabel_an_automated_submission(
+    manual_client, confirmation
+):
+    doc = manual_client.doc
+    doc.set({**doc.data, "status": "submitted", "confirmation": confirmation})
+    before = doc.data
+    writes = len(doc.updates)
+
+    resp = _mark(manual_client.client)
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "reason": "already_submitted",
+        "current": "submitted",
+    }
+    assert doc.data == before
+    assert len(doc.updates) == writes
+
+
+def test_mark_applied_loses_to_a_submit_that_claimed_first(manual_client):
+    """The user clicks Submit and, on another tab, "I applied". The mark holds
+    a read taken before the claim landed; it must not complete a document a
+    browser is now driving, even though ``submitting → submitted`` is legal."""
+    doc = manual_client.doc
+    in_flight = doc.snapshot()
+    assert state.try_transition(doc, doc.get(), "submitting")
+    doc.pin(in_flight)
+
+    resp = _mark(manual_client.client)
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["current"] == "submitting"
+    assert doc.data["status"] == "submitting"
+    assert "confirmation" not in doc.data
+
+
+def test_mark_applied_loses_to_the_sweep(manual_client):
+    doc = manual_client.doc
+    in_flight = doc.snapshot()
+    state.try_transition(
+        doc, doc.get(), "posting_removed", allowed_from=sweep.ACTIVE_APP_STATUSES
+    )
+    doc.pin(in_flight)
+
+    resp = _mark(manual_client.client)
+
+    assert resp.status_code == 409
+    assert doc.data["status"] == "posting_removed"
+    assert "confirmation" not in doc.data
+
+
+def test_two_racing_marks_record_one_submission(manual_client):
+    client, doc = manual_client.client, manual_client.doc
+    in_flight = doc.snapshot()
+    assert _mark(client).json()["changed"] is True
+    doc.pin(in_flight)
+
+    resp = _mark(client)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "changed": False}
+    assert [e["status"] for e in doc.data["timeline"]].count("submitted") == 1
+
+
+def test_mark_applied_404s_on_a_missing_application(manual_client):
+    manual_client.doc.delete()
+    assert _mark(manual_client.client).status_code == 404
+
+
+# ---------------------------------------------------------------- the flag
+
+
+def test_a_confirmation_without_a_method_is_an_automated_one():
+    old = {"submitted_at": "2026-08-02T00:00:00+00:00", "screenshot_uri": "gs://b/c"}
+    assert Confirmation.model_validate(old).method == "auto"
+    app = Application.model_validate(
+        {
+            "id": "app-job1",
+            "user_id": "u1",
+            "job_id": "job1",
+            "status": "submitted",
+            "confirmation": old,
+        }
+    )
+    assert app.confirmation is not None and app.confirmation.method == "auto"
+    with pytest.raises(ValueError):
+        Confirmation.model_validate({**old, "method": "carrier_pigeon"})
+
+
+@pytest.mark.parametrize(
+    ("raw", "on"),
+    [
+        (None, False),
+        ("", False),
+        ("0", False),
+        ("false", False),
+        ("off", False),
+        ("1", True),
+        ("true", True),
+        ("ON", True),
+        (" on ", True),
+    ],
+)
+def test_auto_submit_is_off_unless_switched_on(monkeypatch, raw, on):
+    from tools.submitters import router
+
+    if raw is None:
+        monkeypatch.delenv("AUTO_SUBMIT_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("AUTO_SUBMIT_ENABLED", raw)
+    assert router.auto_submit_enabled() is on
+    assert router.auto_submit_available("greenhouse") is on
+    assert router.auto_submit_available("lever") is False
+    assert router.auto_submit_available(None) is False
+
+
+@pytest.mark.parametrize("queue_mode", [False, True])
+def test_submit_is_refused_by_default_before_anything_happens(
+    manual_client, monkeypatch, queue_mode
+):
+    """Flag unset: 409 with nothing claimed, written or dispatched, and the
+    job's source never even read."""
+    if queue_mode:
+        monkeypatch.setenv("QUEUE_MODE", "1")
+    reads: list = []
+    monkeypatch.setattr(
+        applications, "_job_sources", lambda u, ids: reads.append(ids) or {}
+    )
+    doc = manual_client.doc
+    before = doc.data
+
+    resp = manual_client.client.post("/applications/app-job1/submit")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "auto_submit_unavailable"
+    assert doc.data == before
+    assert doc.updates == []
+    assert manual_client.dispatched == []
+    assert reads == []
+
+
+@pytest.mark.parametrize("source", ["lever", "ashby", "workable", "google_jobs", None])
+def test_submit_is_refused_for_a_source_with_no_submitter(
+    manual_client, monkeypatch, source
+):
+    _auto_submit_on(monkeypatch, source)
+    resp = manual_client.client.post("/applications/app-job1/submit")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "auto_submit_unavailable"
+    assert manual_client.doc.updates == []
+    assert manual_client.dispatched == []
+
+
+def test_submit_still_works_for_greenhouse_with_the_flag_on(manual_client, monkeypatch):
+    _auto_submit_on(monkeypatch, "greenhouse")
+    resp = manual_client.client.post("/applications/app-job1/submit")
+    assert resp.status_code == 200
+    assert manual_client.doc.data["status"] == "submitting"
+    assert manual_client.dispatched == [("background", "app-job1", False)]
+
+
+# ------------------------------------------------------- capability field
+
+
+class _ListCollection:
+    """``_apps()`` over several fake documents, with ``stream()``."""
+
+    def __init__(self, docs: dict[str, _FakeDoc]):
+        self._docs = docs
+
+    def document(self, doc_id):
+        return self._docs[doc_id]
+
+    def stream(self):
+        return [d.get() for d in self._docs.values()]
+
+
+def _app_doc(app_id: str, job_id: str) -> _FakeDoc:
+    return _FakeDoc(
+        {
+            "id": app_id,
+            "user_id": "u1",
+            "job_id": job_id,
+            "job_url": f"https://boards.example.com/acme/{job_id}",
+            "status": "ready_for_review",
+            "timeline": [{"at": "2026-08-01T00:00:00+00:00", "status": "tailoring"}],
+        },
+        doc_id=app_id,
+    )
+
+
+@pytest.fixture
+def capability_api(monkeypatch):
+    docs = {
+        "app-gh": _app_doc("app-gh", "gh"),
+        "app-lever": _app_doc("app-lever", "lv"),
+        "app-gone": _app_doc("app-gone", "missing"),
+    }
+    sources = {"gh": "greenhouse", "lv": "lever"}
+    reads: list[set] = []
+
+    def fake_sources(user_id, job_ids):
+        reads.append(set(job_ids))
+        return {j: sources.get(j) for j in job_ids}
+
+    monkeypatch.setattr(applications, "_apps", lambda user_id: _ListCollection(docs))
+    monkeypatch.setattr(applications, "_job_sources", fake_sources)
+    app = FastAPI()
+    app.include_router(applications.router)
+    app.dependency_overrides[verify_user] = lambda: "u1"
+    return SimpleNamespace(client=TestClient(app), docs=docs, reads=reads)
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        (None, {"app-gh": False, "app-lever": False, "app-gone": False}),
+        ("1", {"app-gh": True, "app-lever": False, "app-gone": False}),
+    ],
+)
+def test_the_capability_field_on_get_and_list(
+    capability_api, monkeypatch, flag, expected
+):
+    if flag is None:
+        monkeypatch.delenv("AUTO_SUBMIT_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("AUTO_SUBMIT_ENABLED", flag)
+    client = capability_api.client
+
+    for app_id, want in expected.items():
+        body = client.get(f"/applications/{app_id}").json()
+        assert body["auto_submit"] is want, app_id
+
+    listed = client.get("/applications").json()["applications"]
+    assert {a["id"]: a["auto_submit"] for a in listed} == expected
+    # Response-only: never written back to the document.
+    for doc in capability_api.docs.values():
+        assert "auto_submit" not in doc.data
+        assert doc.updates == []
+    if flag is None:
+        assert capability_api.reads == []  # off costs no reads
+    else:
+        # The list reads every job's source in one batch, not one per row.
+        assert capability_api.reads[-1] == {"gh", "lv", "missing"}
+
+
+class _JobRef:
+    def __init__(self, job_id):
+        self.id = job_id
+
+
+class _JobsClient:
+    """Just enough ``firestore.Client`` for ``_job_sources``."""
+
+    def __init__(self, jobs: dict[str, dict]):
+        self._jobs = jobs
+        self.batches: list[list[str]] = []
+
+    def collection(self, name):
+        return self
+
+    def document(self, doc_id):
+        return self if doc_id == "u1" else _JobRef(doc_id)
+
+    def get_all(self, refs):
+        refs = list(refs)
+        self.batches.append([r.id for r in refs])
+        return [_FakeSnap(r.id, self._jobs.get(r.id), 1) for r in refs]
+
+
+def test_job_sources_is_one_batched_read(monkeypatch):
+    db = _JobsClient({"gh": {"source": "greenhouse"}, "lv": {"source": "lever"}})
+    monkeypatch.setattr(applications, "_client", lambda: db)
+
+    assert applications._job_sources("u1", ["gh", "lv", "missing"]) == {
+        "gh": "greenhouse",
+        "lv": "lever",
+        "missing": None,
+    }
+    assert db.batches == [["gh", "lv", "missing"]]
+    assert applications._job_sources("u1", []) == {}
+    assert len(db.batches) == 1

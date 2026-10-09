@@ -54,7 +54,12 @@ from tools.applications import reaper, state
 from tools.ats.validate import check_posting
 from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 from tools.submitters import SUBMIT_CLICKED
-from tools.submitters.router import submit_application
+from tools.submitters.router import (
+    UNSUPPORTED_SOURCE_ERROR,
+    auto_submit_available,
+    auto_submit_enabled,
+    submit_application,
+)
 from tools.submitters.storage import (
     discard_resume,
     download_resume,
@@ -74,6 +79,9 @@ log = get_logger("api.applications")
 # Derived from the state machine so the two can't drift — the enforcement is the
 # compare-and-swap in submit(), not this set.
 SUBMITTABLE = {s for s, nxt in state.TRANSITIONS.items() if "submitting" in nxt}
+#: Timeline note on a manual "I applied". User-facing: ``web/`` renders notes
+#: verbatim.
+MANUAL_APPLY_NOTE = "you applied on the employer's site"
 #: Prefix on every timeline note a rehearsal writes. ``web/`` renders notes
 #: verbatim, so this is the only thing separating "we walked the form for free"
 #: from "we applied to this job" in the user's record.
@@ -467,12 +475,43 @@ def _backfill_job_url(user_id: str, app: dict) -> dict:
     return app
 
 
+def _job_sources(user_id: str, job_ids: Collection[str]) -> dict[str, str | None]:
+    """``job_id -> Job.source`` in one batched read; a missing job maps to None."""
+    if not job_ids:
+        return {}
+    jobs = _client().collection("users").document(user_id).collection("jobs")
+    snaps = _client().get_all([jobs.document(j) for j in job_ids])
+    return {
+        snap.id: ((snap.to_dict() or {}).get("source") if snap.exists else None)
+        for snap in snaps
+    }
+
+
+def _auto_submit_flags(user_id: str, apps: list[dict]) -> list[bool]:
+    """Per application: may the user ask Hermes to submit it?
+
+    Reads nothing while ``AUTO_SUBMIT_ENABLED`` is off, which is the default.
+    """
+    if not auto_submit_enabled():
+        return [False] * len(apps)
+    job_ids = {a["job_id"] for a in apps if a.get("job_id")}
+    sources = _job_sources(user_id, job_ids)
+    return [auto_submit_available(sources.get(a.get("job_id") or "")) for a in apps]
+
+
+def _with_capabilities(user_id: str, apps: list[dict]) -> list[dict]:
+    """Add the response-only ``auto_submit`` field. Never written to Firestore."""
+    for app, flag in zip(apps, _auto_submit_flags(user_id, apps), strict=True):
+        app["auto_submit"] = flag
+    return apps
+
+
 @router.get("/applications")
 def list_applications(user_id: str = Depends(verify_user)) -> dict:
     """All applications for the user, newest activity first."""
     apps = [_backfill_job_url(user_id, s.to_dict()) for s in _apps(user_id).stream()]
     apps.sort(key=lambda a: (a.get("timeline") or [{}])[-1].get("at", ""), reverse=True)
-    return {"applications": apps}
+    return {"applications": _with_capabilities(user_id, apps)}
 
 
 @router.get("/applications/{app_id}")
@@ -480,7 +519,7 @@ def get_application(app_id: str, user_id: str = Depends(verify_user)) -> dict:
     snap = _apps(user_id).document(app_id).get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="application not found")
-    return _backfill_job_url(user_id, snap.to_dict())
+    return _with_capabilities(user_id, [_backfill_job_url(user_id, snap.to_dict())])[0]
 
 
 @router.get("/applications/{app_id}/resume")
@@ -892,6 +931,7 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                         "confirmation": {
                             "submitted_at": submitted_at,
                             "screenshot_uri": confirm_uri,
+                            "method": "auto",
                         },
                     },
                 )
@@ -1083,6 +1123,10 @@ def submit(
     refuse to run, and the submission is silently lost. In this order the worst
     case is a claim with nothing behind it and nothing ever clicked, which
     :func:`_abandon_unstarted_claim` rolls back to ``failed``.
+
+    Refused with 409 ``auto_submit_unavailable`` — before any claim, write or
+    dispatch — unless ``AUTO_SUBMIT_ENABLED`` is on and the job's source has an
+    automated submitter. The user applies themselves and calls ``mark-applied``.
     """
     ref = _apps(user_id).document(app_id)
     snap = ref.get()
@@ -1090,6 +1134,15 @@ def submit(
         raise HTTPException(status_code=404, detail="application not found")
     doc = snap.to_dict() or {}
     status = doc.get(state.STATUS_FIELD)
+    if not _auto_submit_flags(user_id, [doc])[0]:
+        log.info("application.submit_unavailable", app_id=app_id, user_id=user_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "auto_submit_unavailable",
+                "message": UNSUPPORTED_SOURCE_ERROR,
+            },
+        )
     # Bumped inside the swap below, never outside it. The counter names the
     # apply task, so two claims sharing a number would share a task name and
     # the second would be deduped into silence; only a winning claim advances
@@ -1152,6 +1205,58 @@ def submit(
         _abandon_unstarted_claim(ref, app_id)
         raise HTTPException(status_code=503, detail="could not schedule the submission")
     return {"ok": True}
+
+
+@router.post("/applications/{app_id}/mark-applied")
+def mark_applied(app_id: str, user_id: str = Depends(verify_user)) -> dict:
+    """Record that the user applied on the employer's site themselves.
+
+    Moves ``ready_for_review`` or ``failed`` to ``submitted`` with a
+    ``confirmation`` of ``method: "manual"``, in one compare-and-swap narrowed
+    to those statuses, so it cannot overwrite a submission in flight or a
+    posting the sweep just removed. Repeating it on an application already
+    marked this way is a 200 that changes nothing; any other status, including
+    one Hermes submitted itself, is a 409.
+    """
+    ref = _apps(user_id).document(app_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="application not found")
+    if _is_manually_submitted(snap.to_dict()):
+        return {"ok": True, "changed": False}
+    if state.try_transition(
+        ref,
+        snap,
+        "submitted",
+        note=MANUAL_APPLY_NOTE,
+        allowed_from=state.MANUAL_SUBMIT_FROM,
+        extra={"confirmation": {"submitted_at": _now(), "method": "manual"}},
+    ):
+        log.info("application.marked_applied", app_id=app_id, user_id=user_id)
+        return {"ok": True, "changed": True}
+    # Lost, or never legal. A concurrent mark-applied that won is still success.
+    now = ref.get()
+    doc = now.to_dict() if now.exists else None
+    if _is_manually_submitted(doc):
+        return {"ok": True, "changed": False}
+    if doc is None:
+        raise HTTPException(status_code=404, detail="application not found")
+    status = doc.get(state.STATUS_FIELD)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "reason": (
+                "already_submitted" if status == "submitted" else "cannot_mark_applied"
+            ),
+            "current": status,
+        },
+    )
+
+
+def _is_manually_submitted(doc: dict | None) -> bool:
+    if not doc or doc.get(state.STATUS_FIELD) != "submitted":
+        return False
+    return (doc.get("confirmation") or {}).get("method") == "manual"
 
 
 @router.get("/applications/{app_id}/events")

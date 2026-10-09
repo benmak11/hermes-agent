@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import tools.submitters.router as router
 from models.job import Job
 from models.profile import JobPreferences, MasterProfile
 from tools.submitters.router import submit_application
@@ -49,21 +50,24 @@ def _profile() -> MasterProfile:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["lever", "ashby", "workable"])
+@pytest.mark.parametrize(
+    "source", ["lever", "ashby", "workable", "google_jobs", "meta_jobs"]
+)
 async def test_router_unsupported_source_fails_gracefully(source: str) -> None:
     res = await submit_application(
         _job(source), _profile(), Path("/tmp/x.docx"), dry_run=True
     )
     assert res["success"] is False
-    assert source in res["error"]
+    # Plain language: it reaches the user's timeline verbatim.
+    assert res["error"] == router.UNSUPPORTED_SOURCE_ERROR
+    for jargon in ("Computer Use", "not supported yet", "source", source):
+        assert jargon not in res["error"]
 
 
 @pytest.mark.asyncio
 async def test_only_greenhouse_reaches_the_auto_submitter(monkeypatch) -> None:
     """Workable is manual-apply, like Lever and Ashby: the browser submitter is
     never driven at it. The spy keeps a misroute from launching Playwright."""
-    import tools.submitters.router as router
-
     called: list[str] = []
 
     async def spy(job, *args, **kwargs):
@@ -76,7 +80,7 @@ async def test_only_greenhouse_reaches_the_auto_submitter(monkeypatch) -> None:
         _job("workable"), _profile(), Path("/tmp/x.docx"), dry_run=True
     )
     assert workable["success"] is False
-    assert "Apply manually" in workable["error"]
+    assert "mark it as applied" in workable["error"]
     assert called == []
 
     await submit_application(
