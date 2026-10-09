@@ -943,6 +943,54 @@ def test_batch_run_start_refunds_when_it_does_not_start(budgeted, monkeypatch):
     assert budgeted.budget_state["jobs_scored_this_cycle"] == 0
 
 
+@pytest.mark.parametrize("mode", ["shadow", "on"])
+def test_batch_run_start_under_selection_skips_a_load_the_grant_decides(
+    budgeted, monkeypatch, mode
+):
+    """A grant of 5 can never reach 50, and loading would stream the whole
+    pool and log a pick the online scorer is about to make again."""
+    monkeypatch.setenv("PRERANK_MODE", mode)
+    loaded = _patch_pending(
+        monkeypatch, batch_runs, [(SimpleNamespace(), _job(f"j{i}")) for i in range(9)]
+    )
+
+    result = asyncio.run(batch_runs.start("u1", min_pending=50))
+
+    assert loaded == []
+    assert result["started"] is False and result["pending"] == 0
+    assert result["budget_granted"] == 5
+    assert budgeted.budget_state["jobs_scored_this_cycle"] == 0
+
+
+@pytest.mark.parametrize("mode", [None, "off"])
+def test_batch_run_start_with_selection_off_still_loads(budgeted, monkeypatch, mode):
+    if mode is None:
+        monkeypatch.delenv("PRERANK_MODE", raising=False)
+    else:
+        monkeypatch.setenv("PRERANK_MODE", mode)
+    loaded = _patch_pending(
+        monkeypatch, batch_runs, [(SimpleNamespace(), _job(f"j{i}")) for i in range(9)]
+    )
+
+    result = asyncio.run(batch_runs.start("u1", min_pending=50))
+
+    assert loaded == [5]
+    assert result["started"] is False and result["pending"] == 5
+    assert budgeted.budget_state["jobs_scored_this_cycle"] == 0
+
+
+def test_batch_run_start_under_selection_loads_when_the_grant_could_start(
+    budgeted, monkeypatch
+):
+    monkeypatch.setenv("PRERANK_MODE", "on")
+    loaded = _patch_pending(monkeypatch, batch_runs, [(SimpleNamespace(), _job("j1"))])
+
+    result = asyncio.run(batch_runs.start("u1", min_pending=5))
+
+    assert loaded == [5]
+    assert result["started"] is False and result["pending"] == 1
+
+
 # --------------------------------------------------------------------------
 # resets_at — the daily window's rolling instant, for display only
 # --------------------------------------------------------------------------

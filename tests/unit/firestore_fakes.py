@@ -218,10 +218,11 @@ class _FakeSyncDB(_FakeDB):
 
 
 class _QuerySnap:
-    def __init__(self, doc_id, doc):
+    def __init__(self, doc_id, doc, reference=None):
         self.id = doc_id
         self._doc = doc
         self.exists = doc is not None
+        self.reference = reference
 
     def to_dict(self):
         return dict(self._doc) if self._doc is not None else None
@@ -303,7 +304,7 @@ class _Query:
             self._db.selects.append((self._path, self._fields))
             rows = [(i, {f: d[f] for f in self._fields if f in d}) for i, d in rows]
         for doc_id, doc in rows:
-            yield _QuerySnap(doc_id, doc)
+            yield _QuerySnap(doc_id, doc, self._db._doc_ref(self._path, doc_id))
 
 
 class _QueryColl(_Query):
@@ -340,6 +341,11 @@ class FakeQueryDB:
     def collection(self, name):
         return _QueryColl(self, name, self.data.setdefault(name, {}))
 
+    def _doc_ref(self, coll_path, doc_id):
+        """What a streamed snapshot's ``reference`` points at."""
+        doc = self.data.get(coll_path, {}).get(doc_id)
+        return _QueryDoc(self, f"{coll_path}/{doc_id}", doc)
+
 
 # ------------------------------------------------------- read-write store fake
 
@@ -375,6 +381,11 @@ class _StoreDoc(_QueryDoc):
         self._docs().pop(self.id, None)
         self._db.deletes.append(self._path)
 
+    def collection(self, name):
+        """Writable, like the top-level collections."""
+        path = f"{self._path}/{name}"
+        return _StoreColl(self._db, path, self._db.data.setdefault(path, {}))
+
 
 class _StoreColl(_QueryColl):
     def document(self, doc_id):
@@ -406,6 +417,9 @@ class FakeStoreDB(FakeQueryDB):
 
     def collection(self, name):
         return _StoreColl(self, name, self.data.setdefault(name, {}))
+
+    def _doc_ref(self, coll_path, doc_id):
+        return _StoreDoc(self, coll_path, doc_id)
 
     def transaction(self):
         txn = _StoreTransaction(abort_once=self._abort_once)

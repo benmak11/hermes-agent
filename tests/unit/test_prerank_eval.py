@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from firestore_fakes import FakeQueryDB, _Query, _QueryColl, _QueryDoc, _QuerySnap
+from firestore_fakes import FakeQueryDB, _Query, _QueryColl, _QueryDoc
 
 import cli.prerank_eval as pe
 from models.job import ParsedJD
@@ -275,11 +275,7 @@ async def test_location_signal_is_a_weightless_diagnostic_row(capsys):
 
 
 @pytest.mark.asyncio
-async def test_backlog_uses_the_scorers_pending_predicate(monkeypatch, capsys):
-    monkeypatch.setattr(
-        _QuerySnap, "reference", property(lambda s: s.id), raising=False
-    )
-
+async def test_backlog_uses_the_scorers_pending_predicate(capsys):
     def full(job_id: str, **extra) -> dict:
         return {
             "id": job_id,

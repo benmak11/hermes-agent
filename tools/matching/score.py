@@ -24,7 +24,7 @@ from models.match import JobMatch
 from models.profile import MasterProfile
 from obs import tracing
 from obs.logging import current_run_id, get_logger
-from tools.matching import budget, geo, jd_cache
+from tools.matching import budget, geo, jd_cache, selection
 from tools.matching.pipeline import (
     FLASH_MODEL,
     MATCH_PROMPT_VERSION,
@@ -455,12 +455,21 @@ async def load_profile_and_pending(
 ) -> tuple[MasterProfile, list[tuple]]:
     """The user's profile plus their pending, unscored ``(doc_ref, Job)`` pairs.
 
-    Raises ``ValueError`` when the user has no profile to match against.
+    With a ``limit`` and ``PRERANK_MODE`` not ``off``, the pick is
+    :func:`selection.select_pending`'s, which may return fewer than ``limit``
+    and writes a selections record. Raises ``ValueError`` when the user has no
+    profile to match against.
     """
     profile_doc = await db.collection("users").document(user_id).get()
     if not profile_doc.exists:
         raise ValueError(f"No profile at users/{user_id}.")
     profile = MasterProfile.model_validate(profile_doc.to_dict())
+
+    if limit and (mode := selection.prerank_mode()) != selection.OFF:
+        pending = await selection.select_pending(
+            db, user_id, profile_doc.to_dict(), limit, mode=mode
+        )
+        return profile, pending
 
     jobs_ref = db.collection("users").document(user_id).collection("jobs")
     query = jobs_ref.where(filter=FieldFilter("user_decision", "==", "pending"))

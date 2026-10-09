@@ -37,6 +37,7 @@ from tools.decisions import COLLECTION as DECISIONS
 from tools.exposures import COLLECTION as EXPOSURES
 from tools.journeys import COLLECTION as JOURNEYS
 from tools.run_costs import COLLECTION as RUN_COSTS
+from tools.selections import COLLECTION as SELECTIONS
 from tools.spend.consent import COLLECTION as SPEND_CONSENTS
 from tools.tailoring.render import resume_bucket_name
 
@@ -69,6 +70,7 @@ USER_SUBCOLLECTIONS = (
     DECISIONS,
     EXPOSURES,
     SPEND_CONSENTS,
+    SELECTIONS,
 )
 
 #: Firestore's hard cap on writes per batch.
@@ -88,6 +90,7 @@ class WipeCounts:
     decisions: int = 0
     exposures: int = 0
     spend_consents: int = 0
+    selections: int = 0
     batch_runs: int = 0
     gcs_blobs: int = 0
     #: Whether ``users/{uid}`` was there to delete. False on a re-run of a wipe
@@ -205,6 +208,7 @@ async def wipe_user_data(
         decisions=counts[DECISIONS],
         exposures=counts[EXPOSURES],
         spend_consents=counts[SPEND_CONSENTS],
+        selections=counts[SELECTIONS],
         batch_runs=counts["batch_runs"],
         gcs_blobs=counts["gcs_blobs"],
         user_doc_existed=user_doc_existed,
