@@ -1,351 +1,516 @@
 greenhouse:
 - slug: acquia
+  name: Acquia
   added: '2026-06-20'
 - slug: adyen
+  name: Adyen
   added: '2026-06-20'
 - slug: akuity
+  name: Akuity
   added: '2026-06-20'
 - slug: betterhelpcom
+  name: BetterHelp
   added: '2026-06-20'
 - slug: branch
+  name: Branch
   added: '2026-06-20'
 - slug: c3iot
+  name: C3 AI
   added: '2026-06-20'
 - slug: callrail
+  name: CallRail
   added: '2026-06-20'
 - slug: chainguard
+  name: Chainguard
   added: '2026-06-20'
 - slug: charliehealth
+  name: Charlie Health
   added: '2026-06-20'
 - slug: coinbase
+  name: Coinbase
   added: '2026-06-20'
 - slug: coupang
+  name: Coupang
   added: '2026-06-20'
 - slug: fingerprint
+  name: Fingerprint
   added: '2026-06-20'
 - slug: florenceeu
+  name: Florence Healthcare - EU
   added: '2026-06-20'
 - slug: formlabs
+  name: Formlabs
   added: '2026-06-20'
 - slug: fundraiseup
+  name: Fundraise Up
   added: '2026-06-20'
 - slug: gradle
+  name: Develocity
   added: '2026-06-20'
 - slug: guild
+  name: Guild
   added: '2026-06-20'
 - slug: honeycomb
+  name: Honeycomb.io
   added: '2026-06-20'
 - slug: instacart
+  name: Instacart
   added: '2026-06-20'
 - slug: jetbrains
+  name: JetBrains
   added: '2026-06-20'
 - slug: justworks
+  name: Justworks
   added: '2026-06-20'
 - slug: later
+  name: Later
   added: '2026-06-20'
 - slug: lithic
+  name: Lithic
   added: '2026-06-20'
 - slug: lumimeds
+  name: Lumimeds
   added: '2026-06-20'
 - slug: mavenclinic
+  name: Maven Clinic
   added: '2026-06-20'
 - slug: metalab
+  name: Metalab
   added: '2026-06-20'
 - slug: northbeam
+  name: Northbeam
   added: '2026-06-20'
 - slug: novoed
+  name: NovoEd, Inc.
   added: '2026-06-20'
 - slug: omadahealth
+  name: Omada Health
   added: '2026-06-20'
 - slug: onesixsolutions27
+  name: OneSix - External
   added: '2026-06-20'
 - slug: opswat
+  name: OPSWAT
   added: '2026-06-20'
 - slug: penninteractive
+  name: Penn Interactive
   added: '2026-06-20'
 - slug: pingidentity
+  name: Ping Identity
   added: '2026-06-20'
 - slug: processstreet
+  name: Process Street
   added: '2026-06-20'
 - slug: quillbot
+  name: Quillbot
   added: '2026-06-20'
 - slug: recordedfuture
+  name: Recorded Future
   added: '2026-06-20'
 - slug: remotecom
+  name: Remote
   added: '2026-06-20'
 - slug: remotewoman
+  name: Upsun (via Remote Woman)
   added: '2026-06-20'
 - slug: renpsg
+  name: Ren
   added: '2026-06-20'
 - slug: robinhood
+  name: Robinhood
   added: '2026-06-20'
 - slug: saasgroup
+  name: saas.group
   added: '2026-06-20'
 - slug: samsara
+  name: Samsara
   added: '2026-06-20'
 - slug: shopltk
+  name: LTK USA
   added: '2026-06-20'
 - slug: simplepractice55
+  name: SimplePractice
   added: '2026-06-20'
 - slug: telnyx54
+  name: Telnyx
   added: '2026-06-20'
 - slug: toast
+  name: Toast
   added: '2026-06-20'
 - slug: twilio
+  name: Twilio
   added: '2026-06-20'
 - slug: twinhealth
+  name: Twin Health
   added: '2026-06-20'
 - slug: waymark
+  name: Waymark
   added: '2026-06-20'
 - slug: workleap
+  name: Workleap
   added: '2026-06-20'
 - slug: yipitdata
+  name: YipitData
   added: '2026-06-20'
 - slug: yipitdatajobs
+  name: YipitData (Alternative)
   added: '2026-06-20'
 lever:
 - slug: BestEgg
+  name: Best Egg
   added: '2026-06-20'
 - slug: CollectlyInc
+  name: Collectly
   added: '2026-06-20'
 - slug: Flex
+  name: Flex
   added: '2026-06-20'
 - slug: Huckleberrylabs
+  name: Huckleberry Labs
   added: '2026-06-20'
 - slug: Instrumentl
+  name: Instrumentl
   added: '2026-06-20'
 - slug: Mediafly
+  name: Mediafly
   added: '2026-06-20'
 - slug: actian
+  name: Actian Corporation
   added: '2026-06-20'
 - slug: additionwealth
+  name: Addition
   added: '2026-06-20'
 - slug: aircall
   added: '2026-06-20'
 - slug: brightedge
+  name: BrightEdge
   added: '2026-06-20'
 - slug: caremessage
   added: '2026-06-20'
 - slug: certifid
   added: '2026-06-20'
 - slug: colibrigroup
+  name: Colibri Group
   added: '2026-06-20'
 - slug: decilegroup
+  name: Decile Group
   added: '2026-06-20'
 - slug: distru
+  name: Distru
   added: '2026-06-20'
 - slug: dronedeploy
+  name: DroneDeploy
   added: '2026-06-20'
 - slug: easypost-2
+  name: EasyPost
   added: '2026-06-20'
 - slug: entefy
+  name: Entefy
   added: '2026-06-20'
 - slug: epoch-ai
+  name: Epoch AI
   added: '2026-06-20'
 - slug: everlywell
+  name: Everlywell
   added: '2026-06-20'
 - slug: filevine
+  name: Filevine
   added: '2026-06-20'
 - slug: finn
+  name: FINN
   added: '2026-06-20'
 - slug: foodsmart
+  name: Foodsmart
   added: '2026-06-20'
 - slug: gearset
   added: '2026-06-20'
 - slug: goswift
+  name: Swiftly, Inc.
   added: '2026-06-20'
 - slug: greenlight
+  name: Greenlight Financial Technology
   added: '2026-06-20'
 - slug: happyco
+  name: HappyCo
   added: '2026-06-20'
 - slug: healthcare
+  name: HealthCare
   added: '2026-06-20'
 - slug: iheartjane
+  name: Jane Technologies
   added: '2026-06-20'
 - slug: includedhealth
+  name: Included Health
   added: '2026-06-20'
 - slug: jobgether
+  name: Jobgether
   added: '2026-06-20'
 - slug: jumpcloud
+  name: JumpCloud
   added: '2026-06-20'
 - slug: leadershipconnect
+  name: Leadership Connect
   added: '2026-06-20'
 - slug: magnals
+  name: Magna Legal Services
   added: '2026-06-20'
 - slug: mhnchicago
+  name: Medical Home Network
   added: '2026-06-20'
 - slug: mindtickle
+  name: Mindtickle
   added: '2026-06-20'
 - slug: muttdata
+  name: Muttdata
   added: '2026-06-20'
 - slug: olo
+  name: Olo
   added: '2026-06-20'
 - slug: openx
+  name: OpenX
   added: '2026-06-20'
 - slug: playonsports
   added: '2026-06-20'
 - slug: pointclickcare
+  name: PointClickCare
   added: '2026-06-20'
 - slug: portpro
+  name: PortPro
   added: '2026-06-20'
 - slug: redoxengine
+  name: Redox
   added: '2026-06-20'
 - slug: secureframe
   added: '2026-06-20'
 - slug: tandems
+  name: Tandems
   added: '2026-06-20'
 - slug: teamsnap
+  name: TeamSnap
   added: '2026-06-20'
 - slug: termgrid
+  name: Termgrid Inc.
   added: '2026-06-20'
 - slug: theathletic
+  name: The Athletic Media Company
   added: '2026-06-20'
 - slug: theblockcrypto
+  name: The Block
   added: '2026-06-20'
 - slug: tracktik
+  name: Trackforce
   added: '2026-06-20'
 - slug: veeva
   added: '2026-06-20'
 - slug: viget
+  name: Viget
   added: '2026-06-20'
 - slug: vogo
+  name: Vogo
   added: '2026-06-20'
 - slug: vrchat
+  name: VRChat
   added: '2026-06-20'
 - slug: waveapps
+  name: Wave HQ
   added: '2026-06-20'
 - slug: wmg
+  name: Warner Music Group
   added: '2026-06-20'
 - slug: xsolla
+  name: Xsolla
   added: '2026-06-20'
 - slug: yuno
+  name: Yuno
   added: '2026-06-20'
 ashby:
 - slug: DeepL
+  name: DeepL
   added: '2026-06-20'
 - slug: Meadow
+  name: Meadow
   added: '2026-06-20'
 - slug: Natter
+  name: Natter
   added: '2026-06-20'
 - slug: Perk
+  name: Perk
   added: '2026-06-20'
 - slug: acorns
+  name: Acorns
   added: '2026-06-20'
 - slug: answersnow
+  name: AnswersNow Inc
   added: '2026-06-20'
 - slug: ashby
   added: '2026-06-20'
 - slug: bestow
+  name: Bestow
   added: '2026-06-20'
 - slug: camunda
+  name: Camunda
   added: '2026-06-20'
 - slug: catena
+  name: Catena
   added: '2026-06-20'
 - slug: check-technologies
+  name: Check
   added: '2026-06-20'
 - slug: chromatic
+  name: Chromatic
   added: '2026-06-20'
 - slug: close
+  name: Close
   added: '2026-06-20'
 - slug: cohere
+  name: Cohere
   added: '2026-06-20'
 - slug: credo
+  name: Credo Semiconductor Inc
   added: '2026-06-20'
 - slug: curri
+  name: Curri
   added: '2026-06-20'
 - slug: eightsleep
+  name: Eight Sleep
   added: '2026-06-20'
 - slug: freshpaint
+  name: Freshpaint
   added: '2026-06-20'
 - slug: givebutter
+  name: Givebutter
   added: '2026-06-20'
 - slug: gridverify
+  name: Grid
   added: '2026-06-20'
 - slug: grow-therapy
+  name: Grow Therapy
   added: '2026-06-20'
 - slug: hang
+  name: Hang
   added: '2026-06-20'
 - slug: hirehangar
+  name: Hire Hangar
   added: '2026-06-20'
 - slug: ideals
+  name: Ideals
   added: '2026-06-20'
 - slug: ivai
+  name: IV.AI
   added: '2026-06-20'
 - slug: lightning
+  name: Lightning Labs
   added: '2026-06-20'
 - slug: lightspeedhq
+  name: Lightspeed Commerce, Inc.
   added: '2026-06-20'
 - slug: matterworks
+  name: Matterworks, Inc.
   added: '2026-06-20'
 - slug: midpage
+  name: Midpage
   added: '2026-06-20'
 - slug: mui
+  name: MUI
   added: '2026-06-20'
 - slug: mytomorrows
+  name: myTomorrows
   added: '2026-06-20'
 - slug: n8n
+  name: n8n
   added: '2026-06-20'
 - slug: nerdwallet
+  name: NerdWallet
   added: '2026-06-20'
 - slug: nory
+  name: Nory
   added: '2026-06-20'
 - slug: nylas
+  name: Nylas
   added: '2026-06-20'
 - slug: optro
+  name: Optro
   added: '2026-06-20'
 - slug: oscilar
+  name: Oscilar
   added: '2026-06-20'
 - slug: owner
+  name: Owner.com
   added: '2026-06-20'
 - slug: paradigm-health
+  name: Paradigm Health
   added: '2026-06-20'
 - slug: permitflow
+  name: PermitFlow
   added: '2026-06-20'
 - slug: phantom
+  name: Phantom
   added: '2026-06-20'
 - slug: reflow
+  name: Reflow
   added: '2026-06-20'
 - slug: rillet
+  name: Rillet
   added: '2026-06-20'
 - slug: roompricegenie
+  name: RoomPriceGenie
   added: '2026-06-20'
 - slug: rula
+  name: Rula
   added: '2026-06-20'
 - slug: sardine
+  name: Sardine
   added: '2026-06-20'
 - slug: sentilink
+  name: SentiLink
   added: '2026-06-20'
 - slug: shortstory
+  name: Short Story
   added: '2026-06-20'
 - slug: sift
+  name: Sift
   added: '2026-06-20'
 - slug: sosafe
+  name: SoSafe
   added: '2026-06-20'
 - slug: span
+  name: SPAN
   added: '2026-06-20'
 - slug: substack
+  name: Substack
   added: '2026-06-20'
 - slug: talkiatry
+  name: Talkiatry
   added: '2026-06-20'
 - slug: teamworks
+  name: Teamworks
   added: '2026-06-20'
 - slug: tem
+  name: tem
   added: '2026-06-20'
 - slug: tern
+  name: Tern Travel
   added: '2026-06-20'
 - slug: tonal
+  name: Tonal
   added: '2026-06-20'
 - slug: tremendous
+  name: Tremendous
   added: '2026-06-20'
 - slug: vanta
+  name: Vanta
   added: '2026-06-20'
 - slug: vetcove
+  name: Vetcove
   added: '2026-06-20'
 - slug: virtahealth
+  name: Virta Health
   added: '2026-06-20'
 - slug: weave
+  name: Weave
   added: '2026-06-20'
 - slug: weave-grid
+  name: WeaveGrid, Inc.
   added: '2026-06-20'
 - slug: clickhouse
   name: ClickHouse
