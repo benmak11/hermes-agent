@@ -15,7 +15,7 @@ from pathlib import Path
 
 from models.application import Application, StatusEvent
 from models.job import Job
-from models.profile import MasterProfile
+from models.profile import Experience, MasterProfile
 from obs.logging import get_logger
 
 from .objective import generate_objective
@@ -28,6 +28,32 @@ log = get_logger("tools.tailoring")
 def application_id(job_id: str) -> str:
     """Stable per-job application id, so re-tailoring is idempotent."""
     return f"app-{job_id}"
+
+
+def snapshot_experience(experience: list[Experience]) -> list[dict]:
+    """The ``master_bullets`` / ``tailored_bullets`` shape stored on an Application."""
+    return [
+        {
+            "company": exp.company,
+            "role": exp.role,
+            "bullets": [b.text for b in exp.bullets],
+        }
+        for exp in experience
+    ]
+
+
+def render_tailored_resume(
+    job: Job, profile: MasterProfile, objective: str, output_path: Path
+) -> list[Experience]:
+    """Rerank the profile's bullets to the job and render the .docx; no LLM call.
+
+    Returns the reranked experience the file was rendered from.
+    """
+    if job.jd_parsed is None:
+        raise ValueError(f"Job {job.id} has no jd_parsed; run matching first.")
+    reranked = rerank_experience(profile.experience, job.jd_parsed)
+    render_resume_docx(profile, reranked, objective, output_path)
+    return reranked
 
 
 async def tailor_application(
@@ -50,15 +76,13 @@ async def tailor_application(
         # reaches "approved" only after matching, so this is normally populated.
         raise ValueError(f"Job {job.id} has no jd_parsed; run matching first.")
 
-    reranked = rerank_experience(profile.experience, job.jd_parsed)
-    job_log.info("tailoring.reranked", roles=len(reranked))
     objective = await generate_objective(profile, job)
     job_log.info("tailoring.objective_generated", chars=len(objective))
 
     with tempfile.TemporaryDirectory() as tmp:
-        local_path = render_resume_docx(
-            profile, reranked, objective, Path(tmp) / "resume.docx"
-        )
+        local_path = Path(tmp) / "resume.docx"
+        reranked = render_tailored_resume(job, profile, objective, local_path)
+        job_log.info("tailoring.reranked", roles=len(reranked))
         if upload:
             resume_uri = upload_resume(local_path, profile.user_id, job.id)
         else:
@@ -66,16 +90,6 @@ async def tailor_application(
             kept = Path(tempfile.gettempdir()) / f"resume-{job.id}.docx"
             kept.write_bytes(local_path.read_bytes())
             resume_uri = str(kept)
-
-    def _snapshot(experience) -> list[dict]:
-        return [
-            {
-                "company": exp.company,
-                "role": exp.role,
-                "bullets": [b.text for b in exp.bullets],
-            }
-            for exp in experience
-        ]
 
     ready_at = datetime.now(UTC)
     job_log.info(
@@ -93,8 +107,8 @@ async def tailor_application(
         status="ready_for_review",
         resume_variant_uri=resume_uri,
         objective_text=objective,
-        master_bullets=_snapshot(profile.experience),
-        tailored_bullets=_snapshot(reranked),
+        master_bullets=snapshot_experience(profile.experience),
+        tailored_bullets=snapshot_experience(reranked),
         timeline=[
             StatusEvent(at=created_at, status="tailoring"),
             StatusEvent(at=ready_at, status="ready_for_review"),

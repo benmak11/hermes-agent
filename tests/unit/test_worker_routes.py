@@ -1347,6 +1347,38 @@ def submission_world(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("submitter_raises", [False, True])
+def test_the_downloaded_resume_is_deleted_once_the_submitter_is_done(
+    submission_world, monkeypatch, submitter_raises
+):
+    """The submitter reads a private copy of the resume, and that copy is gone
+    afterwards whether the submitter returned or raised."""
+    from tools.submitters import storage
+
+    downloaded: list[Path] = []
+
+    def fake_download(uri):
+        # Shaped like a real download, so discard_resume recognises it.
+        path = Path(storage.tempfile.mkdtemp(prefix=storage._DOWNLOAD_PREFIX))
+        path = path / "resume.docx"
+        path.write_bytes(b"docx")
+        downloaded.append(path)
+        return path
+
+    def during():
+        assert downloaded[0].read_bytes() == b"docx"  # readable mid-submit
+        if submitter_raises:
+            raise RuntimeError("browser crashed")
+
+    monkeypatch.setattr(applications, "download_resume", fake_download)
+    submission_world.hooks.during = during
+
+    asyncio.run(applications.run_submission("u1", "app-job1", dry_run=True))
+
+    assert len(downloaded) == 1
+    assert not downloaded[0].exists() and not downloaded[0].parent.exists()
+
+
 def test_a_dry_run_never_records_a_submission(submission_world):
     """``submit_greenhouse`` reports a dry run as ``success=True`` (with
     ``dry_run=True``). Treating that as a real success would mark a job
