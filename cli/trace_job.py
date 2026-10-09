@@ -33,6 +33,8 @@ from dotenv import load_dotenv
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
+from tools.matching.score import is_pruned
+
 # Pins GOOGLE_CLOUD_PROJECT from the project-root .env. ADC's default quota
 # project on a dev machine is a different GCP project, so the client below is
 # constructed with an explicit project rather than letting it be inferred.
@@ -249,7 +251,25 @@ def scored_event(doc: dict, run_id: str | None) -> Event | None:
     return Event(at, "scored (jobs)", details)
 
 
+def pruned_event(stone: dict) -> Event:
+    """A tombstone ``cli.prune_backlog`` wrote: no model scored the job."""
+    pruned = stone.get("pruned") or {}
+    details = [
+        f"prerank {pruned.get('prerank')} <= cutoff {pruned.get('cutoff')} "
+        f"(prerank v{pruned.get('version')}); never scored",
+        "reversible: python -m cli.prune_backlog --undo",
+    ]
+    details += parse_lines(stone)
+    return Event(
+        to_utc(pruned.get("at") or stone.get("discarded_at")),
+        "pruned unscored (tombstone)",
+        details,
+    )
+
+
 def discarded_event(stone: dict) -> Event:
+    if is_pruned(stone):
+        return pruned_event(stone)
     score = _score_of(stone, tombstone=True)
     details = [
         f"score {score if score is not _ABSENT else '(none)'}, "
@@ -484,7 +504,8 @@ def render(trace: Trace) -> list[str]:
         out.append(f"   {head['url']}")
     if trace.job is not None and trace.tombstone is not None:
         out.append(
-            "   ! in BOTH jobs and discarded_jobs (a geo_resurrect restore?); "
+            "   ! in BOTH jobs and discarded_jobs (an interrupted geo_resurrect "
+            "or prune_backlog?); "
             "both are shown below"
         )
     elif trace.job is not None:

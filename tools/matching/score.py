@@ -37,6 +37,7 @@ from tools.matching.pipeline import (
     parse_jd,
     prefilter,
 )
+from tools.matching.prerank import PRERANK_VERSION
 
 log = get_logger("tools.matching")
 
@@ -448,6 +449,43 @@ def discard_tombstone(
     if provenance is not None:
         stone["scored_with"] = provenance
     return stone
+
+
+#: ``pruned.by`` on a tombstone :func:`prune_tombstone` wrote.
+PRUNED_BY_PRERANK = "prerank"
+
+
+def prune_tombstone(job: Job, *, prerank_score: float, cutoff: float, at: str) -> dict:
+    """``discarded_jobs`` record for a job pruned from the backlog unscored.
+
+    Unlike :func:`discard_tombstone` no model judged the job, so there is no
+    ``score``, ``recommendation``, ``reasoning``, ``scored_run_id`` or
+    ``scored_with``; readers that treat a tombstone as a Pro rejection must
+    skip it (:func:`is_pruned`). It always carries ``restore``, because the
+    decision is a free heuristic's and ``cli.prune_backlog --undo`` reverses it.
+    """
+    return {
+        "job_id": job.id,
+        "company": job.company,
+        "title": job.title,
+        "url": job.url,
+        "discarded_at": at,
+        "jd_parsed": (job.jd_parsed.model_dump(mode="json") if job.jd_parsed else None),
+        "restore": restore_payload(job),
+        "pruned": {
+            "by": PRUNED_BY_PRERANK,
+            "version": PRERANK_VERSION,
+            "cutoff": cutoff,
+            "prerank": prerank_score,
+            "at": at,
+        },
+    }
+
+
+def is_pruned(doc: dict | None) -> bool:
+    """True for a tombstone :func:`prune_tombstone` wrote: no model scored it."""
+    pruned = (doc or {}).get("pruned")
+    return isinstance(pruned, dict) and pruned.get("by") == PRUNED_BY_PRERANK
 
 
 async def load_profile_and_pending(

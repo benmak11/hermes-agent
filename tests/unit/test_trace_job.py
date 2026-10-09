@@ -419,3 +419,27 @@ def test_an_untimed_event_keeps_the_timeline_column_aligned():
     untimed = next(line for line in rows if "(no time)" in line)
     timed = next(line for line in rows if line.startswith("     2026"))
     assert untimed.index("scored") == timed.index("discovered")
+
+
+def test_a_pruned_tombstone_reads_as_pruned_not_scored():
+    stone = {
+        "job_id": JOB,
+        "company": "Acme",
+        "title": "Sales Lead",
+        "url": "https://example.com/1",
+        "discarded_at": iso(6),
+        "jd_parsed": None,
+        "restore": {"discovered_at": iso(0), "discovered_via": "known"},
+        "pruned": {
+            "by": "prerank",
+            "version": 2,
+            "cutoff": -20.0,
+            "prerank": -40.0,
+            "at": iso(6),
+        },
+    }
+    text = _text(_db(discarded_jobs={JOB: stone}))
+    assert "pruned unscored (tombstone)" in text
+    assert "prerank -40.0 <= cutoff -20.0 (prerank v2); never scored" in text
+    assert "discarded (tombstone)" not in text
+    assert "score (none)" not in text

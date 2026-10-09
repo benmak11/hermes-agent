@@ -62,7 +62,7 @@ from tools.discovery.title_filter import (
     TITLE_FILTER_VERSION,
     evaluate_title,
 )
-from tools.matching.score import DISCARD_AT_OR_BELOW
+from tools.matching.score import DISCARD_AT_OR_BELOW, is_pruned
 
 load_dotenv()
 
@@ -181,7 +181,12 @@ async def replay_user(
 
     if with_discarded:
         async for tomb in user_ref.collection("discarded_jobs").stream():
-            title = (tomb.to_dict() or {}).get("title")
+            doc = tomb.to_dict() or {}
+            # A pruned tombstone was never parsed or scored, so a drop there
+            # saves nothing; it would inflate the "Pro rejected anyway" share.
+            if is_pruned(doc):
+                continue
+            title = doc.get("title")
             if title:
                 result.record_tombstone(str(title), preferences)
     return result

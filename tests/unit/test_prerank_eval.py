@@ -413,3 +413,82 @@ async def test_the_cli_never_writes(monkeypatch, capsys):
     assert out.startswith(f"prerank v{pr.PRERANK_VERSION} · title map: ")
     assert "users/nobody: no such user, skipped" in out
     assert "pooled, within-user pairs only" in out
+
+
+# --------------------------------------------------------- prune cutoffs
+
+
+def _pruned(title: str, **extra) -> dict:
+    return {"title": title, "company": "acme", "pruned": {"by": "prerank"}, **extra}
+
+
+@pytest.mark.asyncio
+async def test_pruned_tombstones_are_never_labelled_negatives():
+    """A pruned tombstone was never scored. One carrying a ``score`` anyway
+    must still stay out, or a prune would read as Pro agreeing with it."""
+    jobs, tombs = _corpus([GOOD] * 3, [BAD] * 3)
+    tombs["x-pruned"] = _pruned(BAD)
+    tombs["x-pruned-scored"] = _pruned(GOOD, score=0)
+    db = _db(jobs, tombs)
+    corpus = await _load(db)
+    ids = {r.job_id for r in corpus.rows}
+    assert "x-pruned" not in ids and "x-pruned-scored" not in ids
+    assert len(corpus.rows) == 6
+    assert "pruned" in dict(db.selects)["users/u1/discarded_jobs"]
+
+
+@pytest.mark.asyncio
+async def test_cutoff_table_masks_the_corpus_and_not_the_backlog(capsys):
+    """Ties at the cutoff count as pruned. A rejecting parse moves a backlog
+    job below 0 but cannot move a labelled row, whose prerank is masked."""
+    sales = {"role_family": "sales", "summary": "x"}
+    other = {"company": "other"}
+    jobs = {
+        "p-good": _job(GOOD, 80, **other),
+        "p-leaky": _job(GOOD, 80, jd_parsed=sales, **other),
+        "p-bad": _job(BAD, 70, **other),
+        "b-bad": {"title": BAD, "user_decision": "pending", **other},
+        "b-worse": {"title": "Office Manager", "user_decision": "pending", **other},
+        "b-good": {"title": GOOD, "user_decision": "pending", **other},
+        "b-leaky": {
+            "title": GOOD,
+            "user_decision": "pending",
+            "jd_parsed": sales,
+            **other,
+        },
+    }
+    tombs = {
+        "n-bad1": {**_tomb(BAD), **other},
+        "n-bad2": {**_tomb(BAD), **other},
+        "n-worse": {**_tomb("Office Manager"), **other},
+        "n-good": {**_tomb(GOOD, 10), **other},
+        "x-pruned": _pruned(BAD, **other),
+    }
+    corpus = await _load(_db(jobs, tombs))
+    by_id = {r.job_id: r for r in corpus.rows}
+    assert by_id["p-leaky"].gate.score == 90 and by_id["p-bad"].gate.score == -40
+    backlog = dict(zip(corpus.backlog.job_ids, corpus.backlog.scores, strict=True))
+    assert backlog == {"b-bad": -40, "b-worse": -60, "b-good": 90, "b-leaky": -10}
+
+    table = pe.cutoff_table(corpus.rows, corpus.backlog.scores, (0, -10, -40, -41))
+    got = [(t.cutoff, t.positives, t.negatives, t.lost, t.backlog) for t in table]
+    assert got == [
+        (-41, 0, 1, 0.0, 1),
+        (-40, 1, 3, pytest.approx(1 / 3), 2),
+        (-10, 1, 3, pytest.approx(1 / 3), 3),
+        (0, 1, 3, pytest.approx(1 / 3), 3),
+    ]
+    assert table[-1].backlog_share == pytest.approx(0.75)
+
+    pe.report(corpus, half=None, cutoffs=(-40,))
+    out = capsys.readouterr().out
+    assert "7. Prune cutoffs (prune = prerank <= cutoff)" in out
+    assert re.search(r"-40\s+1\s+3\s+33\.3%\s+2\s+50\.0%", out)
+
+
+def test_cutoff_table_is_undefined_without_positives_or_backlog():
+    rows = [pe.Row("n", pe.TOMBSTONES, {}, 0, pr.Prerank(-50.0), pr.Prerank(-50.0))]
+    (row,) = pe.cutoff_table(rows, [], (-40,))
+    assert (row.positives, row.negatives, row.backlog) == (0, 1, 0)
+    assert isinstance(row.lost, pe.Undefined)
+    assert isinstance(row.backlog_share, pe.Undefined)
