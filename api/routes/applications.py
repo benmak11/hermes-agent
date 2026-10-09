@@ -32,15 +32,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 from collections.abc import Collection
 from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
+from google.api_core.exceptions import FailedPrecondition
 from google.cloud import firestore
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
 
 from api.deps import verify_user, verify_user_query
 from models.job import Job
@@ -52,8 +55,18 @@ from tools.ats.validate import check_posting
 from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 from tools.submitters import SUBMIT_CLICKED
 from tools.submitters.router import submit_application
-from tools.submitters.storage import download_resume, upload_screenshot
-from tools.tailoring.pipeline import application_id, tailor_application
+from tools.submitters.storage import (
+    discard_resume,
+    download_resume,
+    replace_resume,
+    upload_screenshot,
+)
+from tools.tailoring.pipeline import (
+    application_id,
+    render_tailored_resume,
+    snapshot_experience,
+    tailor_application,
+)
 
 log = get_logger("api.applications")
 
@@ -65,12 +78,20 @@ SUBMITTABLE = {s for s, nxt in state.TRANSITIONS.items() if "submitting" in nxt}
 #: verbatim, so this is the only thing separating "we walked the form for free"
 #: from "we applied to this job" in the user's record.
 DRY_RUN_NOTE = "[dry run] "
+# Statuses whose resume file may still be rebuilt by an objective edit: the ones
+# a submission can still start from. Never ``submitting`` or later — the file is
+# then evidence of what was sent — and not before tailoring has produced one.
+OBJECTIVE_EDITABLE = SUBMITTABLE
 # Where the SSE stream stops polling. Wider than state.TERMINAL_STATUSES on
 # purpose: submitted/failed end *this* submission even though the lifecycle can
 # still move on from them.
 TERMINAL = {"submitted", "responded", "posting_removed"}
 
 router = APIRouter(tags=["applications"])
+
+# Bound at import, as in ``tools.applications.state``: a static factory that
+# needs no client, and a test that swaps ``firestore.Client`` cannot take it.
+_precondition = firestore.Client.write_option
 
 _db: firestore.Client | None = None
 
@@ -481,6 +502,9 @@ def download_resume_file(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         ),
         filename=f"resume_{company}.docx",
+        # Runs once the body has been sent, so each request's private copy is
+        # deleted rather than left to pile up on the instance.
+        background=BackgroundTask(discard_resume, path),
     )
 
 
@@ -492,11 +516,71 @@ class ObjectiveUpdate(BaseModel):
 def update_objective(
     app_id: str, body: ObjectiveUpdate, user_id: str = Depends(verify_user)
 ) -> dict:
-    """Inline-edit the generated objective from the review UI."""
+    """Inline-edit the objective and rebuild the resume file with it.
+
+    No LLM call: the bullets are re-ranked deterministically from the user's
+    *current* profile and the job's ``jd_parsed``, so a profile edited since
+    tailoring shows up in the rebuilt file (and in ``tailored_bullets``).
+
+    The file at ``resume_variant_uri`` is overwritten first and the document
+    written second, conditioned on the snapshot the status check read. A failed
+    render or upload therefore changes nothing; a document that moved on
+    meanwhile (e.g. Submit was pressed) gets a 409 saying the file may already
+    carry the new objective.
+    """
+    user_ref = _client().collection("users").document(user_id)
     ref = _apps(user_id).document(app_id)
-    if not ref.get().exists:
+    snap = ref.get()
+    if not snap.exists:
         raise HTTPException(status_code=404, detail="application not found")
-    ref.update({"objective_text": body.objective_text})
+    doc = snap.to_dict()
+    status = doc.get(state.STATUS_FIELD)
+    if status not in OBJECTIVE_EDITABLE:
+        raise HTTPException(
+            status_code=409, detail=f"cannot edit the objective in status '{status}'"
+        )
+    uri = doc.get("resume_variant_uri")
+    if not uri:
+        raise HTTPException(status_code=409, detail="no resume for this application")
+
+    job_snap = user_ref.collection("jobs").document(doc["job_id"]).get()
+    if not job_snap.exists:
+        raise HTTPException(status_code=409, detail="job for this application is gone")
+    job = Job.model_validate(job_snap.to_dict())
+    if job.jd_parsed is None:
+        raise HTTPException(status_code=409, detail="job has no parsed description")
+    profile = MasterProfile.model_validate(user_ref.get().to_dict())
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "resume.docx"
+            reranked = render_tailored_resume(job, profile, body.objective_text, local)
+            replace_resume(uri, local)
+    except Exception:
+        log.exception("application.objective_rebuild_failed", app_id=app_id)
+        raise HTTPException(
+            status_code=502,
+            detail="could not rebuild the resume; the objective was not changed",
+        ) from None
+
+    try:
+        ref.update(
+            {
+                "objective_text": body.objective_text,
+                "tailored_bullets": snapshot_experience(reranked),
+                "master_bullets": snapshot_experience(profile.experience),
+            },
+            option=_precondition(last_update_time=snap.update_time),
+        )
+    except FailedPrecondition:
+        log.warning("application.objective_update_conflict", app_id=app_id)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "application changed while saving; the resume file may already "
+                "carry the new objective — reload and try again"
+            ),
+        ) from None
     log.info(
         "application.objective_updated",
         app_id=app_id,
@@ -725,15 +809,17 @@ async def run_submission(user_id: str, app_id: str, *, dry_run: bool = False) ->
                 return True
 
             resume_path = download_resume(resume_uri)
-
-            result = await submit_application(
-                job,
-                profile,
-                resume_path,
-                dry_run=dry_run,
-                headless=True,
-                on_progress=progress,
-            )
+            try:
+                result = await submit_application(
+                    job,
+                    profile,
+                    resume_path,
+                    dry_run=dry_run,
+                    headless=True,
+                    on_progress=progress,
+                )
+            finally:
+                discard_resume(resume_path)
 
             shots: list[dict] = []
             for key, name in (
