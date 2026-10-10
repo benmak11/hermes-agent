@@ -5,6 +5,7 @@
 import {
   createUserWithEmailAndPassword,
   GoogleAuthProvider,
+  sendEmailVerification,
   sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signInWithPopup,
@@ -18,10 +19,21 @@ import { auth } from "@/lib/firebase";
 import { readStored, writeStored } from "@/lib/localStore";
 import { APP_HOME, safeNext, SIGNUP_FROM_KEY } from "@/lib/nav";
 import { signupOutcome, type SignupResult } from "@/lib/signupFlow";
+import {
+  canResend,
+  maskEmail,
+  openVerify,
+  resendWaitSeconds,
+  verifyReducer,
+  type VerifyAction,
+  type VerifyState,
+} from "@/lib/verifyEmail";
 import { CARD, SERIF } from "@/components/warm/styles";
 
 type Mode = "signin" | "signup";
 type Phase = "idle" | "creating" | "checking";
+/** What admit() left behind: carry on, the session was ended, or verify first. */
+type Admission = "continue" | "stopped" | "verify";
 type ErrState = {
   tone: "recover" | "error" | "locked" | "waitlisted";
   title?: string;
@@ -126,7 +138,16 @@ function panelStyle(bg: string, border: string): React.CSSProperties {
   return { background: bg, border: `1px solid ${border}`, borderRadius: 16, padding: "14px 17px" };
 }
 
-export function AuthCard({ initialMode, next }: { initialMode: Mode; next: string | null }) {
+export function AuthCard({
+  initialMode,
+  next,
+  verify = false,
+}: {
+  initialMode: Mode;
+  next: string | null;
+  /** `?verify=1`: an app route refused this session as unverified. */
+  verify?: boolean;
+}) {
   const router = useRouter();
   const { user, loading } = useAuth();
 
@@ -145,16 +166,45 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
   // listener has actually nulled `user` out, and the redirect effect below
   // must not race that window and let a locked-out session through.
   const [lockedOut, setLockedOut] = useState(false);
+  // The verify-your-email screen. Unlike a lock-out it keeps the session: the
+  // user needs it to reload their verified status and retry admission.
+  const [verifyState, setVerifyState] = useState<VerifyState | null>(null);
+  // Set once the `verify` arrival has been dealt with (verified, or the user
+  // started a different sign-in), so the prop stops opening the screen.
+  const [verifyDone, setVerifyDone] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+
+  // Arriving from an app route's 403 opens the screen for whoever is signed
+  // in, without sending an email; "I've verified" refreshes the token, so a
+  // stale claim cannot bounce the user between /app and here.
+  const verifying: VerifyState | null =
+    verifyState ??
+    (verify && !verifyDone && user ? openVerify(user.email, "app") : null);
+  const isVerifying = verifying !== null;
+
+  function dispatchVerify(action: VerifyAction) {
+    setVerifyState((s) =>
+      verifyReducer(s ?? openVerify(auth.currentUser?.email ?? null, "app"), action),
+    );
+  }
+
+  // Ticks the resend countdown, only while one is running.
+  const resendWait = verifying ? resendWaitSeconds(verifying.sentAt, now) : 0;
+  useEffect(() => {
+    if (resendWait <= 0) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [resendWait]);
 
   // Already-signed-in visitor, or a successful sign in / Google → home. The
   // create-account flow handles its own handoff (below), so it's excluded.
-  // Also held off during "checking" (the post-auth admission check) and once
-  // locked out — see admit.
+  // Also held off during "checking" (the post-auth admission check), once
+  // locked out — see admit — and while the verify screen is up.
   useEffect(() => {
-    if (!loading && user && !created && phase === "idle" && !lockedOut) {
+    if (!loading && user && !created && phase === "idle" && !lockedOut && !isVerifying) {
       router.push(safeNext(next) ?? APP_HOME);
     }
-  }, [loading, user, created, phase, lockedOut, router, next]);
+  }, [loading, user, created, phase, lockedOut, isVerifying, router, next]);
 
   // New account created → show the success beat, then hand off to onboarding.
   useEffect(() => {
@@ -172,6 +222,15 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
     setError(null);
     setNotice(null);
     setLockedOut(false);
+  }
+
+  /** A fresh sign-in attempt: clear every leftover panel and screen. */
+  function resetForAttempt() {
+    setError(null);
+    setNotice(null);
+    setLockedOut(false);
+    setVerifyState(null);
+    setVerifyDone(true);
   }
 
   /** End the session here: flag first, then sign out, then explain. The flag
@@ -200,42 +259,92 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
     return true;
   }
 
-  /** Post-auth admission. True = carry on; false = the session was ended here.
-   *  Records the marketing CTA the visitor came in through (stashed by /signup)
-   *  and clears it once the outcome is known — kept on fallback/error so the
-   *  next attempt still carries it. */
-  async function admit(provider: "google" | "email"): Promise<boolean> {
+  /** Post-auth admission. "continue" = carry on; "stopped" = the session was
+   *  ended here; "verify" = the session stays, and the caller opens the verify
+   *  screen. Records the marketing CTA the visitor came in through (stashed by
+   *  /signup) and clears it once the outcome is known — kept on
+   *  fallback/error/verify so the next attempt still carries it. */
+  async function admit(provider: "google" | "email"): Promise<Admission> {
     const source = readStored("session", SIGNUP_FROM_KEY);
     let result: SignupResult;
     try {
-      const r = await apiFetch<{ allowed: boolean }>("/account/signup", {
+      const r = await apiFetch<{ allowed: boolean; reason?: string }>("/account/signup", {
         method: "POST",
         body: JSON.stringify({ source }),
       });
-      result = { kind: "ok", allowed: r.allowed };
+      result = { kind: "ok", allowed: r.allowed, reason: r.reason };
     } catch (e) {
       result = { kind: "error", status: e instanceof ApiError ? e.status : null };
     }
     switch (signupOutcome(result)) {
       case "continue":
         writeStored("session", SIGNUP_FROM_KEY, null);
-        return true;
+        return "continue";
+      case "verify":
+        return "verify";
       case "waitlist":
         writeStored("session", SIGNUP_FROM_KEY, null);
         await lockOut(WAITLISTED_PANEL);
-        return false;
+        return "stopped";
       case "locked":
         await lockOut(LOCKED_PANEL);
-        return false;
+        return "stopped";
       case "fallback":
-        return provider === "google" ? legacyProbe() : true;
+        if (provider === "email") return "continue";
+        return (await legacyProbe()) ? "continue" : "stopped";
     }
   }
 
+  /** "I've verified": refresh the user and the token's claim, then re-admit. */
+  async function onCheckVerified() {
+    const u = auth.currentUser;
+    if (!u || !verifying) return;
+    const origin = verifying.origin;
+    dispatchVerify({ type: "check_start" });
+    try {
+      await u.reload();
+      await u.getIdToken(true);
+    } catch {
+      dispatchVerify({ type: "check_failed" });
+      return;
+    }
+    const admission = await admit("email");
+    if (admission === "verify") {
+      dispatchVerify({ type: "still_unverified" });
+      return;
+    }
+    setVerifyState(null);
+    setVerifyDone(true);
+    // A brand-new account goes on to onboarding; anyone else is redirected
+    // by the effect above now the screen is down.
+    if (admission === "continue" && origin === "create") setCreated(true);
+  }
+
+  /** "Resend email", held to one per cooldown. */
+  async function onResend() {
+    const u = auth.currentUser;
+    if (!u || !verifying || !canResend(verifying, now)) return;
+    dispatchVerify({ type: "send_start" });
+    try {
+      await sendEmailVerification(u);
+      const sentAt = Date.now();
+      setNow(sentAt);
+      dispatchVerify({ type: "sent", now: sentAt });
+    } catch (e) {
+      dispatchVerify({ type: "send_failed", code: errCode(e) });
+    }
+  }
+
+  /** "Use a different account": end the session, back to the form. */
+  async function onUseDifferentAccount() {
+    setLockedOut(true); // same race as lockOut: hold the redirect effect off
+    await auth.signOut();
+    setVerifyState(null);
+    setVerifyDone(true);
+  }
+
   async function withGoogle() {
-    setError(null);
-    setNotice(null);
-    setLockedOut(false);
+    resetForAttempt();
     setPhase("checking");
     try {
       await signInWithPopup(auth, new GoogleAuthProvider());
@@ -249,7 +358,9 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
     // redirect effect can act on it; on "not allowed" admit() has already
     // signed the user back out and lockedOut holds the effect off.
     try {
-      await admit("google");
+      if ((await admit("google")) === "verify") {
+        setVerifyState(openVerify(auth.currentUser?.email ?? null, "signin"));
+      }
     } finally {
       setPhase("idle");
     }
@@ -281,9 +392,7 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setError(null);
-    setNotice(null);
-    setLockedOut(false);
+    resetForAttempt();
 
     if (mode === "signin") {
       // "checking" goes on before the await, as withGoogle does: the phase
@@ -295,7 +404,11 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
         // Same admission as Google: a waitlisted address that comes back and
         // signs in gets the panel here, not a raw 403 on /app — and this is
         // the exact path the operator's grant relies on ("sign in again").
-        await admit("email");
+        // An unverified address gets the verify screen, with no email sent:
+        // resending is the user's call, not every sign-in's.
+        if ((await admit("email")) === "verify") {
+          setVerifyState(openVerify(auth.currentUser?.email ?? email.trim(), "signin"));
+        }
       } catch (err) {
         setError(describeAuthError(errCode(err)));
       } finally {
@@ -309,23 +422,53 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
     // holds a seat. The client-side code field this replaced only ever gated
     // this form, never Google sign-in, and shipped its codes in the bundle.
     setPhase("creating");
+    let newUser;
     try {
-      await createUserWithEmailAndPassword(auth, email.trim(), password);
+      newUser = (await createUserWithEmailAndPassword(auth, email.trim(), password)).user;
     } catch (err) {
       setPhase("idle");
       setError(describeAuthError(errCode(err)));
       return;
     }
+    // The address must be proven before the API lets the account in. A send
+    // failure is shown on the verify screen, whose resend button retries it.
+    let sentAt: number | null = null;
+    let sendError: string | null = null;
+    try {
+      await sendEmailVerification(newUser);
+      sentAt = Date.now();
+      setNow(sentAt);
+    } catch (err) {
+      sendError = errCode(err);
+    }
     // Phase stays "creating" through the admission check so the redirect
     // effect stays out; a stranger gets the waitlist panel instead of
     // /onboarding and a 403 there.
-    if (await admit("email")) setCreated(true);
-    else setPhase("idle");
+    const admission = await admit("email");
+    if (admission === "continue") {
+      setCreated(true);
+      return;
+    }
+    if (admission === "verify") {
+      const opened = openVerify(newUser.email ?? email.trim(), "create", sentAt);
+      setVerifyState(
+        sendError ? verifyReducer(opened, { type: "send_failed", code: sendError }) : opened,
+      );
+    }
+    setPhase("idle");
   }
 
   const card = (
     <div style={{ ...CARD, width: "min(440px, 100%)", padding: 36 }}>
-      {created ? (
+      {verifying && !created ? (
+        <VerifyPanel
+          state={verifying}
+          resendWait={resendWait}
+          onCheck={onCheckVerified}
+          onResend={onResend}
+          onSwitch={onUseDifferentAccount}
+        />
+      ) : created ? (
         <div className="py-4 text-center">
           <span
             className="h-pop mx-auto inline-flex h-11 w-11 items-center justify-center rounded-full text-[22px]"
@@ -619,4 +762,84 @@ export function AuthCard({ initialMode, next }: { initialMode: Mode; next: strin
   );
 
   return <main className="flex flex-1 items-center justify-center p-6">{card}</main>;
+}
+
+/** "Check your inbox": shown until the address is verified. */
+function VerifyPanel({
+  state,
+  resendWait,
+  onCheck,
+  onResend,
+  onSwitch,
+}: {
+  state: VerifyState;
+  resendWait: number;
+  onCheck: () => void;
+  onResend: () => void;
+  onSwitch: () => void;
+}) {
+  const masked = maskEmail(state.email);
+  const busy = state.busy !== "idle";
+  return (
+    <div>
+      <h1
+        className="text-[30px] font-normal"
+        style={{ fontFamily: SERIF, lineHeight: 1.15, color: "var(--ink)" }}
+      >
+        Check your inbox
+      </h1>
+      <p className="mt-2 text-[14.5px]" style={{ color: "var(--ink-4)", lineHeight: 1.55 }}>
+        {state.sentAt !== null
+          ? `We sent a link to verify ${masked}. Open it, then come back here.`
+          : `Verify ${masked} to continue. Open the link in the email we sent, or ask for a new one.`}
+      </p>
+
+      {state.message && (
+        <p
+          className="mt-4 text-[13.5px]"
+          style={{ color: state.message.tone === "error" ? "var(--brick)" : "var(--sage)" }}
+        >
+          {state.message.text}
+        </p>
+      )}
+
+      <button
+        type="button"
+        onClick={onCheck}
+        disabled={busy}
+        className="wm-cta mt-6 flex h-[48px] w-full items-center justify-center gap-2.5 rounded-[13px] text-[15px] font-semibold"
+      >
+        {state.busy === "checking" ? (
+          <>
+            <Spinner size={15} color="#b0a08d" />
+            Checking…
+          </>
+        ) : (
+          "I've verified"
+        )}
+      </button>
+      <button
+        type="button"
+        onClick={onResend}
+        disabled={busy || resendWait > 0}
+        className="wm-ghost mt-3 flex h-[46px] w-full items-center justify-center rounded-[13px] border text-[14px] font-semibold"
+        style={{
+          borderColor: "#e8dacb",
+          color: "var(--ink)",
+          cursor: busy || resendWait > 0 ? "not-allowed" : "pointer",
+        }}
+      >
+        {state.busy === "sending"
+          ? "Sending…"
+          : resendWait > 0
+            ? `Resend email in ${resendWait}s`
+            : "Resend email"}
+      </button>
+      <div className="mt-4 text-center">
+        <button type="button" onClick={onSwitch} className="wm-link text-[13px] font-semibold">
+          Use a different account
+        </button>
+      </div>
+    </div>
+  );
 }

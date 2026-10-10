@@ -120,11 +120,47 @@ async def _check_allowlist(uid: str, email: str | None) -> None:
 
 @dataclass(frozen=True)
 class Identity:
-    """What a verified token says, before the allowlist has been consulted."""
+    """What a verified token says, before the allowlist has been consulted.
+
+    ``provider`` is the token's ``firebase.sign_in_provider`` (``"password"``,
+    ``"google.com"``, ...); ``None`` on the dev bypass.
+    """
 
     uid: str
     email: str | None
     email_verified: bool
+    provider: str | None = None
+
+    @property
+    def needs_verification(self) -> bool:
+        """An email/password account whose address is not verified yet.
+
+        Only password accounts: an OAuth provider vouches for the address, and
+        Google tokens do not always carry ``email_verified``.
+        """
+        return self.provider == "password" and not self.email_verified
+
+
+def verification_required() -> bool:
+    """Is ``REQUIRE_VERIFIED_EMAIL`` on? Read per call, default on.
+
+    ``0`` / ``false`` / ``no`` / ``off`` is the emergency kill switch. It is
+    independent of ``ALLOWLIST_ENFORCED`` on purpose: the allowlist lifts at
+    launch, and this check has to outlive it.
+    """
+    raw = os.getenv("REQUIRE_VERIFIED_EMAIL", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _check_verified(ident: Identity) -> None:
+    """403 ``{"reason": "email_unverified"}`` for an unverified password account.
+
+    A dict detail, unlike the allowlist's string, so the web app can tell the
+    two refusals apart and show the verify screen rather than the invite one.
+    """
+    if verification_required() and ident.needs_verification:
+        log.warning("auth.email_unverified", user_id=ident.uid)
+        raise HTTPException(status_code=403, detail={"reason": "email_unverified"})
 
 
 def _bearer(authorization: str | None) -> str | None:
@@ -175,23 +211,35 @@ async def _verify_identity(token: str | None) -> Identity:
 
     uid = decoded["uid"]
     bind_request_context(user_id=uid)
+    firebase_claim = decoded.get("firebase")
+    provider = (
+        firebase_claim.get("sign_in_provider")
+        if isinstance(firebase_claim, dict)
+        else None
+    )
     return Identity(
         uid=uid,
         email=decoded.get("email"),
         email_verified=bool(decoded.get("email_verified")),
+        provider=provider,
     )
 
 
 async def _verified_user(token: str | None) -> Identity:
-    """Verify the token and the allowlist, returning the caller's identity.
+    """Verify the token, the email-verification rule and the allowlist,
+    returning the caller's identity.
 
-    The allowlist check runs after the dev bypass and is skipped entirely on
-    it, so local dev and the ``me`` demo account keep working even with
+    Both checks run after the dev bypass and are skipped entirely on it, so
+    local dev and the ``me`` demo account keep working even with
     ``ALLOWLIST_ENFORCED=1`` — the bypass identity carries no email, which
     :func:`_check_allowlist` would refuse.
+
+    Verification runs first and whether or not the allowlist is enforced, so an
+    unverified account sees the verify screen and costs no allowlist read.
     """
     ident = await _verify_identity(token)
     if _dev_bypass_uid() is None:
+        _check_verified(ident)
         await _check_allowlist(ident.uid, ident.email)
     return ident
 
@@ -204,11 +252,12 @@ async def _verify_token(token: str | None) -> str:
 async def verify_identity(
     authorization: str | None = Header(default=None),
 ) -> Identity:
-    """Token verified, allowlist not consulted.
+    """Token verified, allowlist and email verification not consulted.
 
     Only for routes that must answer a stranger — today just
     ``POST /account/signup``, where a non-allowlisted account is told it is
-    waitlisted rather than 403'd. Every other route uses :func:`verify_user`.
+    waitlisted, and an unverified one to verify, rather than 403'd. Every
+    other route uses :func:`verify_user`.
     """
     return await _verify_identity(_bearer(authorization))
 

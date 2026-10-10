@@ -19,5 +19,11 @@ export default function LoginPage() {
 
 function LoginInner() {
   const params = useSearchParams();
-  return <AuthCard initialMode="signin" next={params.get("next")} />;
+  return (
+    <AuthCard
+      initialMode="signin"
+      next={params.get("next")}
+      verify={params.get("verify") === "1"}
+    />
+  );
 }

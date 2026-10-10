@@ -2,6 +2,7 @@
 // Unauthorized copying, distribution, or use is prohibited.
 import { ApiError } from "@/lib/apiError";
 import { auth } from "@/lib/firebase";
+import { verifyRedirect } from "@/lib/verifyEmail";
 
 export { ApiError };
 
@@ -18,6 +19,18 @@ export function newRequestId(): string {
 }
 
 
+let verifyRedirecting = false;
+
+/** An unverified email/password account lands on the verify screen rather than
+ *  a raw 403. Once per page: concurrent requests all fail the same way. */
+function routeToVerify(status: number, body: string): void {
+  if (typeof window === "undefined" || verifyRedirecting) return;
+  const href = verifyRedirect(status, body, window.location.pathname, window.location.search);
+  if (!href) return;
+  verifyRedirecting = true;
+  window.location.assign(href);
+}
+
 /** Run the request, raising an ApiError (with the correlation id) on failure. */
 async function send<T>(
   path: string,
@@ -32,6 +45,7 @@ async function send<T>(
   if (!res.ok) {
     const body = await res.text();
     console.error(`api ${res.status} ${path} (request ${id})`, body);
+    routeToVerify(res.status, body);
     throw new ApiError(res.status, body, id);
   }
   return (await res.json()) as T;

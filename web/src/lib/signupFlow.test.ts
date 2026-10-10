@@ -10,6 +10,14 @@ describe("signupOutcome", () => {
     expect(signupOutcome({ kind: "ok", allowed: false })).toBe("waitlist");
   });
 
+  it("asks for verification, not the waitlist, on verify_email", () => {
+    expect(signupOutcome({ kind: "ok", allowed: false, reason: "verify_email" })).toBe("verify");
+  });
+
+  it("treats an unknown refusal reason as the waitlist", () => {
+    expect(signupOutcome({ kind: "ok", allowed: false, reason: "other" })).toBe("waitlist");
+  });
+
   it("falls back to the legacy probe when the route is not deployed yet (404)", () => {
     expect(signupOutcome({ kind: "error", status: 404 })).toBe("fallback");
   });

@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiUpload } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { extractErrorMessage } from "@/lib/extractError";
 import type { Profile } from "@/lib/types";
 import { CARD, SERIF } from "@/components/warm/styles";
 
@@ -98,11 +99,7 @@ export default function OnboardingPage() {
         router.push("/onboarding/review");
       } catch (e) {
         clearTimeout(toParsing);
-        setError(
-          e instanceof Error
-            ? e.message.replace(/^\d+:\s*/, "")
-            : "Something went wrong reading your resume.",
-        );
+        setError(extractErrorMessage(e));
         setPhase("idle");
       }
     },

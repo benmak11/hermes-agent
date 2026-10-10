@@ -5,6 +5,8 @@
 Signup is the one route that answers a stranger: it runs on
 :func:`api.deps.verify_identity` (token verified, allowlist not consulted),
 records where the visitor came from, and answers ``{"allowed": bool}``. An
+email/password account with an unverified address is answered
+``{"allowed": false, "reason": "verify_email"}`` and nothing is written. An
 allowlisted account gets ``users/{uid}`` stamped once with ``signup_source``
 and ``signed_up_at``; anyone else gets a ``waitlist/{email}`` doc and nothing
 under ``users/``. Every other route still 403s a stranger through
@@ -33,7 +35,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from google.cloud import firestore
 from pydantic import BaseModel
 
-from api.deps import Identity, firebase_auth, verify_identity, verify_user
+from api.deps import (
+    Identity,
+    firebase_auth,
+    verification_required,
+    verify_identity,
+    verify_user,
+)
 from obs.logging import get_logger
 from tools import allowlist
 from tools.account.delete import delete_account, is_deleted
@@ -84,6 +92,13 @@ async def signup(
     ``api.deps`` keeps for the other routes: a fresh grant must be visible on
     the very next sign-in.
     """
+    if verification_required() and ident.needs_verification:
+        # Ahead of everything, and writes nothing: an unverified address may
+        # not be the caller's, so it must not hold a seat, a waitlist place or
+        # a ``signup_source``. The client verifies and calls again.
+        log.info("account.signup.verify_email", user_id=ident.uid)
+        return {"allowed": False, "reason": "verify_email"}
+
     source = body.source if body.source in SIGNUP_SOURCES else None
     db = _client()
 
