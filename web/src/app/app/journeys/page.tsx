@@ -395,7 +395,7 @@ function RowTitle({ role, company, size = 15.5 }: { role: string; company: strin
 
 function SourcePill({ source }: { source: Journey["source"] }) {
   return source === "hermes" ? (
-    <Pill tone="accent">Hermes applied for you</Pill>
+    <Pill tone="accent">Found by Hermes</Pill>
   ) : (
     <Pill tone="muted">You added this one</Pill>
   );

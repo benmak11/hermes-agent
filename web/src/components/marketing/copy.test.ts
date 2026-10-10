@@ -24,6 +24,18 @@ describe("marketing copy", () => {
     }
   });
 
+  it("never claims Hermes submits applications for you", () => {
+    for (const claim of ["does the applying", "Apply for me", "applied for you", "Applying for you"]) {
+      const hits = all.filter((s) => s.toLowerCase().includes(claim.toLowerCase()));
+      expect(hits, claim).toEqual([]);
+    }
+  });
+
+  it("says résumés are processed by Google Gemini on the band and the privacy page", () => {
+    expect(copy.security.points.some((p) => p.strong.includes("Google Gemini"))).toBe(true);
+    expect(copy.pages.security.p).toContain("Google Gemini");
+  });
+
   it("uses the same CTA text in all four placements", () => {
     // Deliberately four keys, not one: the sharpening pass is per placement,
     // and this is the conscious checkpoint if they ever diverge.

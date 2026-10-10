@@ -23,7 +23,7 @@ const TONES: Record<PillTone, CSSProperties> = {
   },
 };
 
-/** Rounded status pill ("Hermes applied for you", "Not booked"). */
+/** Rounded status pill ("Found by Hermes", "Not booked"). */
 export function Pill({
   tone,
   children,
