@@ -21,6 +21,7 @@ def auth_user(
     display_name: str | None = None,
     created_ms: int = 1_767_225_600_000,  # 2026-01-01T00:00:00Z
     last_sign_in_ms: int | None = 1_788_220_800_000,  # 2026-09-01T00:00:00Z
+    providers: tuple[str, ...] = (),
 ) -> SimpleNamespace:
     return SimpleNamespace(
         uid=uid,
@@ -28,6 +29,7 @@ def auth_user(
         email_verified=email_verified,
         disabled=disabled,
         display_name=display_name,
+        provider_data=[SimpleNamespace(provider_id=p) for p in providers],
         user_metadata=SimpleNamespace(
             creation_timestamp=created_ms, last_sign_in_timestamp=last_sign_in_ms
         ),

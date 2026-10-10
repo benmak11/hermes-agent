@@ -33,6 +33,7 @@ from tools import queues
 from tools.account import plan
 from tools.discovery import budget as discovery_budget
 from tools.matching import budget as matching_budget
+from tools.profile import extract_budget
 from tools.profile.extract import extract_profile, read_resume_text
 from tools.run_costs import DONE, FAILED, RUNNING, open_run, persist_run_cost
 
@@ -126,19 +127,22 @@ def _new_account_fields(existing: dict, now: datetime) -> dict:
     return fields
 
 
-@router.post("/profile/extract")
-async def extract(
-    user_id: str = Depends(verify_user),
-    file: UploadFile | None = File(default=None),
-    text: str | None = Form(default=None),
-) -> dict:
-    """Extract a draft profile from an uploaded resume or pasted text. Spends
-    real money on Gemini.
+def _extract_cap_429(charge: extract_budget.Charge) -> HTTPException:
+    """The daily-extraction refusal. 429, not 402: a cap is not a price."""
+    return HTTPException(
+        status_code=429,
+        detail={
+            "reason": "extract_cap",
+            "used": charge.used,
+            "per_day": charge.per_day,
+            # An ISO instant; the client renders it in the viewer's timezone.
+            "resets_at": charge.resets_at,
+        },
+    )
 
-    Saves the result to ``users/{uid}`` as a draft
-    (``onboarding_complete=false``) and returns it for the review screen. The
-    blocking Gemini call runs off the event loop.
-    """
+
+async def _resume_text(file: UploadFile | None, text: str | None) -> str:
+    """The résumé as plain text, or the 4xx that says why it can't be read."""
     if file is not None:
         raw = await file.read()
         if len(raw) > MAX_RESUME_BYTES:
@@ -154,6 +158,39 @@ async def extract(
         raise HTTPException(
             status_code=422, detail="Could not read any text from that resume."
         )
+    return resume_text
+
+
+@router.post("/profile/extract")
+async def extract(
+    user_id: str = Depends(verify_user),
+    file: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+) -> dict:
+    """Extract a draft profile from an uploaded resume or pasted text. Spends
+    real money on Gemini.
+
+    Saves the result to ``users/{uid}`` as a draft
+    (``onboarding_complete=false``) and returns it for the review screen. The
+    blocking Gemini call runs off the event loop.
+
+    Charged against the daily extraction cap first (429 ``extract_cap`` when
+    it is spent); the slot is refunded if the upload cannot be read, but not
+    once Gemini has been called. See :mod:`tools.profile.extract_budget`.
+    """
+    charge = await asyncio.to_thread(extract_budget.charge, _client(), user_id)
+    if not charge.granted:
+        raise _extract_cap_429(charge)
+
+    try:
+        resume_text = await _resume_text(file, text)
+    except Exception:
+        # Nothing reached the model, so the slot was never spent.
+        if charge.charged:
+            await asyncio.to_thread(
+                extract_budget.refund, _client(), user_id, day=charge.day
+            )
+        raise
 
     source = "file" if file is not None else "text"
     log.info("profile.extract.request", source=source, chars=len(resume_text))
