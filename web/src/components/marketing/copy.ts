@@ -9,7 +9,7 @@
  */
 
 const lede =
-  "Hermes finds the roles and writes the applications from your real history. You approve them with a tap and every interview that follows shows up on one map.";
+  "Hermes finds the roles and tailors your résumé to each one from your real history. You send the application, and every interview that follows shows up on one map.";
 
 export const copy = {
   meta: { title: "Hermes — the job search, run for you", description: lede },
@@ -19,7 +19,7 @@ export const copy = {
     features: "Features",
     items: [
       { title: "Journeys", blurb: "Where you stand in every interview" },
-      { title: "Applying for you", blurb: "Roles matched and written up from your history" },
+      { title: "Matched for you", blurb: "Roles found and résumés tailored from your history" },
       { title: "Insights", blurb: "What your own notes say about where you stall" },
     ],
     howItWorks: "How it works",
@@ -31,7 +31,7 @@ export const copy = {
   hero: {
     badgeNew: "New",
     badge: "Journeys are ways to see where you stand in every interview",
-    h1Line1: "Hermes does the applying.",
+    h1Line1: "Hermes does the searching.",
     h1Em: "You",
     h1Line2Rest: " do the interviews.",
     lede,
@@ -43,7 +43,7 @@ export const copy = {
       live: "3 live",
       role: "Staff Engineer, Payments",
       company: "· Shopify",
-      pill: "Hermes applied for you",
+      pill: "Found by Hermes",
       stages: {
         applied: { name: "Applied", note: "2 Sep" },
         recruiter: { name: "Recruiter call", note: "went well" },
@@ -54,8 +54,8 @@ export const copy = {
     },
   },
   proof: [
-    { before: "Every application is written from ", strong: "your real history", after: ", not a template." },
-    { before: "", strong: "Nothing is sent until you approve it.", after: " No exceptions." },
+    { before: "Every résumé is tailored from ", strong: "your real history", after: ", not a template." },
+    { before: "", strong: "Nothing is sent on your behalf.", after: " You submit every application yourself." },
     { before: "Roles ", strong: "you found yourself", after: " track the same way." },
   ],
   how: {
@@ -63,9 +63,9 @@ export const copy = {
     h2: "The searching and the paperwork are ours. The conversations are yours.",
     beats: [
       {
-        pill: "01 — It applies",
+        pill: "01 — It finds",
         h3: "It finds the roles and writes them up",
-        p: "Hermes reads your history once, then matches roles and drafts each application from what's actually in it. You read the draft, approve it, and it goes. Roles you found yourself sit in the same list.",
+        p: "Hermes reads your history once, then matches roles and tailors your résumé to each from what's actually in it. You check the draft, apply on the employer's site, and mark it sent. Roles you found yourself sit in the same list.",
       },
       {
         pill: "02 — You interview",
@@ -83,7 +83,7 @@ export const copy = {
         { title: "Senior Engineer, Billing", sub: "Anthropic · remote", chip: "strong match" },
         { title: "Staff Engineer, Payments", sub: "Shopify · hybrid", chip: "strong match" },
       ],
-      apply: "Apply for me",
+      apply: "Approve",
       skip: "Not this one",
     },
     mock2: {
@@ -145,7 +145,11 @@ export const copy = {
     h2: "Your search is nobody else's business.",
     p: "Not your employer's, not a recruiter's, and not ours to sell. Interview notes are private to you by default, and stay that way.",
     points: [
-      { strong: "Nothing sends without you.", rest: " Every application waits for your approval." },
+      { strong: "Nothing sends without you.", rest: " You submit every application yourself." },
+      {
+        strong: "Your résumé is read by Google Gemini.",
+        rest: " Hermes uses it to build your profile, match roles and tailor your résumé.",
+      },
       { strong: "Your notes stay yours.", rest: " What you write after an interview is never training data." },
       { strong: "Leave with your data.", rest: " Delete everything, any time." },
     ],
@@ -166,7 +170,7 @@ export const copy = {
     security: {
       title: "Security & privacy",
       h1: "Security & privacy",
-      p: "Hermes keeps your résumé and interview notes only to run your search. Nothing is sent to an employer until you approve it, what you write after an interview is never used to train anything, and you can delete your account and everything in it from your profile at any time.",
+      p: "Hermes keeps your résumé and interview notes only to run your search. Your résumé and the job postings are processed by Google Gemini to build your profile, match roles and tailor your résumé. Nothing is sent to an employer on your behalf, what you write after an interview is never used to train anything, and you can delete your account and everything in it from your profile at any time.",
     },
     contact: {
       title: "Contact",
